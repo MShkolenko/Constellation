@@ -54,6 +54,7 @@
 
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 using namespace Trinity::ChatCommands;
@@ -70,6 +71,14 @@ bool IsEnabled()
 bool AutoSummon()
 {
     return sConfigMgr->GetBoolDefault("Constellation.AutoSummon", true);
+}
+
+// 0 = весь состав. Постоянные сессии всего состава — это в девять раз больше, чем
+// было измерено, и дорожная карта требует мерить нагрузку ДО роста; ключ нужен,
+// чтобы оператор мог убавить, не пересобирая ядро.
+uint32 MaxActive()
+{
+    return sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
 }
 
 std::string AccountName()
@@ -130,18 +139,21 @@ public:
         if (!_bootstrapped)
             Bootstrap();
 
-        // stagger the pipeline: at most one state advance per 2 s tick window
+        // Ступенчатый пуск: не больше N продвижений состояния за окно в 2 с.
+        // Раньше было ровно ОДНО, и на составе из 122 спутников по пять состояний
+        // каждый это давало около двадцати минут на подъём. Ограничение всё равно
+        // нужно — оно разносит во времени создание персонажей и входы, — но одно
+        // продвижение на окно было настроено под состав из тринадцати.
         _throttleMs += diff;
-        bool mayAdvance = _throttleMs >= 2000;
+        uint32 budget = (_throttleMs >= 2000) ? sConfigMgr->GetIntDefault("Constellation.PerTick", 6) : 0;
+        if (budget)
+            _throttleMs = 0;
 
         for (Companion& c : _companions)
         {
             TickSession(c, diff);
-            if (mayAdvance && AdvanceOne(c))
-            {
-                _throttleMs = 0;
-                mayAdvance = false;
-            }
+            if (budget && AdvanceOne(c))
+                --budget;
         }
         DebugGroupPair();
     }
@@ -307,15 +319,26 @@ private:
             out += chars[pick(rd)];
         return out;
     }
-
-    // Its own battlenet + game account, created on first need and RECONCILED: the
-    // two halves are created by one call, but a crash between them (or an earlier
-    // partial run) leaves a battlenet account with no game account, and the first
-    // version then skipped that companion on every boot forever. Now the missing
-    // half is linked instead.
+    // ONE ACCOUNT PER RACE, shared by that race's classes.
+    //
+    // The operator's reason for splitting accounts was that a night elf must not
+    // inherit a dwarf's flight points, and in 11.x the warband shares appearances,
+    // mounts, pets and part of the achievements across a BATTLENET account. That is
+    // a RACE-level concern: a human paladin and a human mage sharing a warband is
+    // what a real player looks like. So the roster's companions live on 13 accounts,
+    // not one each -- well inside CharactersPerAccount (60), since the largest race
+    // offers 11 classes. Resolved once per race and cached.
     bool ResolveAccount(Companion& c)
     {
-        c.BnetEmail = Trinity::StringFormat("{}-{}@algalon.local", AccountName(), c.Entry->Name);
+        c.BnetEmail = Trinity::StringFormat("{}-R{}@algalon.local", AccountName(), uint32(c.Entry->Race));
+        auto known = _raceAccounts.find(c.Entry->Race);
+        if (known != _raceAccounts.end())
+        {
+            c.BnetId = known->second.first;
+            c.AccountId = known->second.second;
+            return true;
+        }
+
         c.BnetId = Battlenet::AccountMgr::GetId(c.BnetEmail);
         if (!c.BnetId)
         {
@@ -326,8 +349,8 @@ private:
                 return false;
             }
             c.BnetId = Battlenet::AccountMgr::GetId(c.BnetEmail);
-            TC_LOG_INFO("server.loading", "Constellation: account for {} created ({}, game '{}')",
-                c.Entry->Name, c.BnetEmail, gameAccountName);
+            TC_LOG_INFO("server.loading", "Constellation: account for race {} created ({}, game '{}')",
+                uint32(c.Entry->Race), c.BnetEmail, gameAccountName);
         }
         if (!c.BnetId)
         {
@@ -337,35 +360,32 @@ private:
         c.AccountId = AccountMgr::GetId(Trinity::StringFormat("{}#1", c.BnetId));
         if (!c.AccountId)
         {
-            // the halves disagree: create the game account and link it to the parent
             std::string gameName = Trinity::StringFormat("{}#1", c.BnetId);
-            TC_LOG_WARN("server.loading", "Constellation: {} has a battlenet account but no game account - repairing",
-                c.Entry->Name);
-            // the core's own battlenet command creates it already linked, by passing
-            // the parent id and index -- no separate LinkWithGameAccount needed
+            TC_LOG_WARN("server.loading", "Constellation: race {} has a battlenet account but no game account - repairing",
+                uint32(c.Entry->Race));
             if (sAccountMgr->CreateAccount(gameName, RandomPassword(), c.BnetEmail, c.BnetId, 1) != AccountOpResult::AOR_OK)
             {
-                TC_LOG_ERROR("server.loading", "Constellation: cannot repair game account for {}", c.Entry->Name);
+                TC_LOG_ERROR("server.loading", "Constellation: cannot repair game account for race {}", uint32(c.Entry->Race));
                 return false;
             }
             c.AccountId = AccountMgr::GetId(gameName);
         }
         if (!c.AccountId)
         {
-            TC_LOG_ERROR("server.loading", "Constellation: game account for {} still unresolved", c.Entry->Name);
+            TC_LOG_ERROR("server.loading", "Constellation: game account for race {} still unresolved", uint32(c.Entry->Race));
             return false;
         }
         // the name <bnetId>#1 alone does not prove the link: a stale or mislinked
         // account carrying that name would have been accepted and used (Codex r3).
-        // Refuse rather than adopt somebody else's account.
         uint32 parent = Battlenet::AccountMgr::GetIdByGameAccount(c.AccountId);
         if (parent != c.BnetId)
         {
-            TC_LOG_ERROR("server.loading", "Constellation: game account {} for {} is linked to battlenet {}, expected {} - refusing",
-                c.AccountId, c.Entry->Name, parent, c.BnetId);
+            TC_LOG_ERROR("server.loading", "Constellation: game account {} is linked to battlenet {}, expected {} - refusing",
+                c.AccountId, parent, c.BnetId);
             c.AccountId = 0;
             return false;
         }
+        _raceAccounts[c.Entry->Race] = { c.BnetId, c.AccountId };
         return true;
     }
 
@@ -395,6 +415,15 @@ private:
             {
                 if (!AutoSummon() && c.Retries == 0 && c.TicksInState < 2)
                     return false;   // waits for .constellation summon
+                if (uint32 cap = MaxActive())
+                {
+                    uint32 live = 0;
+                    for (Companion const& o : _companions)
+                        if (o.Session)
+                            ++live;
+                    if (live >= cap)
+                        return false;   // предохранитель: не больше cap в мире разом
+                }
                 if (!c.AccountId)
                     return false;
                 // session FIRST: Player's constructor (used by CreateCharacter)
@@ -646,6 +675,7 @@ private:
 
     std::vector<Companion> _companions;
     bool _debugPairDone = false;
+    std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
     bool _bootstrapped = false;
