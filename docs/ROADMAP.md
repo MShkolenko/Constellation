@@ -6,7 +6,7 @@
 |---|---|---|---|
 | `MShkolenko/AlgalonCore` | публичный | GPL-2.0 (унаследована, выбора нет) | форк ядра: замороженный 11.2.7 + проверенные бэкпорты + ОДИН охраняемый крюк модуля |
 | `MShkolenko/TrinityCore` | публичный | GPL-2.0 (унаследована) | нетронутое зеркало апстрима для местных раскопок |
-| `MShkolenko/Constellation` | **приватный** | заголовки GPL-2.0-or-later, полный текст при публикации | модуль спутников — целиком наша работа |
+| `MShkolenko/Constellation` | **публичный** | GPL-2.0-or-later, COPYING в корне | модуль спутников — целиком наша работа |
 | `MShkolenko/homelab` | приватный | — | процесс, решения, инструменты; никогда не игровой код |
 
 ## Решение по лицензии
@@ -23,8 +23,7 @@ Copyright (C) 2026 Constellation Project (AlgalonCore)
 Более жёсткое «упомяните нас в README/рекламе» несовместимо с GPL и невозможно при линковке
 с ядром. Вежливая просьба об упоминании идёт в README как просьба, не как условие лицензии.
 
-Пока репозиторий приватный, распространения нет и обязательства не срабатывают; заголовки
-уже расставлены, так что открытие — это добавить COPYING, и всё.
+Репозиторий публичен с 2026-08-29: COPYING в корне, шапки в каждом файле исходников.
 
 ## Фазы
 
@@ -60,7 +59,7 @@ Copyright (C) 2026 Constellation Project (AlgalonCore)
 |---|---|---|---|
 | `MShkolenko/AlgalonCore` | public | GPL-2.0 (inherited, no choice) | the core fork: frozen 11.2.7 + audited back-ports + ONE guarded module hook |
 | `MShkolenko/TrinityCore` | public | GPL-2.0 (inherited) | untouched upstream mirror, for local archaeology |
-| `MShkolenko/Constellation` | **private** | GPL-2.0-or-later headers, full text at publication | the companion module — all our own work |
+| `MShkolenko/Constellation` | **public** | GPL-2.0-or-later, COPYING at the root | the companion module — all our own work |
 | `MShkolenko/homelab` | private | — | process, decisions, tooling; never gameplay code |
 
 ### Licensing decision
@@ -78,8 +77,7 @@ the same license. A stronger "credit us in your README/advertising" clause would
 GPL-incompatible and cannot be used while linking the core. A polite request for a mention
 goes in the README as a request, not a license term.
 
-While the repository is private nothing is distributed and no obligation triggers; the
-headers are in place so flipping to public is a two-line change (add COPYING, done).
+The repository is public since 2026-08-29: COPYING at the root, headers in every source file.
 
 ### Phases
 

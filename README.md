@@ -29,6 +29,12 @@ tools/  integrate.sh — подключает модуль к чекауту я�
 
 `tools/integrate.sh <каталог-исходников-ядра>` делает шаг 1 и проверяет шаг 2.
 
+## Лицензия
+
+GPL-2.0-or-later — см. [COPYING](COPYING): модуль линкуется с ядром TrinityCore (GPL-2.0).
+Строки авторства в файлах сохраняются при любом использовании — этого требует лицензия.
+Если модуль вам пригодился, будем рады ссылке на репозиторий — это просьба, не условие.
+
 ## Состояние
 
 Фаза 0 (каркас) — на боевом сервере. Фазы 1–2 (состав по расам, вход через сессии
@@ -68,6 +74,12 @@ Integration is:
    so the core builds byte-identically whether or not the module is checked out.
 
 `tools/integrate.sh <core-src-dir>` performs step 1 and verifies step 2.
+
+### License
+
+GPL-2.0-or-later — see [COPYING](COPYING): the module links against TrinityCore (GPL-2.0).
+Copyright notices in the files must be preserved by any use — the license requires it.
+If the module serves you, a link back to the repository is appreciated — a request, not a term.
 
 ### Status
 
