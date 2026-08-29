@@ -1,56 +1,103 @@
-# Constellation — architecture
+# Constellation — устройство / architecture
 
-## What a companion is
+## Что такое спутник
+
+Спутник — это **настоящий Player, ведомый сервером**: строка в базе персонажей, вошедшая
+через сессию без сокета (WorldSession с пустым сокетом), которую двигает и действует код
+модуля. Это не существо, переодетое игроком.
+
+Почему это решение несущее:
+
+- Всё, что ядро уже умеет для игроков — заклинания, ауры, предметы, движение, угроза,
+  лут, группы, профессии — достаётся спутникам бесплатно. Имитация на существах
+  переписывает это заново и всё равно выдаёт себя (не те пакеты, не та рамка, не может
+  в группу, не может торговать).
+- Настоящие клиенты видят спутника ровно как другого игрока — потому что для ядра он
+  и есть другой игрок.
+- Цена: одна WorldSession + один Player на спутника. Отсюда фаза замера нагрузки
+  **до** масштабирования.
+
+## Уроки интеграции, оплаченные стендом (девять кругов фазы 1–2)
+
+1. Сессия строится **до** персонажа: конструктор Player разыменовывает её.
+2. Сессии живут **вне** менеджера сессий: пустой сокет — `Update()` вернёт false и
+   менеджер её пожнёт. Модуль сам зовёт `Update()` каждый тик и игнорирует false.
+3. Перед каждым тиком — `ResetTimeOutTime(false)`: первая же строка `Update()` зовёт
+   `CloseSocket()` по простою **без проверки на пустоту**.
+4. После `HandlePlayerLoginOpcode` — сразу `HandleContinuePlayerLogin()`: настоящий вход
+   продолжает второй (мировой) сокет клиента, которого у нас нет.
+5. Внешность собирается **зеркалом проверки ядра**: опция входит, если её требование
+   проходит `MeetsChrCustomizationReq`, вариант — если его требование проходит **против
+   уже собранного набора** (требования вариантов зависят от других выбранных).
+6. Учётка — настоящая связка Battle.net + игровая: без родителя валятся внешние ключи
+   таблиц коллекций.
+7. Фиксация сохранения персонажа — только асинхронная (её запросы помечены для
+   асинхронного соединения); правда о создании берётся стадией «Сохраняется» — опросом
+   строки в базе, а не доверием вызову.
+
+## Инварианты
+
+1. **Ядро остаётся чистым.** Один охраняемый крюк; нужда в правке ядра — отдельный
+   именованный коммит, никогда не «заодно».
+2. **Выключен — значит инертен.**
+3. **Свои таблицы, свой префикс** `constellation_*` в базе персонажей.
+4. **Та же дисциплина отгрузки, что у ядра.**
+
+## Фазы
+
+См. ROADMAP.md — там таблица фаз с состоянием и ворота замера нагрузки.
+
+---
+
+<details>
+<summary><strong>English</strong></summary>
+
+<br>
+
+### What a companion is
 
 A companion is a **real Player driven by the server**: a character row in the characters
-database, logged in through a headless session (a WorldSession with no socket), moved and
-acted by module code. It is not a creature dressed as a player.
+database, logged in through a socketless session, moved and acted by module code. It is
+not a creature dressed as a player.
 
 Why this is the load-bearing decision:
 
 - Everything the core already implements for players — spells, auras, items, movement,
   threat, loot, groups, professions — works for companions for free. A creature-based
-  imitation re-implements all of it and still looks wrong (wrong packets, wrong nameplate,
-  cannot join a group, cannot trade).
-- The companion is visible to real clients exactly as another player, because to the core
-  it *is* another player.
-- Cost: one WorldSession + one Player per companion. Phase 0 of the old plan — measure
-  before scaling — still applies; the measurement target is sessions-per-core-thread on
-  the live host.
+  imitation re-implements all of it and still looks wrong.
+- Real clients see a companion exactly as another player, because to the core it *is*
+  another player.
+- Cost: one WorldSession + one Player per companion — hence the load-measurement phase
+  gates any scaling.
 
-## Invariants (hold in every phase)
+### Integration lessons, paid for on the rig (nine cycles of phase 1–2)
 
-1. **Core stays clean.** The fork carries exactly one guarded hook in
-   `Custom/custom_script_loader.cpp`. Everything else lives in this repository and enters
-   the build through the `Custom/Constellation` symlink. If a phase ever genuinely needs a
-   core change, that change is a separate, named fork commit — never silently mixed in.
-2. **Disabled means inert.** With `Constellation.Enable = 0` the module must not touch
-   the world: no sessions, no timers, no DB reads beyond config.
-3. **Own tables only, own prefix.** Module state lives in tables named `constellation_*`
-   in the characters database. The module never alters core tables' schema.
-4. **Same shipping discipline as the core:** build and boot on the THRONE rig, DBErrors
-   comparison against the live baseline, server-side probe on port 8095, only then swap.
+1. The session is built **before** the character: Player's constructor dereferences it.
+2. Sessions live **outside** the session manager: with a null socket `Update()` returns
+   false and the manager reaps them. The module ticks `Update()` itself and ignores false.
+3. `ResetTimeOutTime(false)` before every tick: `Update()`'s first statement calls
+   `CloseSocket()` on idle **without a null check**.
+4. `HandleContinuePlayerLogin()` right after `HandlePlayerLoginOpcode`: the real login is
+   continued by the client's second (instance) socket, which we do not have.
+5. Appearance is assembled by **mirroring the core's validator**: an option enters if its
+   requirement passes `MeetsChrCustomizationReq`, a choice if its requirement passes
+   **against the set built so far** (choice requirements depend on other selections).
+6. The account is a real Battle.net + game pair: without the parent, the collection
+   tables' foreign keys fail on every login.
+7. Character-save commits are async by necessity (their statements are flagged
+   async-connection-only); creation truth comes from a Saving stage that polls for the
+   row instead of trusting the call.
 
-## Phases
+### Invariants
 
-| Phase | Deliverable | Proof |
-|---|---|---|
-| 0 | Skeleton: registration, config, `.constellation status` | startup log line, command answers |
-| 1 | Session fabrication: log one existing character in and out by command | character appears online, clean logout, no leaks after repeated cycles |
-| 2 | Presence: the companion stands in the world, respawns on server restart | visible to a real client, survives restart |
-| 3 | Follow: companion joins the summoner's group on command, follows, teleports when left behind | group invite accepted, MoveFollow holds through zones |
-| 4 | Combat: assist mode — attacks the summoner's target with a class-appropriate rotation | target dies, companion survives, no stuck-in-combat |
-| 5 | Population: N companions from config, distributed over capital cities | load measured against Phase-0 baseline |
+1. **The core stays clean.** One guarded hook; a genuine core change is a separate,
+   named commit — never mixed in.
+2. **Disabled means inert.**
+3. **Own tables, own prefix** `constellation_*` in the characters database.
+4. **The same shipping discipline as the core.**
 
-Later (unordered): equipment management, vendor trips, quest execution, auction house.
-The old client-side task list (0005–0017 in the homelab repo) is superseded by this plan;
-its ideas return as phases here, implemented server-side.
+### Phases
 
-## Phase 1 sketch (next)
+See ROADMAP.md for the phase table with states and the load-measurement gate.
 
-- `constellation_characters` table: character GUID + role flags.
-- `.constellation summon <name>` / `.constellation dismiss <name>` (GM-only at first).
-- Session fabrication path: create WorldSession with null socket, feed it through
-  `HandlePlayerLogin` the way the login handler does, drive updates from the module's
-  world-update hook. Logout through the normal path, verified by session/player counters.
-- The first measurement: memory and update-time delta for 1 vs 10 idle companions.
+</details>

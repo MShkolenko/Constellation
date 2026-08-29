@@ -13,6 +13,7 @@
 #include "Roster.h"
 
 #include "AccountMgr.h"
+#include "BattlenetAccountMgr.h"
 #include "CharacterCache.h"
 #include "CharacterPackets.h"
 #include "Chat.h"
@@ -59,6 +60,7 @@ std::string AccountName()
 enum class Stage : uint8
 {
     Offline,        // known, no session
+    Saving,         // creation committed asynchronously; polling for the row
     EnumQueued,     // session made, char-enum sent (fills _legitCharacters)
     LoginSent,      // player-login sent, holder in flight
     InWorld,        // session->GetPlayer() is live
@@ -170,17 +172,29 @@ private:
     {
         _bootstrapped = true;
 
-        _accountId = AccountMgr::GetId(AccountName());
-        if (!_accountId)
+        // a REAL battlenet account with a linked game account, like a human player:
+        // a game account with bnet id 0 breaks the collection tables' foreign keys
+        // (battlenet_item_appearances INSERT ... battlenetAccountId=0) on every login
+        _bnetEmail = Trinity::StringFormat("{}@algalon.local", AccountName());
+        _bnetId = Battlenet::AccountMgr::GetId(_bnetEmail);
+        if (!_bnetId)
         {
             std::string password = Trinity::StringFormat("cst-{}", GameTime::GetGameTime());
-            if (sAccountMgr->CreateAccount(AccountName(), password) != AccountOpResult::AOR_OK)
+            std::string gameAccountName;
+            if (Battlenet::AccountMgr::CreateBattlenetAccount(_bnetEmail, password, true, &gameAccountName) != AccountOpResult::AOR_OK)
             {
-                TC_LOG_ERROR("server.loading", "Constellation: cannot create account '{}'", AccountName());
+                TC_LOG_ERROR("server.loading", "Constellation: cannot create battlenet account '{}'", _bnetEmail);
                 return;
             }
-            _accountId = AccountMgr::GetId(AccountName());
-            TC_LOG_INFO("server.loading", "Constellation: account '{}' created (id {})", AccountName(), _accountId);
+            _bnetId = Battlenet::AccountMgr::GetId(_bnetEmail);
+            TC_LOG_INFO("server.loading", "Constellation: battlenet account '{}' created (id {}, game '{}')",
+                _bnetEmail, _bnetId, gameAccountName);
+        }
+        _accountId = AccountMgr::GetId(Trinity::StringFormat("{}#1", _bnetId));
+        if (!_accountId)
+        {
+            TC_LOG_ERROR("server.loading", "Constellation: game account '{}#1' not found", _bnetId);
+            return;
         }
 
         for (RosterEntry const& entry : Roster)
@@ -224,14 +238,38 @@ private:
                 // dereferences it — creating before the session was the phase-1 segfault
                 if (!c.Session)
                     MakeSession(c);
-                if (!c.Guid && !CreateCharacter(c))
-                    { Fail(c, "creation"); return true; }
-                WorldPacket raw(CMSG_ENUM_CHARACTERS);
-                WorldPackets::Character::EnumCharacters enumChars(std::move(raw));
-                c.Session->HandleCharEnumOpcode(enumChars);
-                c.State = Stage::EnumQueued;
-                c.TicksInState = 0;
+                if (!c.Guid)
+                {
+                    if (!CreateCharacter(c))
+                        { Fail(c, "creation"); return true; }
+                    c.State = Stage::Saving;    // commit is async: trust the row, not the call
+                    c.TicksInState = 0;
+                    return true;
+                }
+                SendEnum(c);
                 return true;
+            }
+            case Stage::Saving:
+            {
+                // the character-save statements are async-connection-only, so the
+                // commit cannot be made synchronous; poll for the actual row instead
+                QueryResult exists = CharacterDatabase.Query(
+                    Trinity::StringFormat("SELECT 1 FROM characters WHERE guid = {}", c.Guid.GetCounter()).c_str());
+                if (exists)
+                {
+                    sCharacterCache->AddCharacterCacheEntry(c.Guid, _accountId, c.Entry->Name,
+                        c.Entry->Sex, c.Entry->Race, c.Entry->Class, 1, false);
+                    TC_LOG_INFO("server.worldserver", "Constellation: created {} ({})", c.Entry->Name, c.Guid.ToString());
+                    SendEnum(c);
+                    return true;
+                }
+                if (c.TicksInState > 10)
+                {
+                    c.Guid.Clear();
+                    Fail(c, "save-commit");
+                    return true;
+                }
+                return false;
             }
             case Stage::EnumQueued:
             {
@@ -242,6 +280,11 @@ private:
                 WorldPackets::Character::PlayerLogin login(std::move(raw));
                 login.Guid = c.Guid;
                 c.Session->HandlePlayerLoginOpcode(login);
+                // the opcode handler only sends SMSG_CONNECT_TO and waits for the
+                // client to open the second (instance) connection; no client will,
+                // so we continue the login ourselves — this is exactly the call the
+                // attaching instance socket would have made
+                c.Session->HandleContinuePlayerLogin();
                 c.State = Stage::LoginSent;
                 c.TicksInState = 0;
                 return true;
@@ -259,6 +302,7 @@ private:
                 {
                     if (++c.Retries > 3)
                         { Fail(c, "login"); return true; }
+                    TC_LOG_INFO("server.worldserver", "Constellation: {} login retry {}", c.Entry->Name, c.Retries);
                     DropSession(c);
                     c.State = Stage::Offline;
                     c.TicksInState = 0;
@@ -291,8 +335,9 @@ private:
 
     void MakeSession(Companion& c)
     {
-        std::string name = AccountName();
-        c.Session = new WorldSession(_accountId, std::move(name), 0, "",
+        std::string name = Trinity::StringFormat("{}#1", _bnetId);
+        std::string email = _bnetEmail;
+        c.Session = new WorldSession(_accountId, std::move(name), _bnetId, std::move(email),
             nullptr, SEC_PLAYER, uint8(sWorld->getIntConfig(CONFIG_EXPANSION)),
             0, "Win", Minutes(0), 65299 /* frozen client build */, {}, LOCALE_ruRU, 0, false);
     }
@@ -342,16 +387,37 @@ private:
         if (std::vector<ChrCustomizationOptionEntry const*> const* options =
                 sDB2Manager.GetCustomiztionOptions(e.Race, e.Sex))
         {
+            // mirror ValidateAppearance with its own calls: an option enters the set
+            // only if its requirement passes, and a choice only if its requirement
+            // passes AGAINST THE SET BUILT SO FAR (choice reqs may depend on other
+            // selected choices — the trap that kept night elves and gnomes failing)
+            std::vector<UF::ChrCustomizationChoice> picked;
+            auto pickedRange = [&] {
+                return Trinity::IteratorPair<UF::ChrCustomizationChoice const*>(
+                    picked.data(), picked.data() + picked.size());
+            };
             for (ChrCustomizationOptionEntry const* option : *options)
             {
+                if (ChrCustomizationReqEntry const* req = sChrCustomizationReqStore.LookupEntry(option->ChrCustomizationReqID))
+                    if (!c.Session->MeetsChrCustomizationReq(req, Races(e.Race), Classes(e.Class), false, pickedRange()))
+                        continue;
                 std::vector<ChrCustomizationChoiceEntry const*> const* choices =
                     sDB2Manager.GetCustomiztionChoices(option->ID);
                 if (!choices || choices->empty())
                     continue;
-                auto& choice = createInfo->Customizations.emplace_back();
-                choice.ChrCustomizationOptionID = option->ID;
-                choice.ChrCustomizationChoiceID = choices->front()->ID;
+                for (ChrCustomizationChoiceEntry const* candidate : *choices)
+                {
+                    if (ChrCustomizationReqEntry const* req = sChrCustomizationReqStore.LookupEntry(candidate->ChrCustomizationReqID))
+                        if (!c.Session->MeetsChrCustomizationReq(req, Races(e.Race), Classes(e.Class), true, pickedRange()))
+                            continue;
+                    UF::ChrCustomizationChoice& choice = picked.emplace_back();
+                    choice.ChrCustomizationOptionID = option->ID;
+                    choice.ChrCustomizationChoiceID = candidate->ID;
+                    break;
+                }
             }
+            for (UF::ChrCustomizationChoice const& choice : picked)
+                createInfo->Customizations.push_back(choice);
         }
 
         std::shared_ptr<Player> newChar(new Player(c.Session), [](Player* ptr)
@@ -371,20 +437,29 @@ private:
         CharacterDatabaseTransaction characterTransaction = CharacterDatabase.BeginTransaction();
         LoginDatabaseTransaction loginTransaction = LoginDatabase.BeginTransaction();
         newChar->SaveToDB(loginTransaction, characterTransaction, true);
+        // async by NECESSITY: the character-save statements are flagged for the
+        // async connection only ("Could not fetch prepared statement ...,
+        // connection type: synchronous"). Stage::Saving polls for the row.
         CharacterDatabase.CommitTransaction(characterTransaction);
         LoginDatabase.CommitTransaction(loginTransaction);
 
-        sCharacterCache->AddCharacterCacheEntry(newChar->GetGUID(), _accountId, newChar->GetName(),
-            e.Sex, e.Race, e.Class, 1, false);
-
         c.Guid = newChar->GetGUID();
-        TC_LOG_INFO("server.worldserver", "Constellation: created {} ({}, race {}, class {})",
-            name, c.Guid.ToString(), e.Race, e.Class);
         return true;
+    }
+
+    void SendEnum(Companion& c)
+    {
+        WorldPacket raw(CMSG_ENUM_CHARACTERS);
+        WorldPackets::Character::EnumCharacters enumChars(std::move(raw));
+        c.Session->HandleCharEnumOpcode(enumChars);
+        c.State = Stage::EnumQueued;
+        c.TicksInState = 0;
     }
 
     std::vector<Companion> _companions;
     uint32 _accountId = 0;
+    uint32 _bnetId = 0;
+    std::string _bnetEmail;
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
     bool _bootstrapped = false;

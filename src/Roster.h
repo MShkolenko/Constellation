@@ -1,9 +1,9 @@
-/*
- * Constellation — the fixed first roster: one companion per playable race.
+﻿/*
+ * Constellation вЂ” the fixed first roster: one companion per playable race.
  *
  * Names are hand-picked and GENDER-MATCHED: the client treats sex as body 1 /
  * body 2, so nothing downstream will catch a male body carrying a female name.
- * The pairing below is the single source of truth — change name and gender
+ * The pairing below is the single source of truth вЂ” change name and gender
  * together or not at all. No famous lore figures: those sit in the reserved
  * names store and would bounce on CheckPlayerName.
  */
@@ -22,10 +22,10 @@ struct RosterEntry
     char const* Name;       // gender-matched, see header comment
     uint8 Race;
     uint8 Class;
-    uint8 Sex;              // GENDER_MALE / GENDER_FEMALE — must match Name
+    uint8 Sex;              // GENDER_MALE / GENDER_FEMALE вЂ” must match Name
 };
 
-// 13 classic races, lore-fitting class each, 6 female / 7 male.
+// 13 classic races, lore-fitting class each, 7 female / 6 male.
 inline constexpr std::array<RosterEntry, 13> Roster =
 {{
     // Alliance
