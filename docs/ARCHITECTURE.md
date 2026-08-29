@@ -42,7 +42,12 @@
    «клик» по квестодателю через опкоды сессии, не вызов внутренних API вроде
    `Player::AddQuest`. Бот, неотличимый от клиента на уровне протокола, ломается ровно
    там, где сломался бы игрок, — в этом его ценность как проверяющего мира. Транспортный
-   уровень (вход без второго сокета, сброс простоя) — единственное дозволенное исключение.
+   уровень (вход без второго сокета, сброс простоя) — дозволенное исключение.
+
+   **Уровень учётной записи — тоже не игровой поступок** (оператор, 2026-08-29): заведение
+   персонажа и его привязка к учётке происходят до появления в мире и делаются серверной
+   стороной, ровно как вход без сокета. Правило говорит об игре — о том, что спутник делает,
+   уже находясь в мире.
 1. **Ядро остаётся чистым.** Один охраняемый крюк; нужда в правке ядра — отдельный
    именованный коммит, никогда не «заодно».
 2. **Выключен — значит инертен.**
@@ -101,7 +106,12 @@ Why this is the load-bearing decision:
    on the questgiver via session opcodes, never an internal API call like
    `Player::AddQuest`. A bot indistinguishable from a client at the protocol level breaks
    exactly where a player would — that is its value as a world-checker. The transport
-   layer (socketless login, idle-clock reset) is the only allowed exception.
+   layer (socketless login, idle-clock reset) is an allowed exception.
+
+   **Account level is not a gameplay action either** (operator, 2026-08-29): creating a
+   character and binding it to an account happen before it exists in the world and are done
+   server-side, exactly like socketless login. The rule is about play — what a companion does
+   once it is already in the world.
 1. **The core stays clean.** One guarded hook; a genuine core change is a separate,
    named commit — never mixed in.
 2. **Disabled means inert.**
