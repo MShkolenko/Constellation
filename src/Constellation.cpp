@@ -41,7 +41,6 @@
 #include "GameTime.h"
 #include "Log.h"
 #include "Group.h"
-#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "PartyPackets.h"
@@ -283,7 +282,6 @@ private:
             }
             _companions.push_back(c);
         }
-        MigrateListedGuids();       // inert unless the operator supplied a guid list
         TC_LOG_INFO("server.loading", "Constellation: bootstrap - roster {}, one account each", uint32(_companions.size()));
         if (_companions.size() != Roster.size())
             TC_LOG_ERROR("server.loading", "Constellation: ONLY {} of {} companions provisioned - the roster is short",
@@ -357,60 +355,20 @@ private:
             TC_LOG_ERROR("server.loading", "Constellation: game account for {} still unresolved", c.Entry->Name);
             return false;
         }
+        // the name <bnetId>#1 alone does not prove the link: a stale or mislinked
+        // account carrying that name would have been accepted and used (Codex r3).
+        // Refuse rather than adopt somebody else's account.
+        uint32 parent = Battlenet::AccountMgr::GetIdByGameAccount(c.AccountId);
+        if (parent != c.BnetId)
+        {
+            TC_LOG_ERROR("server.loading", "Constellation: game account {} for {} is linked to battlenet {}, expected {} - refusing",
+                c.AccountId, c.Entry->Name, parent, c.BnetId);
+            c.AccountId = 0;
+            return false;
+        }
         return true;
     }
 
-    // ONE-TIME migration off the old shared account, by EXPLICIT GUID LIST.
-    //
-    // The previous version authorised deletion by NAME, and Codex called it right:
-    // a real player holding a roster name would have been bound to a companion and
-    // then permanently deleted (deleteFinally=true). No name ever authorises a
-    // deletion here now. The operator captures the exact guids before rollout and
-    // puts them in Constellation.MigrateGuids; anything not on that list is never
-    // touched, an online character is skipped, and an empty setting (the default)
-    // makes this whole function inert.
-    //
-    // The core's own Player::DeleteFromDB is used rather than SQL: a hand-rolled
-    // DELETE left orphans in character_* once already.
-    void MigrateListedGuids()
-    {
-        std::string list = sConfigMgr->GetStringDefault("Constellation.MigrateGuids", "");
-        if (list.empty())
-            return;
-        for (size_t pos = 0; pos < list.size(); )
-        {
-            size_t comma = list.find(',', pos);
-            std::string piece = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            pos = (comma == std::string::npos) ? list.size() : comma + 1;
-            Optional<uint64> low = Trinity::StringTo<uint64>(piece);
-            if (!low)
-                continue;
-            ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(*low);
-            CharacterCacheEntry const* cached = sCharacterCache->GetCharacterCacheByGuid(guid);
-            if (!cached)
-                continue;
-            // it must be one of OURS by name AND must not already sit on a
-            // companion account, and it must not be in the world right now
-            bool isRosterName = false;
-            for (RosterEntry const& e : Roster)
-                if (cached->Name == e.Name || cached->Name == e.Name + std::string("us"))
-                    isRosterName = true;
-            bool ownedByCompanion = false;
-            for (Companion const& c : _companions)
-                if (c.AccountId == cached->AccountId)
-                    ownedByCompanion = true;
-            if (!isRosterName || ownedByCompanion || ObjectAccessor::FindConnectedPlayer(guid))
-            {
-                TC_LOG_INFO("server.loading", "Constellation: migrate skips {} ({}) - roster={} companion={} online={}",
-                    cached->Name, guid.ToString(), isRosterName, ownedByCompanion,
-                    ObjectAccessor::FindConnectedPlayer(guid) != nullptr);
-                continue;
-            }
-            TC_LOG_INFO("server.loading", "Constellation: migrating {} ({}) off account {}",
-                cached->Name, guid.ToString(), cached->AccountId);
-            Player::DeleteFromDB(guid, cached->AccountId, true, true);
-        }
-    }
 
 
     // our sessions live outside the manager: tick them or their query
