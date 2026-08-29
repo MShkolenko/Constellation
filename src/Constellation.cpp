@@ -40,8 +40,10 @@
 #include "DB2Stores.h"
 #include "GameTime.h"
 #include "Log.h"
+#include "Group.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
+#include "PartyPackets.h"
 #include "Player.h"
 #include "RBAC.h"
 #include "ScriptMgr.h"
@@ -131,6 +133,7 @@ public:
                 mayAdvance = false;
             }
         }
+        DebugGroupPair();
     }
 
     void Shutdown()
@@ -164,6 +167,42 @@ public:
             }
         handler->PSendSysMessage("Constellation: {} companions dismissed.", dropped);
         return true;
+    }
+
+    // rig-only test path (no client on the rig): companion A invites companion B
+    // THROUGH A's OWN session handler — the same CMSG_PARTY_INVITE a client sends;
+    // B then auto-accepts from the InWorld tick. Driven by Constellation.DebugGroupPair.
+    void DebugGroupPair()
+    {
+        std::string pair = sConfigMgr->GetStringDefault("Constellation.DebugGroupPair", "");
+        if (pair.empty() || _debugPairDone)
+            return;
+        size_t comma = pair.find(',');
+        if (comma == std::string::npos)
+            return;
+        std::string inviterName = pair.substr(0, comma);
+        std::string inviteeName = pair.substr(comma + 1);
+        Companion* inviter = FindByName(inviterName);
+        Companion* invitee = FindByName(inviteeName);
+        if (!inviter || !invitee
+            || inviter->State != Stage::InWorld || invitee->State != Stage::InWorld
+            || !inviter->Session->GetPlayer() || !invitee->Session->GetPlayer())
+            return;
+        _debugPairDone = true;
+        WorldPacket raw(CMSG_PARTY_INVITE);
+        WorldPackets::Party::PartyInviteClient invite(std::move(raw));
+        invite.TargetName = invitee->Session->GetPlayer()->GetName();
+        invite.TargetGUID = invitee->Session->GetPlayer()->GetGUID();
+        inviter->Session->HandlePartyInviteOpcode(invite);
+        TC_LOG_INFO("server.worldserver", "Constellation: {} invited {} to a group", inviterName, inviteeName);
+    }
+
+    Companion* FindByName(std::string const& name)
+    {
+        for (Companion& c : _companions)
+            if (name == c.Entry->Name)
+                return &c;
+        return nullptr;
     }
 
     void Status(ChatHandler* handler)
@@ -328,11 +367,24 @@ private:
             }
             case Stage::InWorld:
             {
-                if (!c.Session->GetPlayer())    // died out of world? re-run pipeline
+                Player* player = c.Session->GetPlayer();
+                if (!player)                    // died out of world? re-run pipeline
                 {
                     DropSession(c);
                     c.State = Stage::Offline;
                     c.TicksInState = 0;
+                    return false;
+                }
+                // invariant 0: a pending group invite is answered the way a real
+                // client answers — CMSG_PARTY_INVITE_RESPONSE through the session
+                // handler, never Group::AddMember
+                if (player->GetGroupInvite())
+                {
+                    WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
+                    WorldPackets::Party::PartyInviteResponse response(std::move(raw));
+                    response.Accept = true;
+                    c.Session->HandlePartyInviteResponseOpcode(response);
+                    TC_LOG_INFO("server.worldserver", "Constellation: {} accepted a group invite", c.Entry->Name);
                 }
                 return false;
             }
@@ -477,6 +529,7 @@ private:
     uint32 _accountId = 0;
     uint32 _bnetId = 0;
     std::string _bnetEmail;
+    bool _debugPairDone = false;
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
     bool _bootstrapped = false;
