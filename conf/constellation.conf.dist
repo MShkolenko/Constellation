@@ -1,0 +1,15 @@
+###############################################################################
+# Constellation — configuration keys
+#
+# Phase 0: keys are read from worldserver.conf under the Constellation.* prefix.
+# This file documents them; copy the lines you change into worldserver.conf.
+###############################################################################
+
+#
+#    Constellation.Enable
+#        Description: Master switch. With 0 the module registers, announces
+#                     itself in the startup log and does nothing else.
+#        Default:     0
+#
+
+Constellation.Enable = 0
