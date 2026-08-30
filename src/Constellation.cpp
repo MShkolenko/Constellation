@@ -40,8 +40,15 @@
 #include "DB2Stores.h"
 #include "GameTime.h"
 #include "Log.h"
+#include "CellImpl.h"
+#include "Creature.h"
 #include "Group.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "MovementPackets.h"
+#include "GossipDef.h"
+#include "QuestDef.h"
+#include "QuestPackets.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -58,6 +65,7 @@
 #include <cmath>
 #include <memory>
 #include <random>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -83,6 +91,30 @@ bool AutoSummon()
 uint32 MaxActive()
 {
     return sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
+}
+
+// квесты целиком: свой выключатель
+bool QuestsEnabled()
+{
+    return sConfigMgr->GetBoolDefault("Constellation.Quests", true);
+}
+
+// сколько квестов держать в журнале разом (предел ядра — 35)
+uint32 MaxQuestsHeld()
+{
+    return sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
+}
+
+// как часто спутник осматривается в поисках квестодателя
+uint32 QuestIntervalMs()
+{
+    return sConfigMgr->GetIntDefault("Constellation.QuestIntervalMs", 5000);
+}
+
+// на каком расстоянии он замечает восклицательный знак
+float QuestGiverRange()
+{
+    return sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
 }
 
 // следование целиком: выключатель, независимый от роспуска спутников
@@ -153,6 +185,8 @@ struct Companion
     bool Moving = false;                // мы САМИ считаем, идём ли: флаги ядра могут быть нормализованы
     bool DebugWalk = false;             // только стенд: уходить в точку, а не за лидером
     Position DebugTarget;
+    uint32 QuestMs = 0;                 // накопитель между попытками взять квест
+    std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
 };
 
 class Manager
@@ -193,6 +227,7 @@ public:
         {
             TickSession(c, diff);
             FollowTick(c, diff);        // каждый такт: ограничитель конвейера — про вход, не про ходьбу
+            QuestTick(c, diff);
             if (budget && AdvanceOne(c))
                 --budget;
         }
@@ -372,6 +407,121 @@ public:
         SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
         c.Moving = true;
     }
+    // ВЗЯТИЕ КВЕСТА — цепочкой опкодов, и выбор ТОЖЕ клиентский.
+    //
+    // Ограничение, которое надо назвать честно: сессия спутника БЕЗ СОКЕТА, поэтому
+    // ответы сервера до неё не доходят. Правило то же, что для входа без второго
+    // сокета: ДЕЙСТВИЕ идёт опкодом, СВЕДЕНИЯ берутся оттуда же, откуда их берёт
+    // сервер, СОБИРАЯ ПАКЕТ КЛИЕНТУ.
+    //
+    // Первая версия выбирала квест через sObjectMgr->GetCreatureQuestRelations, и
+    // Кодекс справедливо назвал это переходом черты: это внутренний перечень связей
+    // квестодателя, а не то, что видит игрок. Теперь спутник шлёт Hello и читает
+    // МЕНЮ, которое ядро только что построило В ОТВЕТ на этот Hello и попыталось
+    // отправить — тот самый список, что нарисовался бы в окне у игрока, в том же
+    // порядке. Пакет упал в пустой сокет, но меню осталось.
+    void QuestTick(Companion& c, uint32 diff)
+    {
+        if (!QuestsEnabled() || c.State != Stage::InWorld || !c.Session)
+            return;
+        Player* self = c.Session->GetPlayer();
+        if (!self || !self->IsInWorld() || !self->IsAlive())
+            return;
+
+        c.QuestMs += diff;
+        if (c.QuestMs < QuestIntervalMs())
+            return;
+        c.QuestMs = 0;
+
+        // журнал полон — это ВСЕ слоты заняты, а не первые три
+        uint32 used = 0;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (self->GetQuestSlotQuestId(slot))
+                ++used;
+        if (used >= MAX_QUEST_LOG_SIZE || used >= MaxQuestsHeld())
+            return;
+
+        Creature* giver = NearestQuestGiver(self);
+        if (!giver)
+            return;
+
+        // каноническая проверка ядра: расстояние, флаги, враждебность, смерть.
+        // Прямой вызов обработчика мог бы обойти то, что клиенту не позволено.
+        if (!self->CanInteractWithQuestGiver(giver))
+            return;
+
+        // «подойти и заговорить» — тот же опкод, что шлёт клиент по клику
+        WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
+        WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
+        hello.QuestGiverGUID = giver->GetGUID();
+        c.Session->HandleQuestgiverHelloOpcode(hello);
+
+        // читаем то, что ядро только что собрало для клиента, в его же порядке
+        QuestMenu const& menu = self->PlayerTalkClass->GetQuestMenu();
+        for (uint8 i = 0; i < menu.GetMenuItemCount(); ++i)
+        {
+            uint32 questId = menu.GetItem(i).QuestId;
+            if (c.QuestRefused.count(questId))
+                continue;                       // уже пробовали и не вышло
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest || !self->CanTakeQuest(quest, false))
+                continue;
+
+            WorldPacket rawAccept(CMSG_QUEST_GIVER_ACCEPT_QUEST);
+            WorldPackets::Quest::QuestGiverAcceptQuest accept(std::move(rawAccept));
+            accept.QuestGiverGUID = giver->GetGUID();
+            accept.QuestID = questId;
+            c.Session->HandleQuestgiverAcceptQuestOpcode(accept);
+
+            QuestStatus st = self->GetQuestStatus(questId);
+            if (st == QUEST_STATUS_INCOMPLETE || st == QUEST_STATUS_COMPLETE)
+            {
+                TC_LOG_INFO("server.worldserver", "Constellation: {} took quest {} '{}' from {}",
+                    self->GetName(), questId, quest->GetLogTitle(), giver->GetName());
+                ++_questsTaken;
+            }
+            else
+            {
+                // Не взялся — запоминаем и больше не долбимся. Так ведут себя
+                // квесты, требующие подтверждения (общие, сопровождение): их
+                // приём — отдельный опкод, и до него дело ещё не дошло.
+                c.QuestRefused.insert(questId);
+                TC_LOG_DEBUG("server.worldserver", "Constellation: {} was refused quest {} (status {})",
+                    self->GetName(), questId, uint32(st));
+            }
+            return;                             // по одному за раз, как человек
+        }
+    }
+
+    // Ближайший квестодатель, У КОТОРОГО ЕСТЬ ЧТО ПРЕДЛОЖИТЬ ИМЕННО ЭТОМУ спутнику.
+    // Восклицательный знак над головой — это QuestGiverStatus, который ядро считает
+    // для клиента; спрашиваем ровно его, а не таблицу связей.
+    Creature* NearestQuestGiver(Player* self) const
+    {
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(self, QuestGiverRange());
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
+        Cell::VisitGridObjects(self, searcher, QuestGiverRange());
+
+        Creature* best = nullptr;
+        float bestDist = QuestGiverRange() + 1.0f;
+        for (Creature* creature : around)
+        {
+            if (!creature->IsAlive())
+                continue;
+            if (self->GetQuestDialogStatus(creature) == QuestGiverStatus::None)
+                continue;
+            if (!self->IsWithinLOSInMap(creature))
+                continue;
+            float d = self->GetExactDist2d(creature);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best = creature;
+            }
+        }
+        return best;
+    }
 
     // ровно тот пакет, что шлёт клиент; ядро само решит, принять его или нет
     void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
@@ -423,6 +573,7 @@ public:
             if (c.State == Stage::InWorld) ++inWorld;
             if (c.State == Stage::Failed)  ++failed;
         }
+        handler->PSendSysMessage("Constellation {}: quests taken {}", CONSTELLATION_VERSION, _questsTaken);
         handler->PSendSysMessage("Constellation {}: {} — roster {}, in world {}, failed {}",
             CONSTELLATION_VERSION, IsEnabled() ? "enabled" : "disabled",
             uint32(_companions.size()), inWorld, failed);
@@ -850,6 +1001,7 @@ private:
 
     std::vector<Companion> _companions;
     bool _debugPairDone = false;
+    uint32 _questsTaken = 0;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
