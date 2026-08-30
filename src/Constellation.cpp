@@ -41,6 +41,9 @@
 #include "GameTime.h"
 #include "Log.h"
 #include "Group.h"
+#include "MovementPackets.h"
+#include "MotionMaster.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "PartyPackets.h"
@@ -52,6 +55,7 @@
 
 #include "StringConvert.h"
 
+#include <cmath>
 #include <memory>
 #include <random>
 #include <unordered_map>
@@ -79,6 +83,38 @@ bool AutoSummon()
 uint32 MaxActive()
 {
     return sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
+}
+
+// следование целиком: выключатель, независимый от роспуска спутников
+bool FollowEnabled()
+{
+    return sConfigMgr->GetBoolDefault("Constellation.Follow", true);
+}
+
+// как близко держаться за лидером, в ярдах
+float FollowDistance()
+{
+    float d = sConfigMgr->GetFloatDefault("Constellation.FollowDistance", 4.0f);
+    return (d > 0.5f && d < 100.0f) ? d : 4.0f;      // защита от нелепой настройки
+}
+
+// дальше этого не догоняем: отстал — значит отстал, а не рывок через полкарты
+float MaxFollowRange()
+{
+    return sConfigMgr->GetFloatDefault("Constellation.FollowMaxRange", 60.0f);
+}
+
+// перепад высоты, который берут шагом; больше — это обрыв или уступ
+float MaxStepUp()
+{
+    return sConfigMgr->GetFloatDefault("Constellation.MaxStepUp", 2.0f);
+}
+
+// ходить за ЖИВЫМ игроком. По умолчанию нет: иначе один человек уводит за собой
+// весь состав, и это видят все вокруг.
+bool FollowPlayers()
+{
+    return sConfigMgr->GetBoolDefault("Constellation.FollowPlayers", false);
 }
 
 std::string AccountName()
@@ -113,6 +149,10 @@ struct Companion
     uint32 TicksInState = 0;
     uint8 Retries = 0;
     bool PendingDismiss = false;        // dismissal requested mid-login; applied when safe
+    uint32 MoveMs = 0;                  // накопитель времени между шагами следования
+    bool Moving = false;                // мы САМИ считаем, идём ли: флаги ядра могут быть нормализованы
+    bool DebugWalk = false;             // только стенд: уходить в точку, а не за лидером
+    Position DebugTarget;
 };
 
 class Manager
@@ -152,6 +192,7 @@ public:
         for (Companion& c : _companions)
         {
             TickSession(c, diff);
+            FollowTick(c, diff);        // каждый такт: ограничитель конвейера — про вход, не про ходьбу
             if (budget && AdvanceOne(c))
                 --budget;
         }
@@ -229,7 +270,11 @@ public:
         invite.TargetName = invitee->Session->GetPlayer()->GetName();
         invite.TargetGUID = invitee->Session->GetPlayer()->GetGUID();
         inviter->Session->HandlePartyInviteOpcode(invite);
-        TC_LOG_INFO("server.worldserver", "Constellation: {} invited {} to a group", inviterName, inviteeName);
+        // и уводим лидера на 40 ярдов, чтобы ведомому было за кем идти
+        Player* lp = inviter->Session->GetPlayer();
+        inviter->DebugTarget = Position(lp->GetPositionX() + 40.0f, lp->GetPositionY(), lp->GetPositionZ(), 0.0f);
+        inviter->DebugWalk = true;
+        TC_LOG_INFO("server.worldserver", "Constellation: {} invited {} and walks 40y away", inviterName, inviteeName);
     }
 
     Companion* FindByName(std::string const& name)
@@ -239,6 +284,136 @@ public:
                 return &c;
         return nullptr;
     }
+    // СЛЕДОВАНИЕ ПО-КЛИЕНТСКИ (нулевой инвариант), с оградами по разбору Кодекса.
+    //
+    // Спутник не отдаётся MotionMaster'у: серверное движение — это то, как ходят
+    // СУЩЕСТВА, и бот на нём перестал бы проверять ровно тот путь, ради которого
+    // существует. Он делает то же, что живой клиент: считает свой следующий шаг и
+    // отправляет CMSG_MOVE_HEARTBEAT в тот же публичный обработчик, куда ядро
+    // отдаёт пакет настоящего клиента.
+    //
+    // Шаг делается ТОЛЬКО в простом наземном состоянии. Всё остальное — вода,
+    // полёт, падение, транспорт, обездвиженность — не выражается этим пакетом
+    // честно, и притвориться, что выражается, значило бы врать ядру о состоянии.
+    // В таких состояниях спутник просто стоит: пусть лучше отстанет, чем поедет
+    // сквозь стену или провалится с обрыва.
+    void FollowTick(Companion& c, uint32 diff)
+    {
+        if (!FollowEnabled() || c.State != Stage::InWorld || !c.Session)
+            return;
+        Player* self = c.Session->GetPlayer();
+        if (!self || !self->IsInWorld() || !self->IsAlive())
+            return;
+
+        // управляем ли мы сами собой: в транспорте или под контролем пакет с нашим
+        // guid относился бы к другому существу (Кодекс, пункт 1)
+        if (self->GetUnitBeingMoved() != self)
+            return;
+
+        c.MoveMs += diff;
+        if (c.MoveMs < 250)                 // 4 Гц, как поток живого клиента
+            return;
+        float dt = c.MoveMs / 1000.0f;
+        c.MoveMs = 0;
+
+        // На стенде лидер УХОДИТ — иначе проверка не отличает «следование
+        // работает» от «оба стояли на одной точке», как и вышло в первый раз.
+        // Уходит он тем же клиентским пакетом, что и все.
+        Position target;
+        if (c.DebugWalk)
+            target = c.DebugTarget;
+        else
+        {
+            Player* leader = FollowTarget(self);
+            if (!leader)
+                return;
+            target = leader->GetPosition();
+        }
+
+        // только простое наземное состояние
+        static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
+            | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
+        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
+            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+            return;
+
+        float dist = self->GetExactDist2d(target.GetPositionX(), target.GetPositionY());
+        float keep = FollowDistance();
+        if (dist < keep)
+        {
+            if (c.Moving)                   // своё состояние, не догадка по флагам ядра
+            {
+                SendMove(c, self, self->GetPosition(), 0);
+                c.Moving = false;
+            }
+            return;
+        }
+        if (dist > MaxFollowRange())        // отстал безнадёжно — не телепортируемся
+            return;
+
+        float angle = self->GetAbsoluteAngle(target.GetPositionX(), target.GetPositionY());
+        float step = std::min(self->GetSpeed(MOVE_RUN) * dt, dist - keep * 0.5f);
+        if (step <= 0.0f)
+            return;
+        float nx = self->GetPositionX() + std::cos(angle) * step;
+        float ny = self->GetPositionY() + std::sin(angle) * step;
+
+        float ground = self->GetMap()->GetHeight(self->GetPhaseShift(), nx, ny, self->GetPositionZ() + 2.0f);
+        if (ground <= INVALID_HEIGHT)
+            return;                         // рельеф не разрешился — стоим, а не едем вслепую
+        // обрыв или уступ: шагом такой перепад не берут, и подменять им падение нельзя
+        if (std::fabs(ground - self->GetPositionZ()) > MaxStepUp())
+            return;
+        // сквозь стену не ходим: то, чего не видно, для шага недостижимо
+        if (!self->IsWithinLOS(nx, ny, ground + 2.0f))
+            return;
+
+        Position next(nx, ny, ground, angle);
+        SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
+        c.Moving = true;
+    }
+
+    // ровно тот пакет, что шлёт клиент; ядро само решит, принять его или нет
+    void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
+    {
+        MovementInfo mi;
+        mi.guid = self->GetGUID();
+        mi.pos.Relocate(pos);
+        mi.flags = flags;
+        mi.time = GameTime::GetGameTimeMS();
+        c.Session->HandleMovementOpcode(CMSG_MOVE_HEARTBEAT, mi);
+    }
+
+    // За кем идти: лидер группы. За ЖИВЫМ игроком — только с явного разрешения:
+    // иначе один человек, взявший спутников в группу, потянул бы за собой толпу
+    // (Кодекс, пункт 4). По умолчанию спутники ходят только за спутниками.
+    Player* FollowTarget(Player* self) const
+    {
+        Group* group = self->GetGroup();
+        if (!group)
+            return nullptr;
+        ObjectGuid leaderGuid = group->GetLeaderGUID();
+        if (leaderGuid == self->GetGUID())
+            return nullptr;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+        if (!leader || !leader->IsInWorld() || leader->GetMap() != self->GetMap())
+            return nullptr;
+        if (!self->GetPhaseShift().CanSee(leader->GetPhaseShift()))   // одна карта — ещё не одно место
+            return nullptr;
+        if (!IsCompanionAccount(leader->GetSession()->GetAccountId()) && !FollowPlayers())
+            return nullptr;
+        return leader;
+    }
+
+    bool IsCompanionAccount(uint32 accountId) const
+    {
+        for (Companion const& c : _companions)
+            if (c.AccountId == accountId)
+                return true;
+        return false;
+    }
+
+
 
     void Status(ChatHandler* handler)
     {
