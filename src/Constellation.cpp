@@ -26,6 +26,7 @@
  * Outbound packets are dropped by WorldSession::SendPacket's null-socket guard.
  */
 
+#include "BuildStamp.h"
 #include "Registration.h"
 #include "Roster.h"
 
@@ -46,10 +47,13 @@
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "MovementPackets.h"
+#include "CombatPackets.h"
 #include "GossipDef.h"
+#include "MiscPackets.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
+#include "PathGenerator.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -75,83 +79,63 @@ namespace Constellation
 {
 namespace
 {
-bool IsEnabled()
+// НАСТРОЙКА ЧИТАЕТСЯ ОДИН РАЗ, а не на каждом обращении.
+//
+// Первая версия звала sConfigMgr->Get*Default прямо из тиковых функций. Ядро пишет
+// предупреждение «Missing name X in config file» КАЖДЫЙ раз, когда ключа нет в файле,
+// и на 122 спутниках это дало 31 343 238 строк в журнале за один десятиминутный
+// прогон — дисковый поток и синхронная запись прямо в такте мира.
+//
+// Значения обновляются в OnConfigLoad, поэтому `.reload config` по-прежнему меняет их
+// без пересборки — требование оператора выполнено.
+struct Settings
 {
-    return sConfigMgr->GetBoolDefault("Constellation.Enable", false);
-}
+    bool  Enable          = false;
+    bool  AutoSummon      = true;
+    bool  RigMode         = false;
+    bool  Follow          = true;
+    bool  Quests          = true;
+    bool  Fight           = true;
+    uint32 MaxActive      = 0;
+    uint32 PerTick        = 6;
+    uint32 MaxQuests      = 10;
+    uint32 QuestIntervalMs = 5000;
+    float FollowDistance  = 4.0f;
+    float FollowMaxRange  = 60.0f;
+    float MaxStepUp       = 2.0f;
+    float QuestGiverRange = 30.0f;
+    float FightRange      = 120.0f;
+    std::string Account   = "CONSTELLATION";
+    std::string DebugGroupPair;
 
-bool AutoSummon()
-{
-    return sConfigMgr->GetBoolDefault("Constellation.AutoSummon", true);
-}
+    void Load()
+    {
+        Enable          = sConfigMgr->GetBoolDefault("Constellation.Enable", false);
+        AutoSummon      = sConfigMgr->GetBoolDefault("Constellation.AutoSummon", true);
+        RigMode         = sConfigMgr->GetBoolDefault("Constellation.RigMode", false);
+        Follow          = sConfigMgr->GetBoolDefault("Constellation.Follow", true);
+        Quests          = sConfigMgr->GetBoolDefault("Constellation.Quests", true);
+        Fight           = sConfigMgr->GetBoolDefault("Constellation.Fight", true);
+        MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
+        PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
+        MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
+        QuestIntervalMs = sConfigMgr->GetIntDefault("Constellation.QuestIntervalMs", 5000);
+        float d         = sConfigMgr->GetFloatDefault("Constellation.FollowDistance", 4.0f);
+        FollowDistance  = (d > 0.5f && d < 100.0f) ? d : 4.0f;    // защита от нелепой настройки
+        FollowMaxRange  = sConfigMgr->GetFloatDefault("Constellation.FollowMaxRange", 60.0f);
+        MaxStepUp       = sConfigMgr->GetFloatDefault("Constellation.MaxStepUp", 2.0f);
+        QuestGiverRange = sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
+        // широко: цель ищется по округе, а не на длину руки — к ней ходят
+    FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
+        Account         = sConfigMgr->GetStringDefault("Constellation.Account", "CONSTELLATION");
+        DebugGroupPair  = sConfigMgr->GetStringDefault("Constellation.DebugGroupPair", "");
+    }
+};
 
-// 0 = весь состав. Постоянные сессии всего состава — это в девять раз больше, чем
-// было измерено, и дорожная карта требует мерить нагрузку ДО роста; ключ нужен,
-// чтобы оператор мог убавить, не пересобирая ядро.
-uint32 MaxActive()
+inline Settings& Cfg()
 {
-    return sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
-}
-
-// квесты целиком: свой выключатель
-bool QuestsEnabled()
-{
-    return sConfigMgr->GetBoolDefault("Constellation.Quests", true);
-}
-
-// сколько квестов держать в журнале разом (предел ядра — 35)
-uint32 MaxQuestsHeld()
-{
-    return sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
-}
-
-// как часто спутник осматривается в поисках квестодателя
-uint32 QuestIntervalMs()
-{
-    return sConfigMgr->GetIntDefault("Constellation.QuestIntervalMs", 5000);
-}
-
-// на каком расстоянии он замечает восклицательный знак
-float QuestGiverRange()
-{
-    return sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
-}
-
-// следование целиком: выключатель, независимый от роспуска спутников
-bool FollowEnabled()
-{
-    return sConfigMgr->GetBoolDefault("Constellation.Follow", true);
-}
-
-// как близко держаться за лидером, в ярдах
-float FollowDistance()
-{
-    float d = sConfigMgr->GetFloatDefault("Constellation.FollowDistance", 4.0f);
-    return (d > 0.5f && d < 100.0f) ? d : 4.0f;      // защита от нелепой настройки
-}
-
-// дальше этого не догоняем: отстал — значит отстал, а не рывок через полкарты
-float MaxFollowRange()
-{
-    return sConfigMgr->GetFloatDefault("Constellation.FollowMaxRange", 60.0f);
-}
-
-// перепад высоты, который берут шагом; больше — это обрыв или уступ
-float MaxStepUp()
-{
-    return sConfigMgr->GetFloatDefault("Constellation.MaxStepUp", 2.0f);
-}
-
-// ходить за ЖИВЫМ игроком. По умолчанию нет: иначе один человек уводит за собой
-// весь состав, и это видят все вокруг.
-bool FollowPlayers()
-{
-    return sConfigMgr->GetBoolDefault("Constellation.FollowPlayers", false);
-}
-
-std::string AccountName()
-{
-    return sConfigMgr->GetStringDefault("Constellation.Account", "CONSTELLATION");
+    static Settings s;
+    return s;
 }
 
 // ---------------------------------------------------------------- companions
@@ -167,6 +151,8 @@ enum class Stage : uint8
     Dismissed       // operator said stop; ONLY .summon (or restart) wakes it —
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
+
+enum class Behavior : uint8 { Idle, FollowingOwner, ApproachingTarget, Attacking, TurningIn };
 
 struct Companion
 {
@@ -187,6 +173,19 @@ struct Companion
     Position DebugTarget;
     uint32 QuestMs = 0;                 // накопитель между попытками взять квест
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
+    uint32 FightMs = 0;                 // накопитель между решениями в бою
+    Behavior Mode = Behavior::Idle;     // ровно одно намерение за раз
+    ObjectGuid TargetGuid;              // цель, которая не меняется по дороге
+    uint32 ModeMs = 0;                  // сколько в этом состоянии — для сроков
+    float LastDist = 0.0f;              // для проверки, что мы вообще приближаемся
+    std::vector<Position> Waypoints;    // маршрут, построенный ядром
+    size_t WaypointIndex = 0;
+    float PathTargetX = 0.0f, PathTargetY = 0.0f;
+    uint32 TurnInQuest = 0;             // что сдаём
+    uint32 TurnInEntry = 0;             // кому
+    Position TurnInPos;                 // и где он стоит
+    ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
+    std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
 };
 
 class Manager
@@ -200,7 +199,7 @@ public:
 
     void OnWorldUpdate(uint32 diff)
     {
-        if (!IsEnabled())
+        if (!Cfg().Enable)
             return;
 
         // gentle start: let the world settle before the first login
@@ -219,14 +218,14 @@ public:
         // нужно — оно разносит во времени создание персонажей и входы, — но одно
         // продвижение на окно было настроено под состав из тринадцати.
         _throttleMs += diff;
-        uint32 budget = (_throttleMs >= 2000) ? sConfigMgr->GetIntDefault("Constellation.PerTick", 6) : 0;
+        uint32 budget = (_throttleMs >= 2000) ? Cfg().PerTick : 0;
         if (budget)
             _throttleMs = 0;
 
         for (Companion& c : _companions)
         {
             TickSession(c, diff);
-            FollowTick(c, diff);        // каждый такт: ограничитель конвейера — про вход, не про ходьбу
+            BehaveTick(c, diff);        // автомат поведения: одно намерение за раз
             QuestTick(c, diff);
             if (budget && AdvanceOne(c))
                 --budget;
@@ -276,40 +275,33 @@ public:
         return true;
     }
 
-    // rig-only test path (no client on the rig): companion A invites companion B
-    // THROUGH A's OWN session handler — the same CMSG_PARTY_INVITE a client sends;
-    // B then auto-accepts from the InWorld tick. Driven by Constellation.DebugGroupPair.
+    // Стендовая проверка следования. Спутник НИКОГДА никого не приглашает — правило
+    // оператора, — поэтому на стенде, где живого игрока нет, хозяин назначается
+    // напрямую, без группы вовсе. Это честнее прежней спайки: та заставляла бота
+    // выдать приглашение, чего в жизни не будет никогда.
     void DebugGroupPair()
     {
-        // rig-only: refuses to run without an explicit RigMode flag, so a leaked
-        // DebugGroupPair key on the live realm does nothing (Codex item 2)
-        if (!sConfigMgr->GetBoolDefault("Constellation.RigMode", false))
+        if (!Cfg().RigMode)
             return;
-        std::string pair = sConfigMgr->GetStringDefault("Constellation.DebugGroupPair", "");
+        std::string const& pair = Cfg().DebugGroupPair;
         if (pair.empty() || _debugPairDone)
             return;
         size_t comma = pair.find(',');
         if (comma == std::string::npos)
             return;
-        std::string inviterName = pair.substr(0, comma);
-        std::string inviteeName = pair.substr(comma + 1);
-        Companion* inviter = FindByName(inviterName);
-        Companion* invitee = FindByName(inviteeName);
-        if (!inviter || !invitee
-            || inviter->State != Stage::InWorld || invitee->State != Stage::InWorld
-            || !inviter->Session->GetPlayer() || !invitee->Session->GetPlayer())
+        Companion* leader = FindByName(pair.substr(0, comma));
+        Companion* follower = FindByName(pair.substr(comma + 1));
+        if (!leader || !follower
+            || leader->State != Stage::InWorld || follower->State != Stage::InWorld
+            || !leader->Session->GetPlayer() || !follower->Session->GetPlayer())
             return;
         _debugPairDone = true;
-        WorldPacket raw(CMSG_PARTY_INVITE);
-        WorldPackets::Party::PartyInviteClient invite(std::move(raw));
-        invite.TargetName = invitee->Session->GetPlayer()->GetName();
-        invite.TargetGUID = invitee->Session->GetPlayer()->GetGUID();
-        inviter->Session->HandlePartyInviteOpcode(invite);
-        // и уводим лидера на 40 ярдов, чтобы ведомому было за кем идти
-        Player* lp = inviter->Session->GetPlayer();
-        inviter->DebugTarget = Position(lp->GetPositionX() + 40.0f, lp->GetPositionY(), lp->GetPositionZ(), 0.0f);
-        inviter->DebugWalk = true;
-        TC_LOG_INFO("server.worldserver", "Constellation: {} invited {} and walks 40y away", inviterName, inviteeName);
+        Player* lp = leader->Session->GetPlayer();
+        follower->Owner = lp->GetGUID();
+        leader->DebugTarget = Position(lp->GetPositionX() + 40.0f, lp->GetPositionY(), lp->GetPositionZ(), 0.0f);
+        leader->DebugWalk = true;
+        TC_LOG_INFO("server.worldserver", "Constellation: стенд — {} ведёт {}, уходит на 40 ярдов",
+            lp->GetName(), follower->Session->GetPlayer()->GetName());
     }
 
     Companion* FindByName(std::string const& name)
@@ -319,93 +311,351 @@ public:
                 return &c;
         return nullptr;
     }
-    // СЛЕДОВАНИЕ ПО-КЛИЕНТСКИ (нулевой инвариант), с оградами по разбору Кодекса.
+    // ОДИН ШАГ К ТОЧКЕ, клиентским пакетом. Общий для следования и подхода к цели.
     //
-    // Спутник не отдаётся MotionMaster'у: серверное движение — это то, как ходят
-    // СУЩЕСТВА, и бот на нём перестал бы проверять ровно тот путь, ради которого
-    // существует. Он делает то же, что живой клиент: считает свой следующий шаг и
-    // отправляет CMSG_MOVE_HEARTBEAT в тот же публичный обработчик, куда ядро
-    // отдаёт пакет настоящего клиента.
+    // Маршрут строит ЯДРО. Путь к этому был длинный и поучительный:
+    //   1. три самодельные ограды (высота, перепад, прямая видимость) — последняя
+    //      отвергала шаг в 1.8 ярда на ровном месте: доходило 4 подхода из 52;
+    //   2. штатный GetFirstCollisionPosition — луч по навигационной сетке. Лучше,
+    //      но луч ПРЯМОЙ: спутники стоят в аббатстве, цели снаружи, и луч упирается
+    //      в стену в двадцати сантиметрах. Дошло 2 из 55.
+    //   3. PathGenerator — тот же построитель, которым ядро водит существ. Он умеет
+    //      ОБХОДИТЬ: строит маршрут по сетке и возвращает точки. Спутник идёт по
+    //      ним, как игрок, кликнувший в нужную сторону.
     //
-    // Шаг делается ТОЛЬКО в простом наземном состоянии. Всё остальное — вода,
-    // полёт, падение, транспорт, обездвиженность — не выражается этим пакетом
-    // честно, и притвориться, что выражается, значило бы врать ядру о состоянии.
-    // В таких состояниях спутник просто стоит: пусть лучше отстанет, чем поедет
-    // сквозь стену или провалится с обрыва.
-    void FollowTick(Companion& c, uint32 diff)
+    // Инвариант цел: путь — это решение «куда бежать», а само движение по-прежнему
+    // уходит клиентским пакетом и проверяется ядром.
+    bool StepToward(Companion& c, Player* self, float tx, float ty, float stopAt, float dt)
     {
-        if (!FollowEnabled() || c.State != Stage::InWorld || !c.Session)
+        static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
+            | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
+        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
+            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+            return false;
+
+        float dist = self->GetExactDist2d(tx, ty);
+        if (dist < stopAt)
+        {
+            if (c.Moving)
+            {
+                SendMove(c, self, self->GetPosition(), 0);
+                c.Moving = false;
+            }
+            return false;
+        }
+
+        float step = std::min(self->GetSpeed(MOVE_RUN) * dt, dist - stopAt * 0.5f);
+        if (step <= 0.0f)
+            return false;
+
+        // маршрут пересчитывается не каждый шаг: он нужен, только пока мы далеко
+        // от следующей его точки
+        if (c.Waypoints.empty() || c.WaypointIndex >= c.Waypoints.size()
+            || self->GetExactDist2d(c.PathTargetX, c.PathTargetY) > 5.0f
+                && (std::fabs(c.PathTargetX - tx) > 3.0f || std::fabs(c.PathTargetY - ty) > 3.0f))
+        {
+            PathGenerator path(self);
+            float groundZ = self->GetMap()->GetHeight(self->GetPhaseShift(), tx, ty, self->GetPositionZ() + 5.0f);
+            if (groundZ <= INVALID_HEIGHT)
+                groundZ = self->GetPositionZ();
+            if (!path.CalculatePath(tx, ty, groundZ, false)
+                || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
+            {
+                if (!_stepDiagDone)
+                {
+                    _stepDiagDone = true;
+                    TC_LOG_INFO("server.worldserver", "Constellation STEP {}: маршрута нет, тип {:X}, точек {}",
+                        self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()));
+                }
+                return false;
+            }
+            c.Waypoints.clear();
+            for (G3D::Vector3 const& v : path.GetPath())
+                c.Waypoints.emplace_back(v.x, v.y, v.z);
+            c.WaypointIndex = 0;
+            c.PathTargetX = tx;
+            c.PathTargetY = ty;
+        }
+
+        // идём к текущей точке маршрута; дошли — берём следующую
+        while (c.WaypointIndex < c.Waypoints.size()
+            && self->GetExactDist2d(c.Waypoints[c.WaypointIndex].GetPositionX(),
+                                    c.Waypoints[c.WaypointIndex].GetPositionY()) < 1.5f)
+            ++c.WaypointIndex;
+        if (c.WaypointIndex >= c.Waypoints.size())
+        {
+            c.Waypoints.clear();
+            return false;                   // маршрут пройден
+        }
+
+        Position const& wp = c.Waypoints[c.WaypointIndex];
+        float angle = self->GetAbsoluteAngle(wp.GetPositionX(), wp.GetPositionY());
+        float legLen = self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY());
+        float go = std::min(step, legLen);
+        Position next(self->GetPositionX() + std::cos(angle) * go,
+                      self->GetPositionY() + std::sin(angle) * go,
+                      wp.GetPositionZ(), angle);
+        SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
+        c.Moving = true;
+        return true;
+    }
+    // ==================== АВТОМАТ ПОВЕДЕНИЯ ====================
+    //
+    // Предложение Кодекса, принятое оператором 2026-08-30: перестать наращивать
+    // поведения и свести их в ЯВНЫЙ автомат с жёсткими правилами. Причина — вся
+    // цепочка сегодняшних ошибок родилась не из сложных мест, а из двух подсистем,
+    // обменивавшихся булевым флагом на разных часах: подход, запертый за чужим
+    // выключателем; цель, переискиваемая каждую секунду; удар, отложенный на такт;
+    // подход без конца. Каждую чинили отдельно. Автомат гасит их класс.
+    //
+    // ПРАВИЛА, которые он держит:
+    //   * у спутника РОВНО ОДНО намерение за раз — Mode, и оно решает, куда он идёт;
+    //   * цель не меняется, пока идём: только смерть, недоступность или срок;
+    //   * КАЖДЫЙ подход обязан кончиться ударом, отменой или сроком — молча повиснуть
+    //     нельзя, у каждого состояния есть предельное время;
+    //   * пишется только ПЕРЕХОД, с причиной, — а не событие на каждом такте: прежняя
+    //     потактовая запись дала 31 миллион строк за прогон.
+    void BehaveTick(Companion& c, uint32 diff)
+    {
+        if (c.State != Stage::InWorld || !c.Session)
             return;
         Player* self = c.Session->GetPlayer();
-        if (!self || !self->IsInWorld() || !self->IsAlive())
+        if (!self || !self->IsInWorld())
             return;
 
-        // управляем ли мы сами собой: в транспорте или под контролем пакет с нашим
-        // guid относился бы к другому существу (Кодекс, пункт 1)
-        if (self->GetUnitBeingMoved() != self)
-            return;
-
+        c.ModeMs += diff;
         c.MoveMs += diff;
         if (c.MoveMs < 250)                 // 4 Гц, как поток живого клиента
             return;
         float dt = c.MoveMs / 1000.0f;
         c.MoveMs = 0;
 
-        // На стенде лидер УХОДИТ — иначе проверка не отличает «следование
-        // работает» от «оба стояли на одной точке», как и вышло в первый раз.
-        // Уходит он тем же клиентским пакетом, что и все.
-        Position target;
-        if (c.DebugWalk)
-            target = c.DebugTarget;
-        else
+        // мёртвый спутник ничего не делает — но и не висит в бою
+        if (!self->IsAlive())
         {
-            Player* leader = FollowTarget(self);
-            if (!leader)
-                return;
-            target = leader->GetPosition();
+            if (c.Mode != Behavior::Idle)
+                Switch(c, self, Behavior::Idle, "погиб");
+            return;
         }
-
-        // только простое наземное состояние
-        static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
-            | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
-        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
-            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+        // не управляем собой (транспорт, контроль) — пакет с нашим guid относился бы
+        // к другому существу
+        if (self->GetUnitBeingMoved() != self)
             return;
 
-        float dist = self->GetExactDist2d(target.GetPositionX(), target.GetPositionY());
-        float keep = FollowDistance();
-        if (dist < keep)
+        switch (c.Mode)
         {
-            if (c.Moving)                   // своё состояние, не догадка по флагам ядра
+            case Behavior::Idle:
             {
-                SendMove(c, self, self->GetPosition(), 0);
-                c.Moving = false;
+                // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
+                // занимает место и не даёт взять следующий, а награда — это опыт,
+                // без которого спутник останется первого уровня навсегда.
+                if (Cfg().Quests && FindTurnIn(c, self))
+                {
+                    Switch(c, self, Behavior::TurningIn, "есть что сдать");
+                    return;
+                }
+                if (Creature* target = Cfg().Fight ? FindObjectiveTarget(c, self) : nullptr)
+                {
+                    c.TargetGuid = target->GetGUID();
+                    c.LastDist = self->GetExactDist2d(target);
+                    Switch(c, self, Behavior::ApproachingTarget, "нашлась цель квеста");
+                    return;
+                }
+                // за хозяином идём, только если он ДОСТИЖИМ. Иначе спутник метался
+                // «пошёл — далеко — стою» по нескольку раз в секунду: 420 холостых
+                // переходов за прогон, из которых ни один ничего не менял.
+                Position owner;
+                if (Cfg().Follow && FollowTargetPos(c, self, &owner)
+                    && self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY()) <= Cfg().FollowMaxRange)
+                    Switch(c, self, Behavior::FollowingOwner, "есть за кем идти");
+                return;
             }
-            return;
+
+            case Behavior::FollowingOwner:
+            {
+                // дело важнее сопровождения: цель квеста перебивает следование
+                if (Creature* target = Cfg().Fight ? FindObjectiveTarget(c, self) : nullptr)
+                {
+                    c.TargetGuid = target->GetGUID();
+                    c.LastDist = self->GetExactDist2d(target);
+                    Switch(c, self, Behavior::ApproachingTarget, "нашлась цель квеста");
+                    return;
+                }
+                Position owner;
+                if (!Cfg().Follow || !FollowTargetPos(c, self, &owner))
+                {
+                    Switch(c, self, Behavior::Idle, "идти не за кем");
+                    return;
+                }
+                if (self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY()) > Cfg().FollowMaxRange)
+                {
+                    Switch(c, self, Behavior::Idle, "хозяин слишком далеко");
+                    return;
+                }
+                StepToward(c, self, owner.GetPositionX(), owner.GetPositionY(), Cfg().FollowDistance, dt);
+                return;
+            }
+
+            case Behavior::ApproachingTarget:
+            {
+                Creature* target = ObjectAccessor::GetCreature(*self, c.TargetGuid);
+                if (!target || !target->IsAlive())
+                {
+                    Switch(c, self, Behavior::Idle, "цель мертва или исчезла");
+                    return;
+                }
+                if (!self->IsValidAttackTarget(target)
+                    || !self->GetPhaseShift().CanSee(target->GetPhaseShift()))
+                {
+                    c.Refused.insert(c.TargetGuid);
+                    Switch(c, self, Behavior::Idle, "цель стала недоступной");
+                    return;
+                }
+                float dist = self->GetExactDist2d(target);
+                if (dist <= 5.0f)
+                {
+                    if (TryAttack(c, self, target))
+                        Switch(c, self, Behavior::Attacking, "дошёл и ударил");
+                    else
+                    {
+                        c.Refused.insert(c.TargetGuid);
+                        Switch(c, self, Behavior::Idle, "удар не принят ядром");
+                    }
+                    return;
+                }
+                StepToward(c, self, target->GetPositionX(), target->GetPositionY(), 4.0f, dt);
+                if (dist < c.LastDist - 0.5f)
+                {
+                    c.LastDist = dist;      // продвинулись — срок отсчитывается заново
+                    c.ModeMs = 0;
+                }
+                // СРОК: подход не может длиться вечно
+                else if (c.ModeMs > 20000)
+                {
+                    c.Refused.insert(c.TargetGuid);
+                    Switch(c, self, Behavior::Idle, "20 с без продвижения к цели");
+                }
+                return;
+            }
+
+            case Behavior::TurningIn:
+            {
+                // идём к точке принимающего; дойдя — ищем его в двух шагах
+                float d = self->GetExactDist2d(c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY());
+                if (d > 6.0f)
+                {
+                    StepToward(c, self, c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY(), 5.0f, dt);
+                    if (c.ModeMs > 60000)
+                        Switch(c, self, Behavior::Idle, "минуту не дойти до принимающего");
+                    return;
+                }
+                std::list<Creature*> near;
+                Trinity::AnyUnitInObjectRangeCheck check(self, 12.0f);
+                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                Cell::VisitGridObjects(self, searcher, 12.0f);
+                for (Creature* creature : near)
+                {
+                    if (creature->GetEntry() != c.TurnInEntry || !creature->IsAlive())
+                        continue;
+                    if (!self->CanInteractWithQuestGiver(creature))
+                        continue;
+                    TurnInAt(c, self, creature);
+                    Switch(c, self, Behavior::Idle, "сдал");
+                    return;
+                }
+                Switch(c, self, Behavior::Idle, "у точки принимающего нет");
+                return;
+            }
+
+            case Behavior::Attacking:
+            {
+                Unit* victim = self->GetVictim();
+                if (!victim || !victim->IsAlive())
+                {
+                    Switch(c, self, Behavior::Idle, victim ? "цель убита" : "бой прекратился");
+                    return;
+                }
+                if (self->GetExactDist2d(victim) > 6.0f)
+                {
+                    // отошли или цель убежала — догоняем, оставаясь на той же цели
+                    StepToward(c, self, victim->GetPositionX(), victim->GetPositionY(), 4.0f, dt);
+                }
+                // СРОК: бой, который не кончается, — это находка, а не норма
+                if (c.ModeMs > 120000)
+                    Switch(c, self, Behavior::Idle, "две минуты боя без исхода");
+                return;
+            }
         }
-        if (dist > MaxFollowRange())        // отстал безнадёжно — не телепортируемся
-            return;
+    }
 
-        float angle = self->GetAbsoluteAngle(target.GetPositionX(), target.GetPositionY());
-        float step = std::min(self->GetSpeed(MOVE_RUN) * dt, dist - keep * 0.5f);
-        if (step <= 0.0f)
+    // Переход — ЕДИНСТВЕННОЕ место, где пишется строка. Потактовая запись однажды
+    // дала 31 миллион строк; переходов у спутника единицы в минуту.
+    void Switch(Companion& c, Player* self, Behavior to, char const* why)
+    {
+        if (c.Mode == to)
             return;
-        float nx = self->GetPositionX() + std::cos(angle) * step;
-        float ny = self->GetPositionY() + std::sin(angle) * step;
+        TC_LOG_INFO("server.worldserver", "Constellation FSM {}: {} -> {} ({})",
+            self->GetName(), ModeName(c.Mode), ModeName(to), why);
+        c.Mode = to;
+        c.ModeMs = 0;
+        if (to != Behavior::ApproachingTarget && to != Behavior::Attacking)
+            c.TargetGuid.Clear();
+        ++_transitions;
+    }
 
-        float ground = self->GetMap()->GetHeight(self->GetPhaseShift(), nx, ny, self->GetPositionZ() + 2.0f);
-        if (ground <= INVALID_HEIGHT)
-            return;                         // рельеф не разрешился — стоим, а не едем вслепую
-        // обрыв или уступ: шагом такой перепад не берут, и подменять им падение нельзя
-        if (std::fabs(ground - self->GetPositionZ()) > MaxStepUp())
-            return;
-        // сквозь стену не ходим: то, чего не видно, для шага недостижимо
-        if (!self->IsWithinLOS(nx, ny, ground + 2.0f))
-            return;
+    static char const* ModeName(Behavior b)
+    {
+        switch (b)
+        {
+            case Behavior::Idle:              return "стою";
+            case Behavior::FollowingOwner:    return "иду за хозяином";
+            case Behavior::ApproachingTarget: return "иду к цели";
+            case Behavior::Attacking:         return "бью";
+            case Behavior::TurningIn:         return "сдаю квест";
+        }
+        return "?";
+    }
 
-        Position next(nx, ny, ground, angle);
-        SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
-        c.Moving = true;
+    // позиция хозяина, если за кем идти; заодно отвечает на вопрос «есть ли кто»
+    bool FollowTargetPos(Companion const& c, Player* self, Position* out = nullptr) const
+    {
+        if (c.DebugWalk)
+        {
+            if (out)
+                *out = c.DebugTarget;
+            return true;
+        }
+        Player* owner = FollowTarget(self);
+        if (!owner)
+            return false;
+        if (out)
+            *out = owner->GetPosition();
+        return true;
+    }
+
+    // выбрать цель и ударить — ровно то, что делает игрок мышью
+    bool TryAttack(Companion& c, Player* self, Creature* target)
+    {
+        WorldPacket rawSel(CMSG_SET_SELECTION);
+        WorldPackets::Misc::SetSelection sel(std::move(rawSel));
+        sel.Selection = target->GetGUID();
+        c.Session->HandleSetSelectionOpcode(sel);
+
+        WorldPacket rawSwing(CMSG_ATTACK_SWING);
+        WorldPackets::Combat::AttackSwing swing(std::move(rawSwing));
+        swing.Victim = target->GetGUID();
+        c.Session->HandleAttackSwingOpcode(swing);
+
+        // проверяем ПОСЛЕДСТВИЕ, а не факт вызова: сокета нет, ответа не будет
+        if (self->GetVictim() == target)
+        {
+            ++_fightsStarted;
+            return true;
+        }
+        TC_LOG_INFO("server.worldserver", "Constellation: {} — удар по {} ({}) не принят: жертва {}, дистанция {:.1f}",
+            self->GetName(), target->GetName(), target->GetEntry(),
+            self->GetVictim() ? self->GetVictim()->GetName() : "нет", self->GetExactDist2d(target));
+        return false;
     }
     // ВЗЯТИЕ КВЕСТА — цепочкой опкодов, и выбор ТОЖЕ клиентский.
     //
@@ -422,14 +672,14 @@ public:
     // порядке. Пакет упал в пустой сокет, но меню осталось.
     void QuestTick(Companion& c, uint32 diff)
     {
-        if (!QuestsEnabled() || c.State != Stage::InWorld || !c.Session)
+        if (!Cfg().Quests || c.State != Stage::InWorld || !c.Session)
             return;
         Player* self = c.Session->GetPlayer();
         if (!self || !self->IsInWorld() || !self->IsAlive())
             return;
 
         c.QuestMs += diff;
-        if (c.QuestMs < QuestIntervalMs())
+        if (c.QuestMs < Cfg().QuestIntervalMs)
             return;
         c.QuestMs = 0;
 
@@ -438,7 +688,7 @@ public:
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             if (self->GetQuestSlotQuestId(slot))
                 ++used;
-        if (used >= MAX_QUEST_LOG_SIZE || used >= MaxQuestsHeld())
+        if (used >= MAX_QUEST_LOG_SIZE || used >= Cfg().MaxQuests)
             return;
 
         Creature* giver = NearestQuestGiver(self);
@@ -492,6 +742,254 @@ public:
             return;                             // по одному за раз, как человек
         }
     }
+    // КОМУ СДАВАТЬ И ГДЕ ОН СТОИТ.
+    //
+    // Оператор, 2026-08-30: «у квестодателей и принимающих есть конкретные точки,
+    // их не надо искать, а идти к ним». Так и есть, и так делает игрок: журнал
+    // показывает ему, куда вернуться, а не заставляет обшаривать местность.
+    //
+    // Прежняя версия искала принимающего вокруг — сперва в 30 ярдах, потом в 120, —
+    // и не находила: спутник уходит за добычей, а принимающий остаётся у себя.
+    // Теперь берём его ТОЧКУ: квест -> кто принимает -> где он стоит. Всё это ядро
+    // и так отдаёт клиенту, рисуя метку возврата.
+    bool FindTurnIn(Companion& c, Player* self) const
+    {
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qid);
+            if (!quest || !self->CanRewardQuest(quest, false))
+                continue;
+
+            // кто принимает этот квест
+            for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
+            {
+                // ближайшая его точка на нашей карте
+                Position const* bestSpawn = nullptr;
+                float bestDist = 100000.0f;
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                {
+                    if (data.id != enderEntry || data.mapId != self->GetMapId())
+                        continue;
+                    float d = self->GetExactDist2d(data.spawnPoint.GetPositionX(), data.spawnPoint.GetPositionY());
+                    if (d < bestDist)
+                    {
+                        bestDist = d;
+                        bestSpawn = &data.spawnPoint;
+                    }
+                }
+                if (!bestSpawn)
+                    continue;
+                c.TurnInQuest = qid;
+                c.TurnInEntry = enderEntry;
+                c.TurnInPos = *bestSpawn;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Сдача: поздороваться, сдать, выбрать награду — теми же опкодами, что клиент.
+    // Правда берётся из СОСТОЯНИЯ: сокета нет, ответа не будет, поэтому после сдачи
+    // спрашиваем, числится ли квест награждённым.
+    void TurnInAt(Companion& c, Player* self, Creature* ender)
+    {
+        WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
+        WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
+        hello.QuestGiverGUID = ender->GetGUID();
+        c.Session->HandleQuestgiverHelloOpcode(hello);
+
+        Quest const* quest = sObjectMgr->GetQuestTemplate(c.TurnInQuest);
+        if (!quest || self->GetQuestStatus(c.TurnInQuest) != QUEST_STATUS_COMPLETE)
+            return;
+
+        WorldPacket rawDone(CMSG_QUEST_GIVER_COMPLETE_QUEST);
+        WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(rawDone));
+        done.QuestGiverGUID = ender->GetGUID();
+        done.QuestID = c.TurnInQuest;
+        c.Session->HandleQuestgiverCompleteQuest(done);
+
+        WorldPacket rawPick(CMSG_QUEST_GIVER_CHOOSE_REWARD);
+        WorldPackets::Quest::QuestGiverChooseReward pick(std::move(rawPick));
+        pick.QuestGiverGUID = ender->GetGUID();
+        pick.QuestID = c.TurnInQuest;
+        pick.Choice.Item.ItemID = 0;
+        c.Session->HandleQuestgiverChooseRewardOpcode(pick);
+
+        if (self->IsQuestRewarded(c.TurnInQuest))
+        {
+            TC_LOG_INFO("server.worldserver", "Constellation: {} сдал квест {} '{}' (уровень {})",
+                self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()));
+            ++_questsTurnedIn;
+        }
+        else
+            TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла",
+                self->GetName(), c.TurnInQuest);
+    }
+
+    // Существо рядом, которое ЧИСЛИТСЯ ЦЕЛЬЮ незакрытого квеста в журнале.
+    // Что именно убивать и сколько — знает ядро из quest_objectives; спрашиваем его.
+    Creature* FindObjectiveTarget(Companion const& c, Player* self) const
+    {
+        // какие виды существ нам вообще нужны
+        std::set<uint32> wanted;
+        uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 questId = self->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+            ++slotsUsed;
+            if (self->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            ++incomplete;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            for (QuestObjective const& obj : quest->GetObjectives())
+            {
+                if (obj.Type != QUEST_OBJECTIVE_MONSTER || obj.ObjectID <= 0)
+                    continue;
+                ++monsterObjs;
+                if (self->GetQuestObjectiveData(obj) >= obj.Amount)
+                    continue;                       // эта цель уже набрана
+                ++unmet;
+                wanted.insert(uint32(obj.ObjectID));
+            }
+        }
+        if (!_fightDiagDone && slotsUsed)
+        {
+            _fightDiagDone = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}",
+                self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()));
+        }
+        if (wanted.empty())
+            return nullptr;
+
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().FightRange);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
+        Cell::VisitGridObjects(self, searcher, Cfg().FightRange);
+
+        uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0;
+        uint32 lastEntry = 0, lastFaction = 0;
+        Creature* best = nullptr;
+        float bestDist = Cfg().FightRange + 1.0f;
+        for (Creature* creature : around)
+        {
+            ++seen;
+            if (!creature->IsAlive() || !wanted.count(creature->GetEntry()))
+                continue;
+            ++matched;
+            // ФАЗА. Поиск по сетке возвращает существ независимо от фазы, а игрок
+            // видит только свою: в стартовых зонах их несколько, и без этой проверки
+            // спутник целится в тех, кого на его месте не увидел бы вовсе.
+            if (!self->GetPhaseShift().CanSee(creature->GetPhaseShift()))
+                { ++rejPhase; ++rejected; continue; }
+            // чужую добычу не отбираем: тот, кто уже с кем-то дерётся, не наш
+            if (creature->IsInCombat() && creature->GetVictim() != self)
+                { ++rejBusy; ++rejected; continue; }
+            if (!self->IsValidAttackTarget(creature))
+            {
+                ++rejInvalid; ++rejected;
+                lastEntry = creature->GetEntry(); lastFaction = creature->GetFaction();
+                // Разбираем ОТКАЗ ЯДРА по составляющим, вместо догадок: повторяем те же
+                // условия из WorldObject::IsValidAttackTarget (Object.cpp:2375+) и пишем,
+                // какое именно не выполнено. Один раз за прогон.
+                if (!_whyDone)
+                {
+                    _whyDone = true;
+                    // САМЫЙ ИНФОРМАТИВНЫЙ ВОПРОС: видит ли спутник вообще КОГО-НИБУДЬ?
+                    // Если не видит никого — беда в самом спутнике, и перебирать
+                    // выходы функции видимости по одному бессмысленно. Если видит
+                    // прочих, но не цель, — беда в цели.
+                    uint32 vis = 0, invis = 0;
+                    Creature* seenExample = nullptr;
+                    for (Creature* any : around)
+                        if (self->CanSeeOrDetect(any)) { ++vis; if (!seenExample) seenExample = any; }
+                        else ++invis;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation SEE {}: вокруг {} существ, вижу {}, не вижу {}; пример видимого: {} ({})",
+                        self->GetName(), uint32(around.size()), vis, invis,
+                        seenExample ? seenExample->GetName() : "НИКОГО",
+                        seenExample ? seenExample->GetEntry() : 0);
+                    // Раз невидимы ВСЕ поголовно — виноват выход, не разбирающий цели.
+                    // Единственный такой: сопоставление «живой/призрак». Печатаем его
+                    // числа и состояние жизни спутника.
+                    // ВЕТКА ГМ — версия Кодекса. Прямой возврат срабатывает, только
+                    // если у цели видимость для ГМ НЕНУЛЕВАЯ. Меряем оба числа, а не
+                    // рассуждаем: SetGameMaster(false) ставит SEC_PLAYER, а это 0,
+                    // то есть само по себе ничего бы не изменило.
+                    {
+                        uint32 gmMine = self->m_serverSideVisibilityDetect.GetValue(SERVERSIDE_VISIBILITY_GM);
+                        uint32 gmTarget = creature->m_serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GM);
+                        uint32 withGm = 0;
+                        for (Creature* any : around)
+                            if (any->m_serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GM))
+                                ++withGm;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation GM {}: моё обнаружение ГМ={} у цели видимость ГМ={} | существ с ненулевой видимостью ГМ: {} из {}",
+                            self->GetName(), gmMine, gmTarget, withGm, uint32(around.size()));
+                    }
+
+                    // ПРОВЕРКА САМОГО ЗАМЕРА: себя спутник обязан видеть всегда
+                    // (первая же строка функции: this == obj -> true). Если и это
+                    // ложь — врёт мой вызов, а не ядро. И отдельно: видит ли он
+                    // ДРУГОГО СПУТНИКА, то есть игрока, а не существо.
+                    Player* otherBot = nullptr;
+                    for (Companion const& o : _companions)
+                        if (o.Session && o.Session->GetPlayer() && o.Session->GetPlayer() != self)
+                            { otherBot = o.Session->GetPlayer(); break; }
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation SELF {}: вижу себя={} вижу другого спутника={} ({}) карта своя={} карта его={}",
+                        self->GetName(), self->CanSeeOrDetect(self),
+                        otherBot ? self->CanSeeOrDetect(otherBot) : false,
+                        otherBot ? otherBot->GetName() : "нет",
+                        self->GetMap() ? self->GetMap()->GetId() : 0,
+                        (otherBot && otherBot->GetMap()) ? otherBot->GetMap()->GetId() : 0);
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation GHOST {}: моё обнаружение={} видимость цели={} | isDead={} IsAlive={} health={} deathState={}",
+                        self->GetName(),
+                        self->m_serverSideVisibilityDetect.GetValue(SERVERSIDE_VISIBILITY_GHOST),
+                        creature->m_serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GHOST),
+                        self->isDead(), self->IsAlive(), self->GetHealth(),
+                        uint32(self->getDeathState()));
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation WHY {} -> {} ({}) на {:.0f} ярдах: вижу={} | без фазы={} | со спавн-слежением={} | и то и то={} | одна карта={}",
+                        self->GetName(), creature->GetName(), creature->GetEntry(),
+                        self->GetExactDist2d(creature),
+                        self->CanSeeOrDetect(creature),
+                        self->CanSeeOrDetect(creature, { .IgnorePhaseShift = true }),
+                        self->CanSeeOrDetect(creature, { .IncludeHiddenBySpawnTracking = true }),
+                        self->CanSeeOrDetect(creature, { .IgnorePhaseShift = true, .IncludeHiddenBySpawnTracking = true }),
+                        self->GetMap() == creature->GetMap());
+                }
+                continue;
+            }
+            // Прямую видимость на ВЫБОРЕ не требуем: за 120 ярдов почти всё за
+            // чем-нибудь, а игрок обходит препятствие. Её проверяет шаг и само ядро
+            // при ударе. Здесь отсеиваем лишь то, что уже признано недостижимым.
+            if (c.Refused.count(creature->GetGUID()))
+                { ++rejLos; ++rejected; continue; }
+            float d = self->GetExactDist2d(creature);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best = creature;
+            }
+        }
+        if (!best && matched && !_rejDiagDone)
+        {
+            _rejDiagDone = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation REJ {}: видит {}, подходящих {}, чужая фаза {}, занято {}, недопустимо {}, без видимости {}; пример вид {} фракция {}",
+                self->GetName(), seen, matched, rejPhase, rejBusy, rejInvalid, rejLos, lastEntry, lastFaction);
+        }
+        return best;
+    }
 
     // Ближайший квестодатель, У КОТОРОГО ЕСТЬ ЧТО ПРЕДЛОЖИТЬ ИМЕННО ЭТОМУ спутнику.
     // Восклицательный знак над головой — это QuestGiverStatus, который ядро считает
@@ -499,12 +997,12 @@ public:
     Creature* NearestQuestGiver(Player* self) const
     {
         std::list<Creature*> around;
-        Trinity::AnyUnitInObjectRangeCheck check(self, QuestGiverRange());
+        Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().QuestGiverRange);
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
-        Cell::VisitGridObjects(self, searcher, QuestGiverRange());
+        Cell::VisitGridObjects(self, searcher, Cfg().QuestGiverRange);
 
         Creature* best = nullptr;
-        float bestDist = QuestGiverRange() + 1.0f;
+        float bestDist = Cfg().QuestGiverRange + 1.0f;
         for (Creature* creature : around)
         {
             if (!creature->IsAlive())
@@ -533,26 +1031,42 @@ public:
         mi.time = GameTime::GetGameTimeMS();
         c.Session->HandleMovementOpcode(CMSG_MOVE_HEARTBEAT, mi);
     }
-
-    // За кем идти: лидер группы. За ЖИВЫМ игроком — только с явного разрешения:
-    // иначе один человек, взявший спутников в группу, потянул бы за собой толпу
-    // (Кодекс, пункт 4). По умолчанию спутники ходят только за спутниками.
+    // ЗА КЕМ ИДТИ — ЯВНЫЙ ХОЗЯИН, А НЕ «КТО ПРИДЁТСЯ».
+    //
+    // Оператор, 2026-08-30: «а кто сейчас лидер??? чую подвох и мину в будущем». Мина
+    // была настоящая, и не одна. Прежняя версия шла за ЛИДЕРОМ ГРУППЫ, а лидерство
+    // нам не принадлежит и меняется само:
+    //
+    //   * оператор выходит из группы -> ядро назначает лидером СПУТНИКА, и остальные
+    //     идут теперь за ним, а он в этот момент бежит к мобу за сто ярдов;
+    //   * спутник стал лидером, а в группе живой игрок -> проверка «ходить за
+    //     игроком» бесполезна, она смотрит на лидера, а лидер уже свой;
+    //   * состав группы меняется ПОСЛЕ приглашения: позвали спутника, потом позвали
+    //     друзей — и спутник в группе с посторонними, никого не приглашав.
+    //
+    // Поэтому лидерство убрано из уравнения. У спутника есть хозяин — тот, кто его
+    // позвал, — и он не меняется от чужих действий. По умолчанию хозяина НЕТ, и тогда
+    // спутник не идёт ни за кем: безопасное поведение — стоять, а не брести за
+    // случайным лидером.
     Player* FollowTarget(Player* self) const
     {
-        Group* group = self->GetGroup();
-        if (!group)
+        Companion const* me = nullptr;
+        for (Companion const& c : _companions)
+            if (c.Session && c.Session->GetPlayer() == self)
+                me = &c;
+        if (!me || me->Owner.IsEmpty())
             return nullptr;
-        ObjectGuid leaderGuid = group->GetLeaderGUID();
-        if (leaderGuid == self->GetGUID())
+
+        Player* owner = ObjectAccessor::FindConnectedPlayer(me->Owner);
+        if (!owner || !owner->IsInWorld() || owner->GetMap() != self->GetMap())
             return nullptr;
-        Player* leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
-        if (!leader || !leader->IsInWorld() || leader->GetMap() != self->GetMap())
+        if (!self->GetPhaseShift().CanSee(owner->GetPhaseShift()))   // одна карта — ещё не одно место
             return nullptr;
-        if (!self->GetPhaseShift().CanSee(leader->GetPhaseShift()))   // одна карта — ещё не одно место
+        // В жизни хозяин — всегда человек (боты не приглашают). На стенде человека
+        // нет, поэтому там хозяином может быть спутник — только в RigMode.
+        if (IsCompanionAccount(owner->GetSession()->GetAccountId()) && !Cfg().RigMode)
             return nullptr;
-        if (!IsCompanionAccount(leader->GetSession()->GetAccountId()) && !FollowPlayers())
-            return nullptr;
-        return leader;
+        return owner;
     }
 
     bool IsCompanionAccount(uint32 accountId) const
@@ -565,6 +1079,27 @@ public:
 
 
 
+    // .constellation follow <имя|off> — назначить хозяина или снять
+    bool SetOwner(ChatHandler* handler, std::string const& who)
+    {
+        Player* master = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        uint32 n = 0;
+        bool off = (who == "off" || who == "-");
+        for (Companion& c : _companions)
+        {
+            if (who != "all" && !off && who != c.Entry->Name)
+                continue;
+            c.Owner = off ? ObjectGuid::Empty : (master ? master->GetGUID() : ObjectGuid::Empty);
+            ++n;
+        }
+        if (off)
+            handler->PSendSysMessage("Constellation: {} companions released.", n);
+        else
+            handler->PSendSysMessage("Constellation: {} companions now follow {}.", n,
+                master ? master->GetName() : "nobody");
+        return true;
+    }
+
     void Status(ChatHandler* handler)
     {
         uint32 inWorld = 0, failed = 0;
@@ -573,9 +1108,22 @@ public:
             if (c.State == Stage::InWorld) ++inWorld;
             if (c.State == Stage::Failed)  ++failed;
         }
-        handler->PSendSysMessage("Constellation {}: quests taken {}", CONSTELLATION_VERSION, _questsTaken);
+        handler->PSendSysMessage("Constellation {}: взято {}, боёв {}, СДАНО {}, переходов {}",
+            CONSTELLATION_VERSION, _questsTaken, _fightsStarted, _questsTurnedIn, _transitions);
+        uint32 idle = 0, following = 0, approaching = 0, attacking = 0;
+        for (Companion const& c : _companions)
+            switch (c.Mode)
+            {
+                case Behavior::Idle:              ++idle; break;
+                case Behavior::FollowingOwner:    ++following; break;
+                case Behavior::ApproachingTarget: ++approaching; break;
+                case Behavior::Attacking:         ++attacking; break;
+                case Behavior::TurningIn:         break;
+            }
+        handler->PSendSysMessage("  idle {}, following {}, approaching {}, attacking {}",
+            idle, following, approaching, attacking);
         handler->PSendSysMessage("Constellation {}: {} — roster {}, in world {}, failed {}",
-            CONSTELLATION_VERSION, IsEnabled() ? "enabled" : "disabled",
+            CONSTELLATION_VERSION, Cfg().Enable ? "enabled" : "disabled",
             uint32(_companions.size()), inWorld, failed);
         for (Companion const& c : _companions)
             if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer())
@@ -656,7 +1204,7 @@ private:
     // offers 11 classes. Resolved once per race and cached.
     bool ResolveAccount(Companion& c)
     {
-        c.BnetEmail = Trinity::StringFormat("{}-R{}@algalon.local", AccountName(), uint32(c.Entry->Race));
+        c.BnetEmail = Trinity::StringFormat("{}-R{}@algalon.local", Cfg().Account, uint32(c.Entry->Race));
         auto known = _raceAccounts.find(c.Entry->Race);
         if (known != _raceAccounts.end())
         {
@@ -739,9 +1287,9 @@ private:
         {
             case Stage::Offline:
             {
-                if (!AutoSummon() && c.Retries == 0 && c.TicksInState < 2)
+                if (!Cfg().AutoSummon && c.Retries == 0 && c.TicksInState < 2)
                     return false;   // waits for .constellation summon
-                if (uint32 cap = MaxActive())
+                if (uint32 cap = Cfg().MaxActive)
                 {
                     uint32 live = 0;
                     for (Companion const& o : _companions)
@@ -815,6 +1363,22 @@ private:
                     c.State = Stage::InWorld;
                     c.TicksInState = 0;
                     TC_LOG_INFO("server.worldserver", "Constellation: {} is in the world", c.Entry->Name);
+                    // ЗРЕНИЕ. Player::CanNeverSee отвечает «никогда» про ЛЮБОЙ объект, пока
+                    // не выставлен PLAYER_LOCAL_FLAG_OVERRIDE_TRANSPORT_SERVER_TIME —
+                    // намеренная задержка ядра: не показывать мир, пока клиент к нему не
+                    // готов. Флаг ставится при разборе CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE,
+                    // который живой клиент шлёт, закончив загрузку. Спутник его не слал
+                    // никогда — и видел ровно себя: ни существ, ни других игроков. Отсюда и
+                    // ноль ударов: ядро отказывало в атаке по цели, которой для него не было.
+                    //
+                    // Шлём ПОСЛЕ входа в мир, а не в середине: в середине это ломало вход —
+                    // спутники создавались и застревали, ни один не входил.
+                    {
+                        WorldPacket rawReady(CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE);
+                        WorldPackets::Movement::MoveInitActiveMoverComplete ready(std::move(rawReady));
+                        ready.Ticks = GameTime::GetGameTimeMS();
+                        c.Session->HandleMoveInitActiveMoverComplete(ready);
+                    }
                     return true;
                 }
                 // never tear down a session whose login holder is still in flight —
@@ -847,8 +1411,58 @@ private:
                 // invariant 0: a pending group invite is answered the way a real
                 // client answers — CMSG_PARTY_INVITE_RESPONSE through the session
                 // handler, never Group::AddMember
-                if (player->GetGroupInvite())
+                // ЧЕЛОВЕК УШЁЛ — СПУТНИКИ ВЫХОДЯТ (оператор, 2026-08-30).
+                //
+                // Причина ухода не важна: вышел сам, вылетел по обрыву, был исключён.
+                // Как только в группе не осталось ни одного человека, каждый спутник
+                // выходит сам, и группа рассыпается.
+                //
+                // Путь выбран оператором и он же его проверил: сначала он предложил
+                // расформировывать группу одним действием нового лидера, я нашёл в
+                // ядре Group::Disband и пометил прямой вызов как исключение — а он
+                // ОТКРЫЛ КЛИЕНТ И ТАКОЙ КНОПКИ НЕ НАШЁЛ. Значит и опкода нет, и
+                // исключение было бы выдумкой: игрок так не может. Выходим по одному,
+                // тем же CMSG_LEAVE_GROUP, что жмёт человек. Их не больше четырёх,
+                // и это занимает считаные такты.
+                //
+                // Нулевой инвариант остаётся без единой прорехи.
+                if (Group* grp = player->GetGroup())
                 {
+                    bool humanInside = false;
+                    for (Group::MemberSlot const& slot : grp->GetMemberSlots())
+                    {
+                        Player* member = ObjectAccessor::FindConnectedPlayer(slot.guid);
+                        if (member && member->GetSession()
+                            && !IsCompanionAccount(member->GetSession()->GetAccountId()))
+                            { humanInside = true; break; }
+                    }
+                    if (!humanInside)
+                    {
+                        WorldPacket rawLeave(CMSG_LEAVE_GROUP);
+                        WorldPackets::Party::LeaveGroup leave(std::move(rawLeave));
+                        c.Session->HandleLeaveGroupOpcode(leave);
+                        TC_LOG_INFO("server.worldserver", "Constellation: {} вышел из группы — человека в ней нет",
+                            player->GetName());
+                        c.Owner.Clear();
+                        return false;
+                    }
+                }
+
+                // ПРАВИЛО ОПЕРАТОРА (2026-08-30): «боты в группы сами не собираются,
+                // только если игрок-человек приглашает. Боты только принимают
+                // приглашение, не выдают их. И принимают только от игрока-человека.»
+                //
+                // Отсюда всё остальное: пригласивший человек по умолчанию лидер, он же
+                // становится хозяином — и это не меняется ни от смены лидера, ни от
+                // того, кого позовут в группу потом. Приглашение от другого спутника
+                // отвергается: сцепка ботов между собой не предусмотрена.
+                if (Group* inv = player->GetGroupInvite())
+                {
+                    Player* inviter = ObjectAccessor::FindConnectedPlayer(inv->GetLeaderGUID());
+                    if (!inviter || !inviter->GetSession()
+                        || IsCompanionAccount(inviter->GetSession()->GetAccountId()))
+                        return false;               // не человек — не принимаем
+                    c.Owner = inviter->GetGUID();
                     WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
                     WorldPackets::Party::PartyInviteResponse response(std::move(raw));
                     response.Accept = true;
@@ -1002,6 +1616,13 @@ private:
     std::vector<Companion> _companions;
     bool _debugPairDone = false;
     uint32 _questsTaken = 0;
+    uint32 _fightsStarted = 0;
+    uint32 _transitions = 0;
+    uint32 _questsTurnedIn = 0;
+    mutable bool _fightDiagDone = false;
+    mutable bool _rejDiagDone = false;
+    mutable bool _whyDone = false;
+    bool _stepDiagDone = false;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
@@ -1018,8 +1639,16 @@ public:
 
     void OnStartup() override
     {
-        TC_LOG_INFO("server.loading", "Constellation {} — {}", CONSTELLATION_VERSION,
-            Constellation::IsEnabled() ? "enabled" : "present but disabled (Constellation.Enable = 0)");
+        TC_LOG_INFO("server.loading", "Constellation {} [{}] - {}", CONSTELLATION_VERSION,
+            CONSTELLATION_BUILD_STAMP,
+            Constellation::Cfg().Enable ? "enabled" : "present but disabled (Constellation.Enable = 0)");
+    }
+
+    // сюда ядро зовёт и при старте, и при `.reload config` — значит ключи
+    // по-прежнему меняются без пересборки
+    void OnConfigLoad(bool /*reload*/) override
+    {
+        Constellation::Cfg().Load();
     }
 
     void OnUpdate(uint32 diff) override
