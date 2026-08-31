@@ -53,6 +53,10 @@
 #include "Loot.h"
 #include "LootPackets.h"
 #include "ItemTemplate.h"
+#include "Item.h"
+#include "Bag.h"
+#include "ItemPackets.h"
+#include "NPCPackets.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
@@ -111,6 +115,7 @@ struct Settings
     bool  Fight           = true;
     bool  Abilities       = false;      // произносить умения, а не только выбирать
     bool  Loot            = false;      // подбирать добычу с собственных убийств
+    bool  Vending         = false;      // ходить к торговцу: продать хлам и починиться
     uint32 MaxActive      = 0;
     uint32 PerTick        = 6;
     uint32 MaxQuests      = 10;
@@ -145,6 +150,7 @@ struct Settings
         // список прочитан. Включение не требует ни пересборки, ни остановки мира.
         Abilities       = sConfigMgr->GetBoolDefault("Constellation.Abilities", false);
         Loot            = sConfigMgr->GetBoolDefault("Constellation.Loot", false);
+        Vending         = sConfigMgr->GetBoolDefault("Constellation.Vending", false);
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
         MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
@@ -186,7 +192,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending };
 
 struct Companion
 {
@@ -244,6 +250,13 @@ struct Companion
     uint32 CastsTried = 0;              // за этот бой: попыток произнести
     uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
     uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
+    ObjectGuid VendorGuid;              // торговец, к которому идём
+    uint32 VendCooldownMs = 0;          // не искать торговца каждый такт, если не нашли
+    uint32 VendSold = 0;                // за всё время: продано предметов
+    uint64 VendEarned = 0;              //               выручено медяков (64 бита: 122 бота)
+    uint32 VendRepaired = 0;            //               починок
+    uint32 VendNoVendor = 0;            //               некому продать поблизости
+    uint32 VendPoor = 0;                //               не хватило денег на ремонт
     ObjectGuid LootTarget;              // труп нашего убийства, который ещё не обобран
     uint32 LootOpened = 0;              // за всё время: открыли трупов
     uint32 LootItems = 0;               //               взяли предметов
@@ -569,6 +582,37 @@ public:
         return true;
     }
 
+    // ОТПРАВИТЬ ВЕСЬ СОСТАВ К ТОРГОВЦУ ПРЯМО СЕЙЧАС.
+    //
+    // Обычное условие похода — поломка или полные сумки — в коротком прогоне не наступает,
+    // поэтому проверить торговлю можно только так. Ищем ближайшего каждому спутнику: они
+    // стоят в разных местах, и один общий торговец был бы неправдой.
+    bool VendAll(ChatHandler* handler)
+    {
+        uint32 sent = 0, nobody = 0;
+        for (Companion& c : _companions)
+        {
+            if (c.State != Stage::InWorld || !c.Session)
+                continue;
+            Player* self = c.Session->GetPlayer();
+            if (!self || !self->IsInWorld())
+                continue;
+            // Команда оператора — идём за обеими услугами сразу, но не требуем ни одной:
+            // это ручная проверка, а не автоматика, и отказ «никого нет» тут информативнее.
+            Creature* vendor = FindVendorNear(self, false, false);
+            if (!vendor)
+                { ++nobody; continue; }
+            c.VendorGuid = vendor->GetGUID();
+            c.VendCooldownMs = 0;
+            Switch(c, self, Behavior::Vending, "команда оператора");
+            ++sent;
+        }
+        handler->PSendSysMessage(
+            "Constellation: sent %u companions to a vendor; %u found nobody within 100 yards",
+            sent, nobody);
+        return true;
+    }
+
     bool RepairAll(ChatHandler* handler)
     {
         // ОДНА ДОРОГА К ОДНОМУ ДЕЙСТВИЮ: та же RepairIfBroken, что чинит при входе в мир и
@@ -581,7 +625,7 @@ public:
         {
             if (c.State != Stage::InWorld || !c.Session)
                 continue;
-            if (uint32 broken = RepairIfBroken(c.Session->GetPlayer(), "команда"))
+            if (uint32 broken = RepairIfBroken(c.Session->GetPlayer(), "команда", /*operatorAsked=*/true))
             {
                 c.BrokenNoted = false;
                 ++touched;
@@ -1117,6 +1161,7 @@ public:
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
         if (c.TravelCooldownMs)
             c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
+            c.VendCooldownMs   = (c.VendCooldownMs   <= diff) ? 0 : c.VendCooldownMs   - diff;
         if (c.TravelScanMs)
             c.TravelScanMs = (c.TravelScanMs <= diff) ? 0 : c.TravelScanMs - diff;
         if (c.RestSkipMs)
@@ -1220,6 +1265,35 @@ public:
                 {
                     Switch(c, self, Behavior::Recovering, "надо перевести дух");
                     return;
+                }
+                // К ТОРГОВЦУ — ВПЕРЕДИ ДРАКИ, И ЭТО НЕ ЖАДНОСТЬ.
+                //
+                // Сломанное оружие не наносит урона вовсе — GetWeaponForAttack возвращает
+                // на сломанном nullptr, — а полные сумки означают, что добыча с убийства
+                // пропадёт. И то и другое делает следующий бой бессмысленным, поэтому
+                // решается раньше него, но позже сдачи готовых квестов и отдыха.
+                if (Cfg().Vending && !c.VendCooldownMs)
+                {
+                    bool const broken = BrokenCount(self) > 0 || DamagedCount(self) > 0;
+                    bool const stuffed = FreeBagSpace(self) <= 2;
+                    if (broken || stuffed)
+                    {
+                        // ИЩЕМ ТОГО, КТО УМЕЕТ НУЖНОЕ. Полные сумки требуют продавца,
+                        // поломка — ремонтника; идти к тому, кто не умеет, значит вернуться
+                        // ни с чем и повторить через минуту (Кодекс).
+                        if (Creature* vendor = FindVendorNear(self, stuffed, broken))
+                        {
+                            c.VendorGuid = vendor->GetGUID();
+                            Switch(c, self, Behavior::Vending,
+                                broken ? "сломан, иду чиниться" : "сумки полны, иду продавать");
+                            return;
+                        }
+                        // НИКОГО ПОБЛИЗОСТИ. Это не ошибка, а измеряемый предел первой
+                        // версии: искать по всей карте она не умеет. Считаем и молчим
+                        // пять минут, чтобы не перебирать сетку каждый такт.
+                        ++c.VendNoVendor;
+                        c.VendCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
+                    }
                 }
                 if (Creature* target = Cfg().Fight ? FindObjectiveTarget(c, self) : nullptr)
                 {
@@ -1331,6 +1405,57 @@ public:
                     c.RestSkipMs = Cfg().RestMaxMs * 2;
                     Switch(c, self, Behavior::Idle, "отдых не помогает, иду как есть");
                 }
+                return;
+            }
+
+            case Behavior::Vending:
+            {
+                Creature* vendor = ObjectAccessor::GetCreature(*self, c.VendorGuid);
+                if (!vendor || !vendor->IsAlive())
+                {
+                    c.VendorGuid.Clear();
+                    Switch(c, self, Behavior::Idle, "торговец пропал");
+                    return;
+                }
+
+                // МОЖНО ЛИ УЖЕ ТОРГОВАТЬ — РЕШАЕТ ЯДРО, ТЕМ ЖЕ ВОПРОСОМ, ЧТО ЗАДАЁТ СЕБЕ
+                // ОБРАБОТЧИК. Своей дистанции здесь нет намеренно: клиентский предел это
+                // радиус досягаемости существа плюс четыре ярда, и повторять это число у
+                // себя значит завести вторую истину, которая разойдётся с первой.
+                if (!self->GetNPCIfCanInteractWith(c.VendorGuid, UNIT_NPC_FLAG_NONE, UNIT_NPC_FLAG_2_NONE))
+                {
+                    StepToward(c, self, vendor->GetPositionX(), vendor->GetPositionY(),
+                        vendor->GetPositionZ(), 2.0f, dt);
+                    // СРОК: не дошёл за две минуты — бросаем и живём дальше. Стоять
+                    // столбом у недостижимого торговца хуже, чем ходить сломанным.
+                    if (c.ModeMs > 120000)
+                    {
+                        c.VendCooldownMs = 300000;
+                        c.VendorGuid.Clear();
+                        Switch(c, self, Behavior::Idle, "не дошёл до торговца");
+                    }
+                    return;
+                }
+
+                // ДОШЛИ. Открываем прилавок тем же пакетом, что шлёт клиент; обработчик
+                // сам перепроверит флаг продавца через GetNPCIfCanInteractWith.
+                if (vendor->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
+                {
+                    WorldPacket raw(CMSG_LIST_INVENTORY);
+                    WorldPackets::NPC::Hello list(std::move(raw));
+                    list.Unit = c.VendorGuid;
+                    c.Session->HandleListInventoryOpcode(list);
+                    SellJunkTo(c, self, vendor);
+                }
+                RepairAt(c, self, vendor);
+
+                // РАЗБРОС, ЧТОБЫ НЕ ХОДИТЬ СТРОЕМ. Кодекс: одинаковые пороги и одинаковые
+                // таймеры у 122 спутников дают синхронную толпу у одного NPC — и человеку
+                // это заметнее, чем сама частота пакетов. Разброс берём от идентификатора
+                // спутника, а не от случайного числа: он постоянен и воспроизводим.
+                c.VendCooldownMs = 60000 + (c.Guid.GetCounter() % 47) * 1000;
+                c.VendorGuid.Clear();
+                Switch(c, self, Behavior::Idle, "торговля закончена");
                 return;
             }
 
@@ -2006,6 +2131,198 @@ public:
         return bestPaid ? bestPaid : bestFreeId;
     }
 
+    // СКОЛЬКО МЕСТА РЕАЛЬНО ЕСТЬ ПОД ДОБЫЧУ.
+    //
+    // Не GetFreeInventorySlotCount: он начинает счёт с INVENTORY_SLOT_BAG_START, поэтому
+    // пустые МЕСТА ПОД СУМКИ идут у него в зачёт как свободные ячейки. Положить туда
+    // добычу нельзя — только сумку, — и бот, поверивший этому числу, будет уверен, что
+    // место есть, пока ядро молча отказывает в каждом предмете. Ровно это и случилось на
+    // Легионе (задача 0008): «4 свободных» и 325 неудачных попыток по одному кобольду.
+    //
+    // Считаем то, что действительно примет предмет: рюкзак с ITEM_START и содержимое
+    // надетых сумок.
+    uint32 FreeBagSpace(Player* self) const
+    {
+        uint32 free = 0;
+        uint8 const end = INVENTORY_SLOT_ITEM_START + self->GetInventorySlotCount();
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < end; ++i)
+            if (!self->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                ++free;
+        for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Bag* bag = self->GetBagByPos(i))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    if (!GetItemInBag(bag, j))
+                        ++free;
+        return free;
+    }
+
+    // КОМУ МОЖНО ПРОДАТЬ И У КОГО ПОЧИНИТЬСЯ — СПРАШИВАЕМ У ЗАГРУЖЕННОЙ ОКРУГИ.
+    //
+    // Той же связкой, которой модуль уже дважды ищет существ: поиск по сетке плюс флаг.
+    // Своего радиуса взаимодействия не выдумываем — его позже проверит само ядро; сто
+    // ярдов здесь это радиус ПОИСКА, то есть «стоит ли вообще идти», а не «можно ли
+    // торговать». Предпочитаем того, кто умеет и то и другое: один поход вместо двух.
+    // needSell/needRepair — ЗАЧЕМ идём. Кодекс: без этого бот с полными сумками мог уйти
+    // к ремонтнику, ничего не продать, поставить минутный таймер и вернуться — и так по
+    // кругу вечно. Услуга, за которой идём, теперь обязательна, а вторая — приятный бонус.
+    Creature* FindVendorNear(Player* self, bool needSell, bool needRepair) const
+    {
+        Creature* both = nullptr; float bothDist = 100000.0f;
+        Creature* any = nullptr;  float anyDist = 100000.0f;
+        std::list<Creature*> near;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 100.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+        Cell::VisitGridObjects(self, searcher, 100.0f);
+        for (Creature* cr : near)
+        {
+            if (!cr->IsAlive())
+                continue;
+            bool const sells = cr->HasNpcFlag(UNIT_NPC_FLAG_VENDOR);
+            bool const fixes = cr->HasNpcFlag(UNIT_NPC_FLAG_REPAIR);
+            // ГОДИТСЯ, ТОЛЬКО ЕСЛИ УМЕЕТ ТО, ЗАЧЕМ ИДЁМ.
+            if (needSell && !sells)
+                continue;
+            if (needRepair && !fixes)
+                continue;
+            if (!sells && !fixes)
+                continue;
+            if (!self->IsValidAssistTarget(cr) && self->IsValidAttackTarget(cr))
+                continue;               // враждебный — торговать не станет
+            float const d = self->GetExactDist(cr);
+            if (sells && fixes)
+                { if (d < bothDist) { bothDist = d; both = cr; } }   // один поход вместо двух
+            else if (d < anyDist)
+                { anyDist = d; any = cr; }
+        }
+        return both ? both : any;
+    }
+
+    // ПРОДАТЬ ХЛАМ — ПО ОДНОМУ ПРЕДМЕТУ, ПОТОМУ ЧТО ПАЧКОЙ ЭТА СБОРКА НЕ УМЕЕТ.
+    //
+    // Кодекс советовал CMSG_SELL_ALL_JUNK_ITEMS: ядро само знает, что серое — это мусор,
+    // и само применяет запреты. Проверил в собираемом дереве (rev e861aa8ed2): опкод там
+    // привязан к Handle_NULL и не делает НИЧЕГО. Обработчик есть только в более новом
+    // upstream, который он читал. Поэтому перебираем сами.
+    //
+    // ЧТО ПРОДАЁМ: только серое, только с ненулевой ценой и только не нужное заданию.
+    // Ядро проверит своё (чужой предмет, непустая сумка, открытый лут, возвратный), но
+    // «это ещё пригодится» оно за нас не решит — это наша обязанность.
+    uint32 SellJunkTo(Companion& c, Player* self, Creature* vendor)
+    {
+        std::vector<Item*> junk;
+        auto consider = [&](Item* it)
+        {
+            if (!it || it->IsBag())
+                return;
+            ItemTemplate const* tpl = it->GetTemplate();
+            if (!tpl || tpl->GetQuality() != ITEM_QUALITY_POOR)
+                return;
+            if (!tpl->GetSellPrice())
+                return;                 // ядро такое всё равно откажется купить
+            if (self->HasQuestForItem(tpl->GetId()))
+                return;                 // нужное заданию не продаём никогда
+            junk.push_back(it);
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            consider(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 i = INVENTORY_SLOT_BAG_START; i < INVENTORY_SLOT_BAG_END; ++i)
+            if (Bag* bag = self->GetBagByPos(i))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    consider(GetItemInBag(bag, j));
+
+        uint32 sold = 0, refused = 0;
+        uint64 const before = self->GetMoney();
+        for (Item* it : junk)
+        {
+            // УСПЕХ — ЭТО ИСЧЕЗНОВЕНИЕ ПРЕДМЕТА, А НЕ ОТПРАВКА ПАКЕТА.
+            //
+            // Кодекс: прежний счёт увеличивался после КАЖДОГО вызова обработчика, поэтому
+            // отвергнутый предмет записывался проданным, и журнал мог сказать «продал 3,
+            // выручил 0». Спрашиваем ядро, лежит ли предмет ещё у нас.
+            ObjectGuid const itemGuid = it->GetGUID();
+            WorldPacket raw(CMSG_SELL_ITEM);
+            WorldPackets::Item::SellItem sell(std::move(raw));
+            sell.VendorGUID = vendor->GetGUID();
+            sell.ItemGUID = itemGuid;
+            sell.Amount = it->GetCount();
+            c.Session->HandleSellItemOpcode(sell);
+            if (self->GetItemByGuid(itemGuid))
+                ++refused;              // остался у нас — значит не продан
+            else
+                ++sold;
+        }
+        uint64 const earned = self->GetMoney() > before ? self->GetMoney() - before : 0;
+        c.VendSold += sold;
+        c.VendEarned += earned;
+        if (sold || refused)
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ТОРГ {}: продал {} предметов у {} ({}), выручил {} медяков; "
+                "отвергнуто ядром {}",
+                self->GetName(), sold, vendor->GetName(), vendor->GetEntry(), earned, refused);
+        return sold;
+    }
+
+    // ПОЧИНИТЬСЯ — ПАКЕТОМ, А НЕ ПРЯМЫМ ВЫЗОВОМ.
+    //
+    // Пустой ItemGUID означает «починить всё», ровно как кнопка клиента. Обработчик сам
+    // найдёт ремонтника, проверит флаг, вражду, бой и дистанцию и применит скидку за
+    // репутацию — ничего из этого прямой вызов не делает.
+    //
+    // ДЕНЕГ НЕ ХВАТИЛО — ЯДРО МОЛЧА НЕ ЧИНИТ НИЧЕГО (Кодекс: считает полную стоимость и
+    // выходит). Поэтому сверяем прочность до и после и пишем, если ничего не изменилось:
+    // иначе «починился» было бы утверждением, а не фактом.
+    bool RepairAt(Companion& c, Player* self, Creature* vendor)
+    {
+        if (!vendor->HasNpcFlag(UNIT_NPC_FLAG_REPAIR))
+            return false;
+
+        // НЕЧЕГО ЧИНИТЬ — НЕ ШЛЁМ ПАКЕТ ВОВСЕ.
+        //
+        // Найдено испытанием: ремонт при целом снаряжении всё равно списывает МОНЕТУ —
+        // CalculateDurabilityRepairCost округляет нулевую стоимость до единицы. Один медяк
+        // мелочь, но на 122 спутниках это постоянная утечка на пустом месте, а в журнале
+        // при этом появлялось «ремонт не прошёл», хотя чинить было нечего. Два разных
+        // случая нельзя писать одним словом.
+        if (!BrokenCount(self) && !DamagedCount(self))
+            return true;
+
+        uint32 const brokenBefore = BrokenCount(self);
+        uint32 const damagedBefore = DamagedCount(self);
+        uint64 const moneyBefore = self->GetMoney();
+
+        WorldPacket raw(CMSG_REPAIR_ITEM);
+        WorldPackets::Item::RepairItem fix(std::move(raw));
+        fix.NpcGUID = vendor->GetGUID();
+        fix.ItemGUID = ObjectGuid::Empty;   // пусто = «починить всё»
+        fix.UseGuildBank = false;
+        c.Session->HandleRepairItemOpcode(fix);
+
+        uint32 const brokenAfter = BrokenCount(self);
+        uint32 const damagedAfter = DamagedCount(self);
+        uint64 const spent = moneyBefore > self->GetMoney() ? moneyBefore - self->GetMoney() : 0;
+        // УСПЕХ МЕРЯЕТСЯ ПРОЧНОСТЬЮ, А НЕ ДЕНЬГАМИ (Кодекс: brokenAfter уже посчитан и не
+        // использован). Деньги отвечают на вопрос «сколько стоило», а не «получилось ли»:
+        // нулевой расход бывает и при бедности, и при отказе, и при нулевой стоимости.
+        bool const better = brokenAfter < brokenBefore || damagedAfter < damagedBefore;
+        if (!better)
+        {
+            ++c.VendPoor;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ТОРГ {}: ремонт НЕ прошёл у {} ({}) — сломано {}, изношено {}, "
+                "денег {}, списано {}; ядро чинит всё или ничего",
+                self->GetName(), vendor->GetName(), vendor->GetEntry(),
+                brokenBefore, damagedBefore, moneyBefore, spent);
+            return false;
+        }
+        ++c.VendRepaired;
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ТОРГ {}: починился у {} ({}) за {} медяков; сломано {} -> {}, "
+            "изношено {} -> {}",
+            self->GetName(), vendor->GetName(), vendor->GetEntry(), spent,
+            brokenBefore, brokenAfter, damagedBefore, damagedAfter);
+        return true;
+    }
+
     // ОБОБРАТЬ ТРУП — ЧЕТЫРЬМЯ ПАКЕТАМИ, В ТОМ ЖЕ ПОРЯДКЕ, ЧТО ШЛЁТ КЛИЕНТ.
     //
     // Возвращает true, если с этим трупом закончили (успешно или нет) — вызывающий тогда
@@ -2081,7 +2398,7 @@ public:
         //    сравнения с надетым, а её нет, и подобранная привязка необратима.
         WorldPacket rawItems(CMSG_LOOT_ITEM);
         WorldPackets::Loot::LootItem take(std::move(rawItems));
-        uint32 const freeSlots = self->GetFreeInventorySlotCount();
+        uint32 const freeSlots = FreeBagSpace(self);
         uint32 asked = 0;
         for (auto const& [lootGuid, loot] : self->GetAELootView())
         {
@@ -2103,15 +2420,19 @@ public:
                 // неотличимо от «фильтр всё съел».
                 char const* skip = nullptr;
                 if (!forQuest && !junk)                  skip = "не-квест-и-не-хлам";
-                else if (!forQuest && asked + 2 >= freeSlots) skip = "мало-места-под-хлам";
-                else if (asked + 1 >= freeSlots)         skip = "сумки-полны";
+                // Кодекс: было asked + 1 >= freeSlots, и одна свободная ячейка
+                // не использовалась никогда — при freeSlots == 1 отказывали даже первому предмету.
+                else if (!forQuest && asked + 2 > freeSlots) skip = "мало-места-под-хлам";
+                else if (asked >= freeSlots)            skip = "сумки-полны";
                 TC_LOG_INFO("server.worldserver",
-                    "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} свободно {} -> {}",
+                    "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} "
+                    "свободно {} (ядро говорит {}) -> {}",
                     self->GetName(), item.itemid, uint32(tpl->GetQuality()), item.count,
-                    forQuest ? "да" : "нет", freeSlots, skip ? skip : "БЕРЁМ");
+                    forQuest ? "да" : "нет", freeSlots,
+                    self->GetFreeInventorySlotCount(), skip ? skip : "БЕРЁМ");
                 if (skip)
                 {
-                    if (asked + 1 >= freeSlots)
+                    if (asked >= freeSlots)
                         break;
                     continue;
                 }
@@ -2310,10 +2631,15 @@ public:
 
     // ПОЧИНИТЬ, ЕСЛИ ЕСТЬ ЧТО. Возвращает, сколько надетого было сломано ДО починки, —
     // ноль означает, что вызывать ядро не пришлось вовсе.
-    uint32 RepairIfBroken(Player* self, char const* why) const
+    // ВТОРОЙ ДОВОД ЗА ФЛАГ, помимо инварианта: даровой ремонт скрывает саму нужду в
+    // деньгах. Пока чинят бесплатно, невозможно узнать, хватает ли спутнику выручки на
+    // собственное содержание, — а это и есть вопрос, ради которого заводилась торговля.
+    uint32 RepairIfBroken(Player* self, char const* why, bool operatorAsked = false) const
     {
         if (!self || !self->IsInWorld())
             return 0;
+        if (Cfg().Vending && !operatorAsked)
+            return 0;                   // чинимся у ремонтника за деньги, а не даром
         uint32 broken = BrokenCount(self);
         if (!broken)
             return 0;
@@ -2331,6 +2657,32 @@ public:
                 if (it->IsBroken())
                     ++broken;
         return broken;
+    }
+
+    // ИЗНОШЕННОЕ — ЭТО НЕ СЛОМАННОЕ, И ЧИНИТЬ НАДО РАНЬШЕ.
+    //
+    // Кодекс: поход запускался только при BrokenCount > 0, то есть при вещах с НУЛЕВОЙ
+    // прочностью. Изношенное, но ещё работающее снаряжение не чинилось никогда — а это,
+    // как он верно замечает, гораздо более частое состояние, чем полная поломка. Ждать
+    // нуля значит ждать, пока оружие перестанет наносить урон вовсе.
+    //
+    // Половина — ПОРОГ, А НЕ ВЫВОД. Ядро своего «пора чиниться» не определяет, поэтому
+    // число выбрано, а не найдено; названо здесь, чтобы его можно было оспорить.
+    uint32 DamagedCount(Player* self) const
+    {
+        uint32 damaged = 0;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                // Читаем те же два поля, что читает Item::IsBroken (Item.h:265) — своих
+                // имён не выдумываем, старые ITEM_FIELD_* в этой версии не существуют.
+                uint32 const maxDur = *it->m_itemData->MaxDurability;
+                if (!maxDur)
+                    continue;           // прочности нет вовсе — нечего изнашивать
+                if (uint32(*it->m_itemData->Durability) * 2 < maxDur)
+                    ++damaged;
+            }
+        return damaged;
     }
 
     void LogFightOutcome(Player* self, Unit* victim, char const* how, Companion& c)
@@ -2403,6 +2755,7 @@ public:
             case Behavior::ApproachingTarget: return "иду к цели";
             case Behavior::Attacking:         return "бью";
             case Behavior::Recovering:        return "перевожу дух";
+            case Behavior::Vending:           return "иду к торговцу";
             case Behavior::Travelling:        return "иду к месту задания";
             case Behavior::TurningIn:         return "сдаю квест";
         }
@@ -3971,6 +4324,7 @@ public:
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
         static ChatCommandTable commandTable =
         {
@@ -3998,6 +4352,11 @@ public:
     static bool HandleRepair(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->RepairAll(handler);
+    }
+
+    static bool HandleVend(ChatHandler* handler)
+    {
+        return Constellation::Manager::Instance()->VendAll(handler);
     }
 
     // Без слова подтверждения команда только показывает, что сделает. Это не украшение:
