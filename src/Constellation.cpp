@@ -239,7 +239,11 @@ struct Companion
     uint32 CastsTried = 0;              // за этот бой: попыток произнести
     uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
     uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
+    uint32 CastsBusy = 0;               // не просили: уже читаем или не истёк общий откат
+    uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
+    bool WasCasting = false;            // читали ли на прошлом такте (для счётчика выше)
     std::set<uint32> SpellsLogged;      // о каком выборе уже написали — по разу за всё время
+    bool PaletteDumped = false;         // палитра класса выписана — один раз на спутника
     uint32 WantedCheckMs = 0;           // когда в последний раз спрашивали счётчик цели
     uint32 GateNotReady = 0;            //   вентиль открыт, но таймер удара не готов
     uint32 VictimSwaps = 0;             //   сколько раз цель подменилась
@@ -1446,6 +1450,17 @@ public:
                     // спутник мог добить кого-то ещё; одного совпадения тоже мало —
                     // существо возрождается с тем же GUID, и старая запись о победе над
                     // ним засчиталась бы снова (Кодекс, проход 11).
+                    // ЧИТАЛИ ЛИ МЫ ЗАКЛИНАНИЕ, КОГДА БОЙ КОНЧИЛСЯ.
+                    // Догадка оператора: цель добивает другой спутник, пока мы читаем, и
+                    // каст срывается. Проверять это можно только ЗДЕСЬ — ниже по ветке
+                    // CastAtTarget уже не зовётся. Само по себе число не доказывает срыв
+                    // (мы могли и дочитать в тот же миг), но если оно ноль, версии не на
+                    // чем стоять; а если велико — смотреть, чем кончился бой: «ПОБЕДА»
+                    // значит дочитали и добили сами, «добили не мы» — это ровно случай
+                    // оператора.
+                    if (c.WasCasting)
+                        ++c.CastsDiedUnder;
+
                     Manager::Blows const k = Manager::Instance()->BlowsOf(self->GetGUID());
                     char const* how;
                     if (k.Kills > c.KillsAtStart && k.LastKilled == c.FightVictim)
@@ -1652,6 +1667,133 @@ public:
     //
     // Считаем не «есть ли оружие», а сколько надетого сломано: спутник в сломанной броне
     // гибнет так же надёжно, как и без оружия.
+    // БЬЁТ ИЛИ ЛЕЧИТ — СПРАШИВАТЬ НАДО НА ОДИН УРОВЕНЬ ГЛУБЖЕ.
+    //
+    // Заклинание-снаряд само урона не несёт: у него эффект «запусти вот это», и весь урон
+    // лежит в запускаемом. Frostbolt(116) именно такой, и потому книга мага первого уровня
+    // выглядела пустой — не потому что пуста, а потому что прямых бьющих эффектов в ней
+    // нет ни одного. На Легионе это уже находили и чинили (задача 0005), и там же терялся
+    // Rising Sun Kick у монаха — значит теряется не «маг», а целый ВИД заклинаний у кого
+    // угодно.
+    //
+    // Четыре запускающих эффекта разворачиваются ровно на ОДИН уровень. Глубже намеренно
+    // не идём: цепочки бывают, но каждый лишний уровень — ещё один способ принять за
+    // оружие то, чем оно не является. Один определитель на все три места, а не три копии
+    // массива, которые разъедутся при первой же правке.
+    static bool SpellDoes(SpellInfo const* si, bool wantHeal, Difficulty diff, int depth = 1)
+    {
+        static SpellEffectName const hurting[] = {
+            SPELL_EFFECT_SCHOOL_DAMAGE, SPELL_EFFECT_HEALTH_LEECH,
+            SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL, SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
+            SPELL_EFFECT_WEAPON_DAMAGE, SPELL_EFFECT_NORMALIZED_WEAPON_DMG };
+        static SpellEffectName const healing[] = {
+            SPELL_EFFECT_HEAL, SPELL_EFFECT_HEAL_MAX_HEALTH, SPELL_EFFECT_HEAL_PCT };
+        static SpellEffectName const triggers[] = {
+            SPELL_EFFECT_TRIGGER_SPELL, SPELL_EFFECT_TRIGGER_MISSILE,
+            SPELL_EFFECT_TRIGGER_SPELL_WITH_VALUE,
+            SPELL_EFFECT_TRIGGER_MISSILE_SPELL_WITH_VALUE };
+
+        if (!si)
+            return false;
+        if (wantHeal)
+        {
+            for (SpellEffectName e : healing)
+                if (si->HasEffect(e))
+                    return true;
+        }
+        else
+        {
+            for (SpellEffectName e : hurting)
+                if (si->HasEffect(e))
+                    return true;
+        }
+        if (depth <= 0)
+            return false;
+        for (SpellEffectInfo const& eff : si->GetEffects())
+        {
+            bool trigger = false;
+            for (SpellEffectName t : triggers)
+                if (eff.IsEffect(t)) { trigger = true; break; }
+            if (!trigger || !eff.TriggerSpell)
+                continue;
+            if (SpellDoes(sSpellMgr->GetSpellInfo(eff.TriggerSpell, diff), wantHeal, diff, depth - 1))
+                return true;
+        }
+        return false;
+    }
+
+    // ПАЛИТРА: ЧТО У ЭТОГО КЛАССА ВООБЩЕ ЕСТЬ, ОДИН РАЗ НА СПУТНИКА.
+    //
+    // Без неё ротацию не спроектировать: нельзя решать, что чем сменять, не видя списка.
+    // Пишем ресурс (его вид и запас) и КАЖДОЕ непассивное заклинание книги — с уровнем,
+    // стоимостью, временем произнесения, пометкой «бьёт/лечит/никак» и причиной, по
+    // которой отбор его не берёт. Именно каждое, включая отвергнутые: дамп, печатающий
+    // только прошедшее через фильтр, уже один раз соврал здесь про пустую книгу мага.
+    void DumpPalette(Companion& c, Player* self)
+    {
+        if (c.PaletteDumped)
+            return;
+        c.PaletteDumped = true;
+
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        Powers const pw = self->GetPowerType();
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПАЛИТРА {} класс {} ур {}: ресурс {} = {}/{}",
+            self->GetName(), uint32(self->GetClass()), uint32(self->GetLevel()),
+            uint32(pw), self->GetPower(pw), self->GetMaxPower(pw));
+
+        // СЫРОЙ, А НЕ ОТФИЛЬТРОВАННЫЙ. Печатаем КАЖДУЮ непассивную запись книги вместе с
+        // причиной, по которой отбор её не берёт. Ровно это правило записано в 0005 после
+        // истории с монахом: удобный вид скрыл настоящую запись, и проверявший честно
+        // подтвердил пустоту. Пусть лучше в журнале будет лишняя строка, чем вывод «у
+        // класса ничего нет», который нечем перепроверить.
+        for (auto const& [id, ps] : self->GetSpellMap())
+        {
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            if (!si || si->IsPassive())
+                continue;
+
+            bool const hurts = SpellDoes(si, false, diff);
+            bool const heals = !hurts && SpellDoes(si, true, diff);
+            char const* kind = hurts ? "бьёт" : heals ? "лечит" : "никак";
+
+            // ПОЧЕМУ ОТБОР ЭТО НЕ ВОЗЬМЁТ — первая же несданная проверка, в том же порядке.
+            char const* why = "годится";
+            if (!self->HasActiveSpell(id))                           why = "нет-в-книге";
+            else if (!hurts && !heals)                               why = "не-бьёт-не-лечит";
+            else if (hurts && si->IsPositive())                      why = "доброе";
+            else if (hurts && !si->NeedsExplicitUnitTarget())        why = "без-цели";
+            else if (si->IsAffectingArea() || si->IsTargetingArea()) why = "площадь";
+            else if (!si->CanBeUsedInCombat(self))                   why = "нельзя-в-бою";
+            else if (self->GetSpellHistory()->HasCooldown(si))       why = "откат";
+
+            // стоимость: вид ресурса и сколько. Считает ядро, не я.
+            int32 amount = 0; uint32 power = uint32(POWER_MANA);
+            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
+                if (cost.Amount > 0) { amount = cost.Amount; power = uint32(cost.Power); break; }
+
+            // ФОРМА ЗАКЛИНАНИЯ: номер эффекта, а через «>» — что он запускает, если
+            // запускает. Ровно здесь видно разницу, невидимую на экране: у одного
+            // прямой эффект урона, у другого эффект «запусти вот это», и урон уже там.
+            std::string shape;
+            for (SpellEffectInfo const& eff : si->GetEffects())
+            {
+                if (!shape.empty())
+                    shape += ",";
+                shape += std::to_string(uint32(eff.Effect));
+                if (eff.TriggerSpell)
+                    shape += ">" + std::to_string(eff.TriggerSpell);
+                if (eff.ApplyAuraName)
+                    shape += "/аура" + std::to_string(uint32(eff.ApplyAuraName));
+            }
+
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПАЛИТРА {} класс {}: {} закл {} ур {} цена {}/{} каст {} мс [{}] эфф {}",
+                self->GetName(), uint32(self->GetClass()), kind, id, si->SpellLevel,
+                amount, power, si->CalcCastTime(), why, shape);
+        }
+    }
+
     // ВЫБОР БОЕВОГО УМЕНИЯ — ВОПРОСАМИ К ЯДРУ, БЕЗ ЕДИНОГО ЗАШИТОГО НОМЕРА.
     //
     // Книга берётся оттуда же, откуда её берёт клиент: GetSpellMap плюс HasActiveSpell —
@@ -1664,14 +1806,14 @@ public:
     // вместе с персонажем.
     uint32 PickAttackSpell(Player* self, Unit* victim) const
     {
-        // ШЕСТЬ ЭФФЕКТОВ, КОТОРЫЕ ДЕЙСТВИТЕЛЬНО БЬЮТ. Заклинание без единого из них — не
-        // оружие, чем бы оно ни было по прочим признакам.
-        static SpellEffectName const damaging[] = {
-            SPELL_EFFECT_SCHOOL_DAMAGE, SPELL_EFFECT_HEALTH_LEECH,
-            SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL, SPELL_EFFECT_WEAPON_PERCENT_DAMAGE,
-            SPELL_EFFECT_WEAPON_DAMAGE, SPELL_EFFECT_NORMALIZED_WEAPON_DMG };
-        uint32 best = 0, bestLevel = 0;
-        bool bestFree = false;
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+
+        // ДВА РАЗДЕЛЬНЫХ ЛУЧШИХ: платное и бесплатное. Внутри каждой группы порядок по
+        // уровню заклинания, и это ПРИЗНАННЫЙ СУРРОГАТ — уровень не измеряет силу
+        // (Кодекс). Настоящая мера это урон за произнесение, и её надо намерить, а не
+        // придумать; до тех пор суррогат честнее случайного выбора.
+        uint32 bestPaid = 0, bestPaidLevel = 0;
+        uint32 bestFreeId = 0, bestFreeLevel = 0;
         for (auto const& [id, ps] : self->GetSpellMap())
         {
             if (!self->HasActiveSpell(id))
@@ -1691,10 +1833,7 @@ public:
             // и сюда не пройдут. Это недостающая возможность, а не опасность, и она
             // осознанно оставлена на потом: лучше спутник без рывка, чем спутник,
             // применивший что-то, чего никто не проверял, на живом сервере.
-            bool hurts = false;
-            for (SpellEffectName e : damaging)
-                if (si->HasEffect(e)) { hurts = true; break; }
-            if (!hurts)
+            if (!SpellDoes(si, false, diff))
                 continue;
             if (!si->CanBeUsedInCombat(self))
                 continue;
@@ -1725,19 +1864,66 @@ public:
             if (!affordable)
                 continue;
 
-            // СПЕРВА САМОЕ ВЫСОКОУРОВНЕВОЕ ИЗ ПОСИЛЬНОГО, бесплатность — лишь при равенстве.
-            //
-            // Легионовское правило «free abilities first» я взял дословно, и сухой прогон
-            // сразу показал, что для маны оно перевёрнуто: маг первого уровня выбрал
-            // Shoot (5019) — выстрел из жезла, бесплатный и слабый, — вместо заклинания,
-            // стоящего маны. Для ярости и энергии правило верное, для маны — нет.
-            // Посильность проверена выше, поэтому воин без ярости платное и не увидит;
-            // а значит по уровню можно брать смело.
-            if (best && si->SpellLevel < bestLevel)
+            if (free)
+            {
+                if (!bestFreeId || si->SpellLevel > bestFreeLevel)
+                    { bestFreeId = id; bestFreeLevel = si->SpellLevel; }
+            }
+            else
+            {
+                if (!bestPaid || si->SpellLevel > bestPaidLevel)
+                    { bestPaid = id; bestPaidLevel = si->SpellLevel; }
+            }
+        }
+        // ПЛАТНОЕ ВПЕРЕДИ БЕСПЛАТНОГО, и это поправка оператора, а не украшение:
+        // «самые дешёвые это автоатаки и всякие жезлы — неверно использовать их в первую
+        // очередь; бот должен ТРАТИТЬ ресурс для эффективного уничтожения целей».
+        // Прежнее правило говорило ровно обратное и потому не тратило ничего.
+        return bestPaid ? bestPaid : bestFreeId;
+    }
+
+    // САМОЛЕЧЕНИЕ: ТОТ ЖЕ ОБХОД КНИГИ, НО ЛЕЧАЩЕЕ И НА СЕБЯ.
+    //
+    // Порог 35 % — первое защитимое правило (Кодекс), и он же назвал, чем его заменить
+    // потом: лечиться, если «здоровье ÷ входящий урон» меньше времени произнесения плюс
+    // запас. Это расчёт, а не константа, и для него нужны счётчики, которых пока нет.
+    //
+    // ЧЕГО ЭТО НЕ ВИДИТ, И ЭТО НАЗВАНО, А НЕ УМОЛЧАНО: лечение через ауру. Обновление у
+    // жреца и Возрождение у друида лечат периодической аурой, а не эффектом лечения, и в
+    // три искомых эффекта не попадают — как Frostbolt не попадал в шесть бьющих. Разница
+    // в том, что здесь это осознанный предел первой версии (Кодекс: «прямое
+    // самолечение»), а не сюрприз: постепенное лечение при 35 % здоровья и так почти
+    // всегда опаздывает. Расширять — вместе со счётчиками вылеченного и перелеченного,
+    // иначе нечем будет доказать, что стало лучше.
+    uint32 PickSelfHeal(Player* self) const
+    {
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        uint32 best = 0, bestLevel = 0;
+        for (auto const& [id, ps] : self->GetSpellMap())
+        {
+            if (!self->HasActiveSpell(id))
                 continue;
-            if (best && si->SpellLevel == bestLevel && bestFree && !free)
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            if (!si || si->IsPassive())
                 continue;
-            best = id; bestLevel = si->SpellLevel; bestFree = free;
+            if (!SpellDoes(si, true, diff))
+                continue;
+            if (si->IsAffectingArea() || si->IsTargetingArea())
+                continue;
+            if (!si->CanBeUsedInCombat(self))
+                continue;
+            if (si->CheckTarget(self, self, false) != SPELL_CAST_OK)
+                continue;               // на себя не ложится — не наш случай
+            if (self->GetSpellHistory()->HasCooldown(si))
+                continue;
+            bool affordable = true;
+            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
+                if (cost.Amount > 0 && self->GetPower(cost.Power) < cost.Amount)
+                    { affordable = false; break; }
+            if (!affordable)
+                continue;
+            if (!best || si->SpellLevel > bestLevel)
+                { best = id; bestLevel = si->SpellLevel; }
         }
         return best;
     }
@@ -1748,7 +1934,25 @@ public:
     // ждать неоткуда — сокета нет, — поэтому проверяем ПОСЛЕДСТВИЕ, как и везде в модуле.
     bool CastAtTarget(Companion& c, Player* self, Unit* victim)
     {
-        uint32 const spellId = PickAttackSpell(self, victim);
+        DumpPalette(c, self);
+
+        bool const castingNow = self->HasUnitState(UNIT_STATE_CASTING);
+        c.WasCasting = castingNow;
+
+        // НЕ ПРОСИМ КАСТ ПОВЕРХ КАСТА. Ядро такую просьбу не отклоняет — оно её ОТКЛАДЫВАЕТ,
+        // а следующая замещает отложенную (Player.cpp:30891). Просить каждый такт значит
+        // восемь раз за двухсекундное заклинание выбросить собственный же запрос.
+        if (castingNow)
+            { ++c.CastsBusy; return false; }
+
+        // РАНЕН — ЛЕЧИСЬ. Цель тогда мы сами, а не противник.
+        Unit* castTarget = victim;
+        uint32 spellId = 0;
+        if (self->GetHealthPct() <= 35.0f)
+            if (uint32 heal = PickSelfHeal(self))
+                { spellId = heal; castTarget = self; }
+        if (!spellId)
+            spellId = PickAttackSpell(self, victim);
         if (!spellId)
             return false;
         SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
@@ -1771,11 +1975,17 @@ public:
             TC_LOG_INFO("server.worldserver",
                 "Constellation УМЕНИЕ {} (класс {}, ур {}) выбрал заклинание {} против {} ({}){}",
                 self->GetName(), uint32(self->GetClass()), uint32(self->GetLevel()),
-                spellId, victim->GetName(), victim->GetEntry(),
+                spellId, castTarget->GetName(), castTarget->GetEntry(),
                 Cfg().Abilities ? "" : " — ТОЛЬКО ВЫБОР, произнесение выключено");
         }
         if (!Cfg().Abilities)
             return false;
+
+        // ОБЩИЙ ОТКАТ СПРАШИВАЕМ У ЯДРА ТЕМ ЖЕ ВОПРОСОМ, что задаёт себе оно само
+        // (CanExecutePendingSpellCastRequest). Своя арифметика по времени здесь стоила бы
+        // ровно того же, что стоила своя арифметика по здоровью и по прочности.
+        if (self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
+            { ++c.CastsBusy; return false; }
 
         ++c.CastsTried;
         WorldPacket raw(CMSG_CAST_SPELL);
@@ -1785,13 +1995,22 @@ public:
             self->GetMapId(), spellId, self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
         cast.Cast.SpellID = int32(spellId);
         cast.Cast.Target.Flags = TARGET_FLAG_UNIT;
-        cast.Cast.Target.Unit = victim->GetGUID();
+        cast.Cast.Target.Unit = castTarget->GetGUID();
         // MoveUpdate НЕ ЗАПОЛНЯЕМ: обработчик при нём прогоняет CMSG_MOVE_STOP через
         // HandleMovementOpcode, а тот ЗАМЕЩАЕТ всё состояние движения — ровно та ловушка,
         // на которой пришлось разбираться с поворотом к цели.
         c.Session->HandleCastSpellOpcode(cast);
 
-        if (self->GetCurrentSpell(CURRENT_GENERIC_SPELL) || self->GetSpellHistory()->HasCooldown(si))
+        // СЛЕД УСПЕХА — ОБЩИЙ ОТКАТ, а не «идёт ли заклинание».
+        //
+        // Прежний признак был верен только для читаемых. Мгновенное умение исполняется и
+        // исчезает в тот же миг, своего отката у Sinister Strike, Slam и Crusader Strike
+        // нет, — и все три засчитывались как непрошедшие. Общий откат стартует в обоих
+        // случаях, и это тот же вопрос, которым ядро само решает, можно ли исполнять
+        // следующий запрос.
+        if (self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms
+            || self->GetCurrentSpell(CURRENT_GENERIC_SPELL)
+            || self->GetSpellHistory()->HasCooldown(si))
         {
             ++c.CastsWent;
             return true;
@@ -1859,7 +2078,7 @@ public:
         Manager::Blows const b = Manager::Instance()->BlowsOf(self->GetGUID());
         TC_LOG_INFO("server.worldserver",
             "Constellation БОЙ {} (эфф ур {}) против {} ({}): {} — у него {}, у нас {:.0f}%; "
-            "за {} с: замахов {}, урон прошёл {} раз на {}, вничью {} раз; умений {} из {} (закл {}); по нам {} на {}; "
+            "за {} с: замахов {}, урон прошёл {} раз на {}, вничью {} раз; умений {} из {} (закл {}, занят {}, цель умерла под каст {}); по нам {} на {}; "
             "тактов {} (уклоняется {}, занят {}, не в бою {}, вне досягаемости {}, вне сектора {}, "
             "таймер не готов {}); подмен цели {}",
             self->GetName(), uint32(self->GetEffectiveLevel()),
@@ -1870,7 +2089,7 @@ public:
             c.ModeMs / 1000,
             b.Swings - c.SwingsAtStart, b.Landed - c.LandedAtStart, b.Dealt - c.DealtAtStart,
             b.Zeroed - c.ZeroedAtStart,
-            c.CastsWent, c.CastsTried, c.LastSpell,
+            c.CastsWent, c.CastsTried, c.LastSpell, c.CastsBusy, c.CastsDiedUnder,
             b.Hits - c.HitsAtStart, b.Taken - c.TakenAtStart,
             c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing,
             c.GateNotReady, c.VictimSwaps);
@@ -1979,6 +2198,8 @@ public:
             c.GateNotReady = c.VictimSwaps = 0;
             c.CastMs = 1500;            // первое решение — сразу, а не через полторы секунды
             c.CastsTried = c.CastsWent = c.LastSpell = 0;
+            c.CastsBusy = c.CastsDiedUnder = 0;
+            c.WasCasting = false;
             c.DamageVictim = target->GetGUID();
             c.VictimHp = b.Dealt;       // отсечка сторожа: урон НА НАЧАЛО этого боя
             c.NoDamageMs = 0;
