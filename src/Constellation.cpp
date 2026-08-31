@@ -212,6 +212,10 @@ struct Companion
     bool DebugWalk = false;             // только стенд: уходить в точку, а не за лидером
     Position DebugTarget;
     uint32 QuestMs = 0;                 // накопитель между попытками взять квест
+    ObjectGuid GiverGuid;               // квестодатель, к которому идём (пусто = никуда)
+    uint32 GiverMs = 0;                 // сколько уже идём к нему
+    float GiverDist = 0.0f;             // и с какой дистанции начали — меряем прогресс
+    std::set<ObjectGuid> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
     uint32 FightMs = 0;                 // накопитель между решениями в бою
     Behavior Mode = Behavior::Idle;     // ровно одно намерение за раз
@@ -250,8 +254,10 @@ struct Companion
     uint32 CastsTried = 0;              // за этот бой: попыток произнести
     uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
     uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
+    float EngageRange = 0.0f;           // с какой дистанции драться: 0 = ещё не считали
     ObjectGuid VendorGuid;              // торговец, к которому идём
     uint32 VendCooldownMs = 0;          // не искать торговца каждый такт, если не нашли
+    uint32 VendScanMs = 0;              // и не обходить сетку каждый такт ВООБЩЕ
     uint32 VendSold = 0;                // за всё время: продано предметов
     uint64 VendEarned = 0;              //               выручено медяков (64 бита: 122 бота)
     uint32 VendRepaired = 0;            //               починок
@@ -1272,20 +1278,55 @@ public:
                 // на сломанном nullptr, — а полные сумки означают, что добыча с убийства
                 // пропадёт. И то и другое делает следующий бой бессмысленным, поэтому
                 // решается раньше него, но позже сдачи готовых квестов и отдыха.
-                if (Cfg().Vending && !c.VendCooldownMs)
+                // ОБХОД СЕТКИ — НЕ ЧАЩЕ РАЗА В ПЯТЬ СЕКУНД.
+                //
+                // Замер на боевом: мир упёрся в 99 % ядра, автомат почти перестал тикать —
+                // одна строка журнала за десять секунд. Причина моя: проверка «торговец
+                // рядом?» звала обход сетки на СТО ярдов каждый такт у каждого изношенного
+                // спутника. Изношены почти все, тактов четыре в секунду, спутников 122 —
+                // полтысячи обходов в секунду.
+                if (c.VendScanMs)
                 {
-                    bool const broken = BrokenCount(self) > 0 || DamagedCount(self) > 0;
+                    c.VendScanMs = (c.VendScanMs <= diff) ? 0 : c.VendScanMs - diff;
+                }
+                else if (Cfg().Vending && !c.VendCooldownMs)
+                {
+                    c.VendScanMs = 5000;
+                    // ТРИ РАЗНЫХ ПОВОДА, И ОНИ НЕ РАВНОЗНАЧНЫ.
+                    //
+                    // «Не могу бить» и «сумки полны» действительно останавливают спутника:
+                    // без оружия он не наносит урона, с полными сумками теряет добычу. Ради
+                    // них стоит идти. А просто изношенное снаряжение работает — ради него
+                    // бросать квест и бой нельзя, чинимся мимоходом.
+                    // «БИТЬ НЕЧЕМ» ЛЕЧИТСЯ РЕМОНТОМ ТОЛЬКО ЕСЛИ ЕСТЬ ЧТО ЧИНИТЬ.
+                    //
+                    // У рыцарей смерти слот оружия ПУСТ — оружие им выдаёт первый квест.
+                    // Ремонт пустоту не заполняет, поэтому «бить нечем» у них истинно
+                    // всегда, и они ходили к торговцу бесконечно. Пока нет надевания вещей
+                    // из сумок (задача 0009), таких не отправляем вовсе.
+                    bool const helpless = CannotFight(self) && BrokenCount(self) > 0;
                     bool const stuffed = FreeBagSpace(self) <= 2;
-                    if (broken || stuffed)
+                    bool const worn = DamagedCount(self) > 0;
+
+                    // МИМОХОДОМ: изношен, но дееспособен — только если торговец уже рядом.
+                    // Двадцать ярдов это «прохожу мимо», а не «схожу-ка я за тридцать».
+                    bool passingBy = false;
+                    if (worn && !helpless && !stuffed)
+                        if (Creature* near = FindVendorNear(self, false, true))
+                            passingBy = self->IsWithinDistInMap(near, 20.0f);
+
+                    if (helpless || stuffed || passingBy)
                     {
                         // ИЩЕМ ТОГО, КТО УМЕЕТ НУЖНОЕ. Полные сумки требуют продавца,
                         // поломка — ремонтника; идти к тому, кто не умеет, значит вернуться
                         // ни с чем и повторить через минуту (Кодекс).
-                        if (Creature* vendor = FindVendorNear(self, stuffed, broken))
+                        if (Creature* vendor = FindVendorNear(self, stuffed, helpless || passingBy))
                         {
                             c.VendorGuid = vendor->GetGUID();
                             Switch(c, self, Behavior::Vending,
-                                broken ? "сломан, иду чиниться" : "сумки полны, иду продавать");
+                                helpless ? "бить нечем, иду чиниться"
+                                         : stuffed ? "сумки полны, иду продавать"
+                                                   : "торговец рядом, чинюсь мимоходом");
                             return;
                         }
                         // НИКОГО ПОБЛИЗОСТИ. Это не ошибка, а измеряемый предел первой
@@ -1428,7 +1469,13 @@ public:
                         vendor->GetPositionZ(), 2.0f, dt);
                     // СРОК: не дошёл за две минуты — бросаем и живём дальше. Стоять
                     // столбом у недостижимого торговца хуже, чем ходить сломанным.
-                    if (c.ModeMs > 120000)
+                    // ТУПИК РАСПОЗНАЁМ СРАЗУ, А НЕ ЧЕРЕЗ ДВЕ МИНУТЫ.
+                    //
+                    // Автомат уже умеет говорить «отступать больше некуда» (c.Stalled), и
+                    // три других состояния его слушают. Торговля не слушала — значит
+                    // недостижимый торговец означал две минуты бега в стену вместо трёх
+                    // секунд. Разбор поймал это сравнением с Travelling.
+                    if (c.Stalled || c.ModeMs > 120000)
                     {
                         c.VendCooldownMs = 300000;
                         c.VendorGuid.Clear();
@@ -1439,6 +1486,7 @@ public:
 
                 // ДОШЛИ. Открываем прилавок тем же пакетом, что шлёт клиент; обработчик
                 // сам перепроверит флаг продавца через GetNPCIfCanInteractWith.
+                bool poorBefore = c.VendPoor;
                 if (vendor->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
                 {
                     WorldPacket raw(CMSG_LIST_INVENTORY);
@@ -1453,6 +1501,36 @@ public:
                 // таймеры у 122 спутников дают синхронную толпу у одного NPC — и человеку
                 // это заметнее, чем сама частота пакетов. Разброс берём от идентификатора
                 // спутника, а не от случайного числа: он постоянен и воспроизводим.
+                // НЕ ХВАТИЛО ДЕНЕГ — УХОДИМ НАДОЛГО, А НЕ ПО КРУГУ.
+                //
+                // Живая петля, найденная оператором в клиенте: сломан -> к торговцу ->
+                // денег нет -> обратно -> снова сломан -> снова к торговцу. Поход стоит
+                // ВПЕРЕДИ драки и квестов, поэтому спутник переставал делать что-либо
+                // ещё — а сломаны были почти все. Минутного срока не хватало: за минуту
+                // он ничего не зарабатывает, потому что вместо заработка снова идёт.
+                //
+                // Десять минут — это время, за которое можно набить хлама и продать его.
+                // ДЕНЕГ НЕТ — ЧИНИМ ДАРОМ. ЭТО СТРАХОВКА ОТ ТУПИКА, А НЕ ПОБЛАЖКА.
+                //
+                // Оператор поймал негодность прежнего замысла одним вопросом: «как они
+                // будут воевать в сломанном? скилы не работают у тех, кто завязан на
+                // оружии». Отправить сломанного зарабатывать нельзя — сломанным оружием
+                // не заработать: GetWeaponForAttack на сломанном возвращает nullptr, и ни
+                // автоудар, ни оружейные умения не проходят. Круг замкнут: чтобы починиться
+                // нужны деньги, чтобы деньги — нужно бить, чтобы бить — нужна починка.
+                //
+                // Поэтому платный ремонт остаётся обычным путём, а даровой — полом, ниже
+                // которого спутник не падает. Цена названа вслух: это отступление от
+                // «только клиентскими опкодами», и оно сознательное. Альтернатива —
+                // спутник, навсегда выбывший из игры.
+                bool const stillPoor = c.VendPoor > poorBefore;
+                if (stillPoor && BrokenCount(self))
+                {
+                    uint32 const fixed = RepairIfBroken(self, "страховка: денег нет", /*operatorAsked=*/true);
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТОРГ {}: на ремонт не хватило — починил даром {} вещей, "
+                        "иначе он выбывает навсегда", self->GetName(), fixed);
+                }
                 c.VendCooldownMs = 60000 + (c.Guid.GetCounter() % 47) * 1000;
                 c.VendorGuid.Clear();
                 Switch(c, self, Behavior::Idle, "торговля закончена");
@@ -1516,10 +1594,39 @@ public:
                 // по плоскости», и цель на помосте объявлялась достижимой: удар не
                 // проходил, а мы заносили её в отказные НАВСЕГДА (Кодекс, проход 4).
                 float dist = self->GetExactDist(target);
-                if (self->IsWithinMeleeRange(target))
+
+                // С КАКОЙ ДИСТАНЦИИ ЭТОТ СПУТНИК ВООБЩЕ МОЖЕТ ДРАТЬСЯ.
+                //
+                // Раньше здесь для всех стояли четыре ярда, и маг подбегал вплотную, чтобы
+                // прочитать двухсекундное заклинание под ударами. Дистанцию знает само
+                // заклинание — GetMaxRange, — и берём её у того, которое спутник и
+                // применит. Два ярда внутрь предела: шаг движения не должен выбрасывать
+                // за границу и срывать каст.
+                //
+                // Считаем один раз на бой: обход книги у 122 спутников на каждом такте
+                // это полтысячи обходов в секунду впустую.
+                if (c.EngageRange == 0.0f)
+                {
+                    c.EngageRange = -1.0f;      // -1 = посчитали, вышло «ближний бой»
+                    if (Cfg().Abilities)
+                        if (uint32 sp = PickAttackSpell(self, target))
+                            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(sp, self->GetMap()->GetDifficultyID()))
+                            {
+                                float const r = si->GetMaxRange(false, self);
+                                if (r > 8.0f)   // всё, что меньше, — это и есть ближний бой
+                                    c.EngageRange = r - 2.0f;
+                            }
+                }
+
+                bool const closeEnough = c.EngageRange > 0.0f
+                    ? self->IsWithinDistInMap(target, c.EngageRange) && self->IsWithinLOSInMap(target)
+                    : self->IsWithinMeleeRange(target);
+
+                if (closeEnough)
                 {
                     if (TryAttack(c, self, target))
-                        Switch(c, self, Behavior::Attacking, "дошёл и ударил");
+                        Switch(c, self, Behavior::Attacking,
+                            c.EngageRange > 0.0f ? "на дистанции заклинания" : "дошёл и ударил");
                     else
                     {
                         c.Refused.insert(c.TargetGuid);
@@ -1527,7 +1634,8 @@ public:
                     }
                     return;
                 }
-                StepToward(c, self, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(), 4.0f, dt);
+                StepToward(c, self, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(),
+                    c.EngageRange > 0.0f ? c.EngageRange : 4.0f, dt);
                 if (c.Stalled)
                 {
                     c.Refused.insert(c.TargetGuid);
@@ -2444,8 +2552,20 @@ public:
         }
         if (asked)
         {
+            // СЧИТАЕМ ВЗЯТОЕ, А НЕ ЗАПРОШЕННОЕ. Тот же урок, что и в продаже: ядро может
+            // отказать (переполнение стопки, уникальность, полные сумки), и запрос не
+            // равен предмету в рюкзаке. Меряем по свободному месту до и после — это
+            // ровно то, что изменилось бы, если предмет действительно лёг.
+            uint32 const spaceBefore = FreeBagSpace(self);
             c.Session->HandleAutostoreLootItemOpcode(take);
-            c.LootItems += asked;
+            uint32 const spaceAfter = FreeBagSpace(self);
+            uint32 const landed = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
+            c.LootItems += landed;
+            if (landed != asked)
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЛУТ {}: запрошено {}, легло {} — остальное ядро не приняло "
+                    "(или ушло в существующие стопки, что места не занимает)",
+                    self->GetName(), asked, landed);
         }
 
         TC_LOG_INFO("server.worldserver",
@@ -2685,6 +2805,21 @@ public:
         return damaged;
     }
 
+    // МОГУ ЛИ Я ВООБЩЕ НАНОСИТЬ УРОН — один вопрос вместо «сломан ли» и «изношен ли».
+    //
+    // GetWeaponForAttack(..., useable=true) возвращает nullptr И на сломанном оружии, И на
+    // пустой руке — то есть ровно в обоих случаях, когда бить нечем. Прежние счётчики
+    // пустую руку молча пропускали, и спутник без оружия считался исправным.
+    //
+    // ПРЕДЕЛ НАЗВАН: заклинателю оружие для заклинания не нужно, и он тут будет признан
+    // «не могущим бить» слишком рано. Это осознанно: без оружия он всё равно теряет и
+    // автоудар, и жезл, а различать классы по книге заклинаний здесь — это тот же обход
+    // книги на каждом такте, от которого мы уже отказались в другом месте.
+    bool CannotFight(Player* self) const
+    {
+        return self->GetWeaponForAttack(BASE_ATTACK, true) == nullptr;
+    }
+
     void LogFightOutcome(Player* self, Unit* victim, char const* how, Companion& c)
     {
         // Пишем и БЕЗ указателя на цель: ядро обнуляет жертву при её смерти, а это как
@@ -2724,7 +2859,10 @@ public:
             // правдой лишь внутри модуля: ядро продолжало автоатаку по прежней цели, а
             // «стою» тут же выбирало её снова (Кодекс). Уходим тем же опкодом, каким
             // это делает клиент: CMSG_ATTACK_STOP -> Player::AttackStop().
-            if (c.Mode == Behavior::Attacking && me->GetVictim())
+            c.EngageRange = 0.0f;           // новая цель — новая дистанция боя
+        if (c.GiverUnreachable.size() > 40)
+            c.GiverUnreachable.clear();  // список не должен расти без предела
+        if (c.Mode == Behavior::Attacking && me->GetVictim())
             {
                 WorldPacket raw(CMSG_ATTACK_STOP);
                 WorldPackets::Combat::AttackStop stop(std::move(raw));
@@ -2868,6 +3006,48 @@ public:
         if (!self || !self->IsInWorld() || !self->IsAlive())
             return;
 
+        // ИДЁМ К НАЙДЕННОМУ — КАЖДЫЙ ТАКТ, А НЕ РАЗ В ПЯТЬ СЕКУНД.
+        //
+        // Поиск дорогой и остаётся под сроком, а вот дорога должна идти шагами по 4 Гц,
+        // иначе спутник будет ползти к NPC по одному шагу в пять секунд.
+        if (!c.GiverGuid.IsEmpty())
+        {
+            Creature* going = ObjectAccessor::GetCreature(*self, c.GiverGuid);
+            bool const busy = c.Mode != Behavior::Idle;     // дерётся или идёт по своим делам
+            if (!going || !going->IsAlive() || busy
+                || self->GetExactDist(going) > Cfg().QuestGiverRange + 15.0f)
+            {
+                c.GiverGuid.Clear();                        // цель протухла — забыть
+            }
+            else if (!self->CanInteractWithQuestGiver(going))
+            {
+                StepToward(c, self, going->GetPositionX(), going->GetPositionY(),
+                    going->GetPositionZ(), 3.0f, diff / 1000.0f);
+
+                // ГРАНИЦЫ ДОРОГИ. Без них спутник топчется у лестницы вечно: шаг формально
+                // удаётся, Stalled не взводится, автомат стоит, боёв нет. Это была живая
+                // регрессия, замеченная оператором в клиенте.
+                c.GiverMs += diff;
+                float const now = self->GetExactDist(going);
+                bool const noProgress = c.GiverMs >= 20000 && now > c.GiverDist - 1.0f;
+                if (c.Stalled || noProgress || c.GiverMs >= 30000)
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation: {} — до квестодателя {} ({}) не дойти за {} с, "
+                        "было {:.1f} ярдов, стало {:.1f}; больше не пробую",
+                        self->GetName(), going->GetName(), going->GetEntry(),
+                        c.GiverMs / 1000, c.GiverDist, now);
+                    c.GiverUnreachable.insert(c.GiverGuid);   // иначе выберем его снова
+                    c.GiverGuid.Clear();
+                    c.GiverMs = 0;
+                    StopMoving(c, self);
+                }
+                return;                                     // идём; разговор — как дойдём
+            }
+            // дошли — падаем ниже, к разговору, минуя срок
+            c.QuestMs = Cfg().QuestIntervalMs;
+        }
+
         c.QuestMs += diff;
         if (c.QuestMs < Cfg().QuestIntervalMs)
             return;
@@ -2881,14 +3061,26 @@ public:
         if (used >= MAX_QUEST_LOG_SIZE || used >= Cfg().MaxQuests)
             return;
 
-        Creature* giver = NearestQuestGiver(self);
+        Creature* giver = NearestQuestGiver(c, self);
         if (!giver)
             return;
 
         // каноническая проверка ядра: расстояние, флаги, враждебность, смерть.
         // Прямой вызов обработчика мог бы обойти то, что клиенту не позволено.
+        //
+        // ДАЛЕКО — ЭТО ПОВОД ПОДОЙТИ, А НЕ ПОВОД СДАТЬСЯ. Здесь стоял голый return, и
+        // спутник вечно стоял в пятнадцати ярдах от NPC с восклицательным знаком.
         if (!self->CanInteractWithQuestGiver(giver))
+        {
+            if (c.Mode == Behavior::Idle)
+            {
+                c.GiverGuid = giver->GetGUID();     // пойдём к нему со следующего такта
+                c.GiverMs = 0;
+                c.GiverDist = self->GetExactDist(giver);
+            }
             return;
+        }
+        c.GiverGuid.Clear();                        // дошли и говорим — цель больше не нужна
 
         // «подойти и заговорить» — тот же опкод, что шлёт клиент по клику
         WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
@@ -3102,13 +3294,24 @@ public:
     // и при выборе цели, — просто заданный ещё раз, посреди боя.
     bool StillWanted(Player* self, uint32 entry) const
     {
-        std::set<uint32> wanted;
-        WantedEntries(self, wanted);
-        return wanted.count(entry) != 0;
+        std::set<uint32> wanted, wantedItems;
+        WantedEntries(self, wanted, nullptr, nullptr, nullptr, nullptr, &wantedItems);
+        if (wanted.count(entry))
+            return true;
+        // цель могла быть выбрана КАК ИСТОЧНИК ПРЕДМЕТА — тогда её номера в wanted нет,
+        // и прежний ответ был бы «не нужна» посреди боя, и бой бросился бы.
+        if (!wantedItems.empty())
+            if (std::vector<uint32> const* qi = sObjectMgr->GetCreatureQuestItemList(
+                    entry, self->GetMap()->GetDifficultyID()))
+                for (uint32 item : *qi)
+                    if (wantedItems.count(item))
+                        return true;
+        return false;
     }
 
     void WantedEntries(Player* self, std::set<uint32>& wanted, uint32* slotsUsed = nullptr,
-        uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr) const
+        uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr,
+        std::set<uint32>* wantedItems = nullptr) const
     {
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
@@ -3124,13 +3327,27 @@ public:
                 continue;
             for (QuestObjective const& obj : quest->GetObjectives())
             {
-                if (obj.Type != QUEST_OBJECTIVE_MONSTER || obj.ObjectID <= 0)
+                if (obj.ObjectID <= 0)
                     continue;
-                if (monsterObjs) ++*monsterObjs;
+
+                // ДВА ВИДА ЦЕЛЕЙ, А НЕ ОДИН.
+                //
+                // «Убить существо» даёт номер существа прямо. «Собрать предмет» даёт номер
+                // ПРЕДМЕТА — а кто его роняет, спросим у каждого встречного существа
+                // отдельно: ядро само сообщает клиенту этот список (Creature.cpp:230), и
+                // это ровно те сведения, которые видит игрок, а не внутренняя кухня лута.
+                bool const isMonster = obj.Type == QUEST_OBJECTIVE_MONSTER;
+                bool const isItem = obj.Type == QUEST_OBJECTIVE_ITEM;
+                if (!isMonster && !isItem)
+                    continue;                       // поговорить, посетить, применить — пока не умеем
+                if (isMonster && monsterObjs) ++*monsterObjs;
                 if (self->GetQuestObjectiveData(obj) >= obj.Amount)
                     continue;                       // эта цель уже набрана
                 if (unmet) ++*unmet;
-                wanted.insert(uint32(obj.ObjectID));
+                if (isMonster)
+                    wanted.insert(uint32(obj.ObjectID));
+                else if (wantedItems)
+                    wantedItems->insert(uint32(obj.ObjectID));
             }
         }
     }
@@ -3363,9 +3580,9 @@ public:
             return nullptr;
 
         // какие виды существ нам вообще нужны
-        std::set<uint32> wanted;
+        std::set<uint32> wanted, wantedItems;
         uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
-        WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet);
+        WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet, &wantedItems);
         if (!_fightDiagDone && slotsUsed)
         {
             _fightDiagDone = true;
@@ -3373,7 +3590,7 @@ public:
                 "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}",
                 self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()));
         }
-        if (wanted.empty())
+        if (wanted.empty() && wantedItems.empty())
             return nullptr;
 
         std::list<Creature*> around;
@@ -3388,7 +3605,22 @@ public:
         for (Creature* creature : around)
         {
             ++seen;
-            if (!creature->IsAlive() || !wanted.count(creature->GetEntry()))
+            if (!creature->IsAlive())
+                continue;
+
+            // ГОДИТСЯ ЛИБО КАК ЦЕЛЬ УБИЙСТВА, ЛИБО КАК ИСТОЧНИК НУЖНОГО ПРЕДМЕТА.
+            //
+            // Второе спрашивается у ядра тем же списком, что оно шлёт клиенту, когда тот
+            // запрашивает сведения о существе. Обратный индекс не нужен: перебор существ
+            // вокруг уже идёт, и вопрос задаётся ровно тем, кто попался на глаза.
+            bool suitable = wanted.count(creature->GetEntry()) != 0;
+            if (!suitable && !wantedItems.empty())
+                if (std::vector<uint32> const* qi = sObjectMgr->GetCreatureQuestItemList(
+                        creature->GetEntry(), self->GetMap()->GetDifficultyID()))
+                    for (uint32 item : *qi)
+                        if (wantedItems.count(item))
+                            { suitable = true; break; }
+            if (!suitable)
                 continue;
             ++matched;
             // ФАЗА. Поиск по сетке возвращает существ независимо от фазы, а игрок
@@ -3501,7 +3733,7 @@ public:
     // Ближайший квестодатель, У КОТОРОГО ЕСТЬ ЧТО ПРЕДЛОЖИТЬ ИМЕННО ЭТОМУ спутнику.
     // Восклицательный знак над головой — это QuestGiverStatus, который ядро считает
     // для клиента; спрашиваем ровно его, а не таблицу связей.
-    Creature* NearestQuestGiver(Player* self) const
+    Creature* NearestQuestGiver(Companion const& c, Player* self) const
     {
         std::list<Creature*> around;
         Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().QuestGiverRange);
@@ -3516,6 +3748,8 @@ public:
                 continue;
             if (self->GetQuestDialogStatus(creature) == QuestGiverStatus::None)
                 continue;
+            if (c.GiverUnreachable.count(creature->GetGUID()))
+                continue;               // уже пробовали дойти и не вышло
             if (!self->IsWithinLOSInMap(creature))
                 continue;
             float d = self->GetExactDist2d(creature);
