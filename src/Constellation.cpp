@@ -458,6 +458,106 @@ public:
     // стиле fmt ({}). Они стоят рядом в одном файле, и весь набор команд девять вызовов
     // подряд печатал «{}» буквально, включая `.constellation status`. Нашлось только когда
     // новая строка про ремонт вывела «repaired {} companions».
+    // ВАЙП: СТЕРЕТЬ СОСТАВ ДО НОВОРОЖДЁННОГО И ДАТЬ КОНВЕЙЕРУ СОЗДАТЬ ЗАНОВО.
+    //
+    // Ни одной своей строки SQL: удаляет ядро, создаёт наш же конвейер. Так и стартовые
+    // вещи, и сумки, и панель команд, и здоровье оказываются правильными по построению —
+    // а не потому что я угадал шестьдесят таблиц.
+    //
+    // ТРИ ЗАМКА, потому что это боевой сервер и отменить можно только из резервной копии:
+    //   1. без слова подтверждения команда только ПОКАЗЫВАЕТ, что сделает;
+    //   2. отказ, если в мире есть живой игрок — не наш спутник;
+    //   3. чужие персонажи не трогаются вовсе: список берётся из состава модуля.
+    bool WipeAll(ChatHandler* handler, std::string const& confirm)
+    {
+        // ДВА СЛОВА ПОДТВЕРЖДЕНИЯ, И ЭТО НЕ ЛЕНЬ ВЫБРАТЬ ОДНО: консоль на этой машине
+        // ru-RU, и кириллица через ssh -> cmd -> оболочку уже ломалась не раз. ASCII-слово
+        // это гарантированный путь, русское — удобный.
+        bool const confirmed = (confirm == "СТЕРЕТЬ" || confirm == "WIPE");
+
+        // ЖИВОЙ ИГРОК РЯДОМ — ОТКАЗ. Тем же вопросом, каким модуль отличает своих в группе.
+        uint32 strangers = 0;
+        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+        {
+            if (!player || !player->GetSession())
+                continue;
+            if (!IsCompanionAccount(player->GetSession()->GetAccountId()))
+                ++strangers;
+        }
+
+        uint32 total = 0, withChar = 0;
+        for (Companion const& c : _companions)
+        {
+            ++total;
+            if (!c.Guid.IsEmpty())
+                ++withChar;
+        }
+
+        if (!confirmed)
+        {
+            handler->PSendSysMessage(
+                "Constellation WIPE: would delete %u companion characters of %u and let the "
+                "pipeline recreate them from scratch (same name/race/class/gender/account, NEW guid).",
+                withChar, total);
+            handler->PSendSysMessage(
+                "Constellation WIPE: nothing done. Repeat with the confirmation word to proceed.");
+            if (strangers)
+                handler->PSendSysMessage(
+                    "Constellation WIPE: %u non-companion player(s) online — the command would refuse.",
+                    strangers);
+            return true;
+        }
+
+        if (strangers)
+        {
+            handler->PSendSysMessage(
+                "Constellation WIPE: REFUSED — %u non-companion player(s) online. "
+                "Wipe only on an empty realm.", strangers);
+            return false;
+        }
+
+        // СНАЧАЛА ВЫВЕСТИ ИЗ МИРА, ПОТОМ УДАЛЯТЬ. Живой Player держит состояние в памяти, и
+        // выход записал бы его обратно поверх удаления (Кодекс: WorldSession.cpp:635).
+        uint32 deleted = 0, failed = 0;
+        for (Companion& c : _companions)
+        {
+            if (!c.Guid)
+                continue;
+
+            ObjectGuid const guid = c.Guid;
+            uint32 const account = c.AccountId;
+
+            // СЕССИЮ НАДО СНЕСТИ ЦЕЛИКОМ, А НЕ ПРОСТО ВЫЙТИ ИЗ МИРА.
+            //
+            // Первая версия звала LogoutPlayer и оставляла c.Session — и конвейер вставал
+            // намертво: предохранитель MaxActive считает живыми тех, у кого сессия есть,
+            // так что восемь осиротевших сессий держали счётчик на потолке и создание не
+            // начиналось никогда. То же самое делает роспуск, и по той же причине.
+            DropSession(c);
+
+            // УДАЛЯЕТ ЯДРО, А НЕ Я. deleteFinally = true: стереть насовсем, а не пометить.
+            Player::DeleteFromDB(guid, account, true, true);
+            ++deleted;
+
+            // Конвейер создаёт заново ровно при пустом Guid (BehaveTick, Stage::Offline).
+            c.Guid.Clear();
+            c.State = Stage::Offline;
+            c.TicksInState = 0;
+            c.Retries = 0;
+            c.PaletteDumped = false;
+            c.QuestRefused.clear();
+            TC_LOG_INFO("server.worldserver",
+                "Constellation WIPE: удалён персонаж {} (учётка {}), будет создан заново",
+                guid.ToString(), account);
+        }
+
+        handler->PSendSysMessage(
+            "Constellation WIPE: deleted %u characters (%u failed); the pipeline recreates them "
+            "on the following ticks. Watch .constellation status.", deleted, failed);
+        TC_LOG_INFO("server.worldserver", "Constellation WIPE: стёрто {} персонажей состава", deleted);
+        return true;
+    }
+
     bool RepairAll(ChatHandler* handler)
     {
         // ОДНА ДОРОГА К ОДНОМУ ДЕЙСТВИЮ: та же RepairIfBroken, что чинит при входе в мир и
@@ -3708,6 +3808,7 @@ public:
             { "summon",  HandleSummon,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
         static ChatCommandTable commandTable =
         {
@@ -3735,6 +3836,13 @@ public:
     static bool HandleRepair(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->RepairAll(handler);
+    }
+
+    // Без слова подтверждения команда только показывает, что сделает. Это не украшение:
+    // отменить вайп можно лишь из резервной копии.
+    static bool HandleWipe(ChatHandler* handler, Optional<std::string> confirm)
+    {
+        return Constellation::Manager::Instance()->WipeAll(handler, confirm.value_or(""));
     }
 };
 
