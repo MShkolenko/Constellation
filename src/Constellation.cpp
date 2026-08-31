@@ -60,6 +60,7 @@
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "PartyPackets.h"
+#include "Item.h"
 #include "Player.h"
 #include "RBAC.h"
 #include "ScriptMgr.h"
@@ -225,6 +226,7 @@ struct Companion
     uint32 SwingsAtStart = 0;           // отсечки на входе в бой
     uint64 DealtAtStart = 0;
     uint32 LandedAtStart = 0;
+    uint32 ZeroedAtStart = 0;
     uint32 HitsAtStart = 0;
     uint64 TakenAtStart = 0;
     uint32 KillsAtStart = 0;
@@ -246,6 +248,7 @@ struct Companion
     uint32 StuckMs = 0;                 // сколько стоим, хотя собирались идти
     uint32 UnstickTries = 0;            // сколько раз отступали вбок подряд
     uint32 UnstickTotal = 0;            // и сколько всего за это намерение (не сбросить движением)
+    bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
     uint8 JumpsLeft = 3;                // прыжков в запасе
     uint32 JumpCooldownMs = 0;          // истратил три — минуту без прыжков
@@ -284,6 +287,8 @@ public:
         // другого источника пока нет (в том и суть задачи 0022), поэтому на практике
         // числа сравнимы, но называть разницу «промахи» нельзя (Кодекс, проход 11).
         uint32 Landed = 0;              // событий НАШЕГО урона, любого происхождения
+        uint32 Zeroed = 0;              // НЕ подмножество Landed, а вторая, взаимоисключающая
+                                        // корзина: событие нашего урона на НОЛЬ
         uint64 Dealt = 0;               // и на сколько всего
         uint32 Hits = 0;                // сколько раз попали по нам
         uint64 Taken = 0;
@@ -323,7 +328,7 @@ public:
         // на боевом на порядки больше, чем наших, и сериализовать на них шесть потоков
         // карт незачем (Кодекс, проход 11).
         bool const mine = (attacker && attacker->IsPlayer()) || (victim && victim->IsPlayer());
-        if (!mine || !damage)
+        if (!mine)
             return;
         std::lock_guard<std::mutex> lock(_blowsLock);
         if (attacker && attacker->IsPlayer())
@@ -331,11 +336,25 @@ public:
             auto it = _blows.find(attacker->GetGUID());
             if (it != _blows.end())
             {
-                ++it->second.Landed;
-                it->second.Dealt += damage;
+                // ЧТО ЭТО ЧИСЛО ДОКАЗЫВАЕТ, И ЧТО НЕТ.
+                //
+                // Доказывает ровно одно: было исходящее событие урона, и урон в нём НОЛЬ.
+                // Не доказывает ни что это был автоудар (OnDamage зовётся на любой наш
+                // урон), ни что виновата броня. Заведено потому, что прежде такие события
+                // молча отбрасывались, и разница «замахи минус дошло» читалась как промахи:
+                // на стенде с целым снаряжением она давала 24 %, на боевом со сломанным —
+                // 52 %, и вторую цифру нечем было объяснить. Теперь обе корзины видны, и
+                // объяснение будет взято из них, а не из рассуждения.
+                if (!damage)
+                    ++it->second.Zeroed;
+                else
+                {
+                    ++it->second.Landed;
+                    it->second.Dealt += damage;
+                }
             }
         }
-        if (victim && victim->IsPlayer())
+        if (victim && victim->IsPlayer() && damage)
         {
             auto it = _blows.find(victim->GetGUID());
             if (it != _blows.end())
@@ -404,6 +423,46 @@ public:
             Dismiss(c, /*final=*/true);
     }
 
+    // РАЗОВАЯ УБОРКА ПОСЛЕДСТВИЙ ДЕФЕКТА, А НЕ ОБХОД ПРАВИЛ.
+    //
+    // Снаряжение сломал не игровой процесс, а ошибка модуля: спутники сотнями гибли в боях,
+    // которые не могли выиграть. Мастер игры, чинящий вещи игрокам, — обычное действие; бот,
+    // чинящий себя сам из воздуха, — нет. Поэтому это КОМАНДА, которую отдают руками, а
+    // штатный путь остаётся клиентским: дойти до NPC с UNIT_NPC_FLAG_REPAIR и послать
+    // CMSG_REPAIR_ITEM с пустым ItemGUID, за деньги (задача 0010).
+    // ВНИМАНИЕ: PSendSysMessage форматирует в стиле printf (%u, %s), а TC_LOG_INFO — в
+    // стиле fmt ({}). Они стоят рядом в одном файле, и весь набор команд девять вызовов
+    // подряд печатал «{}» буквально, включая `.constellation status`. Нашлось только когда
+    // новая строка про ремонт вывела «repaired {} companions».
+    bool RepairAll(ChatHandler* handler)
+    {
+        uint32 touched = 0, items = 0;
+        for (Companion& c : _companions)
+        {
+            if (c.State != Stage::InWorld || !c.Session)
+                continue;
+            Player* self = c.Session->GetPlayer();
+            if (!self || !self->IsInWorld())
+                continue;                   // mid-teleport: игрок снят с карты (Кодекс)
+            uint32 broken = BrokenCount(self);
+            if (!broken)
+                continue;
+            // ЧИНИТ ШИРЕ, ЧЕМ ОТБИРАЕТ, и это надо назвать: DurabilityRepairAll обходит не
+            // только надетое, но и рюкзак, сами сумки и их содержимое (Player.cpp:4611-4625).
+            // Отбираем спутников по сломанному НАДЕТОМУ, а чиним у них всё — для уборки
+            // последствий это то, что нужно, но отчёт не должен делать вид, что иначе.
+            self->DurabilityRepairAll(false, 0.0f, false);   // без денег: это уборка, а не покупка
+            c.BrokenNoted = false;
+            ++touched;
+            items += broken;
+            TC_LOG_INFO("server.worldserver", "Constellation: починено у {} — вещей {}", self->GetName(), broken);
+        }
+        handler->PSendSysMessage(
+            "Constellation: repaired %u companions (%u broken equipped items counted; bags repaired too)",
+            touched, items);
+        return true;
+    }
+
     bool SummonAll(ChatHandler* handler)
     {
         uint32 woken = 0;
@@ -415,7 +474,7 @@ public:
                 c.PendingDismiss = false;
                 ++woken;
             }
-        handler->PSendSysMessage("Constellation: {} companions queued (auto pipeline).", woken);
+        handler->PSendSysMessage("Constellation: %u companions queued (auto pipeline).", woken);
         return true;
     }
 
@@ -436,7 +495,7 @@ public:
                 ++dropped;
             Dismiss(c, /*final=*/false);
         }
-        handler->PSendSysMessage("Constellation: {} dismissed, {} deferred (mid-login).", dropped, deferred);
+        handler->PSendSysMessage("Constellation: %u dismissed, %u deferred (mid-login).", dropped, deferred);
         return true;
     }
 
@@ -1025,7 +1084,12 @@ public:
                 // «пошёл — далеко — стою» по нескольку раз в секунду: 420 холостых
                 // переходов за прогон, из которых ни один ничего не менял.
                 // цели рядом нет — но она где-то есть, и мы знаем где
-                if (Cfg().Fight && !c.TravelCooldownMs && !c.TravelScanMs)
+                // СЛОМАННЫЙ НЕ ИДЁТ И К МЕСТУ ЗАДАНИЯ.
+                // Запрет только на выбор существа запретом не был: агро на боевой точке
+                // берётся близостью, и круг смерти оставался, просто шёл медленнее
+                // (Кодекс). Здесь мы уже после сдачи готовых квестов и после отдыха, так
+                // что полезное спутник по-прежнему делает — и за хозяином ходит.
+                if (Cfg().Fight && !c.TravelCooldownMs && !c.TravelScanMs && !BrokenForFight(c, self))
                 {
                     if (FindObjectiveSpot(c, self))
                     {
@@ -1156,6 +1220,12 @@ public:
 
             case Behavior::ApproachingTarget:
             {
+                // сломались по дороге — разворачиваемся, а не доходим умирать
+                if (BrokenForFight(c, self))
+                {
+                    Switch(c, self, Behavior::Idle, "снаряжение сломано");
+                    return;
+                }
                 Creature* target = ObjectAccessor::GetCreature(*self, c.TargetGuid);
                 if (!target || !target->IsAlive())
                 {
@@ -1473,6 +1543,53 @@ public:
     // кто, какого уровня, против кого, какого уровня, и сколько у противника осталось
     // здоровья. Доля оставшегося здоровья и есть ответ: 95 % значит «мы не наносим
     // урона», 10 % — «почти выиграли и не дожали».
+    // СЛОМАННОЕ СНАРЯЖЕНИЕ — ЭТО НЕ «ПОМЕНЬШЕ УРОНА», А НОЛЬ.
+    //
+    // Item::IsBroken() — это MaxDurability > 0 && Durability == 0 (Item.h:265), и применение
+    // характеристик сломанные вещи ПРОПУСКАЕТ (Player.cpp:8936-8992). Оружие при этом
+    // перестаёт существовать и для GetWeaponForAttack(..., true) — тот отдаёт nullptr именно
+    // на сломанном (Player.cpp:9646).
+    //
+    // Считаем не «есть ли оружие», а сколько надетого сломано: спутник в сломанной броне
+    // гибнет так же надёжно, как и без оружия.
+    // ЕДИНСТВЕННОЕ МЕСТО, ГДЕ РЕШАЕТСЯ «МОЖНО ЛИ НАМ ДРАТЬСЯ».
+    //
+    // Первая версия запрещала только ВЫБОР существа, и Кодекс показал, что это не запрет:
+    // спутник продолжал идти к боевой точке задания и ловил там агро близостью, а уже
+    // начатый подход к цели не прерывался вовсе. Круг смерти оставался, просто шёл медленнее.
+    //
+    // ЧТО ИМЕННО ЗАКРЫТО, без преувеличений: выбор существа, выход в дорогу к боевой точке
+    // и уже начатый подход к цели. НЕ закрыты два случая, и оба намеренно: уже идущий бой
+    // (цель бьёт в ответ, а выхода из боя как поведения пока нет) и уже начатая дорога
+    // (обычный путь к поломке — смерть, а она и так возвращает в «стою»). Оба выхода ведут
+    // в «стою», откуда новый бой уже не начать.
+    bool BrokenForFight(Companion& c, Player* self) const
+    {
+        uint32 broken = BrokenCount(self);
+        if (!broken)
+        {
+            c.BrokenNoted = false;
+            return false;
+        }
+        if (!c.BrokenNoted)
+        {
+            c.BrokenNoted = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation: {} не идёт в бой — сломано вещей: {}", self->GetName(), broken);
+        }
+        return true;
+    }
+
+    uint32 BrokenCount(Player* self) const
+    {
+        uint32 broken = 0;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (it->IsBroken())
+                    ++broken;
+        return broken;
+    }
+
     void LogFightOutcome(Player* self, Unit* victim, char const* how, Companion& c)
     {
         // Пишем и БЕЗ указателя на цель: ядро обнуляет жертву при её смерти, а это как
@@ -1480,7 +1597,7 @@ public:
         Manager::Blows const b = Manager::Instance()->BlowsOf(self->GetGUID());
         TC_LOG_INFO("server.worldserver",
             "Constellation БОЙ {} (эфф ур {}) против {} ({}): {} — у него {}, у нас {:.0f}%; "
-            "за {} с: замахов {}, событий урона {} на {}; по нам {} на {}; "
+            "за {} с: замахов {}, урон прошёл {} раз на {}, вничью {} раз; по нам {} на {}; "
             "тактов {} (уклоняется {}, занят {}, не в бою {}, вне досягаемости {}, вне сектора {})",
             self->GetName(), uint32(self->GetEffectiveLevel()),
             c.FightVictimName.empty() ? (victim ? victim->GetName() : "?") : c.FightVictimName,
@@ -1489,6 +1606,7 @@ public:
             self->GetHealthPct(),
             c.ModeMs / 1000,
             b.Swings - c.SwingsAtStart, b.Landed - c.LandedAtStart, b.Dealt - c.DealtAtStart,
+            b.Zeroed - c.ZeroedAtStart,
             b.Hits - c.HitsAtStart, b.Taken - c.TakenAtStart,
             c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing);
     }
@@ -1574,6 +1692,7 @@ public:
             Manager::Blows const b = Manager::Instance()->RegisterAndSnapshot(self->GetGUID());
             c.SwingsAtStart = b.Swings;
             c.LandedAtStart = b.Landed;
+            c.ZeroedAtStart = b.Zeroed;
             c.DealtAtStart  = b.Dealt;
             c.HitsAtStart   = b.Hits;
             c.TakenAtStart  = b.Taken;
@@ -2099,8 +2218,22 @@ public:
         return true;
     }
 
-    Creature* FindObjectiveTarget(Companion const& c, Player* self) const
+    Creature* FindObjectiveTarget(Companion& c, Player* self) const
     {
+        // СО СЛОМАННЫМ СНАРЯЖЕНИЕМ ЦЕЛЬ НЕ ИЩЕМ ВОВСЕ.
+        //
+        // Это и есть тот круг, который держал боевой сервер: тканевый не может выиграть
+        // автоударом, гибнет, каждая смерть снимает десятую часть прочности со ВСЕГО
+        // надетого, через десять смертей сломано всё — и выиграть он не может уже никогда,
+        // потому что бьёт голыми руками и без брони. На 2026-08-31 в этом круге сидели
+        // сорок спутников трёх классов, по семь сломанных вещей из семи, при нуле сломанных
+        // у всех прочих классов.
+        //
+        // Пока похода к починке нет (задача 0010), спутник просто не ищет боя: сдавать
+        // готовые квесты, отдыхать и ходить за хозяином он по-прежнему может.
+        if (BrokenForFight(c, self))
+            return nullptr;
+
         // какие виды существ нам вообще нужны
         std::set<uint32> wanted;
         uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
@@ -2392,9 +2525,9 @@ public:
             ++n;
         }
         if (off)
-            handler->PSendSysMessage("Constellation: {} companions released.", n);
+            handler->PSendSysMessage("Constellation: %u companions released.", n);
         else
-            handler->PSendSysMessage("Constellation: {} companions now follow {}.", n,
+            handler->PSendSysMessage("Constellation: %u companions now follow %s.", n,
                 master ? master->GetName() : "nobody");
         return true;
     }
@@ -2407,7 +2540,7 @@ public:
             if (c.State == Stage::InWorld) ++inWorld;
             if (c.State == Stage::Failed)  ++failed;
         }
-        handler->PSendSysMessage("Constellation {}: взято {}, боёв {}, СДАНО {}, переходов {}",
+        handler->PSendSysMessage("Constellation %s: взято %u, боёв %u, СДАНО %u, переходов %u",
             CONSTELLATION_VERSION, _questsTaken, _fightsStarted, _questsTurnedIn, _transitions);
         uint32 idle = 0, following = 0, approaching = 0, attacking = 0;
         for (Companion const& c : _companions)
@@ -2419,14 +2552,14 @@ public:
                 case Behavior::Attacking:         ++attacking; break;
                 case Behavior::TurningIn:         break;
             }
-        handler->PSendSysMessage("  idle {}, following {}, approaching {}, attacking {}",
+        handler->PSendSysMessage("  idle %u, following %u, approaching %u, attacking %u",
             idle, following, approaching, attacking);
-        handler->PSendSysMessage("Constellation {}: {} — roster {}, in world {}, failed {}",
+        handler->PSendSysMessage("Constellation %s: %s — roster %u, in world %u, failed %u",
             CONSTELLATION_VERSION, Cfg().Enable ? "enabled" : "disabled",
             uint32(_companions.size()), inWorld, failed);
         for (Companion const& c : _companions)
             if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer())
-                handler->PSendSysMessage("  {} — {} in world", c.Entry->Name,
+                handler->PSendSysMessage("  %s — %s in world", c.Entry->Name,
                     c.Session->GetPlayer()->GetName());
     }
 
@@ -3060,6 +3193,7 @@ public:
             { "status",  HandleStatus,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "summon",  HandleSummon,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
         static ChatCommandTable commandTable =
         {
@@ -3082,6 +3216,11 @@ public:
     static bool HandleDismiss(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->DismissAll(handler);
+    }
+
+    static bool HandleRepair(ChatHandler* handler)
+    {
+        return Constellation::Manager::Instance()->RepairAll(handler);
     }
 };
 
