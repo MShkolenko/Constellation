@@ -223,6 +223,9 @@ struct Companion
     uint32 GateNoState = 0;             //   ядро не считает нас атакующими
     uint32 GateOutOfRange = 0;          //   вне досягаемости
     uint32 GateBadFacing = 0;           //   вне сектора 120°
+    uint32 WantedCheckMs = 0;           // когда в последний раз спрашивали счётчик цели
+    uint32 GateNotReady = 0;            //   вентиль открыт, но таймер удара не готов
+    uint32 VictimSwaps = 0;             //   сколько раз цель подменилась
     uint32 SwingsAtStart = 0;           // отсечки на входе в бой
     uint64 DealtAtStart = 0;
     uint32 LandedAtStart = 0;
@@ -436,26 +439,22 @@ public:
     // новая строка про ремонт вывела «repaired {} companions».
     bool RepairAll(ChatHandler* handler)
     {
+        // ОДНА ДОРОГА К ОДНОМУ ДЕЙСТВИЮ: та же RepairIfBroken, что чинит при входе в мир и
+        // после смерти. Команда осталась ради разовой уборки и ради проверки руками.
+        // Оговорка, которую надо назвать: DurabilityRepairAll обходит не только надетое, но
+        // и рюкзак, сами сумки и их содержимое (Player.cpp:4611-4625) — отбираем спутников
+        // по сломанному НАДЕТОМУ, а чиним у них всё.
         uint32 touched = 0, items = 0;
         for (Companion& c : _companions)
         {
             if (c.State != Stage::InWorld || !c.Session)
                 continue;
-            Player* self = c.Session->GetPlayer();
-            if (!self || !self->IsInWorld())
-                continue;                   // mid-teleport: игрок снят с карты (Кодекс)
-            uint32 broken = BrokenCount(self);
-            if (!broken)
-                continue;
-            // ЧИНИТ ШИРЕ, ЧЕМ ОТБИРАЕТ, и это надо назвать: DurabilityRepairAll обходит не
-            // только надетое, но и рюкзак, сами сумки и их содержимое (Player.cpp:4611-4625).
-            // Отбираем спутников по сломанному НАДЕТОМУ, а чиним у них всё — для уборки
-            // последствий это то, что нужно, но отчёт не должен делать вид, что иначе.
-            self->DurabilityRepairAll(false, 0.0f, false);   // без денег: это уборка, а не покупка
-            c.BrokenNoted = false;
-            ++touched;
-            items += broken;
-            TC_LOG_INFO("server.worldserver", "Constellation: починено у {} — вещей {}", self->GetName(), broken);
+            if (uint32 broken = RepairIfBroken(c.Session->GetPlayer(), "команда"))
+            {
+                c.BrokenNoted = false;
+                ++touched;
+                items += broken;
+            }
         }
         handler->PSendSysMessage(
             "Constellation: repaired %u companions (%u broken equipped items counted; bags repaired too)",
@@ -908,6 +907,10 @@ public:
             ++_revived;
             c.ReviveTries = 0;
             c.ReviveGaveUp = false;
+            // СМЕРТЬ СТОИТ ПРОЧНОСТИ — чиним здесь, иначе износ односторонний и любой
+            // спутник рано или поздно молча перестаёт быть бойцом (легионовский урок).
+            RepairIfBroken(self, "после смерти");
+            c.BrokenNoted = false;
             c.TravelCooldownMs = 300000;    // после смерти не бежать туда же сразу (Кодекс)
             // и не возвращаться к убийце на половине здоровья — сперва отдышаться
             Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
@@ -1465,6 +1468,8 @@ public:
                 else if (!self->IsWithinBoundaryRadius(victim)
                     && !self->HasInArc(2.0f * float(M_PI) / 3.0f, victim))
                     ++c.GateBadFacing;
+                else if (!self->isAttackReady(BASE_ATTACK))
+                    ++c.GateNotReady;   // всё открыто, а таймер удара не подошёл
 
                 // СЧИТАЕМ СВОЙ УРОН, А НЕ ЗДОРОВЬЕ ЦЕЛИ.
                 //
@@ -1474,20 +1479,57 @@ public:
                 // выход не сработал НИ РАЗУ, хотя 429 боёв кончились с целью ровно на
                 // 100 %. Свой урон даёт перехватчик, и он не зависит ни от чужих ударов,
                 // ни от восстановления моба при уходе домой.
-                uint64 mine = Manager::Instance()->BlowsOf(self->GetGUID()).Dealt;
-                if (c.DamageVictim != victim->GetGUID())
+                // ЦЕЛЬ БОЯ НЕ ДОЛЖНА ПОДМЕНЯТЬСЯ ПОД НАМИ.
+                //
+                // Прежде подмена молча сбрасывала сторожа, и бой продолжался вечно. Ядро
+                // само перечисляет, когда бой надо прекратить, и подмена жертвы в этом
+                // списке: весь учёт боя — отсечки, замахи, урон — привязан к ОДНОЙ цели,
+                // и с другой он бессмыслен. Уходим и выбираем заново.
+                if (victim->GetGUID() != c.FightVictim)
                 {
-                    c.DamageVictim = victim->GetGUID();
-                    c.VictimHp = mine;
-                    c.NoDamageMs = 0;
+                    ++c.VictimSwaps;
+                    LogFightOutcome(self, victim, "цель подменилась", c);
+                    Switch(c, self, Behavior::Idle, "цель подменилась");
+                    return;
                 }
-                else if (mine > c.VictimHp)
+
+                // СТОРОЖ СЧИТАЕТ УРОН ЭТОГО БОЯ, А НЕ ВСЮ ЖИЗНЬ СПУТНИКА.
+                // Отсечка снята на входе в бой (DealtAtStart), поэтому «урон вырос»
+                // означает «вырос с начала ЭТОГО боя». Оговорка, которую надо назвать:
+                // счётчик урона не разделён по жертвам, так что попадание по кому-то
+                // другому в том же бою тоже продлит сторожа. У этих спутников иного
+                // источника урона нет, но правдой это не станет само собой.
+                uint64 mine = Manager::Instance()->BlowsOf(self->GetGUID()).Dealt;
+                if (mine > c.VictimHp)
                 {
                     c.VictimHp = mine;
-                    c.NoDamageMs = 0;       // НАШ урон есть — считаем заново
+                    c.NoDamageMs = 0;       // НАШ урон в ЭТОМ бою есть — считаем заново
                 }
                 else
                     c.NoDamageMs += diff;
+                // ЦЕЛЬ НАБРАНА — БОЙ ОКОНЧЕН, ДАЖЕ ЕСЛИ ПРОТИВНИК ЖИВ.
+                //
+                // Tiki Target — тренировочный манекен: его скрипт (zone_durotar.cpp) при
+                // ударе, который бы его убил, оставляет ему единицу здоровья, выдаёт ОДИН
+                // зачёт через KilledMonsterCredit и убирает манекен. То есть цель квеста
+                // «побей шестерых» закрывается ударами, а не смертями, и ждать смерти
+                // бессмысленно. Проверять надо не флаги существа (Кодекс: PACIFIED и
+                // STUNNED описывают состояние цели, а не «зачёт невозможен»), а СЧЁТЧИК
+                // ЦЕЛИ — тот же, по которому цель и выбиралась.
+                // РАЗ В СЕКУНДУ, А НЕ КАЖДЫЙ ТАКТ: проверка обходит весь журнал заданий и
+                // все их цели и строит набор заново, а зачёт не может появиться чаще, чем
+                // прилетает удар (Кодекс: не блокер, но лишняя постоянная работа на 122).
+                c.WantedCheckMs += diff;
+                if (c.WantedCheckMs >= 1000)
+                {
+                    c.WantedCheckMs = 0;
+                    if (!StillWanted(self, victim->GetEntry()))
+                    {
+                        LogFightOutcome(self, victim, "цель задания набрана", c);
+                        Switch(c, self, Behavior::Idle, "цель задания набрана");
+                        return;
+                    }
+                }
                 if (c.NoDamageMs > 15000)
                 {
                     LogFightOutcome(self, victim, "бью, а следа нет", c);
@@ -1520,11 +1562,20 @@ public:
                     StopMoving(c, self);
                     FaceTarget(c, self, victim);
                 }
-                // СРОК: бой, который не кончается, — это находка, а не норма
-                if (c.ModeMs > 120000)
+                // СРОК — ТЕПЕРЬ ПРЕДОХРАНИТЕЛЬ, А НЕ СУДЬЯ.
+                //
+                // Двух минут не хватало ровно тем боям, которые ШЛИ КАК НАДО. Манекену с
+                // двумя тысячами здоровья при полусотне урона за дошедший удар нужно около
+                // сорока попаданий; сорок попаданий сами по себе в две минуты уложились бы,
+                // но с промахами, паузами и закрытым вентилем — уже нет (Кодекс справедливо
+                // поправил слишком уверенную формулировку). Держится это не на расчёте, а на
+                // наблюдении: обрывало на 19 % и 41 %, то есть за шаг до зачёта.
+                // Бессмысленные бои теперь кончает сторож на пятнадцатой секунде, поэтому
+                // сюда доходит только то, что действительно продвигается.
+                if (c.ModeMs > 300000)
                 {
-                    LogFightOutcome(self, victim, "две минуты без исхода", c);
-                    Switch(c, self, Behavior::Idle, "две минуты боя без исхода");
+                    LogFightOutcome(self, victim, "пять минут без исхода", c);
+                    Switch(c, self, Behavior::Idle, "пять минут боя без исхода");
                 }
                 return;
             }
@@ -1580,6 +1631,21 @@ public:
         return true;
     }
 
+    // ПОЧИНИТЬ, ЕСЛИ ЕСТЬ ЧТО. Возвращает, сколько надетого было сломано ДО починки, —
+    // ноль означает, что вызывать ядро не пришлось вовсе.
+    uint32 RepairIfBroken(Player* self, char const* why) const
+    {
+        if (!self || !self->IsInWorld())
+            return 0;
+        uint32 broken = BrokenCount(self);
+        if (!broken)
+            return 0;
+        self->DurabilityRepairAll(false, 0.0f, false);
+        TC_LOG_INFO("server.worldserver", "Constellation: {} — починено {} вещей ({})",
+            self->GetName(), broken, why);
+        return broken;
+    }
+
     uint32 BrokenCount(Player* self) const
     {
         uint32 broken = 0;
@@ -1598,7 +1664,8 @@ public:
         TC_LOG_INFO("server.worldserver",
             "Constellation БОЙ {} (эфф ур {}) против {} ({}): {} — у него {}, у нас {:.0f}%; "
             "за {} с: замахов {}, урон прошёл {} раз на {}, вничью {} раз; по нам {} на {}; "
-            "тактов {} (уклоняется {}, занят {}, не в бою {}, вне досягаемости {}, вне сектора {})",
+            "тактов {} (уклоняется {}, занят {}, не в бою {}, вне досягаемости {}, вне сектора {}, "
+            "таймер не готов {}); подмен цели {}",
             self->GetName(), uint32(self->GetEffectiveLevel()),
             c.FightVictimName.empty() ? (victim ? victim->GetName() : "?") : c.FightVictimName,
             c.FightVictimEntry, how,
@@ -1608,7 +1675,8 @@ public:
             b.Swings - c.SwingsAtStart, b.Landed - c.LandedAtStart, b.Dealt - c.DealtAtStart,
             b.Zeroed - c.ZeroedAtStart,
             b.Hits - c.HitsAtStart, b.Taken - c.TakenAtStart,
-            c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing);
+            c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing,
+            c.GateNotReady, c.VictimSwaps);
     }
 
     // Переход — ЕДИНСТВЕННОЕ место, где пишется строка. Потактовая запись однажды
@@ -1620,7 +1688,19 @@ public:
         TC_LOG_INFO("server.worldserver", "Constellation FSM {}: {} -> {} ({})",
             self->GetName(), ModeName(c.Mode), ModeName(to), why);
         if (Player* me = c.Session ? c.Session->GetPlayer() : nullptr)
+        {
             StopMoving(c, me);          // сменили намерение — ноги остановились
+            // И РУКИ ТОЖЕ. Switch менял только намерение, поэтому «ушёл из боя» было
+            // правдой лишь внутри модуля: ядро продолжало автоатаку по прежней цели, а
+            // «стою» тут же выбирало её снова (Кодекс). Уходим тем же опкодом, каким
+            // это делает клиент: CMSG_ATTACK_STOP -> Player::AttackStop().
+            if (c.Mode == Behavior::Attacking && me->GetVictim())
+            {
+                WorldPacket raw(CMSG_ATTACK_STOP);
+                WorldPackets::Combat::AttackStop stop(std::move(raw));
+                c.Session->HandleAttackStopOpcode(stop);
+            }
+        }
         c.Mode = to;
         c.ModeMs = 0;
         if (to != Behavior::TurningIn)
@@ -1699,6 +1779,10 @@ public:
             c.KillsAtStart  = b.Kills;
             c.GateTicks = c.GateEvading = c.GateBusy = 0;
             c.GateNoState = c.GateOutOfRange = c.GateBadFacing = 0;
+            c.GateNotReady = c.VictimSwaps = 0;
+            c.DamageVictim = target->GetGUID();
+            c.VictimHp = b.Dealt;       // отсечка сторожа: урон НА НАЧАЛО этого боя
+            c.NoDamageMs = 0;
             c.FightVictim = target->GetGUID();
             c.FightVictimName = target->GetName();
             c.FightVictimEntry = target->GetEntry();
@@ -1979,6 +2063,15 @@ public:
     // Что именно убивать и сколько — знает ядро из quest_objectives; спрашиваем его.
     // ЧТО НАМ ВООБЩЕ НУЖНО УБИТЬ. Вынесено отдельно, потому что этим пользуются двое:
     // поиск цели ВОКРУГ и — с 2026-08-30 — поиск МЕСТА, куда за целью идти.
+    // Нужна ли нам ещё ЭТА запись существа. Тот же вопрос и тому же счётчику ядра, что
+    // и при выборе цели, — просто заданный ещё раз, посреди боя.
+    bool StillWanted(Player* self, uint32 entry) const
+    {
+        std::set<uint32> wanted;
+        WantedEntries(self, wanted);
+        return wanted.count(entry) != 0;
+    }
+
     void WantedEntries(Player* self, std::set<uint32>& wanted, uint32* slotsUsed = nullptr,
         uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr) const
     {
@@ -2807,6 +2900,7 @@ private:
                 if (c.Session->GetPlayer())
                 {
                     c.State = Stage::InWorld;
+                    RepairIfBroken(c.Session->GetPlayer(), "вход в мир");
                     c.TicksInState = 0;
                     TC_LOG_INFO("server.worldserver", "Constellation: {} is in the world", c.Entry->Name);
                     // ЗРЕНИЕ. Player::CanNeverSee отвечает «никогда» про ЛЮБОЙ объект, пока
