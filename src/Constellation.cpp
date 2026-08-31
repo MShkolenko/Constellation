@@ -55,6 +55,8 @@
 #include "MotionMaster.h"
 #include "PathGenerator.h"
 #include "ObjectAccessor.h"
+#include "ConditionMgr.h"
+#include "MapManager.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "PartyPackets.h"
@@ -70,6 +72,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -95,6 +98,7 @@ struct Settings
     bool  RigMode         = false;
     bool  Follow          = true;
     bool  Quests          = true;
+    bool  TakeQuests      = true;       // БРАТЬ квесты; сдавать разрешает Quests
     bool  Fight           = true;
     uint32 MaxActive      = 0;
     uint32 PerTick        = 6;
@@ -105,6 +109,9 @@ struct Settings
     float MaxStepUp       = 2.0f;
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
+    float RestBelowPct    = 55.0f;      // ниже этого — отдыхаем
+    float ResumeAbovePct  = 85.0f;      // и не встаём, пока не поднимемся сюда
+    uint32 RestMaxMs      = 120000;     // но не дольше двух минут
     std::string Account   = "CONSTELLATION";
     std::string DebugGroupPair;
 
@@ -115,6 +122,10 @@ struct Settings
         RigMode         = sConfigMgr->GetBoolDefault("Constellation.RigMode", false);
         Follow          = sConfigMgr->GetBoolDefault("Constellation.Follow", true);
         Quests          = sConfigMgr->GetBoolDefault("Constellation.Quests", true);
+        // Оператор, 2026-08-30: «отключите автоматическое принятие квестов». Отдельный
+        // ключ, а не Quests=0: сдавать уже взятое надо продолжать, иначе журналы у 122
+        // спутников так и останутся забитыми невыполнимым.
+        TakeQuests      = sConfigMgr->GetBoolDefault("Constellation.TakeQuests", true);
         Fight           = sConfigMgr->GetBoolDefault("Constellation.Fight", true);
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
@@ -127,6 +138,11 @@ struct Settings
         QuestGiverRange = sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
         // широко: цель ищется по округе, а не на длину руки — к ней ходят
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
+        // ГИСТЕРЕЗИС, А НЕ ОДИН ПОРОГ (Кодекс, разбор плана): входить и выходить по
+        // одному числу — значит дёргаться на границе и засорять журнал переходами.
+        RestBelowPct    = sConfigMgr->GetFloatDefault("Constellation.RestBelowPct", 55.0f);
+        ResumeAbovePct  = sConfigMgr->GetFloatDefault("Constellation.ResumeAbovePct", 85.0f);
+        RestMaxMs       = sConfigMgr->GetIntDefault("Constellation.RestMaxMs", 120000);
         Account         = sConfigMgr->GetStringDefault("Constellation.Account", "CONSTELLATION");
         DebugGroupPair  = sConfigMgr->GetStringDefault("Constellation.DebugGroupPair", "");
     }
@@ -152,7 +168,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, FollowingOwner, ApproachingTarget, Attacking, TurningIn };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn };
 
 struct Companion
 {
@@ -183,9 +199,59 @@ struct Companion
     float PathTargetX = 0.0f, PathTargetY = 0.0f;
     uint32 TurnInQuest = 0;             // что сдаём
     uint32 TurnInEntry = 0;             // кому
+    ObjectGuid TurnInGuid;              // и кто именно, когда нашёлся
+    Position TravelPos;                 // куда идти за целью задания
+    uint32 TravelQuest = 0;             // ради какого квеста идём
+    std::map<uint32, uint32> TravelBackoff; // квест -> сколько не ходить к нему снова, мс
+    uint32 TravelScanMs = 0;            // не перебирать точки чаще раза в две секунды
+    uint32 TravelCooldownMs = 0;        // не дойти — не долбиться
+    uint8 FightsLogged = 0;             // по три записи с КАЖДОГО, а не 200 с первых
+    uint32 RestSkipMs = 0;              // отдых не помог — столько не отдыхаем вовсе
+    uint32 ReviveMs = 0;                // как скоро снова пробовать воскреснуть
+    uint32 ReviveTries = 0;             // и сколько раз уже пробовали
+    bool ReviveGaveUp = false;          // сдались: пишем один раз, потом молчим
+    // СЧЁТ УДАРОВ, А НЕ ИСХОДОВ (задача 0022 просила именно это).
+    // Мерить исходы бесполезно: ветка победы почти не срабатывала, а «цель на 100 %
+    // жизни» одинаково выглядит и когда мы не били, и когда моб ушёл домой и восстановился.
+    ObjectGuid FightVictim;             // по кому идёт бой (переживает смерть цели)
+    std::string FightVictimName;        // имя — указателя после смерти уже нет
+    uint32 FightVictimEntry = 0;
+    uint32 GateTicks = 0;               // тактов автомата в бою (НЕ замахов)
+    uint32 GateEvading = 0;             //   цель уклоняется — ядро отдаёт EVADE до всего
+    uint32 GateBusy = 0;                //   мы читаем/несёмся — ядро выходит раньше вентиля
+    uint32 GateNoState = 0;             //   ядро не считает нас атакующими
+    uint32 GateOutOfRange = 0;          //   вне досягаемости
+    uint32 GateBadFacing = 0;           //   вне сектора 120°
+    uint32 SwingsAtStart = 0;           // отсечки на входе в бой
+    uint64 DealtAtStart = 0;
+    uint32 LandedAtStart = 0;
+    uint32 HitsAtStart = 0;
+    uint64 TakenAtStart = 0;
+    uint32 KillsAtStart = 0;
+    ObjectGuid DamageVictim;            // по кому ведём счёт урона
+    uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
+    uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
+    uint32 EnderScanMs = 0;             // когда искать заново
     Position TurnInPos;                 // и где он стоит
+    // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
+    // любая новая неудача переписывала таймер, а по его истечении набор очищался
+    // ЦЕЛИКОМ. То есть минутная неудача укорачивала чужую пятиминутную, и все
+    // отложенные квесты оживали разом (Кодекс, проход 4).
+    std::map<uint32, uint32> TurnInBackoff;   // квест -> сколько ещё ждать, мс
+    std::set<uint32> Impossible;        // квесты, которые закрыть НЕЧЕМ (навсегда)
     ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
+    bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
+    float LastX = 0.0f, LastY = 0.0f;   // где мы были — чтобы заметить, что не идём
+    uint32 StuckMs = 0;                 // сколько стоим, хотя собирались идти
+    uint32 UnstickTries = 0;            // сколько раз отступали вбок подряд
+    uint32 UnstickTotal = 0;            // и сколько всего за это намерение (не сбросить движением)
+    bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
+    uint8 JumpsLeft = 3;                // прыжков в запасе
+    uint32 JumpCooldownMs = 0;          // истратил три — минуту без прыжков
+    bool UnstickLeft = true;            // в какую сторону отступать следующей
+    bool Stalled = false;               // отступать больше некуда — решает автомат
+    uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
 };
 
 class Manager
@@ -195,6 +261,105 @@ public:
     {
         static Manager instance;
         return &instance;
+    }
+
+    // УДАРЫ, СЧИТАННЫЕ САМИМ ЯДРОМ.
+    //
+    // ЗАМОК ЗДЕСЬ ОБЯЗАТЕЛЕН, И ЭТО НЕ ПЕРЕСТРАХОВКА. На боевом MapUpdate.Threads = 6:
+    // Unit::DealDamage выполняется на потоке КАРТЫ, а автомат поведения читает те же
+    // счётчики с потока МИРА (WorldScript::OnUpdate). Незащищённая вставка в
+    // unordered_map с шести потоков — гонка и падение процесса (Кодекс, проход 10).
+    // Наружу отдаётся КОПИЯ, а не ссылка внутрь таблицы.
+    //
+    // Запись заводится ОДИН раз, при первом бое спутника (Register), поэтому обработчик
+    // урона делает только find(): чужие игроки и персонажи оператора в таблицу не
+    // попадают и не считаются.
+    struct Blows
+    {
+        uint32 Swings = 0;              // ЗАМАХИ: ModifyMeleeDamage зовётся ДО броска
+                                        // исхода (Unit.cpp:1377 против 1388), поэтому
+                                        // сюда попадают и промах, и уклонение цели
+        // ВНИМАНИЕ ПРИ ЧТЕНИИ: это НЕ «из замахов дошло». OnDamage зовётся на любой
+        // наш урон — заклинание, периодический эффект, что угодно. У этих спутников
+        // другого источника пока нет (в том и суть задачи 0022), поэтому на практике
+        // числа сравнимы, но называть разницу «промахи» нельзя (Кодекс, проход 11).
+        uint32 Landed = 0;              // событий НАШЕГО урона, любого происхождения
+        uint64 Dealt = 0;               // и на сколько всего
+        uint32 Hits = 0;                // сколько раз попали по нам
+        uint64 Taken = 0;
+        uint32 Kills = 0;               // АТРИБУЦИЯ ЯДРА: OnCreatureKill(мы, кто-то)
+        ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
+    };
+
+    Blows BlowsOf(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        auto it = _blows.find(guid);
+        return it != _blows.end() ? it->second : Blows();
+    }
+
+    // ЗАВЕСТИ И СНЯТЬ ОТСЧЁТ — ОДНОЙ ОПЕРАЦИЕЙ.
+    // Двумя блокировками между ними успевал проскочить замах с потока карты: он попадал
+    // и в отсчёт, и мимо разницы (Кодекс, проход 11).
+    Blows RegisterAndSnapshot(ObjectGuid guid)
+    {
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        return _blows.emplace(guid, Blows()).first->second;
+    }
+
+    void NoteSwing(Unit* attacker)
+    {
+        if (!attacker || !attacker->IsPlayer())
+            return;                     // замок берём только ради игрока
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        auto it = _blows.find(attacker->GetGUID());
+        if (it != _blows.end())
+            ++it->second.Swings;
+    }
+
+    void NoteDamage(Unit* attacker, Unit* victim, uint32 damage)
+    {
+        // СНАЧАЛА ОТСЕИВАЕМ, ПОТОМ БЕРЁМ ЗАМОК. Событий урона существо-против-существа
+        // на боевом на порядки больше, чем наших, и сериализовать на них шесть потоков
+        // карт незачем (Кодекс, проход 11).
+        bool const mine = (attacker && attacker->IsPlayer()) || (victim && victim->IsPlayer());
+        if (!mine || !damage)
+            return;
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        if (attacker && attacker->IsPlayer())
+        {
+            auto it = _blows.find(attacker->GetGUID());
+            if (it != _blows.end())
+            {
+                ++it->second.Landed;
+                it->second.Dealt += damage;
+            }
+        }
+        if (victim && victim->IsPlayer())
+        {
+            auto it = _blows.find(victim->GetGUID());
+            if (it != _blows.end())
+            {
+                ++it->second.Hits;
+                it->second.Taken += damage;
+            }
+        }
+    }
+
+    // КОГО убили — обязательная часть. Считать «убил хоть кого-нибудь за время боя»
+    // мало: спутник мог добить чужой цели или своего добить раньше, а нынешнюю цель
+    // положил сосед — и бой засчитался бы победой (Кодекс, проход 11).
+    void NoteKill(Player* killer, Creature* killed)
+    {
+        if (!killer || !killed)
+            return;
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        auto it = _blows.find(killer->GetGUID());
+        if (it != _blows.end())
+        {
+            ++it->second.Kills;
+            it->second.LastKilled = killed->GetGUID();
+        }
     }
 
     void OnWorldUpdate(uint32 diff)
@@ -284,7 +449,7 @@ public:
         if (!Cfg().RigMode)
             return;
         std::string const& pair = Cfg().DebugGroupPair;
-        if (pair.empty() || _debugPairDone)
+        if (pair.empty() || pair == "none" || _debugPairDone)
             return;
         size_t comma = pair.find(',');
         if (comma == std::string::npos)
@@ -325,15 +490,160 @@ public:
     //
     // Инвариант цел: путь — это решение «куда бежать», а само движение по-прежнему
     // уходит клиентским пакетом и проверяется ядром.
-    bool StepToward(Companion& c, Player* self, float tx, float ty, float stopAt, float dt)
+    // ПРЫЖОК — И ЧЕСТНО О ТОМ, ЧТО ЭТО ТАКОЕ.
+    //
+    // Оператор, 2026-08-30: «помимо шага в сторону добавь им 2-3 прыжка». Сделано, и
+    // теми самыми опкодами, которыми прыгает клиент: CMSG_MOVE_JUMP и закрывающий его
+    // CMSG_MOVE_FALL_LAND, оба через тот же HandleMovementOpcode, которым модуль уже
+    // шлёт шаги. Нулевой инвариант цел.
+    //
+    // НО НЕ НАДО ДУМАТЬ, ЧТО СПУТНИК ПЕРЕЛЕТАЕТ ПРЕПЯТСТВИЕ. Сервер дугу не считает —
+    // её считает клиент, а сервер принимает то, что ему сообщили. По существу это
+    // ПЕРЕНОС на два ярда вперёд, ограниченный лучом ядра, плюс пересадка на законную
+    // высоту. Кодекс сказал это прямо — «косметический прыжок вокруг маленького
+    // переноса», — и он прав. Польза от него всё же настоящая, и ровно двойная:
+    //   * низкий порог, который луч проходит, а маршрутизатор обойти не берётся;
+    //   * спутник, чей Z уполз в геометрию: посадка сажает его на законную высоту, и
+    //     полигон под ним снова находится.
+    // Через стену он не переносит. Для стены есть шаг вбок, он идёт следующим.
+    //
+    // ПРЫЖОК И ПОСАДКА УХОДЯТ В ОДНОМ ТАКТЕ, и это не небрежность. Растянуть их на
+    // 400 мс значило бы завести состояние «в воздухе», из которого есть выходы БЕЗ
+    // посадки: смена управляющего, смерть, выключение модуля, телепорт между картами.
+    // Каждый оставил бы спутника вечно падающим — а падающему наш же заслон в
+    // StepToward запрещает идти. То есть ровно тот вечный тупик, который мы и чиним.
+    // Кодекс нашёл четыре таких выхода; вместо того чтобы затыкать каждый, состояния
+    // просто нет.
+    bool Jump(Companion& c, Player* self, float tx, float ty)
     {
-        static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
-            | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
-        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
-            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+        float ang = self->GetAbsoluteAngle(tx, ty);
+        Position land = self->GetFirstCollisionPosition(2.0f, ang - self->GetOrientation());
+
+        // ВЫСОТУ ПОСАДКИ НЕ ПЕРЕСЧИТЫВАТЬ. Ядро уже посадило её само: последним делом
+        // MovePositionToFirstCollision вызывает UpdateAllowedPositionZ, который знает
+        // про полы и здания. Здесь стоял мой GetHeight поверх — то есть ровно тот брак,
+        // с которого начался этот день: внутри аббатства он вернул бы землю ПОД домом и
+        // посадил спутника под полом. Нашли оба, независимо: и я, и Кодекс.
+        //
+        // Обрыв, мост, этаж ниже: два ярда по горизонтали не гарантируют малого перепада
+        // по высоте (Кодекс). Вниз больше чем на три ярда не прыгаем вовсе — и урона от
+        // падения тогда быть не может, ядро начисляет его от 14.57.
+        if (self->GetPositionZ() - land.GetPositionZ() > 3.0f)
             return false;
 
-        float dist = self->GetExactDist2d(tx, ty);
+        MovementInfo up;
+        up.guid = self->GetGUID();
+        up.pos.Relocate(self->GetPosition());
+        up.pos.SetOrientation(ang);
+        up.flags = MOVEMENTFLAG_FALLING;
+        up.time = GameTime::GetGameTimeMS();
+        up.jump.zspeed = 7.955800f;         // скорость прыжка клиента
+        up.jump.cosAngle = std::cos(ang);
+        up.jump.sinAngle = std::sin(ang);
+        up.jump.xyspeed = self->GetSpeed(MOVE_RUN);
+        up.jump.fallTime = 0;
+        c.Session->HandleMovementOpcode(CMSG_MOVE_JUMP, up);
+
+        MovementInfo down;
+        down.guid = self->GetGUID();
+        down.pos.Relocate(land);
+        down.pos.SetOrientation(ang);
+        down.flags = 0;
+        down.time = GameTime::GetGameTimeMS();
+        down.jump.fallTime = 400;
+        c.Session->HandleMovementOpcode(CMSG_MOVE_FALL_LAND, down);
+
+        c.Moving = false;
+        c.Waypoints.clear();                // маршрут пересчитаем с нового места
+        return true;
+    }
+
+    // УПЁРЛИСЬ — ОТСТУПАЕМ ВДОЛЬ ПРЕПЯТСТВИЯ, КАК ЖИВОЙ.
+    //
+    // Оператор, 2026-08-30: «люди вперлись в препятствие, вы не учили ботов обходить
+    // препятствия?? только честно а не сквозь текстуры». Честно: обходить учили —
+    // маршрут строит PathGenerator по навигационной сетке ядра, тот же, которым ядро
+    // водит существ. Чего НЕ было — выхода из положения, когда сетка маршрута не даёт:
+    // код возвращал false, и спутник стоял у стены вечно.
+    //
+    // Живой игрок в этом месте не проходит сквозь стену — он смещается ВДОЛЬ неё и
+    // пробует снова. Так и делаем, и шаг вбок считает само ядро своим лучом
+    // GetFirstCollisionPosition: луч УПИРАЕТСЯ в стену, а не проходит её. Точка вбок
+    // становится обычной путевой точкой, к ней идём бегом теми же пакетами. Ни одной
+    // прорехи в нулевом инварианте и ни одного прохода сквозь текстуры.
+    bool Unstick(Companion& c, Player* self, float tx, float ty)
+    {
+        // ЛЕСТНИЦА, А НЕ ОДНО СРЕДСТВО: сперва прыгнуть, и только если три прыжка не
+        // сняли с места — уходить вбок. Порядок именно такой, потому что прыжок дешевле
+        // (400 мс на месте против обхода в шесть ярдов) и чаще срабатывает.
+        // ПОТОЛОК ПРЫЖКОВ — НАСТОЯЩИЙ, А НЕ «ТРИ НА КАЖДУЮ СМЕНУ НАМЕРЕНИЯ». Запас
+        // пополнялся в Switch(), а спутник может колебаться «иду за хозяином -> стою ->
+        // иду за хозяином» бесконечно и прыгать вечно (Кодекс). Поэтому истраченный
+        // запас закрывает прыжки на минуту, и смена намерения этого не обходит.
+        if (c.JumpsLeft && Jump(c, self, tx, ty))
+        {
+            // ОКНО ОТКРЫВАЕТ ПЕРВЫЙ ПРЫЖОК, а не третий. Прежде запас пополнялся в
+            // Switch() при каждой смене намерения, и спутник, тративший по одному-два
+            // прыжка и меняющий намерение, получал их снова без конца — потолок,
+            // обещанный в комментарии, не был написан в коде (Кодекс, проход 4).
+            // Теперь это честное «три прыжка в минуту», и смена намерения тут ни при чём.
+            if (!c.JumpCooldownMs)
+                c.JumpCooldownMs = 60000;
+            --c.JumpsLeft;
+            return true;                    // прыжок НЕ тратит запас отступов
+        }
+
+        // ДВА ПРЕДЕЛА, А НЕ ОДИН (Кодекс, 2026-08-30). Первый — попытки подряд; но его
+        // обнуляет сам удавшийся отступ, ведь спутник при этом ДВИГАЛСЯ. Поэтому второй,
+        // общий за намерение, движением не сбрасывается — только сменой намерения.
+        if (++c.UnstickTries > 4 || ++c.UnstickTotal > 8)
+            return false;                   // хватит топтаться — пусть решает автомат
+
+        float toGoal = self->GetAbsoluteAngle(tx, ty);
+        float side = toGoal + (c.UnstickLeft ? float(M_PI) / 2.0f : -float(M_PI) / 2.0f);
+        c.UnstickLeft = !c.UnstickLeft;     // попеременно, чтобы не тереться об угол
+
+        Position hop = self->GetFirstCollisionPosition(6.0f, side - self->GetOrientation());
+        if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f)
+            return true;                    // и вбок стена — на следующем такте другая сторона
+
+        c.Waypoints.clear();
+        c.Waypoints.push_back(hop);
+        c.WaypointIndex = 0;
+        c.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
+        c.PathTargetY = ty;
+        return true;
+    }
+
+    // ОСТАНОВКУ НАДО ПОСЫЛАТЬ, А НЕ ПРОСТО ПЕРЕСТАТЬ ИДТИ.
+    //
+    // Оператор, 2026-08-30: «бриенная бежит на месте» — и на снимке она стоит у
+    // Маршала Макбрайда, отыграв анимацию бега. Причина ровно эта: шаг уходит пакетом
+    // с флагом «иду вперёд», а пакет с нулевыми флагами посылался ИЗ ОДНОГО-
+    // ЕДИНСТВЕННОГО выхода — «дошёл». Все прочие (маршрут пройден, шаг нулевой, запрет
+    // по флагам движения, застряли, маршрута нет) возвращали «не иду» МОЛЧА, и для
+    // всех остальных клиентов последним словом сервера оставалось «бежит».
+    //
+    // У спутника своего клиента нет, поэтому увидеть это мог только живой игрок рядом —
+    // отчего оно и дожило до боевого.
+    void StopMoving(Companion& c, Player* self)
+    {
+        if (!c.Moving)
+            return;
+        SendMove(c, self, self->GetPosition(), 0);
+        c.Moving = false;
+    }
+
+    bool StepToward(Companion& c, Player* self, float tx, float ty, float tz, float stopAt, float dt)
+    {
+        // РАССТОЯНИЕ ЗДЕСЬ — В ПРОСТРАНСТВЕ, А НЕ ПО ПЛОСКОСТИ.
+        //
+        // Было по плоскости, и это тихо ломало ВСЁ, что опирается на «дошёл»: цель на
+        // помосте девятью ярдами выше числилась достигнутой, движение прекращалось, а
+        // ядро — которое меряет в пространстве — отказывало. Спутник не застревал, он
+        // считал себя пришедшим. Кодекс назвал это мёртвой зоной, и она общая для
+        // следования, подхода, боя и сдачи, потому что мерка тут одна на всех.
+        float dist = self->GetExactDist(tx, ty, tz);
         if (dist < stopAt)
         {
             if (c.Moving)
@@ -341,12 +651,48 @@ public:
                 SendMove(c, self, self->GetPosition(), 0);
                 c.Moving = false;
             }
+            c.StuckMs = 0;
+            c.UnstickTries = 0;
+            c.Stalled = false;          // дошли — тупика больше нет (Кодекс)
+            return false;
+        }
+
+        // ЗАСТРЯЛИ — СУДИМ ПО ФАКТУ, А НЕ ПО НАМЕРЕНИЮ. Маршрут может существовать, а
+        // спутник всё равно тереться об угол: значит смотрим, СДВИНУЛСЯ ли он на самом деле.
+        if (self->GetExactDist2d(c.LastX, c.LastY) > 1.0f)
+        {
+            c.LastX = self->GetPositionX();
+            c.LastY = self->GetPositionY();
+            c.StuckMs = 0;
+            c.UnstickTries = 0;
+        }
+        else
+            c.StuckMs += uint32(dt * 1000.0f);
+
+        static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
+            | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
+        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
+            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+        {
+            StopMoving(c, self);
+            return false;               // не наш случай; выручит срок состояния
+        }
+
+        if (c.StuckMs > 2500)
+        {
+            c.StuckMs = 0;
+            if (!Unstick(c, self, tx, ty))
+                c.Stalled = true;
+            StopMoving(c, self);
             return false;
         }
 
         float step = std::min(self->GetSpeed(MOVE_RUN) * dt, dist - stopAt * 0.5f);
         if (step <= 0.0f)
+        {
+            StopMoving(c, self);
             return false;
+        }
 
         // маршрут пересчитывается не каждый шаг: он нужен, только пока мы далеко
         // от следующей его точки
@@ -354,19 +700,30 @@ public:
             || self->GetExactDist2d(c.PathTargetX, c.PathTargetY) > 5.0f
                 && (std::fabs(c.PathTargetX - tx) > 3.0f || std::fabs(c.PathTargetY - ty) > 3.0f))
         {
+            // ВЫСОТА ЦЕЛИ — НАСТОЯЩАЯ, А НЕ ВЫЧИСЛЕННАЯ ЗАНОВО.
+            //
+            // Здесь стояло GetHeight(tx, ty, z + 5): переданный мне Z выбрасывался и
+            // угадывался обратно по карте. Под зданием и на ступенях угадывалось МИМО —
+            // возвращалась высота ЗЕМЛИ ПОД домом, точка уезжала внутрь геометрии, где
+            // полигона нет, и построитель отвечал NOPATH (в живом журнале — «тип A»).
+            // Спутник упирался в угол аббатства и стоял. Настоящий Z известен КАЖДОМУ
+            // месту вызова — берём его.
             PathGenerator path(self);
-            float groundZ = self->GetMap()->GetHeight(self->GetPhaseShift(), tx, ty, self->GetPositionZ() + 5.0f);
-            if (groundZ <= INVALID_HEIGHT)
-                groundZ = self->GetPositionZ();
-            if (!path.CalculatePath(tx, ty, groundZ, false)
+            if (!path.CalculatePath(tx, ty, tz, false)
                 || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
             {
-                if (!_stepDiagDone)
+                ++_noPath;
+                if (_noPathLogged < 20)
                 {
-                    _stepDiagDone = true;
+                    // прежняя диагностика стояла на ОДНОМ глобальном флаге и напечаталась
+                    // за всю жизнь сервера ровно один раз — то есть скрыла масштаб беды
+                    ++_noPathLogged;
                     TC_LOG_INFO("server.worldserver", "Constellation STEP {}: маршрута нет, тип {:X}, точек {}",
                         self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()));
                 }
+                if (!Unstick(c, self, tx, ty))
+                    c.Stalled = true;
+                StopMoving(c, self);
                 return false;
             }
             c.Waypoints.clear();
@@ -379,12 +736,12 @@ public:
 
         // идём к текущей точке маршрута; дошли — берём следующую
         while (c.WaypointIndex < c.Waypoints.size()
-            && self->GetExactDist2d(c.Waypoints[c.WaypointIndex].GetPositionX(),
-                                    c.Waypoints[c.WaypointIndex].GetPositionY()) < 1.5f)
+            && self->GetExactDist(c.Waypoints[c.WaypointIndex]) < 1.5f)
             ++c.WaypointIndex;
         if (c.WaypointIndex >= c.Waypoints.size())
         {
             c.Waypoints.clear();
+            StopMoving(c, self);
             return false;                   // маршрут пройден
         }
 
@@ -399,6 +756,107 @@ public:
         c.Moving = true;
         return true;
     }
+    // СМЕРТЬ — НЕ КОНЕЦ, А ДОРОГА ОБРАТНО.
+    //
+    // Оператор увидел это в игре и спросил, чего они ждут: трое дворфов стоят на
+    // кладбище Холодной долины, health = 1, mana = 0. Это состояние ДУХА, а не
+    // раненого. Они погибли, дух отпустился, ядро перенесло их к целительнице — и там
+    // они остались НАВСЕГДА, потому что весь код на случай смерти был «умер -> стою ->
+    // выйти». То есть любой погибший спутник молча выбывал из игры насовсем, и в
+    // журнале об этом не было ни строки: переход-то состоялся один раз.
+    //
+    // Делаем то, что делает живой, и теми же опкодами:
+    //   тело ещё не отпущено  -> CMSG_REPOP_REQUEST
+    //   дух рядом с целительницей -> CMSG_SPIRIT_HEALER_ACTIVATE
+    // К целительнице надо ДОЙТИ: ядро переносит на кладбище, но не вплотную, а порог
+    // близости у него свой — INTERACTION_DISTANCE, и меряется он в пространстве.
+    // Спрашиваем ядро, а не придумываем: сегодня эта же подмена стоила дня.
+    //
+    // Почему целительница, а не бег к телу: тело лежит там, где нас убили, и дорога
+    // туда ведёт мимо того же, что убило. Целительница берёт плату износом снаряжения
+    // и слабостью после воскрешения — на низких уровнях слабости нет вовсе, а износ
+    // спутнику дешевле смерти по кругу. Бег к телу — отдельная задача, не эта.
+    void Revive(Companion& c, Player* self, float dt)
+    {
+        uint32 ms = uint32(dt * 1000.0f);
+        if (c.ReviveMs > ms)
+        {
+            c.ReviveMs -= ms;
+            return;                     // не чаще раза в две секунды
+        }
+        c.ReviveMs = 2000;
+
+        // ПРЕДЕЛ, А НЕ ВЕЧНАЯ ПОПЫТКА (Кодекс, проход 5). Он перечислил четыре способа
+        // застрять здесь навсегда: отказ отпустить дух, отсутствие целительницы в
+        // шестидесяти ярдах, недостижимая по сетке целительница и молча отклонённое
+        // воскрешение. Каждый из них крутился бы вечно и молча — ровно та беда, которую
+        // мы весь день чиним. Двадцать попыток (сорок секунд), потом отдых пять минут и
+        // ОДНА строка в журнал, чтобы это было видно.
+        if (++c.ReviveTries > 20)
+        {
+            c.ReviveTries = 0;
+            c.ReviveMs = 300000;
+            if (!c.ReviveGaveUp)
+            {
+                c.ReviveGaveUp = true;
+                TC_LOG_INFO("server.worldserver", "Constellation: {} не может воскреснуть — целительницы нет или до неё не дойти",
+                    self->GetName());
+            }
+            return;
+        }
+
+        if (!self->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+        {
+            WorldPacket raw(CMSG_REPOP_REQUEST);
+            WorldPackets::Misc::RepopRequest repop(std::move(raw));
+            repop.CheckInstance = false;
+            c.Session->HandleRepopRequest(repop);
+            return;                     // отпустили дух; переносом займётся ядро
+        }
+
+        Creature* healer = nullptr;
+        float best = 100000.0f;
+        std::list<Creature*> near;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+        Cell::VisitGridObjects(self, searcher, 60.0f);
+        for (Creature* cr : near)
+        {
+            if (!cr->HasNpcFlag(UNIT_NPC_FLAG_SPIRIT_HEALER) || !cr->IsAlive())
+                continue;
+            float d = self->GetExactDist(cr);
+            if (d < best)
+                { best = d; healer = cr; }
+        }
+        if (!healer)
+            return;                     // не видно — ждём, ядро само перенесёт на кладбище
+
+        if (!self->IsWithinDistInMap(healer, INTERACTION_DISTANCE))
+        {
+            StepToward(c, self, healer->GetPositionX(), healer->GetPositionY(),
+                healer->GetPositionZ(), 2.0f, dt);
+            if (c.Stalled)              // до целительницы не дойти — считаем это попыткой
+                c.ReviveTries += 5;
+            return;
+        }
+
+        WorldPacket raw(CMSG_SPIRIT_HEALER_ACTIVATE);
+        WorldPackets::NPC::SpiritHealerActivate act(std::move(raw));
+        act.Healer = healer->GetGUID();
+        c.Session->HandleSpiritHealerActivate(act);
+        if (self->IsAlive())
+        {
+            ++_revived;
+            c.ReviveTries = 0;
+            c.ReviveGaveUp = false;
+            c.TravelCooldownMs = 300000;    // после смерти не бежать туда же сразу (Кодекс)
+            // и не возвращаться к убийце на половине здоровья — сперва отдышаться
+            Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
+            TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
+                self->GetName());
+        }
+    }
+
     // ==================== АВТОМАТ ПОВЕДЕНИЯ ====================
     //
     // Предложение Кодекса, принятое оператором 2026-08-30: перестать наращивать
@@ -423,24 +881,119 @@ public:
         if (!self || !self->IsInWorld())
             return;
 
+        // ТЕЛЕПОРТ НАДО ПОДТВЕРДИТЬ — КЛИЕНТА, КОТОРЫЙ ЭТО ДЕЛАЕТ, У НАС НЕТ.
+        //
+        // Найдено кругом 9 стенда: четверо погибших отпустили дух и «не смогли дойти»
+        // до целительницы. На самом деле они НЕ БЫЛИ на кладбище: отпуск духа — это
+        // ближний телепорт, ядро взводит семафор и ждёт CMSG_MOVE_TELEPORT_ACK от
+        // клиента (HandleMoveTeleportAck: проверяются только guid и семафор, счётчик
+        // не сверяется — прочитано в обработчике, не угадано). Без подтверждения
+        // перенос не завершается никогда — призрак стоит на месте смерти. Та же
+        // судьба ждала бы ЛЮБОЙ будущий телепорт. Подтверждаем, как подтвердил бы
+        // клиент; дальний перенос ядро само предусмотрело для вызовов с серверной
+        // стороны — HandleMoveWorldportAck().
+        if (self->IsBeingTeleportedNear())
+        {
+            WorldPacket raw(CMSG_MOVE_TELEPORT_ACK);
+            WorldPackets::Movement::MoveTeleportAck ack(std::move(raw));
+            ack.MoverGUID = self->GetGUID();
+            ack.AckIndex = 0;
+            ack.MoveTime = GameTime::GetGameTimeMS();
+            c.Session->HandleMoveTeleportAck(ack);
+            return;                     // этот такт ушёл на перенос
+        }
+        if (self->IsBeingTeleportedFar())
+        {
+            c.Session->HandleMoveWorldportAck();
+            return;
+        }
+
         c.ModeMs += diff;
         c.MoveMs += diff;
+        for (auto it = c.TurnInBackoff.begin(); it != c.TurnInBackoff.end(); )
+        {
+            if (it->second <= diff)
+                it = c.TurnInBackoff.erase(it);     // отлежался — можно пробовать снова
+            else
+                { it->second -= diff; ++it; }
+        }
+        if (c.FollowCooldownMs)
+            c.FollowCooldownMs = (c.FollowCooldownMs <= diff) ? 0 : c.FollowCooldownMs - diff;
+        if (c.EnderScanMs)
+            c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
+        if (c.TravelCooldownMs)
+            c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
+        if (c.TravelScanMs)
+            c.TravelScanMs = (c.TravelScanMs <= diff) ? 0 : c.TravelScanMs - diff;
+        if (c.RestSkipMs)
+            c.RestSkipMs = (c.RestSkipMs <= diff) ? 0 : c.RestSkipMs - diff;
+        for (auto it = c.TravelBackoff.begin(); it != c.TravelBackoff.end(); )
+        {
+            if (it->second <= diff)
+                it = c.TravelBackoff.erase(it);
+            else
+                { it->second -= diff; ++it; }
+        }
+        if (c.JumpCooldownMs)
+        {
+            c.JumpCooldownMs = (c.JumpCooldownMs <= diff) ? 0 : c.JumpCooldownMs - diff;
+            // минута прошла — запас возвращается ЗДЕСЬ, а не при следующей смене
+            // намерения: спутник, застрявший в одном намерении, иначе терял прыжки
+            // навсегда, хотя отсрочка обещала обратное (Кодекс, проход 3)
+            if (!c.JumpCooldownMs)
+                c.JumpsLeft = 3;
+        }
         if (c.MoveMs < 250)                 // 4 Гц, как поток живого клиента
             return;
         float dt = c.MoveMs / 1000.0f;
         c.MoveMs = 0;
 
-        // мёртвый спутник ничего не делает — но и не висит в бою
         if (!self->IsAlive())
         {
             if (c.Mode != Behavior::Idle)
+            {
+                if (c.Mode == Behavior::Attacking || c.Mode == Behavior::ApproachingTarget)
+                    LogFightOutcome(self, ObjectAccessor::GetCreature(*self, c.TargetGuid), "ПОГИБ", c);
                 Switch(c, self, Behavior::Idle, "погиб");
+            }
+            // умерли по дороге — не бежать той же дорогой снова (Кодекс, проход 5):
+            // без этого смерть возвращала в «стою», откуда та же цель выбиралась опять
+            c.TravelCooldownMs = 300000;
+            Revive(c, self, dt);
             return;
         }
         // не управляем собой (транспорт, контроль) — пакет с нашим guid относился бы
         // к другому существу
         if (self->GetUnitBeingMoved() != self)
             return;
+
+        // САМОПРОВЕРКА ПРЫЖКА — ТОЛЬКО НА СТЕНДЕ.
+        //
+        // Без неё прыжок уезжает в выкладку недоказанным: за пятиминутный прогон
+        // построитель маршрутов не отказал НИ РАЗУ (ноль строк STEP в журнале), значит
+        // Unstick не вызывался вовсе, и сказать о прыжке было бы нечего, кроме
+        // «собралось». А правило здесь одно: изменение ПРОВЕРЕНО, а не заявлено.
+        //
+        // Проверяем ровно то, что может сломаться: приняло ли ядро пару пакетов,
+        // сдвинулся ли спутник и насколько, снят ли признак падения (иначе он больше
+        // никогда не пойдёт) и не отняло ли здоровья.
+        if (Cfg().RigMode && !c.JumpProbed)
+        {
+            c.JumpProbed = true;
+            Position was = self->GetPosition();
+            uint64 hpWas = self->GetHealth();
+            bool ok = Jump(c, self,
+                self->GetPositionX() + std::cos(self->GetOrientation()) * 5.0f,
+                self->GetPositionY() + std::sin(self->GetOrientation()) * 5.0f);
+            TC_LOG_INFO("server.worldserver",
+                "Constellation JUMPTEST {}: прыгнул={} сдвиг={:.2f} по высоте={:.2f} падение={} здоровье {}->{}",
+                self->GetName(), ok ? 1 : 0,
+                self->GetExactDist2d(was.GetPositionX(), was.GetPositionY()),
+                self->GetPositionZ() - was.GetPositionZ(),
+                self->IsFalling() ? 1 : 0, hpWas, self->GetHealth());
+            return;
+        }
+
 
         switch (c.Mode)
         {
@@ -454,6 +1007,13 @@ public:
                     Switch(c, self, Behavior::TurningIn, "есть что сдать");
                     return;
                 }
+                // ОТДЫХ ВПЕРЕДИ ДРАКИ, но ПОЗАДИ сдачи: сдать готовое можно и раненым,
+                // а вот идти за новой целью — нет.
+                if (!c.RestSkipMs && NeedsRest(self))
+                {
+                    Switch(c, self, Behavior::Recovering, "надо перевести дух");
+                    return;
+                }
                 if (Creature* target = Cfg().Fight ? FindObjectiveTarget(c, self) : nullptr)
                 {
                     c.TargetGuid = target->GetGUID();
@@ -464,10 +1024,23 @@ public:
                 // за хозяином идём, только если он ДОСТИЖИМ. Иначе спутник метался
                 // «пошёл — далеко — стою» по нескольку раз в секунду: 420 холостых
                 // переходов за прогон, из которых ни один ничего не менял.
+                // цели рядом нет — но она где-то есть, и мы знаем где
+                if (Cfg().Fight && !c.TravelCooldownMs && !c.TravelScanMs)
+                {
+                    if (FindObjectiveSpot(c, self))
+                    {
+                        Switch(c, self, Behavior::Travelling, "иду за целью задания");
+                        return;
+                    }
+                    c.TravelScanMs = 2000;  // впустую — не перебирать точки каждый такт
+                }
                 Position owner;
-                if (Cfg().Follow && FollowTargetPos(c, self, &owner)
+                if (Cfg().Follow && !c.FollowCooldownMs && FollowTargetPos(c, self, &owner)
                     && self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY()) <= Cfg().FollowMaxRange)
+                {
+                    c.LastDist = self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY());
                     Switch(c, self, Behavior::FollowingOwner, "есть за кем идти");
+                }
                 return;
             }
 
@@ -492,7 +1065,92 @@ public:
                     Switch(c, self, Behavior::Idle, "хозяин слишком далеко");
                     return;
                 }
-                StepToward(c, self, owner.GetPositionX(), owner.GetPositionY(), Cfg().FollowDistance, dt);
+                // Единственное состояние, у которого НЕ БЫЛО срока: спутник, упёршийся
+                // в угол по дороге к хозяину, стоял там вечно. Теперь и оно смертно —
+                // причём срок обнуляет ПРИБЛИЖЕНИЕ, а не любое шевеление: иначе шаги
+                // вбок у стены продлевали бы его до бесконечности (Кодекс, 2026-08-30).
+                float od = self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY());
+                StepToward(c, self, owner.GetPositionX(), owner.GetPositionY(),
+                    owner.GetPositionZ(), Cfg().FollowDistance, dt);
+                if (od < c.LastDist - 1.0f)
+                {
+                    c.LastDist = od;
+                    c.ModeMs = 0;
+                }
+                else if (c.Stalled || c.ModeMs > 30000)
+                {
+                    char const* why = c.Stalled ? "до хозяина не дойти" : "полминуты без движения к хозяину";
+                    c.FollowCooldownMs = 10000; // не возвращаться сюда каждый такт
+                    Switch(c, self, Behavior::Idle, why);
+                }
+                return;
+            }
+
+            case Behavior::Recovering:
+            {
+                // напали — драться, а не сидеть: отдых прерывается боем
+                if (self->IsInCombat())
+                {
+                    Switch(c, self, Behavior::Idle, "в бою не до отдыха");
+                    return;
+                }
+                StopMoving(c, self);
+                if (RestedEnough(self))
+                {
+                    c.RestSkipMs = 0;   // восстановление работает — запрет ни к чему
+                    Switch(c, self, Behavior::Idle, "отдышался");
+                    return;
+                }
+                // ПОТОЛОК ОЖИДАНИЯ — И ОН ДОЛЖЕН БЫТЬ НАСТОЯЩИМ.
+                //
+                // Первая редакция просто уходила в «стою» по истечении срока — а там
+                // NeedsRest всё ещё истинно, и следующий же такт возвращал в отдых.
+                // Получался вечный «отдыхал две минуты -> такт в стою -> снова две
+                // минуты», то есть обещанный потолок не ограничивал ничего, и спутник
+                // с застрявшим восстановлением стоял бы навсегда, лишь печатая по два
+                // перехода в цикл (Кодекс, проход 7 — блокирующее).
+                //
+                // Настоящий выход: после неудачного отдыха ЗАПРЕЩАЕМ отдыхать вовсе на
+                // время, вдвое большее самого отдыха. Спутник идёт драться раненым —
+                // это плохо, но это ДЕЙСТВИЕ, из которого есть выход, в отличие от
+                // стояния столбом.
+                if (c.ModeMs > Cfg().RestMaxMs)
+                {
+                    c.RestSkipMs = Cfg().RestMaxMs * 2;
+                    Switch(c, self, Behavior::Idle, "отдых не помогает, иду как есть");
+                }
+                return;
+            }
+
+            case Behavior::Travelling:
+            {
+                // дошли настолько, что цель уже видно — дальше обычным порядком
+                if (Creature* target = FindObjectiveTarget(c, self))
+                {
+                    c.TargetGuid = target->GetGUID();
+                    c.LastDist = self->GetExactDist(target);
+                    Switch(c, self, Behavior::ApproachingTarget, "цель показалась");
+                    return;
+                }
+                // ПРИШЛИ, А ЦЕЛЕЙ НЕТ — это ВЫХОД, а не повод стоять до срока и идти
+                // снова (Кодекс, проход 6: круг «дорога -> стою -> та же дорога» был
+                // ограничен только внутри одного захода и повторялся вечно). Область
+                // пуста — выбита или её наполняет скрипт волнами; откладываем ЭТОТ
+                // квест на десять минут, остальным дорога открыта.
+                if (self->GetExactDist2d(c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY()) <= 12.0f)
+                {
+                    c.TravelBackoff[c.TravelQuest] = 600000;
+                    Switch(c, self, Behavior::Idle, "пришёл — целей нет, отложил квест");
+                    return;
+                }
+                StepToward(c, self, c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY(),
+                    c.TravelPos.GetPositionZ(), 10.0f, dt);
+                // СРОК щедрый: до цели бывает и двести ярдов, а бежим мы шагами по 4 Гц
+                if (c.Stalled || c.ModeMs > 180000)
+                {
+                    c.TravelCooldownMs = 120000;
+                    Switch(c, self, Behavior::Idle, c.Stalled ? "до места задания не дойти" : "три минуты в пути без толку");
+                }
                 return;
             }
 
@@ -511,8 +1169,11 @@ public:
                     Switch(c, self, Behavior::Idle, "цель стала недоступной");
                     return;
                 }
-                float dist = self->GetExactDist2d(target);
-                if (dist <= 5.0f)
+                // ДОСТАЛИ ЛИ МЫ ДО ЦЕЛИ — РЕШАЕТ ЯДРО. Здесь стояло «ближе пяти ярдов
+                // по плоскости», и цель на помосте объявлялась достижимой: удар не
+                // проходил, а мы заносили её в отказные НАВСЕГДА (Кодекс, проход 4).
+                float dist = self->GetExactDist(target);
+                if (self->IsWithinMeleeRange(target))
                 {
                     if (TryAttack(c, self, target))
                         Switch(c, self, Behavior::Attacking, "дошёл и ударил");
@@ -523,7 +1184,13 @@ public:
                     }
                     return;
                 }
-                StepToward(c, self, target->GetPositionX(), target->GetPositionY(), 4.0f, dt);
+                StepToward(c, self, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(), 4.0f, dt);
+                if (c.Stalled)
+                {
+                    c.Refused.insert(c.TargetGuid);
+                    Switch(c, self, Behavior::Idle, "до цели не дойти");
+                    return;
+                }
                 if (dist < c.LastDist - 0.5f)
                 {
                     c.LastDist = dist;      // продвинулись — срок отсчитывается заново
@@ -540,29 +1207,116 @@ public:
 
             case Behavior::TurningIn:
             {
-                // идём к точке принимающего; дойдя — ищем его в двух шагах
+                // самостоятельная сдача: никуда не идём, закрываем на месте
+                if (!c.TurnInEntry)
+                {
+                    if (TurnInAt(c, self, nullptr))
+                        Switch(c, self, Behavior::Idle, "сдал сам себе");
+                    else
+                    {
+                        c.TurnInBackoff[c.TurnInQuest] = 300000;   // пять минут: такие квесты часто
+                        Switch(c, self, Behavior::Idle, "сам себе не сдаётся");
+                    }
+                    return;
+                }
+
+                // ПОРОГ БЛИЗОСТИ ПРИДУМЫВАТЬ НЕЛЬЗЯ — ЕГО ЗНАЕТ ЯДРО.
+                //
+                // Здесь стояло «ближе шести ярдов ПО ПЛОСКОСТИ — значит дошёл, ищем
+                // принимающего рядом». На боевом это дало второй мёртвый круг, и вот он
+                // в числах: три гоблина стоят в (-4979, 783, 280), Карво Бластболт — в
+                // (-4984, 780, 289). По плоскости 5.8 ярда, мой порог 6: «дошёл».
+                // В ПРОСТРАНСТВЕ 10.7, а ядру нужно 5 — INTERACTION_DISTANCE, и меряет
+                // оно в пространстве. Он стоит на помосте девятью ярдами выше. Итог:
+                // 916 кругов на спутника за семь минут и НОЛЬ сдач.
+                //
+                // Это та же ошибка, что была утром с высотой цели, только в другой
+                // мерке: своя мерка вместо мерки ядра. Поэтому теперь мы не решаем,
+                // дошли ли мы, — мы СПРАШИВАЕМ ядро (CanInteractWithQuestGiver) и идём
+                // к самому НПС, пока оно не ответит «да». Ровно так делает игрок,
+                // бегущий по метке в журнале.
+                // НАЙДЕННОГО ЗАПОМИНАЕМ. Обзор в сорок ярдов вчетверо дороже прежнего
+                // двенадцатиярдового по площади, а шёл бы он каждый такт: 122 спутника
+                // на 4 Гц — под пять сотен обходов сетки в секунду в потоке мира.
+                // Ровно та же цена, которую Кодекс посчитал за указатель спавнов, и
+                // ровно тот же ответ: искать редко, помнить найденное.
+                Creature* ender = c.TurnInGuid.IsEmpty() ? nullptr : ObjectAccessor::GetCreature(*self, c.TurnInGuid);
+                if (ender && !ender->IsAlive())
+                    ender = nullptr;
+                if (!ender)
+                {
+                    c.TurnInGuid.Clear();
+                    if (c.EnderScanMs <= diff)
+                    {
+                        c.EnderScanMs = 2000;       // не чаще раза в две секунды
+                        std::list<Creature*> near;
+                        Trinity::AnyUnitInObjectRangeCheck check(self, 40.0f);
+                        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                        Cell::VisitGridObjects(self, searcher, 40.0f);
+                        float best = 100000.0f;
+                        for (Creature* creature : near)
+                        {
+                            if (creature->GetEntry() != c.TurnInEntry || !creature->IsAlive())
+                                continue;
+                            float d3 = self->GetExactDist(creature);    // БЛИЖАЙШИЙ, а не первый попавшийся
+                            if (d3 < best)
+                                { best = d3; ender = creature; }
+                        }
+                        if (ender)
+                            c.TurnInGuid = ender->GetGUID();
+                    }
+                }
+
+                if (ender)
+                {
+                    if (self->CanInteractWithQuestGiver(ender))
+                    {
+                        if (TurnInAt(c, self, ender))
+                            Switch(c, self, Behavior::Idle, "сдал");
+                        else
+                        {
+                            // не вышло — откладываем ЭТОТ квест, а не пробуем снова
+                            // четыре раза в секунду (Кодекс, 2026-08-30)
+                            c.TurnInBackoff[c.TurnInQuest] = 60000;
+                            Switch(c, self, Behavior::Idle, "сдача не прошла, отложил");
+                        }
+                        return;
+                    }
+                    // видим, но ядро говорит «далеко» — подходим к НЕМУ САМОМУ, со
+                    // всеми тремя координатами: он может стоять выше или ниже нас, и
+                    // именно это здесь и происходит
+                    StepToward(c, self, ender->GetPositionX(), ender->GetPositionY(),
+                        ender->GetPositionZ(), 2.0f, dt);
+                    if (c.Stalled || c.ModeMs > 60000)
+                    {
+                        c.TurnInBackoff[c.TurnInQuest] = 60000;
+                        Switch(c, self, Behavior::Idle, "к принимающему не подойти вплотную");
+                    }
+                    return;
+                }
+
+                // принимающего не видно вовсе — идём к его точке из указателя спавнов
                 float d = self->GetExactDist2d(c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY());
                 if (d > 6.0f)
                 {
-                    StepToward(c, self, c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY(), 5.0f, dt);
-                    if (c.ModeMs > 60000)
-                        Switch(c, self, Behavior::Idle, "минуту не дойти до принимающего");
+                    StepToward(c, self, c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY(),
+                        c.TurnInPos.GetPositionZ(), 5.0f, dt);
+                    if (c.Stalled || c.ModeMs > 60000)
+                    {
+                        c.TurnInBackoff[c.TurnInQuest] = 60000;
+                        Switch(c, self, Behavior::Idle, "до принимающего не дойти");
+                    }
                     return;
                 }
-                std::list<Creature*> near;
-                Trinity::AnyUnitInObjectRangeCheck check(self, 12.0f);
-                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
-                Cell::VisitGridObjects(self, searcher, 12.0f);
-                for (Creature* creature : near)
-                {
-                    if (creature->GetEntry() != c.TurnInEntry || !creature->IsAlive())
-                        continue;
-                    if (!self->CanInteractWithQuestGiver(creature))
-                        continue;
-                    TurnInAt(c, self, creature);
-                    Switch(c, self, Behavior::Idle, "сдал");
-                    return;
-                }
+
+                // пришли на точку, а его там нет.
+                //
+                // ОТСРОЧКА ЗДЕСЬ И ПОТЕРЯЛАСЬ, и это моя процессная ошибка, а не
+                // логическая: я её сюда добавлял, но тем скриптом, который делал замену
+                // БЕЗ проверки совпадения, а искомая строка отличалась отступом. Замена
+                // молча не произошла, и я этого не увидел. Все позднейшие правки идут
+                // через помощник, который падает, если образец не найден.
+                c.TurnInBackoff[c.TurnInQuest] = 60000;
                 Switch(c, self, Behavior::Idle, "у точки принимающего нет");
                 return;
             }
@@ -572,20 +1326,171 @@ public:
                 Unit* victim = self->GetVictim();
                 if (!victim || !victim->IsAlive())
                 {
-                    Switch(c, self, Behavior::Idle, victim ? "цель убита" : "бой прекратился");
+                    // ПОБЕДУ СЧИТАЕТ ЯДРО, А НЕ Я.
+                    //
+                    // Прежняя ветка читала GetVictim(), который ядро обнуляет в момент
+                    // смерти цели, — победа не засчитывалась почти никогда, и ночные
+                    // выводы строились на числе, которое мерило редкую гонку.
+                    //
+                    // Первая попытка починки объявляла победой «запомненный моб мёртв или
+                    // исчез», и Кодекс её справедливо забраковал: это доказывает смерть
+                    // моба, а не НАШЕ авторство. Сто двадцать два спутника ходят по одним
+                    // стартовым зонам, поэтому чужое убийство записывалось бы нам. Теперь
+                    // берём атрибуцию у ядра: OnCreatureKill(убийца, убитый) зовётся из
+                    // Unit::Kill (Unit.cpp:11558) ровно для того, кто добил.
+                    // ДВА УСЛОВИЯ, И ОБА НУЖНЫ: счёт убийств вырос ЗА ЭТОТ БОЙ, и
+                    // последним убитым был ИМЕННО наш противник. Одного счётчика мало —
+                    // спутник мог добить кого-то ещё; одного совпадения тоже мало —
+                    // существо возрождается с тем же GUID, и старая запись о победе над
+                    // ним засчиталась бы снова (Кодекс, проход 11).
+                    Manager::Blows const k = Manager::Instance()->BlowsOf(self->GetGUID());
+                    char const* how;
+                    if (k.Kills > c.KillsAtStart && k.LastKilled == c.FightVictim)
+                        how = "ПОБЕДА";
+                    else if (victim)
+                        how = "цель мертва, но добили не мы";
+                    else
+                        how = "бой прекратился";
+                    LogFightOutcome(self, victim, how, c);
+                    Switch(c, self, Behavior::Idle, how);
                     return;
                 }
-                if (self->GetExactDist2d(victim) > 6.0f)
+                // МАНЕКЕН НЕ УМРЁТ, И ЖДАТЬ ЕГО СМЕРТИ БЕССМЫСЛЕННО.
+                //
+                // Четверо троллей висели в бою по четырнадцать раз, при ПОЛНОМ здоровье:
+                // их квест «The Basics: Hitting Things» велит бить Tiki Target, а у того
+                // unit_flags = PACIFIED|STUNNED — это тренировочный манекен. Он не
+                // отвечает и не умирает, и засчитано за наши удары не было ничего:
+                // строк прогресса в базе НОЛЬ. Ждать тут нечего — уходим через
+                // пятнадцать секунд, а не через две минуты.
+                // Первая версия помнила МИНИМУМ здоровья, и Кодекс показал, чем это
+                // плохо: после любого лечения последующий настоящий урон выше старого
+                // минимума становился невидим, и живой лечащийся моб объявлялся
+                // манекеном. Плюс отсчёт не был привязан к КОНКРЕТНОЙ жертве: смена
+                // цели под автоматом наследовала чужой отсчёт.
+                // ПЕРЕПИСЬ СОСТОЯНИЙ — ЭТО ДОЛЯ ТАКТОВ, А НЕ ЧИСЛО ОТКАЗОВ.
+                //
+                // Ядро проверяет вентиль в Player::Update, когда готов таймер замаха, и
+                // отдельно для правой и левой руки. Автомат идёт 4 Гц и берёт ОДНО
+                // состояние за такт, поэтому короткие выпадения он пропустит, а долгие
+                // переоценит (Кодекс, проход 10). Читать эти числа как «сколько времени
+                // спутник провёл в состоянии, при котором удар невозможен» — и только.
+                //
+                // ПОРЯДОК — КАК В ЯДРЕ, и уклонение считается ОТДЕЛЬНО.
+                // DoMeleeAttackIfReady проверяет: боевое состояние, рывок, чтение,
+                // жертву, дальность, сектор. Уклонение цели вычисляется ПОЗЖЕ, уже
+                // внутри броска исхода, поэтому это независимое наблюдение, а не звено
+                // той же цепочки: моб может одновременно уклоняться и быть вне
+                // досягаемости, и ядро откажет по дальности (Кодекс, проход 11).
+                ++c.GateTicks;
+                if (Creature* vc = victim->ToCreature())
+                    if (vc->IsEvadingAttacks())
+                        ++c.GateEvading;
+                if (!self->HasUnitState(UNIT_STATE_MELEE_ATTACKING))
+                    ++c.GateNoState;
+                else if (self->HasUnitState(UNIT_STATE_CHARGING) || self->HasUnitState(UNIT_STATE_CASTING))
+                    ++c.GateBusy;
+                else if (!self->IsWithinMeleeRange(victim))
+                    ++c.GateOutOfRange;
+                else if (!self->IsWithinBoundaryRadius(victim)
+                    && !self->HasInArc(2.0f * float(M_PI) / 3.0f, victim))
+                    ++c.GateBadFacing;
+
+                // СЧИТАЕМ СВОЙ УРОН, А НЕ ЗДОРОВЬЕ ЦЕЛИ.
+                //
+                // Прежний вариант обнулял отсчёт при любом падении здоровья жертвы. В
+                // общих стартовых зонах по одному мобу бьют несколько спутников, поэтому
+                // ЧУЖОЙ удар постоянно продлевал наш бессмысленный бой: за 1033 боя этот
+                // выход не сработал НИ РАЗУ, хотя 429 боёв кончились с целью ровно на
+                // 100 %. Свой урон даёт перехватчик, и он не зависит ни от чужих ударов,
+                // ни от восстановления моба при уходе домой.
+                uint64 mine = Manager::Instance()->BlowsOf(self->GetGUID()).Dealt;
+                if (c.DamageVictim != victim->GetGUID())
+                {
+                    c.DamageVictim = victim->GetGUID();
+                    c.VictimHp = mine;
+                    c.NoDamageMs = 0;
+                }
+                else if (mine > c.VictimHp)
+                {
+                    c.VictimHp = mine;
+                    c.NoDamageMs = 0;       // НАШ урон есть — считаем заново
+                }
+                else
+                    c.NoDamageMs += diff;
+                if (c.NoDamageMs > 15000)
+                {
+                    LogFightOutcome(self, victim, "бью, а следа нет", c);
+                    c.Refused.insert(victim->GetGUID());
+                    Switch(c, self, Behavior::Idle, "бью, а следа нет — не наша цель");
+                    return;
+                }
+                if (!self->IsWithinMeleeRange(victim))
                 {
                     // отошли или цель убежала — догоняем, оставаясь на той же цели
-                    StepToward(c, self, victim->GetPositionX(), victim->GetPositionY(), 4.0f, dt);
+                    StepToward(c, self, victim->GetPositionX(), victim->GetPositionY(),
+                        victim->GetPositionZ(), 4.0f, dt);
+                    // тупик в бою был единственным, который никто не разбирал: спутник
+                    // тёрся о стену до двухминутного срока (Кодекс, 2026-08-30)
+                    if (c.Stalled)
+                    {
+                        LogFightOutcome(self, victim, "до цели в бою не дойти", c);
+                        c.Refused.insert(victim->GetGUID());
+                        Switch(c, self, Behavior::Idle, "до цели в бою не дойти");
+                        return;
+                    }
+                }
+                else
+                {
+                    // ДОШЛИ: сперва останавливаемся, потом поворачиваемся к цели.
+                    // Порядок важен (Кодекс, проход 9): пока догоняем, поворот задаёт
+                    // само движение, и отдельный пакет только затирал бы состояние; а
+                    // остановка, не сделанная при входе в досягаемость, оставляла бы
+                    // «иду вперёд» висеть, пока шагов уже нет.
+                    StopMoving(c, self);
+                    FaceTarget(c, self, victim);
                 }
                 // СРОК: бой, который не кончается, — это находка, а не норма
                 if (c.ModeMs > 120000)
+                {
+                    LogFightOutcome(self, victim, "две минуты без исхода", c);
                     Switch(c, self, Behavior::Idle, "две минуты боя без исхода");
+                }
                 return;
             }
         }
+    }
+
+    // ЧЕМ КОНЧИЛСЯ БОЙ — С ИМЕНАМИ И ЧИСЛАМИ.
+    //
+    // На стенде восемь спутников в Северной Долине выигрывают 94 боя из 102. На боевом
+    // те же двоичные файлы дают 4 победы на 65 подходов, 33 смерти и 17 «двух минут без
+    // исхода» за семь минут. Значит дело не в коде боя, а в ТОМ, КОГО он выбирает, — а
+    // этого в журнале нет: переход пишет «погиб», не говоря, от кого.
+    //
+    // Проверять догадками дорого: сегодня я уже предположил, что спутники дерутся
+    // голыми руками, и замер это отверг — оружие есть у 109 из 122. Поэтому пишем факт:
+    // кто, какого уровня, против кого, какого уровня, и сколько у противника осталось
+    // здоровья. Доля оставшегося здоровья и есть ответ: 95 % значит «мы не наносим
+    // урона», 10 % — «почти выиграли и не дожали».
+    void LogFightOutcome(Player* self, Unit* victim, char const* how, Companion& c)
+    {
+        // Пишем и БЕЗ указателя на цель: ядро обнуляет жертву при её смерти, а это как
+        // раз тот случай, который надо записать. Имя и запись берём из памяти о бое.
+        Manager::Blows const b = Manager::Instance()->BlowsOf(self->GetGUID());
+        TC_LOG_INFO("server.worldserver",
+            "Constellation БОЙ {} (эфф ур {}) против {} ({}): {} — у него {}, у нас {:.0f}%; "
+            "за {} с: замахов {}, событий урона {} на {}; по нам {} на {}; "
+            "тактов {} (уклоняется {}, занят {}, не в бою {}, вне досягаемости {}, вне сектора {})",
+            self->GetName(), uint32(self->GetEffectiveLevel()),
+            c.FightVictimName.empty() ? (victim ? victim->GetName() : "?") : c.FightVictimName,
+            c.FightVictimEntry, how,
+            victim ? Trinity::StringFormat("{:.0f}%", victim->GetHealthPct()) : std::string("мёртв/исчез"),
+            self->GetHealthPct(),
+            c.ModeMs / 1000,
+            b.Swings - c.SwingsAtStart, b.Landed - c.LandedAtStart, b.Dealt - c.DealtAtStart,
+            b.Hits - c.HitsAtStart, b.Taken - c.TakenAtStart,
+            c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing);
     }
 
     // Переход — ЕДИНСТВЕННОЕ место, где пишется строка. Потактовая запись однажды
@@ -596,8 +1501,18 @@ public:
             return;
         TC_LOG_INFO("server.worldserver", "Constellation FSM {}: {} -> {} ({})",
             self->GetName(), ModeName(c.Mode), ModeName(to), why);
+        if (Player* me = c.Session ? c.Session->GetPlayer() : nullptr)
+            StopMoving(c, me);          // сменили намерение — ноги остановились
         c.Mode = to;
         c.ModeMs = 0;
+        if (to != Behavior::TurningIn)
+            c.TurnInGuid.Clear();       // другое намерение — найденный принимающий не наш
+        if (to != Behavior::Attacking)
+            { c.VictimHp = 0; c.NoDamageMs = 0; c.DamageVictim.Clear(); }
+        c.Stalled = false;              // новое намерение — новая попытка дойти
+        c.StuckMs = 0;
+        c.UnstickTries = 0;
+        c.UnstickTotal = 0;
         if (to != Behavior::ApproachingTarget && to != Behavior::Attacking)
             c.TargetGuid.Clear();
         ++_transitions;
@@ -611,6 +1526,8 @@ public:
             case Behavior::FollowingOwner:    return "иду за хозяином";
             case Behavior::ApproachingTarget: return "иду к цели";
             case Behavior::Attacking:         return "бью";
+            case Behavior::Recovering:        return "перевожу дух";
+            case Behavior::Travelling:        return "иду к месту задания";
             case Behavior::TurningIn:         return "сдаю квест";
         }
         return "?";
@@ -641,6 +1558,7 @@ public:
         sel.Selection = target->GetGUID();
         c.Session->HandleSetSelectionOpcode(sel);
 
+        FaceTarget(c, self, target);        // иначе ядро ответит BadFacing и не ударит
         WorldPacket rawSwing(CMSG_ATTACK_SWING);
         WorldPackets::Combat::AttackSwing swing(std::move(rawSwing));
         swing.Victim = target->GetGUID();
@@ -650,6 +1568,40 @@ public:
         if (self->GetVictim() == target)
         {
             ++_fightsStarted;
+            // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою.
+            // Register заводит запись, если её ещё нет; обработчики урона делают только
+            // find(), поэтому персонажи оператора в счёт не попадают.
+            Manager::Blows const b = Manager::Instance()->RegisterAndSnapshot(self->GetGUID());
+            c.SwingsAtStart = b.Swings;
+            c.LandedAtStart = b.Landed;
+            c.DealtAtStart  = b.Dealt;
+            c.HitsAtStart   = b.Hits;
+            c.TakenAtStart  = b.Taken;
+            c.KillsAtStart  = b.Kills;
+            c.GateTicks = c.GateEvading = c.GateBusy = 0;
+            c.GateNoState = c.GateOutOfRange = c.GateBadFacing = 0;
+            c.FightVictim = target->GetGUID();
+            c.FightVictimName = target->GetName();
+            c.FightVictimEntry = target->GetEntry();
+            // ХАРАКТЕРИСТИКА ЦЕЛИ В МОМЕНТ НАЧАЛА БОЯ. Исход пишется не всегда (ядро
+            // очищает жертву при её смерти, и ветка победы почти не срабатывает), а
+            // начало — всегда. Без этого нельзя сравнить того, кого спутники бьют, с
+            // тем, от кого гибнут: по базе у них одна настройка содержимого и один
+            // множитель здоровья, а в мире — разное.
+            if (c.FightsLogged < 3)
+            {
+                ++c.FightsLogged;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation БОЙ-НАЧАЛО {} (ур {}/эфф {}, жизни {}) -> {} ({}): сырой ур {}, ДЛЯ НАС ур {}, "
+                    "жизней сырых {} / для нас {:.0f}, его урон x{:.2f}, его броня x{:.2f}",
+                    self->GetName(), uint32(self->GetLevel()), uint32(self->GetEffectiveLevel()), self->GetMaxHealth(),
+                    target->GetName(), target->GetEntry(),
+                    uint32(target->GetLevel()), uint32(target->GetLevelForTarget(self)),
+                    target->GetMaxHealth(),
+                    float(target->GetMaxHealth()) * target->GetHealthMultiplierForTarget(self),
+                    target->GetDamageMultiplierForTarget(self),
+                    target->GetArmorMultiplierForTarget(self));
+            }
             return true;
         }
         TC_LOG_INFO("server.worldserver", "Constellation: {} — удар по {} ({}) не принят: жертва {}, дистанция {:.1f}",
@@ -672,7 +1624,7 @@ public:
     // порядке. Пакет упал в пустой сокет, но меню осталось.
     void QuestTick(Companion& c, uint32 diff)
     {
-        if (!Cfg().Quests || c.State != Stage::InWorld || !c.Session)
+        if (!Cfg().Quests || !Cfg().TakeQuests || c.State != Stage::InWorld || !c.Session)
             return;
         Player* self = c.Session->GetPlayer();
         if (!self || !self->IsInWorld() || !self->IsAlive())
@@ -744,14 +1696,14 @@ public:
     }
     // КОМУ СДАВАТЬ И ГДЕ ОН СТОИТ.
     //
-    // Оператор, 2026-08-30: «у квестодателей и принимающих есть конкретные точки,
-    // их не надо искать, а идти к ним». Так и есть, и так делает игрок: журнал
-    // показывает ему, куда вернуться, а не заставляет обшаривать местность.
+    // Оператор: «у квестодателей и принимающих есть конкретные точки, их не надо
+    // искать, а идти к ним». Так и делает игрок: журнал показывает метку возврата.
     //
-    // Прежняя версия искала принимающего вокруг — сперва в 30 ярдах, потом в 120, —
-    // и не находила: спутник уходит за добычей, а принимающий остаётся у себя.
-    // Теперь берём его ТОЧКУ: квест -> кто принимает -> где он стоит. Всё это ядро
-    // и так отдаёт клиенту, рисуя метку возврата.
+    // ЦЕНА. Первая версия перебирала ВСЕ спавны мира — и делала это каждый такт у
+    // каждого стоящего спутника. Кодекс посчитал: 122 спутника на 4 Гц дают 488
+    // полных обходов мира в СЕКУНДУ, в потоке обновления мира. На стенде с восемью
+    // ботами это не проявилось никак. Теперь указатель строится ОДИН РАЗ при
+    // загрузке, а поиск идёт только по нужному виду на нашей карте.
     bool FindTurnIn(Companion& c, Player* self) const
     {
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
@@ -759,26 +1711,54 @@ public:
             uint32 qid = self->GetQuestSlotQuestId(slot);
             if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
                 continue;
+            if (c.TurnInBackoff.count(qid))      // недавно не вышло — не долбимся
+                continue;
+            if (c.Impossible.count(qid))         // закрыть нечем — и не станет
+                continue;
             Quest const* quest = sObjectMgr->GetQuestTemplate(qid);
             if (!quest || !self->CanRewardQuest(quest, false))
                 continue;
 
-            // кто принимает этот квест
+            // САМОСТОЯТЕЛЬНАЯ СДАЧА — ПО ФЛАГУ ЯДРА, А НЕ ПО ОТСУТСТВИЮ ПРИНИМАЮЩЕГО.
+            //
+            // Повод: оператор увидел двух эльфов второго уровня, стоящих на месте, — в
+            // живом журнале 4007 попыток сдать квест 55660 «Time Trials», у которого нет
+            // строки в creature_questender.
+            //
+            // Первая версия объявила самосдаваемым ЛЮБОЙ квест без принимающего-НПС. Это
+            // была догадка, и Кодекс её снёс, а замер по базе подтвердил его правоту:
+            // без принимающего и без флага — 19 868 квестов, а настоящих самосдаваемых —
+            // 4 733. Ошибка вчетверо, и не в безопасную сторону.
+            //
+            // Разрешение выдаёт САМО ЯДРО, и одной строкой: HandleQuestgiverCompleteQuest
+            // пропускает режим самосдачи только при QUEST_FLAGS_AUTO_COMPLETE, иначе
+            // требует, чтобы объект ЧИСЛИЛСЯ принимающим, — а объект в этом режиме сам
+            // игрок. Спрашиваем ровно этот флаг. У 55660 его, к слову, нет.
+            if (quest->HasFlag(QUEST_FLAGS_AUTO_COMPLETE))
+            {
+                c.TurnInQuest = qid;
+                c.TurnInEntry = 0;              // 0 = сдать самому себе, никуда не идти
+                c.TurnInPos = self->GetPosition();
+                return true;
+            }
+
+            bool anyEnder = false;
             for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
             {
-                // ближайшая его точка на нашей карте
+                anyEnder = true;            // принимающий В МИРЕ есть — приговора не будет
+                auto mapIt = _spawns.find(self->GetMapId());
+                if (mapIt == _spawns.end())
+                    continue;
+                auto entryIt = mapIt->second.find(enderEntry);
+                if (entryIt == mapIt->second.end())
+                    continue;
                 Position const* bestSpawn = nullptr;
                 float bestDist = 100000.0f;
-                for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                for (Position const& pos : entryIt->second)
                 {
-                    if (data.id != enderEntry || data.mapId != self->GetMapId())
-                        continue;
-                    float d = self->GetExactDist2d(data.spawnPoint.GetPositionX(), data.spawnPoint.GetPositionY());
+                    float d = self->GetExactDist2d(pos.GetPositionX(), pos.GetPositionY());
                     if (d < bestDist)
-                    {
-                        bestDist = d;
-                        bestSpawn = &data.spawnPoint;
-                    }
+                        { bestDist = d; bestSpawn = &pos; }
                 }
                 if (!bestSpawn)
                     continue;
@@ -787,35 +1767,81 @@ public:
                 c.TurnInPos = *bestSpawn;
                 return true;
             }
+
+            // ПРИГОВОР — ТОЛЬКО ЗА УСТРОЙСТВО КВЕСТА, А НЕ ЗА ТО, ГДЕ МЫ СТОИМ.
+            //
+            // Кодекс остановил этим выкладку, и правильно: поиск точки идёт по ТЕКУЩЕЙ
+            // карте спутника, а первая редакция приговаривала квест, если точки на ней
+            // не нашлось. То есть принимающий на другой карте означал «никогда» — и
+            // спутник, доехавший туда позже, сдать бы уже не смог. Регрессию внёс я,
+            // вместе с самой пометкой, часом раньше.
+            //
+            // Навсегда помечаем ровно тот случай, который и наблюдался: принимающего нет
+            // НИ СРЕДИ СУЩЕСТВ, НИ СРЕДИ ОБЪЕКТОВ, и флага самосдачи тоже нет. По замеру
+            // базы это 19 868 квестов — их закрывают сценарии и события, которые модулю
+            // изображать незачем. Всё остальное просто ждёт: FindTurnIn вернёт false,
+            // спутник займётся делом и попробует снова, когда окажется где надо.
+            //
+            // lazy: 970 квестов принимает ИГРОВОЙ ОБЪЕКТ — они сюда НЕ попадают (проверяем
+            // и эту таблицу), но и сдать их модуль пока не умеет. Задача 0020.
+            if (!anyEnder && sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).begin()
+                             == sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).end())
+            {
+                if (c.Impossible.insert(qid).second)
+                    TC_LOG_INFO("server.worldserver", "Constellation: {} — квест {} '{}' закрыть нечем: ни принимающего, ни флага самосдачи",
+                        self->GetName(), qid, quest->GetLogTitle());
+            }
         }
         return false;
+    }
+
+    // Указатель «карта -> вид -> где стоит», построенный один раз.
+    void BuildSpawnIndex()
+    {
+        uint32 n = 0;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+        {
+            _spawns[data.mapId][data.id].push_back(data.spawnPoint);
+            ++n;
+        }
+        TC_LOG_INFO("server.loading", "Constellation: указатель спавнов — {} точек на {} картах",
+            n, uint32(_spawns.size()));
     }
 
     // Сдача: поздороваться, сдать, выбрать награду — теми же опкодами, что клиент.
     // Правда берётся из СОСТОЯНИЯ: сокета нет, ответа не будет, поэтому после сдачи
     // спрашиваем, числится ли квест награждённым.
-    void TurnInAt(Companion& c, Player* self, Creature* ender)
+    // ender == nullptr означает самостоятельную сдачу: ядро в этом режиме берёт
+    // самого игрока как «объект», и здороваться не с кем.
+    bool TurnInAt(Companion& c, Player* self, Creature* ender)
     {
-        WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
-        WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
-        hello.QuestGiverGUID = ender->GetGUID();
-        c.Session->HandleQuestgiverHelloOpcode(hello);
+        if (ender)
+        {
+            WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
+            WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
+            hello.QuestGiverGUID = ender->GetGUID();
+            c.Session->HandleQuestgiverHelloOpcode(hello);
+        }
 
         Quest const* quest = sObjectMgr->GetQuestTemplate(c.TurnInQuest);
         if (!quest || self->GetQuestStatus(c.TurnInQuest) != QUEST_STATUS_COMPLETE)
-            return;
+            return false;
 
         WorldPacket rawDone(CMSG_QUEST_GIVER_COMPLETE_QUEST);
         WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(rawDone));
-        done.QuestGiverGUID = ender->GetGUID();
+        done.QuestGiverGUID = ender ? ender->GetGUID() : self->GetGUID();
         done.QuestID = c.TurnInQuest;
+        done.FromScript = (ender == nullptr);
         c.Session->HandleQuestgiverCompleteQuest(done);
 
         WorldPacket rawPick(CMSG_QUEST_GIVER_CHOOSE_REWARD);
         WorldPackets::Quest::QuestGiverChooseReward pick(std::move(rawPick));
-        pick.QuestGiverGUID = ender->GetGUID();
+        pick.QuestGiverGUID = ender ? ender->GetGUID() : self->GetGUID();
         pick.QuestID = c.TurnInQuest;
-        pick.Choice.Item.ItemID = 0;
+        // если квест предлагает выбор, берём ПЕРВУЮ настоящую награду, а не ноль:
+        // с нулём ядро откажет, и спутник вернётся сюда через секунду (Кодекс)
+        pick.Choice.Item.ItemID = quest->GetRewChoiceItemsCount() > 0 ? quest->RewardChoiceItemId[0] : 0;
+        pick.Choice.LootItemType = LootItemType::Item;
         c.Session->HandleQuestgiverChooseRewardOpcode(pick);
 
         if (self->IsQuestRewarded(c.TurnInQuest))
@@ -823,28 +1849,29 @@ public:
             TC_LOG_INFO("server.worldserver", "Constellation: {} сдал квест {} '{}' (уровень {})",
                 self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()));
             ++_questsTurnedIn;
+            return true;
         }
-        else
-            TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла",
-                self->GetName(), c.TurnInQuest);
+        TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла ({})",
+            self->GetName(), c.TurnInQuest, ender ? "у принимающего" : "самому себе");
+        return false;
     }
 
     // Существо рядом, которое ЧИСЛИТСЯ ЦЕЛЬЮ незакрытого квеста в журнале.
     // Что именно убивать и сколько — знает ядро из quest_objectives; спрашиваем его.
-    Creature* FindObjectiveTarget(Companion const& c, Player* self) const
+    // ЧТО НАМ ВООБЩЕ НУЖНО УБИТЬ. Вынесено отдельно, потому что этим пользуются двое:
+    // поиск цели ВОКРУГ и — с 2026-08-30 — поиск МЕСТА, куда за целью идти.
+    void WantedEntries(Player* self, std::set<uint32>& wanted, uint32* slotsUsed = nullptr,
+        uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr) const
     {
-        // какие виды существ нам вообще нужны
-        std::set<uint32> wanted;
-        uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
             uint32 questId = self->GetQuestSlotQuestId(slot);
             if (!questId)
                 continue;
-            ++slotsUsed;
+            if (slotsUsed) ++*slotsUsed;
             if (self->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
                 continue;
-            ++incomplete;
+            if (incomplete) ++*incomplete;
             Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
             if (!quest)
                 continue;
@@ -852,13 +1879,232 @@ public:
             {
                 if (obj.Type != QUEST_OBJECTIVE_MONSTER || obj.ObjectID <= 0)
                     continue;
-                ++monsterObjs;
+                if (monsterObjs) ++*monsterObjs;
                 if (self->GetQuestObjectiveData(obj) >= obj.Amount)
                     continue;                       // эта цель уже набрана
-                ++unmet;
+                if (unmet) ++*unmet;
                 wanted.insert(uint32(obj.ObjectID));
             }
         }
+    }
+
+    // ПЕРЕВЕСТИ ДУХ, ПРЕЖДЕ ЧЕМ ЛЕЗТЬ В СЛЕДУЮЩУЮ ДРАКУ.
+    //
+    // Замер на боевом через пять минут после заливки: 122 спутника, 132 найденных цели,
+    // 127 ударов — и ТРИДЦАТЬ смертей, шесть в минуту. Причём сосредоточенных: Эмрик 6,
+    // Аделина 6, Деверел 5 — тканевые классы первого-второго уровня. Модуль умеет только
+    // рукопашную автоатаку, поэтому маг, бьющий волка посохом, обречён; настоящее
+    // лечение этому — дальний бой, задача 0007. Но круг «умер -> воскрес -> вернулся ->
+    // умер» ломается и малым: не начинать драку, пока не отдышался.
+    //
+    // Оператор ставил эту фазу в конец, считая, что «негде умирать да и не от кого». Это
+    // было верно, пока спутники СТОЯЛИ. Замер после того, как они пошли, говорит иначе,
+    // и я иду за замером — с отметкой для утренней проверки.
+    //
+    // Мана — только тем, у кого она ДЕЙСТВУЮЩИЙ вид силы (Кодекс: GetPower(MANA)==0 у
+    // воина ничего не значит и запарковало бы его навсегда).
+    bool NeedsRest(Player* self) const
+    {
+        if (self->IsInCombat())
+            return false;               // в бою не отдыхают
+        if (self->GetHealthPct() < Cfg().RestBelowPct)
+            return true;
+        return self->GetPowerType() == POWER_MANA
+            && self->GetPowerPct(POWER_MANA) < Cfg().RestBelowPct;
+    }
+
+    bool RestedEnough(Player* self) const
+    {
+        if (self->GetHealthPct() < Cfg().ResumeAbovePct)
+            return false;
+        return self->GetPowerType() != POWER_MANA
+            || self->GetPowerPct(POWER_MANA) >= Cfg().ResumeAbovePct;
+    }
+
+    // КУДА ИДТИ ЗА ЦЕЛЬЮ — ПО ТОЧКАМ ИНТЕРЕСА КВЕСТА, КАК ИГРОК ПО МЕТКЕ.
+    //
+    // Оператор, 2026-08-30, отклоняя предел в четыреста ярдов: «у нас есть точные
+    // места и ареалы куда и зачем ходить». Есть: quest_poi_points — те самые области,
+    // которые игра рисует игроку на карте; ядро грузит их целиком и отдаёт клиенту.
+    // Это закрывает и дворфов, чьих Захватчиков призывает СКРИПТ и статичных спавнов
+    // у них нет вовсе, — а область квеста по устройству соразмерна его уровню, что
+    // снимает и опасение Кодекса про уход малышей в чужие зоны (задача 0017).
+    //
+    // Контракт добыт из исходников ядра тремя читателями и сверщиком (2026-08-30;
+    // сверщик, к слову, поймал двоих на выдуманных числах — цена перепроверки видна):
+    //   * блоб цели отличается от маркеров сдачи/приёма признаком QuestObjectiveID != 0;
+    //     сопоставление — сперва по ID цели, запасное — по StorageIndex;
+    //   * координаты точек — МИРОВЫЕ на карте MapID; транспортные карты — мимо;
+    //   * ВЫСОТЕ POI НЕ ВЕРИТЬ НИКОГДА: единственный её потребитель в ядре (.go quest)
+    //     сам её выбрасывает и берёт землю (cs_go.cpp:293); 709 из 4473 точек несут
+    //     ноль, а ноль против настоящих 383 не попадает даже в 50-ярдовое окно поиска
+    //     полигона — маршрут молча выродится в прямую. Землю ищем от MAX_HEIGHT;
+    //   * NavigationPlayerConditionID и PlayerConditionID обязательны к проверке,
+    //     Flags/SpawnTrackingID/UiMapID ядро само не читает — игнорируем;
+    //   * указатель GetQuestPOIData НЕ ДЕРЖАТЬ между тактами: .reload quest_poi чистит
+    //     хранилище без всякой синхронизации. Каждый раз спрашиваем заново — это один
+    //     шаг по хеш-таблице, уже целиком сидящей в памяти.
+    bool BlobDestination(Player* self, QuestPOIBlobData const& blob, Position* out) const
+    {
+        float x, y;
+        if (blob.Points.size() == 1)
+        {
+            x = float(blob.Points[0].X);
+            y = float(blob.Points[0].Y);
+        }
+        else
+        {
+            // 3..12 вершин — замкнутый контур области
+            std::vector<Position> verts;
+            verts.reserve(blob.Points.size());
+            float sx = 0.0f, sy = 0.0f;
+            for (QuestPOIBlobPoint const& pt : blob.Points)
+            {
+                verts.emplace_back(float(pt.X), float(pt.Y), 0.0f);
+                sx += float(pt.X);
+                sy += float(pt.Y);
+            }
+            x = sx / float(blob.Points.size());
+            y = sy / float(blob.Points.size());
+            if (!Position(x, y, 0.0f).IsInPolygon2D(Position(0.0f, 0.0f, 0.0f), verts))
+            {
+                // контур вогнутый и середина снаружи — идём к ближайшей вершине
+                float best = 100000.0f;
+                for (Position const& v : verts)
+                {
+                    float d = self->GetExactDist2d(v.GetPositionX(), v.GetPositionY());
+                    if (d < best)
+                        { best = d; x = v.GetPositionX(); y = v.GetPositionY(); }
+                }
+            }
+        }
+        if (!MapManager::IsValidMapCoord(self->GetMapId(), x, y))
+            return false;
+        float z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y, MAX_HEIGHT);
+        if (z <= INVALID_HEIGHT)
+            return false;
+        out->Relocate(x, y, z);
+        return true;
+    }
+
+    // Запасной путь для квестов без точек: ближайший спавн из указателя. Прежний
+    // предел дальности остаётся ТОЛЬКО здесь — этот путь, в отличие от точек квеста,
+    // ничем не привязан к его области.
+    bool SpawnDestination(Player* self, uint32 entry, Position* out) const
+    {
+        auto mapIt = _spawns.find(self->GetMapId());
+        if (mapIt == _spawns.end())
+            return false;
+        auto entryIt = mapIt->second.find(entry);
+        if (entryIt == mapIt->second.end())
+            return false;
+        Position const* best = nullptr;
+        float bestDist = 100000.0f;
+        for (Position const& pos : entryIt->second)
+        {
+            float d = self->GetExactDist2d(pos.GetPositionX(), pos.GetPositionY());
+            if (d < bestDist)
+                { bestDist = d; best = &pos; }
+        }
+        if (!best || bestDist > 400.0f)
+            return false;
+        *out = *best;
+        return true;
+    }
+
+    bool FindObjectiveSpot(Companion& c, Player* self) const
+    {
+        Position best;
+        float bestDist = 100000.0f;
+        bool found = false;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 questId = self->GetQuestSlotQuestId(slot);
+            if (!questId || self->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            if (c.TravelBackoff.count(questId))
+                continue;                   // недавно сходили впустую — не повторяем
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            QuestPOIData const* poi = sObjectMgr->GetQuestPOIData(int32(questId));
+            for (QuestObjective const& obj : quest->GetObjectives())
+            {
+                if (obj.Type != QUEST_OBJECTIVE_MONSTER || obj.ObjectID <= 0)
+                    continue;
+                if (self->GetQuestObjectiveData(obj) >= obj.Amount)
+                    continue;
+
+                Position dest;
+                bool got = false;
+                if (poi)
+                {
+                    // Кодекс, проход 6: (1) негодный лучший блоб раньше уводил на
+                    // запасной путь, не дав шанса ОСТАЛЬНЫМ кандидатам — теперь точка
+                    // проверяется у каждого, и выбирается лучший из ГОДНЫХ; (2) ряд
+                    // сравнения полный, по контракту: приоритет, ближе к нам, меньший
+                    // BlobIndex.
+                    int32 bestPrio = 0, bestBlob = 0;
+                    float bestD = 0.0f;
+                    for (int pass = 0; pass < 2 && !got; ++pass)
+                        for (QuestPOIBlobData const& b : poi->Blobs)
+                        {
+                            if (b.Points.empty() || !b.QuestObjectiveID)
+                                continue;               // пустые и маркеры сдачи — мимо
+                            if (b.MapID != int32(self->GetMapId()) || sObjectMgr->IsTransportMap(uint32(b.MapID)))
+                                continue;
+                            if (b.NavigationPlayerConditionID
+                                && !ConditionMgr::IsPlayerMeetingCondition(self, uint32(b.NavigationPlayerConditionID)))
+                                continue;
+                            if (b.PlayerConditionID
+                                && !ConditionMgr::IsPlayerMeetingCondition(self, uint32(b.PlayerConditionID)))
+                                continue;
+                            bool match = (pass == 0)
+                                ? (b.QuestObjectiveID == int32(obj.ID))
+                                : (b.ObjectiveIndex == int32(obj.StorageIndex));
+                            if (!match)
+                                continue;
+                            Position cand;
+                            if (!BlobDestination(self, b, &cand))
+                                continue;               // негодная точка — следующий кандидат
+                            float dd = self->GetExactDist2d(cand.GetPositionX(), cand.GetPositionY());
+                            bool better = !got
+                                || b.Priority > bestPrio
+                                || (b.Priority == bestPrio && dd < bestD - 0.5f)
+                                || (b.Priority == bestPrio && std::fabs(dd - bestD) <= 0.5f
+                                    && b.BlobIndex < bestBlob);
+                            if (better)
+                            {
+                                got = true;
+                                dest = cand;
+                                bestPrio = b.Priority;
+                                bestD = dd;
+                                bestBlob = b.BlobIndex;
+                            }
+                        }
+                }
+                if (!got)
+                    got = SpawnDestination(self, uint32(obj.ObjectID), &dest);
+                if (!got)
+                    continue;
+                float d = self->GetExactDist2d(dest.GetPositionX(), dest.GetPositionY());
+                if (d < bestDist)
+                    { bestDist = d; best = dest; found = true; c.TravelQuest = questId; }
+            }
+        }
+        // ближе FightRange идти незачем: там цель и так увидит обычный поиск
+        if (!found || bestDist < Cfg().FightRange)
+            return false;
+        c.TravelPos = best;
+        return true;
+    }
+
+    Creature* FindObjectiveTarget(Companion const& c, Player* self) const
+    {
+        // какие виды существ нам вообще нужны
+        std::set<uint32> wanted;
+        uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
+        WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet);
         if (!_fightDiagDone && slotsUsed)
         {
             _fightDiagDone = true;
@@ -1022,6 +2268,58 @@ public:
     }
 
     // ровно тот пакет, что шлёт клиент; ядро само решит, принять его или нет
+    // ПОВЕРНУТЬСЯ К ЦЕЛИ — БЕЗ ЭТОГО ЯДРО НЕ ДАЁТ УДАРИТЬ.
+    //
+    // Замер на боевом за десять минут: 896 начатых боёв, ДВЕНАДЦАТЬ побед, 455 смертей,
+    // 421 «две минуты без исхода». Противники при этом — первого-второго уровня с 27-51
+    // единицей здоровья ДЛЯ НАС, а у спутника 148. Проигрывать такому в 98.6 % случаев
+    // невозможно, если бьёшь. Значит не бьёт.
+    //
+    // Ответ нашёлся там, где и положено, — в ядре. Unit::UpdateMeleeAttackingState
+    // требует ДВУХ условий, а не одного:
+    //     if (!IsWithinMeleeRange(victim))                  -> NotInRange
+    //     if (!IsWithinBoundaryRadius(victim) && !HasInArc(2*PI/3, victim)) -> BadFacing
+    // Дальность я держал, а ПОВОРОТ не задавал никогда. Пока спутник идёт, он смотрит по
+    // ходу движения; дойдя, шлёт пакет остановки со СТАРОЙ ориентацией. Если она мимо
+    // цели — каждый замах отвергается, таймер переставляется на 100 мс, и так до самой
+    // смерти. Ноль урона.
+    //
+    // Отсюда же и разница со стендом, которая сбивала меня всю ночь: там цели далеко,
+    // спутник ИДЁТ к ним и в конце пути смотрит на цель — 94 победы из 102. На боевом
+    // мобы подходят сами, спутник бьёт не сойдя с места и глядя в сторону.
+    //
+    // Поворот шлём тем же опкодом, что и клиент: CMSG_MOVE_SET_FACING через тот же
+    // HandleMovementOpcode. Нулевой инвариант цел.
+    void FaceTarget(Companion& c, Player* self, Unit* target)
+    {
+        if (!target)
+            return;
+
+        // УГОЛ СЧИТАЕМ ЗНАКОВЫЙ, А НЕ ЧЕРЕЗ НОРМАЛИЗАЦИЮ В [0, 2PI).
+        // Кодекс, проход 9: NormalizeOrientation превращает -0.01 в 6.27, и модуль
+        // считал бы «повёрнут неверно» при отклонении в полградуса — с одной стороны
+        // цели пакеты шли бы без конца, с другой не шли бы вовсе.
+        float ang = self->GetAbsoluteAngle(target);
+        float diff = ang - self->GetOrientation();
+        while (diff > float(M_PI))  diff -= 2.0f * float(M_PI);
+        while (diff < -float(M_PI)) diff += 2.0f * float(M_PI);
+        if (std::fabs(diff) < 0.05f)
+            return;                         // уже смотрим куда надо — не сорим пакетами
+
+        // СОСТОЯНИЕ ДВИЖЕНИЯ СОХРАНЯЕМ ЦЕЛИКОМ.
+        // Обработчик не правит ориентацию, а ЗАМЕЩАЕТ весь m_movementInfo присланным
+        // (MovementHandler.cpp:356). Мой «c.Moving ? FORWARD : 0» стирал бы флаги,
+        // дополнительные флаги, транспорт, падение, прыжок и тангаж. Берём нынешнее
+        // состояние игрока и меняем в нём только положение, поворот и время.
+        MovementInfo mi = self->m_movementInfo;
+        mi.guid = self->GetGUID();
+        Position pos = self->GetPosition();
+        pos.SetOrientation(ang);
+        mi.pos.Relocate(pos);
+        mi.time = GameTime::GetGameTimeMS();
+        c.Session->HandleMovementOpcode(CMSG_MOVE_SET_FACING, mi);
+    }
+
     void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
     {
         MovementInfo mi;
@@ -1090,6 +2388,7 @@ public:
             if (who != "all" && !off && who != c.Entry->Name)
                 continue;
             c.Owner = off ? ObjectGuid::Empty : (master ? master->GetGUID() : ObjectGuid::Empty);
+            c.OwnerFromGroup = false;   // назначено командой — группой не отменяется
             ++n;
         }
         if (off)
@@ -1168,6 +2467,7 @@ private:
             }
             _companions.push_back(c);
         }
+        BuildSpawnIndex();
         TC_LOG_INFO("server.loading", "Constellation: bootstrap - roster {}, one account each", uint32(_companions.size()));
         if (_companions.size() != Roster.size())
             TC_LOG_ERROR("server.loading", "Constellation: ONLY {} of {} companions provisioned - the roster is short",
@@ -1343,6 +2643,19 @@ private:
                 // enum callback needs a few ticks; then declare the login
                 if (c.TicksInState < 3)
                     return false;
+                // СЧЁТЧИК ЗАВОДИМ ДО ВХОДА, А НЕ ПОСЛЕ.
+                //
+                // Раньше запись создавалась в первом бою, потом — в BehaveTick, и оба
+                // раза поздно: BehaveTick работает только при Stage::InWorld, а это
+                // состояние выставляет AdvanceOne, который в обходе идёт ПОСЛЕ него.
+                // То есть спутник жил в мире минимум такт без записи, и любой удар с
+                // потока карты в это окно обработчики молча выбрасывали — терялось
+                // ровно то, ради чего прибор ставится (Кодекс, проход 13).
+                //
+                // Здесь GUID уже известен, а объекта игрока на карте ещё нет: раньше
+                // этой точки урона по нему быть не может.
+                Manager::Instance()->RegisterAndSnapshot(c.Guid);
+
                 WorldPacket raw(CMSG_PLAYER_LOGIN);
                 WorldPackets::Character::PlayerLogin login(std::move(raw));
                 login.Guid = c.Guid;
@@ -1426,6 +2739,27 @@ private:
                 // и это занимает считаные такты.
                 //
                 // Нулевой инвариант остаётся без единой прорехи.
+                // ХОЗЯИН ДЕРЖИТСЯ НА ГРУППЕ, А НЕ НА ПАМЯТИ.
+                //
+                // Оператор, 2026-08-30: «взял в группу, она пошла за мной. я ее выгнал
+                // из группы — она продолжает следовать за мной». Так и было: проверка
+                // ниже срабатывала, только пока спутник СОСТОИТ в группе, а выгнанный
+                // не состоит нигде — и хозяин, записанный при приглашении, оставался
+                // навсегда. Группа и есть поводок: нет общей группы — нет хозяина.
+                // Одной проверкой покрыты сразу выгнали, распустили и хозяин вышел сам.
+                if (c.OwnerFromGroup && !c.Owner.IsEmpty())
+                {
+                    Group* mine = player->GetGroup();
+                    Player* owner = ObjectAccessor::FindConnectedPlayer(c.Owner);
+                    if (!mine || !owner || owner->GetGroup() != mine)
+                    {
+                        TC_LOG_INFO("server.worldserver", "Constellation: {} больше не в группе с хозяином — перестаю следовать",
+                            player->GetName());
+                        c.Owner.Clear();
+                        c.OwnerFromGroup = false;
+                    }
+                }
+
                 if (Group* grp = player->GetGroup())
                 {
                     bool humanInside = false;
@@ -1444,6 +2778,7 @@ private:
                         TC_LOG_INFO("server.worldserver", "Constellation: {} вышел из группы — человека в ней нет",
                             player->GetName());
                         c.Owner.Clear();
+                        c.OwnerFromGroup = false;
                         return false;
                     }
                 }
@@ -1463,6 +2798,7 @@ private:
                         || IsCompanionAccount(inviter->GetSession()->GetAccountId()))
                         return false;               // не человек — не принимаем
                     c.Owner = inviter->GetGUID();
+                    c.OwnerFromGroup = true;    // поводок — группа; порвётся вместе с ней
                     WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
                     WorldPackets::Party::PartyInviteResponse response(std::move(raw));
                     response.Accept = true;
@@ -1614,6 +2950,8 @@ private:
     }
 
     std::vector<Companion> _companions;
+    std::mutex _blowsLock;                                  // см. Blows: шесть потоков карт
+    std::unordered_map<ObjectGuid, Manager::Blows> _blows;  // счёт ударов, по GUID спутника
     bool _debugPairDone = false;
     uint32 _questsTaken = 0;
     uint32 _fightsStarted = 0;
@@ -1622,7 +2960,10 @@ private:
     mutable bool _fightDiagDone = false;
     mutable bool _rejDiagDone = false;
     mutable bool _whyDone = false;
-    bool _stepDiagDone = false;
+    uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
+    uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
+    uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
+    std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
@@ -1659,6 +3000,51 @@ public:
     void OnShutdown() override
     {
         Constellation::Manager::Instance()->Shutdown();
+    }
+};
+
+// ГДЕ УРОН И ЗАМАХИ СЧИТАЮТСЯ, И ЧТО ИМЕННО ЭТИ ЧИСЛА ЗНАЧАТ.
+//
+// ModifyMeleeDamage зовётся из Unit::CalculateMeleeDamage (Unit.cpp:1377) ДО броска
+// исхода (Unit.cpp:1388), поэтому считает и промах, и уклонение, и EVADE. Единственный
+// вызов CalculateMeleeDamage во всём ядре — внутри Unit::AttackerStateUpdate
+// (Unit.cpp:2300), а тот зовётся только для правой руки, левой руки и дополнительного
+// удара. Но «каждый замах» сказать всё же нельзя, и это нашёл Кодекс в проходе 12,
+// прямо в доказательстве, которое я ему принёс: внутри AttackerStateUpdate вызов стоит
+// под условием отсутствия meleeAttackSpellId — автоудар, подменённый заклинанием, этот
+// путь минует. У наших спутников такой подмены нет, но число называть безусловным
+// нельзя.
+//
+// OnDamage зовётся из Unit::DealDamage на ЛЮБОЙ наш урон, а не только на дошедший
+// автоудар. Поэтому разницу «замахи минус события урона» НЕЛЬЗЯ читать как промахи —
+// сегодня у спутников просто нет другого источника урона, и это единственная причина,
+// по которой числа сопоставимы.
+class constellation_unitscript : public UnitScript
+{
+public:
+    constellation_unitscript() : UnitScript("constellation_unitscript") { }
+
+    void ModifyMeleeDamage(Unit* /*target*/, Unit* attacker, uint32& /*damage*/) override
+    {
+        Constellation::Manager::Instance()->NoteSwing(attacker);
+    }
+
+    void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override
+    {
+        Constellation::Manager::Instance()->NoteDamage(attacker, victim, damage);
+    }
+};
+
+// КТО ДОБИЛ — ОТВЕЧАЕТ ЯДРО. Unit::Kill зовёт этот крючок ровно для того, чей удар
+// оказался последним (Unit.cpp:11558), поэтому чужое убийство нам не запишется.
+class constellation_playerscript : public PlayerScript
+{
+public:
+    constellation_playerscript() : PlayerScript("constellation_playerscript") { }
+
+    void OnCreatureKill(Player* killer, Creature* killed) override
+    {
+        Constellation::Manager::Instance()->NoteKill(killer, killed);
     }
 };
 
@@ -1702,5 +3088,7 @@ public:
 void AddConstellationScripts()
 {
     new constellation_worldscript();
+    new constellation_unitscript();
+    new constellation_playerscript();
     new constellation_commandscript();
 }
