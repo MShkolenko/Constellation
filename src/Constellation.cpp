@@ -50,6 +50,9 @@
 #include "CombatPackets.h"
 #include "GossipDef.h"
 #include "MiscPackets.h"
+#include "Loot.h"
+#include "LootPackets.h"
+#include "ItemTemplate.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
@@ -107,6 +110,7 @@ struct Settings
     bool  TakeQuests      = true;       // БРАТЬ квесты; сдавать разрешает Quests
     bool  Fight           = true;
     bool  Abilities       = false;      // произносить умения, а не только выбирать
+    bool  Loot            = false;      // подбирать добычу с собственных убийств
     uint32 MaxActive      = 0;
     uint32 PerTick        = 6;
     uint32 MaxQuests      = 10;
@@ -140,6 +144,7 @@ struct Settings
         // БЫ, — он пишется в журнал, — а произнесение включается этим ключом, когда
         // список прочитан. Включение не требует ни пересборки, ни остановки мира.
         Abilities       = sConfigMgr->GetBoolDefault("Constellation.Abilities", false);
+        Loot            = sConfigMgr->GetBoolDefault("Constellation.Loot", false);
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
         MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
@@ -239,6 +244,12 @@ struct Companion
     uint32 CastsTried = 0;              // за этот бой: попыток произнести
     uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
     uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
+    ObjectGuid LootTarget;              // труп нашего убийства, который ещё не обобран
+    uint32 LootOpened = 0;              // за всё время: открыли трупов
+    uint32 LootItems = 0;               //               взяли предметов
+    uint32 LootMoney = 0;               //               взяли денег (в медяках)
+    uint32 LootTooFar = 0;              //               не дотянулись — мера нужды в ходьбе
+    uint32 LootDenied = 0;              //               ядро не дало (чужой лут, розыгрыш)
     uint32 CastsBusy = 0;               // не просили: уже читаем или не истёк общий откат
     uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
     bool WasCasting = false;            // читали ли на прошлом такте (для счётчика выше)
@@ -1562,13 +1573,26 @@ public:
                         ++c.CastsDiedUnder;
 
                     Manager::Blows const k = Manager::Instance()->BlowsOf(self->GetGUID());
+                    bool const won = k.Kills > c.KillsAtStart && k.LastKilled == c.FightVictim;
                     char const* how;
-                    if (k.Kills > c.KillsAtStart && k.LastKilled == c.FightVictim)
+                    if (won)
                         how = "ПОБЕДА";
                     else if (victim)
                         how = "цель мертва, но добили не мы";
                     else
                         how = "бой прекратился";
+                    // ДОБЫЧА ТОЛЬКО СО СВОЕГО УБИЙСТВА, и это не вежливость: сто двадцать
+                    // два спутника ходят по одним стартовым зонам, и бег к любому видимому
+                    // трупу — это кража у живого игрока и лагерь у чужого тела (Кодекс,
+                    // разбор рисков). Право проверит и ядро, но пакета, заведомо обречённого
+                    // на отказ, лучше не слать вовсе.
+                    if (Cfg().Loot && won && c.Session)
+                    {
+                        c.LootTarget = c.FightVictim;
+                        LootFromCorpse(c, self);
+                        c.LootTarget.Clear();
+                    }
+
                     LogFightOutcome(self, victim, how, c);
                     Switch(c, self, Behavior::Idle, how);
                     return;
@@ -1980,6 +2004,144 @@ public:
         // очередь; бот должен ТРАТИТЬ ресурс для эффективного уничтожения целей».
         // Прежнее правило говорило ровно обратное и потому не тратило ничего.
         return bestPaid ? bestPaid : bestFreeId;
+    }
+
+    // ОБОБРАТЬ ТРУП — ЧЕТЫРЬМЯ ПАКЕТАМИ, В ТОМ ЖЕ ПОРЯДКЕ, ЧТО ШЛЁТ КЛИЕНТ.
+    //
+    // Возвращает true, если с этим трупом закончили (успешно или нет) — вызывающий тогда
+    // забывает его. Всё делается за ОДИН заход: спутник после ближнего боя уже стоит
+    // вплотную, а ходьбу к трупу первая версия не умеет и честно считает, сколько раз она
+    // была бы нужна.
+    bool LootFromCorpse(Companion& c, Player* self)
+    {
+        Creature* corpse = ObjectAccessor::GetCreature(*self, c.LootTarget);
+        if (!corpse || corpse->IsAlive())
+            return true;                        // исчез или воскрес — забыть
+
+        // ДИСТАНЦИЮ СПРАШИВАЕМ У ЯДРА ТЕМ ЖЕ ЧИСЛОМ, что применяет обработчик лута
+        // (LootHandler.cpp: 30 ярдов от трупа). Своего числа не выдумываем.
+        if (!self->IsWithinDistInMap(corpse, 30.0f))
+        {
+            ++c.LootTooFar;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ЛУТ {}: не дотянулся до {} ({}), {:.1f} ярдов",
+                self->GetName(), corpse->GetName(), corpse->GetEntry(),
+                self->GetDistance(corpse));
+            return true;
+        }
+
+        // ПРАВО НА ЛУТ РЕШАЕТ ЯДРО. isAllowedToLoot — тот же предикат, которым обработчик
+        // отсеивает чужую добычу, метку другой группы, розыгрыш и мастер-лут. Спрашиваем
+        // его сами, чтобы не слать пакет, который заведомо отвергнут.
+        if (!self->isAllowedToLoot(corpse))
+        {
+            ++c.LootDenied;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ЛУТ {}: ядро не дало обобрать {} ({})",
+                self->GetName(), corpse->GetName(), corpse->GetEntry());
+            return true;
+        }
+
+        // 1. ОТКРЫТЬ. Без этого обработчик предмета не найдёт лут в m_AELootView.
+        {
+            WorldPacket raw(CMSG_LOOT_UNIT);
+            WorldPackets::Loot::LootUnit open(std::move(raw));
+            open.Unit = c.LootTarget;
+            c.Session->HandleLootOpcode(open);
+        }
+        if (self->GetAELootView().empty())
+        {
+            ++c.LootDenied;                     // ядро отказало молча — не настаиваем
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ЛУТ {}: открыл {} ({}), но вид лута пуст",
+                self->GetName(), corpse->GetName(), corpse->GetEntry());
+            return true;
+        }
+        ++c.LootOpened;
+
+        // 2. ДЕНЬГИ — если они там есть. Пакет без GUID: обработчик берёт из всего
+        //    открытого вида сразу, поэтому шлём его один раз.
+        bool anyGold = false;
+        for (auto const& [lootGuid, loot] : self->GetAELootView())
+            if (loot && loot->gold)
+                { anyGold = true; c.LootMoney += loot->gold; }
+        if (anyGold)
+        {
+            WorldPacket raw(CMSG_LOOT_MONEY);
+            WorldPackets::Loot::LootMoney money(std::move(raw));
+            c.Session->HandleLootMoneyOpcode(money);
+        }
+
+        // 3. ПРЕДМЕТЫ. Собираем запросы по всему открытому виду и шлём ОДНИМ пакетом:
+        //    он и рассчитан на список (Array<LootRequest, 100>).
+        //
+        //    ЧТО БЕРЁМ, И ПОЧЕМУ ИМЕННО ЭТО: нужное текущим заданиям — иначе задание не
+        //    закроется; и серый хлам — его ядро само считает мусором и умеет продавать.
+        //    Всё остальное пока мимо: чтобы решать про зелёное и выше, нужна логика
+        //    сравнения с надетым, а её нет, и подобранная привязка необратима.
+        WorldPacket rawItems(CMSG_LOOT_ITEM);
+        WorldPackets::Loot::LootItem take(std::move(rawItems));
+        uint32 const freeSlots = self->GetFreeInventorySlotCount();
+        uint32 asked = 0;
+        for (auto const& [lootGuid, loot] : self->GetAELootView())
+        {
+            if (!loot)
+                continue;
+            for (LootItem const& item : loot->items)
+            {
+                if (item.is_looted || item.is_blocked)
+                    continue;
+                if (!item.HasAllowedLooter(self->GetGUID()))
+                    continue;
+                ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(item.itemid);
+                if (!tpl)
+                    continue;
+                bool const forQuest = item.needs_quest || self->HasQuestForItem(item.itemid);
+                bool const junk = tpl->GetQuality() == ITEM_QUALITY_POOR;
+
+                // СЫРАЯ ЗАПИСЬ: что лежало и почему не взяли. Без неё «предметов 0»
+                // неотличимо от «фильтр всё съел».
+                char const* skip = nullptr;
+                if (!forQuest && !junk)                  skip = "не-квест-и-не-хлам";
+                else if (!forQuest && asked + 2 >= freeSlots) skip = "мало-места-под-хлам";
+                else if (asked + 1 >= freeSlots)         skip = "сумки-полны";
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} свободно {} -> {}",
+                    self->GetName(), item.itemid, uint32(tpl->GetQuality()), item.count,
+                    forQuest ? "да" : "нет", freeSlots, skip ? skip : "БЕРЁМ");
+                if (skip)
+                {
+                    if (asked + 1 >= freeSlots)
+                        break;
+                    continue;
+                }
+                WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
+                req.Object = lootGuid;          // КЛЮЧ вида — это и есть GUID объекта лута
+                req.LootListID = uint8(item.LootListId);   // НЕ номер в списке
+                ++asked;
+            }
+        }
+        if (asked)
+        {
+            c.Session->HandleAutostoreLootItemOpcode(take);
+            c.LootItems += asked;
+        }
+
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ЛУТ {}: обобрал {} ({}) — денег {}, предметов запрошено {}; "
+            "за всё время трупов {}, предметов {}, денег {}",
+            self->GetName(), corpse->GetName(), corpse->GetEntry(),
+            anyGold ? "да" : "нет", asked,
+            c.LootOpened, c.LootItems, c.LootMoney);
+
+        // 4. ОТПУСТИТЬ. Иначе вид остаётся открытым и следующий труп не откроется.
+        {
+            WorldPacket raw(CMSG_LOOT_RELEASE);
+            WorldPackets::Loot::LootRelease done(std::move(raw));
+            done.Unit = c.LootTarget;
+            c.Session->HandleLootReleaseOpcode(done);
+        }
+        return true;
     }
 
     // САМОЛЕЧЕНИЕ: ТОТ ЖЕ ОБХОД КНИГИ, НО ЛЕЧАЩЕЕ И НА СЕБЯ.
