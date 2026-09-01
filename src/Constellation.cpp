@@ -57,9 +57,12 @@
 #include "Bag.h"
 #include "ItemPackets.h"
 #include "NPCPackets.h"
+#include "PhasingHandler.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
+#include "DB2Stores.h"
+#include "GameObjectPackets.h"
 #include "PathGenerator.h"
 #include "ObjectAccessor.h"
 #include "ConditionMgr.h"
@@ -192,7 +195,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering };
 
 struct Companion
 {
@@ -294,6 +297,21 @@ struct Companion
     uint32 EnderScanMs = 0;             // когда искать заново
     uint32 IdleScanMs = 0;              // «стою» не перебирает мир на каждом такте
     bool FightDiagDone = false;         // диагностика боевого поиска — по разу на КАЖДОГО
+    bool GiverDiagDone = false;         // и то же для поиска квестодателя
+    bool GatherDiagDone = false;        // и для отбора точки сбора
+    bool TalkDiagDone = false;          // и для самого разговора
+    // КАНДИДАТ, А НЕ ЖИВОЙ УКАЗАТЕЛЬ. Живой объект берётся по приходу, по идентификатору
+    // спавна; до этого мы знаем только, ГДЕ он записан на карте.
+    uint32 GatherSpawnId = 0;           // идентификатор точки появления объекта
+    uint32 GatherEntry = 0;             // и вид объекта — для отчёта
+    Position GatherPos;                 // куда идти
+    uint32 GatherMs = 0;                // сколько уже идём
+    float GatherDist = 0.0f;            // и с какого расстояния начали
+    uint32 Gathered = 0;                // сколько объектов обобрано за жизнь
+    // ОТСРОЧКА ПО ТОЧКЕ ПОЯВЛЕНИЯ, А НЕ ПО GUID (Кодекс): у одной точки бывает несколько
+    // экземпляров — личных, фазовых, — и запрет по GUID промахивается мимо следующего.
+    // Причины разные и сроки разные: не дойти, ещё не возродился, не та фаза, брать нечего.
+    std::unordered_map<uint32, uint32> GatherBackoff;
     Position TurnInPos;                 // и где он стоит
     // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
     // любая новая неудача переписывала таймер, а по его истечении набор очищался
@@ -1361,6 +1379,13 @@ public:
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
         if (c.IdleScanMs)
             c.IdleScanMs = (c.IdleScanMs <= diff) ? 0 : c.IdleScanMs - diff;
+        for (auto it = c.GatherBackoff.begin(); it != c.GatherBackoff.end(); )
+        {
+            if (it->second <= diff)
+                it = c.GatherBackoff.erase(it);
+            else
+                { it->second -= diff; ++it; }
+        }
         if (c.TravelCooldownMs)
             c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
             c.VendCooldownMs   = (c.VendCooldownMs   <= diff) ? 0 : c.VendCooldownMs   - diff;
@@ -1382,6 +1407,8 @@ public:
             }
             else
                 c.GiverForgetMs -= diff;
+
+
         if (c.TravelScanMs)
             c.TravelScanMs = (c.TravelScanMs <= diff) ? 0 : c.TravelScanMs - diff;
         if (c.RestSkipMs)
@@ -1573,6 +1600,20 @@ public:
                     c.TargetGuid = target->GetGUID();
                     c.LastDist = self->GetExactDist2d(target);
                     Switch(c, self, Behavior::ApproachingTarget, "нашлась цель квеста");
+                    return;
+                }
+                // БИТЬ НЕКОГО — МОЖЕТ, НУЖНОЕ ПРОСТО ЛЕЖИТ НА ЗЕМЛЕ.
+                //
+                // Ниже боя намеренно: если задание закрывается убийством, драться полезнее —
+                // это и опыт, и добыча. Сбор идёт, когда драться не за что.
+                // под тем же флагом, что и сдача: это квестовая работа, а не добыча ради
+                // добычи (Кодекс — сдача под Cfg().Quests, бой под Cfg().Fight, а сбор был
+                // не под чем)
+                if (idleScan && Cfg().Quests && FindGatherCandidate(c, self))
+                {
+                    c.GatherMs = 0;
+                    c.GatherDist = self->GetExactDist(c.GatherPos);
+                    Switch(c, self, Behavior::Gathering, "нужное лежит на земле");
                     return;
                 }
                 // за хозяином идём, только если он ДОСТИЖИМ. Иначе спутник метался
@@ -2007,6 +2048,157 @@ public:
                 return;
             }
 
+            // СБОР С ОБЪЕКТА НА ЗЕМЛЕ — фаза 5 плана `constellation-liveness.md`.
+            //
+            // Форма ровно та же, что у похода к принимающему: идём, границы дороги (нет
+            // продвижения за 20 с / всего 30 с), не дошли — в чёрный список и заняться
+            // другим. Дистанцию взаимодействия НЕ ВЫДУМЫВАЕМ: ядро само отвечает
+            // GetGameObjectIfCanInteractWith, и оно же решает про полёт, значок и состояние.
+            //
+            // Открыв объект, добычу забирает ОБЩАЯ процедура TakeOpenLoot — та же, что у
+            // трупа: Use() наполняет тот же m_AELootView.
+            case Behavior::Gathering:
+            {
+                // ИДЁМ ПО СЧИСЛЕНИЮ, ПРАВДУ СПРАШИВАЕМ ПО ПРИХОДУ.
+                //
+                // Пока мы в пути, мир не опрашивается вовсе: место известно из указателя.
+                // У самой точки берём живой объект ПО ИДЕНТИФИКАТОРУ СПАВНА — прямое
+                // обращение к карте вместо обхода сетки (Кодекс: Map::GetGameObjectBySpawnId).
+                float const near = self->GetExactDist(c.GatherPos);
+                GameObject* go = near <= 12.0f
+                    ? self->GetMap()->GetGameObjectBySpawnId(c.GatherSpawnId) : nullptr;
+
+                if (!go || !go->isSpawned() || !self->GetGameObjectIfCanInteractWith(go->GetGUID()))
+                {
+                    // ещё не дошли — идём; дошли, а его нет — отсрочка с причиной
+                    if (near > 4.0f)
+                    {
+                        StepToward(c, self, c.GatherPos.GetPositionX(), c.GatherPos.GetPositionY(),
+                                   c.GatherPos.GetPositionZ(), 0.25f, dt);
+
+                        // МАРШРУТА НЕТ — БЕРЁМ ДРУГУЮ ТОЧКУ, А НЕ ЖДЁМ.
+                        //
+                        // Здесь сталкивались два моих же отсчёта. При отказе построителя шаг
+                        // уходит в отступание на 3-24 секунды и молча стоит, а сбор отсчитывает
+                        // свои 20 секунд «без продвижения» и сдаётся. Замер это и показал: 127
+                        // отказов из 181 захода, и в них «было 56, стало 56» — расстояние не
+                        // менялось ВООБЩЕ, то есть спутник не шёл, а ждал по одному правилу,
+                        // пока его судили по другому.
+                        //
+                        // Точек в указателе 13 281. Если к этой дороги нет — это повод взять
+                        // следующую, а не стоять двадцать секунд у той же.
+                        if (c.NoPathMs > 0)
+                        {
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation СБОР {}: к точке {} (вид {}) маршрута нет, беру другую",
+                                self->GetName(), c.GatherSpawnId, c.GatherEntry);
+                            c.GatherBackoff[c.GatherSpawnId] = 300000;
+                            c.GatherSpawnId = 0;
+                            Switch(c, self, Behavior::Idle, "к объекту нет дороги");
+                            return;
+                        }
+                        c.GatherMs += slice;
+                        bool const noProgress = c.GatherMs >= 20000 && near > c.GatherDist - 1.0f;
+                        if (c.Stalled || noProgress || c.GatherMs >= 45000)
+                        {
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation СБОР {}: до точки {} (вид {}) не дойти за {} с, было {:.0f}, стало {:.0f}",
+                                self->GetName(), c.GatherSpawnId, c.GatherEntry,
+                                c.GatherMs / 1000, c.GatherDist, near);
+                            c.GatherBackoff[c.GatherSpawnId] = 300000;   // не дойти — надолго
+                            c.GatherSpawnId = 0;
+                            Switch(c, self, Behavior::Idle, "до объекта не дойти");
+                        }
+                        return;
+                    }
+
+                    // ПРИШЛИ, А ОБЪЕКТА НЕТ. Это не ошибка и не навсегда: в пуле живёт один
+                    // член из многих, событие может быть выключено, а взятый объект
+                    // возрождается по своему сроку (Кодекс перечислил все эти случаи).
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СБОР {}: пришёл к точке {} (вид {}), а объекта там нет",
+                        self->GetName(), c.GatherSpawnId, c.GatherEntry);
+                    c.GatherBackoff[c.GatherSpawnId] = 120000;
+                    c.GatherSpawnId = 0;
+                    Switch(c, self, Behavior::Idle, "объекта на месте нет");
+                    return;
+                }
+
+                // ОТКРЫВАЕМ ТЕМ ЖЕ ОПКОДОМ, КАКИМ ЭТО ДЕЛАЕТ КЛИЕНТ ПО КЛИКУ.
+                // Пакет несёт ровно один GUID (GameObjectPackets.h), обработчик зовёт
+                // GetGameObjectIfCanInteractWith и затем obj->Use(player).
+                std::string const name = go->GetName();
+                uint32 const entry = go->GetEntry();
+
+                // ДОСТУПНОСТЬ СУНДУКА ЗАВИСИТ ОТ САМОГО ИГРОКА, И ЭТО НАДО СПРОСИТЬ.
+                //
+                // Кодекс называл это среди того, чего строка в таблице не знает: для
+                // сундуков и точек сбора ядро проверяет квестовое состояние игрока через
+                // GameObject::ActivateToQuest, и без этого добыча для него не создаётся
+                // вовсе. Замер на боевом после переделки: 106 заходов, из них НИ ОДНОГО
+                // с добычей — «открыл, но ничего не легло». Проверки не было.
+                //
+                // Здесь же — права на добычу: IsLootAllowedFor знает про уже опустошённое,
+                // разрешённых собирателей, личную добычу и список захвативших.
+                if (!go->ActivateToQuest(self))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СБОР {}: {} ({}) для меня не активен по квесту",
+                        self->GetName(), name, entry);
+                    c.GatherBackoff[c.GatherSpawnId] = 300000;
+                    c.GatherSpawnId = 0;
+                    Switch(c, self, Behavior::Idle, "объект не мой по квесту");
+                    return;
+                }
+                if (!go->IsLootAllowedFor(self))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СБОР {}: {} ({}) уже занят или обобран другим",
+                        self->GetName(), name, entry);
+                    c.GatherBackoff[c.GatherSpawnId] = 120000;
+                    c.GatherSpawnId = 0;
+                    Switch(c, self, Behavior::Idle, "добыча не наша");
+                    return;
+                }
+                uint32 const spaceBefore = FreeBagSpace(self);
+                {
+                    WorldPacket raw(CMSG_GAME_OBJ_USE);
+                    WorldPackets::GameObject::GameObjUse use(std::move(raw));
+                    use.Guid = go->GetGUID();
+                    c.Session->HandleGameObjectUseOpcode(use);
+                }
+
+                // Считаем ЛЁГШЕЕ, а не запрошенное: предмет, ушедший в имеющуюся стопку,
+                // места не занимает, и по свободным ячейкам удачный сбор выглядел бы пустым.
+                // ЧАСТЬ СУНДУКОВ КЛАДЁТ ДОБЫЧУ СРАЗУ, БЕЗ ОКНА (Кодекс).
+                //
+                // При флаге chestPushLoot ядро складывает предметы прямо внутри Use, и
+                // окна добычи не появляется вовсе. Прежний счёт считал такой заход
+                // неудачей — вид пуст, значит «ничего не легло», — и ставил объекту
+                // отсрочку, хотя предмет реально лежал в сумке. Поэтому меряем по месту
+                // в сумках вокруг самого Use, а не только по окну.
+                uint32 const landed = self->GetAELootView().empty()
+                    ? (spaceBefore > FreeBagSpace(self) ? spaceBefore - FreeBagSpace(self) : 0u)
+                    : TakeOpenLoot(c, self, go->GetGUID(), name, entry);
+                if (landed)
+                {
+                    ++c.Gathered;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СБОР {}: обобрал {} ({}), предметов легло {}; всего объектов {}",
+                        self->GetName(), name, entry, landed, c.Gathered);
+                    c.GatherBackoff[c.GatherSpawnId] = 60000;   // взят — вернёмся не сразу
+                }
+                else
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
+                        self->GetName(), name, entry);
+                    c.GatherBackoff[c.GatherSpawnId] = 120000;
+                }
+                c.GatherSpawnId = 0;
+                Switch(c, self, Behavior::Idle, "собрал");
+                return;
+            }
             case Behavior::Attacking:
             {
                 Unit* victim = self->GetVictim();
@@ -2728,6 +2920,142 @@ public:
     // забывает его. Всё делается за ОДИН заход: спутник после ближнего боя уже стоит
     // вплотную, а ходьбу к трупу первая версия не умеет и честно считает, сколько раз она
     // была бы нужна.
+    // ЗАБРАТЬ ИЗ УЖЕ ОТКРЫТОГО ВИДА ДОБЫЧИ.
+    //
+    // Вынесено из LootFromCorpse без единого изменения смысла: труп и объект на земле
+    // отличаются только тем, ЧЕМ вид открывается — CMSG_LOOT_UNIT против CMSG_GAME_OBJ_USE.
+    // Дальше ядро наполняет один и тот же m_AELootView, поэтому деньги, предметы, отчёт и
+    // освобождение вида — общие. Второй такой процедуры заводить нельзя (ступень 2
+    // лестницы: сперва ищем, что уже написано).
+    //
+    // Возвращает, сколько предметов было ЗАПРОШЕНО; сколько реально легло, считает и
+    // печатает сама — по свободному месту до и после, а не по числу запросов.
+    // Возвращает, сколько предметов РЕАЛЬНО ЛЕГЛО (не запрошено): Кодекс верно указал, что
+    // счётчик по запросам называет успехом заход, с которого ничего не взяли.
+    uint32 TakeOpenLoot(Companion& c, Player* self, ObjectGuid src, std::string const& what, uint32 entry)
+    {
+// 2. ДЕНЬГИ — если они там есть. Пакет без GUID: обработчик берёт из всего
+        //    открытого вида сразу, поэтому шлём его один раз.
+        bool anyGold = false;
+        for (auto const& [lootGuid, loot] : self->GetAELootView())
+            if (loot && loot->gold)
+                { anyGold = true; c.LootMoney += loot->gold; }
+        if (anyGold)
+        {
+            WorldPacket raw(CMSG_LOOT_MONEY);
+            WorldPackets::Loot::LootMoney money(std::move(raw));
+            c.Session->HandleLootMoneyOpcode(money);
+        }
+
+        // 3. ПРЕДМЕТЫ. Собираем запросы по всему открытому виду и шлём ОДНИМ пакетом:
+        //    он и рассчитан на список (Array<LootRequest, 100>).
+        //
+        //    ЧТО БЕРЁМ, И ПОЧЕМУ ИМЕННО ЭТО: нужное текущим заданиям — иначе задание не
+        //    закроется; и серый хлам — его ядро само считает мусором и умеет продавать.
+        //    Всё остальное пока мимо: чтобы решать про зелёное и выше, нужна логика
+        //    сравнения с надетым, а её нет, и подобранная привязка необратима.
+        WorldPacket rawItems(CMSG_LOOT_ITEM);
+        WorldPackets::Loot::LootItem take(std::move(rawItems));
+        uint32 const freeSlots = FreeBagSpace(self);
+        uint32 asked = 0, got = 0;
+        std::set<uint32> askedIds;      // ЧТО именно просили — чтобы сосчитать пришедшее
+        for (auto const& [lootGuid, loot] : self->GetAELootView())
+        {
+            if (!loot)
+                continue;
+            for (LootItem const& item : loot->items)
+            {
+                if (item.is_looted || item.is_blocked)
+                    continue;
+                if (!item.HasAllowedLooter(self->GetGUID()))
+                    continue;
+                ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(item.itemid);
+                if (!tpl)
+                    continue;
+                bool const forQuest = item.needs_quest || self->HasQuestForItem(item.itemid);
+                bool const junk = tpl->GetQuality() == ITEM_QUALITY_POOR;
+
+                // СЫРАЯ ЗАПИСЬ: что лежало и почему не взяли. Без неё «предметов 0»
+                // неотличимо от «фильтр всё съел».
+                char const* skip = nullptr;
+                if (!forQuest && !junk)                  skip = "не-квест-и-не-хлам";
+                // Кодекс: было asked + 1 >= freeSlots, и одна свободная ячейка
+                // не использовалась никогда — при freeSlots == 1 отказывали даже первому предмету.
+                else if (!forQuest && asked + 2 > freeSlots) skip = "мало-места-под-хлам";
+                else if (asked >= freeSlots)            skip = "сумки-полны";
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} "
+                    "свободно {} (ядро говорит {}) -> {}",
+                    self->GetName(), item.itemid, uint32(tpl->GetQuality()), item.count,
+                    forQuest ? "да" : "нет", freeSlots,
+                    self->GetFreeInventorySlotCount(), skip ? skip : "БЕРЁМ");
+                if (skip)
+                {
+                    if (asked >= freeSlots)
+                        break;
+                    continue;
+                }
+                WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
+                req.Object = lootGuid;          // КЛЮЧ вида — это и есть GUID объекта лута
+                req.LootListID = uint8(item.LootListId);   // НЕ номер в списке
+                askedIds.insert(item.itemid);
+                ++asked;
+            }
+        }
+        if (asked)
+        {
+            // СЧИТАЕМ ВЗЯТОЕ, А НЕ ЗАПРОШЕННОЕ. Тот же урок, что и в продаже: ядро может
+            // отказать (переполнение стопки, уникальность, полные сумки), и запрос не
+            // равен предмету в рюкзаке. Меряем по свободному месту до и после — это
+            // ровно то, что изменилось бы, если предмет действительно лёг.
+            // СЧИТАЕМ ПО КОЛИЧЕСТВУ ПРЕДМЕТОВ, А НЕ ПО СВОБОДНЫМ ЯЧЕЙКАМ.
+            //
+            // Оговорка про стопки стояла тут же, в старом сообщении: предмет, ушедший в
+            // УЖЕ ИМЕЮЩУЮСЯ стопку, места не занимает. Пока это число было только строкой
+            // отчёта, ошибка ничего не стоила. Но сбор с объектов принимает по нему
+            // решение — «ничего не легло, объект в отсрочку», — и удачный сбор второго
+            // цветка того же вида объявлялся пустым заходом. Нашёл стоп-разбор Кодекса.
+            //
+            // Спрашиваем у ядра, СКОЛЬКО ЭТИХ предметов у нас было и стало: стопки при
+            // таком счёте видны, а чужое добро в счёт не идёт.
+            uint32 countBefore = 0;
+            for (uint32 id : askedIds)
+                countBefore += self->GetItemCount(id, true);
+            uint32 const spaceBefore = FreeBagSpace(self);
+            c.Session->HandleAutostoreLootItemOpcode(take);
+            uint32 const spaceAfter = FreeBagSpace(self);
+            uint32 countAfter = 0;
+            for (uint32 id : askedIds)
+                countAfter += self->GetItemCount(id, true);
+
+            uint32 const landed = countAfter > countBefore ? countAfter - countBefore : 0;
+            uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
+            got = landed;
+            c.LootItems += landed;
+            if (landed != asked)
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЛУТ {}: запрошено {}, легло {} (ячеек занято {}) — "
+                    "разница это стопки и отказы ядра",
+                    self->GetName(), asked, landed, slotsUsedUp);
+        }
+
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ЛУТ {}: обобрал {} ({}) — денег {}, предметов запрошено {}; "
+            "за всё время трупов {}, предметов {}, денег {}",
+            self->GetName(), what, entry,
+            anyGold ? "да" : "нет", asked,
+            c.LootOpened, c.LootItems, c.LootMoney);
+
+        // 4. ОТПУСТИТЬ. Иначе вид остаётся открытым и следующий труп не откроется.
+        {
+            WorldPacket raw(CMSG_LOOT_RELEASE);
+            WorldPackets::Loot::LootRelease done(std::move(raw));
+            done.Unit = src;
+            c.Session->HandleLootReleaseOpcode(done);
+        }
+        return got;
+    }
+
     bool LootFromCorpse(Companion& c, Player* self)
     {
         Creature* corpse = ObjectAccessor::GetCreature(*self, c.LootTarget);
@@ -2775,104 +3103,7 @@ public:
         }
         ++c.LootOpened;
 
-        // 2. ДЕНЬГИ — если они там есть. Пакет без GUID: обработчик берёт из всего
-        //    открытого вида сразу, поэтому шлём его один раз.
-        bool anyGold = false;
-        for (auto const& [lootGuid, loot] : self->GetAELootView())
-            if (loot && loot->gold)
-                { anyGold = true; c.LootMoney += loot->gold; }
-        if (anyGold)
-        {
-            WorldPacket raw(CMSG_LOOT_MONEY);
-            WorldPackets::Loot::LootMoney money(std::move(raw));
-            c.Session->HandleLootMoneyOpcode(money);
-        }
-
-        // 3. ПРЕДМЕТЫ. Собираем запросы по всему открытому виду и шлём ОДНИМ пакетом:
-        //    он и рассчитан на список (Array<LootRequest, 100>).
-        //
-        //    ЧТО БЕРЁМ, И ПОЧЕМУ ИМЕННО ЭТО: нужное текущим заданиям — иначе задание не
-        //    закроется; и серый хлам — его ядро само считает мусором и умеет продавать.
-        //    Всё остальное пока мимо: чтобы решать про зелёное и выше, нужна логика
-        //    сравнения с надетым, а её нет, и подобранная привязка необратима.
-        WorldPacket rawItems(CMSG_LOOT_ITEM);
-        WorldPackets::Loot::LootItem take(std::move(rawItems));
-        uint32 const freeSlots = FreeBagSpace(self);
-        uint32 asked = 0;
-        for (auto const& [lootGuid, loot] : self->GetAELootView())
-        {
-            if (!loot)
-                continue;
-            for (LootItem const& item : loot->items)
-            {
-                if (item.is_looted || item.is_blocked)
-                    continue;
-                if (!item.HasAllowedLooter(self->GetGUID()))
-                    continue;
-                ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(item.itemid);
-                if (!tpl)
-                    continue;
-                bool const forQuest = item.needs_quest || self->HasQuestForItem(item.itemid);
-                bool const junk = tpl->GetQuality() == ITEM_QUALITY_POOR;
-
-                // СЫРАЯ ЗАПИСЬ: что лежало и почему не взяли. Без неё «предметов 0»
-                // неотличимо от «фильтр всё съел».
-                char const* skip = nullptr;
-                if (!forQuest && !junk)                  skip = "не-квест-и-не-хлам";
-                // Кодекс: было asked + 1 >= freeSlots, и одна свободная ячейка
-                // не использовалась никогда — при freeSlots == 1 отказывали даже первому предмету.
-                else if (!forQuest && asked + 2 > freeSlots) skip = "мало-места-под-хлам";
-                else if (asked >= freeSlots)            skip = "сумки-полны";
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} "
-                    "свободно {} (ядро говорит {}) -> {}",
-                    self->GetName(), item.itemid, uint32(tpl->GetQuality()), item.count,
-                    forQuest ? "да" : "нет", freeSlots,
-                    self->GetFreeInventorySlotCount(), skip ? skip : "БЕРЁМ");
-                if (skip)
-                {
-                    if (asked >= freeSlots)
-                        break;
-                    continue;
-                }
-                WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
-                req.Object = lootGuid;          // КЛЮЧ вида — это и есть GUID объекта лута
-                req.LootListID = uint8(item.LootListId);   // НЕ номер в списке
-                ++asked;
-            }
-        }
-        if (asked)
-        {
-            // СЧИТАЕМ ВЗЯТОЕ, А НЕ ЗАПРОШЕННОЕ. Тот же урок, что и в продаже: ядро может
-            // отказать (переполнение стопки, уникальность, полные сумки), и запрос не
-            // равен предмету в рюкзаке. Меряем по свободному месту до и после — это
-            // ровно то, что изменилось бы, если предмет действительно лёг.
-            uint32 const spaceBefore = FreeBagSpace(self);
-            c.Session->HandleAutostoreLootItemOpcode(take);
-            uint32 const spaceAfter = FreeBagSpace(self);
-            uint32 const landed = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
-            c.LootItems += landed;
-            if (landed != asked)
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation ЛУТ {}: запрошено {}, легло {} — остальное ядро не приняло "
-                    "(или ушло в существующие стопки, что места не занимает)",
-                    self->GetName(), asked, landed);
-        }
-
-        TC_LOG_INFO("server.worldserver",
-            "Constellation ЛУТ {}: обобрал {} ({}) — денег {}, предметов запрошено {}; "
-            "за всё время трупов {}, предметов {}, денег {}",
-            self->GetName(), corpse->GetName(), corpse->GetEntry(),
-            anyGold ? "да" : "нет", asked,
-            c.LootOpened, c.LootItems, c.LootMoney);
-
-        // 4. ОТПУСТИТЬ. Иначе вид остаётся открытым и следующий труп не откроется.
-        {
-            WorldPacket raw(CMSG_LOOT_RELEASE);
-            WorldPackets::Loot::LootRelease done(std::move(raw));
-            done.Unit = c.LootTarget;
-            c.Session->HandleLootReleaseOpcode(done);
-        }
+        TakeOpenLoot(c, self, c.LootTarget, corpse->GetName(), corpse->GetEntry());
         return true;
     }
 
@@ -3151,6 +3382,7 @@ public:
             // «стою» тут же выбирало её снова (Кодекс). Уходим тем же опкодом, каким
             // это делает клиент: CMSG_ATTACK_STOP -> Player::AttackStop().
             c.EngageRange = 0.0f;           // новая цель — новая дистанция боя
+
         if (c.GiverUnreachable.size() > 40)
             c.GiverUnreachable.clear();  // список не должен расти без предела
         if (c.Mode == Behavior::Attacking && me->GetVictim())
@@ -3190,6 +3422,7 @@ public:
             case Behavior::Vending:           return "иду к торговцу";
             case Behavior::Travelling:        return "иду к месту задания";
             case Behavior::TurningIn:         return "сдаю квест";
+            case Behavior::Gathering:         return "иду собирать";
         }
         return "?";
     }
@@ -3388,8 +3621,63 @@ public:
         hello.QuestGiverGUID = giver->GetGUID();
         c.Session->HandleQuestgiverHelloOpcode(hello);
 
+        // У NPC СО СЦЕНАРИЕМ БЕСЕДЫ ЭТОГО ОПКОДА МАЛО — И ЭТО НЕ ДОГАДКА, А СТРОКА ЯДРА.
+        //
+        //     _player->PlayerTalkClass->ClearMenus();
+        //     if (creature->AI()->OnGossipHello(_player))
+        //         return;                              <-- выход ДО подготовки меню
+        //     _player->PrepareQuestMenu(creature->GetGUID());
+        //
+        // То есть если у существа есть свой обработчик приветствия, меню квестов не
+        // готовится вовсе. Замер это и показал: прибор напечатал «предложил пунктов 0» у
+        // всех, кто дошёл до Milly Osworth, — не «ядро не даёт взять», не «отказные», а
+        // ПУСТО. Спутник стучался не в ту дверь.
+        //
+        // Живой игрок в этот момент видит окно беседы, и его клиент шлёт CMSG_GOSSIP_HELLO.
+        // Тот путь идёт через Player::PrepareGossipMenu, который меню квестов заполняет
+        // (Player.cpp: два вызова PrepareQuestMenu внутри). Поэтому: пусто после первого
+        // опкода — шлём второй, ровно как клиент, и читаем снова. Своих внутренних вызовов
+        // ядра по-прежнему нет.
+        if (self->PlayerTalkClass->GetQuestMenu().GetMenuItemCount() == 0)
+        {
+            // опкод в этом ядре зовётся CMSG_TALK_TO_GOSSIP (Opcodes.cpp), а не
+            // CMSG_GOSSIP_HELLO — имя проверено по таблице обработчиков, не по памяти
+            WorldPacket rawGossip(CMSG_TALK_TO_GOSSIP);
+            WorldPackets::NPC::Hello gossip(std::move(rawGossip));
+            gossip.Unit = giver->GetGUID();
+            c.Session->HandleGossipHelloOpcode(gossip);
+        }
+
         // читаем то, что ядро только что собрало для клиента, в его же порядке
         QuestMenu const& menu = self->PlayerTalkClass->GetQuestMenu();
+
+        // ЧТО ИМЕННО ПРЕДЛОЖИЛИ И ЧТО ИЗ ЭТОГО ОТВЕРГНУТО — ПО РАЗУ НА КАЖДОГО.
+        //
+        // Прибор выше показал, что 56 спутников из 122 квестодателя ВЫБИРАЮТ, при этом за
+        // все часы взят один квест и ни одной строки «не дойти». Значит срыв здесь, и без
+        // этой строки различить «меню пустое» и «CanTakeQuest всё отверг» нельзя.
+        if (!c.TalkDiagDone)
+        {
+            c.TalkDiagDone = true;
+            uint32 refused = 0, noTemplate = 0, cannotTake = 0;
+            for (uint8 i = 0; i < menu.GetMenuItemCount(); ++i)
+            {
+                uint32 const qid = menu.GetItem(i).QuestId;
+                if (c.QuestRefused.count(qid))
+                    { ++refused; continue; }
+                Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+                if (!q)
+                    { ++noTemplate; continue; }
+                if (!self->CanTakeQuest(q, false))
+                    ++cannotTake;
+            }
+            TC_LOG_INFO("server.worldserver",
+                "Constellation РАЗГОВОР {}: {} ({}) предложил пунктов {}, из них ранее отказных {}, "
+                "без шаблона {}, ядро не даёт взять {}",
+                self->GetName(), giver->GetName(), giver->GetEntry(),
+                uint32(menu.GetMenuItemCount()), refused, noTemplate, cannotTake);
+        }
+
         for (uint8 i = 0; i < menu.GetMenuItemCount(); ++i)
         {
             uint32 questId = menu.GetItem(i).QuestId;
@@ -3536,6 +3824,71 @@ public:
         }
         TC_LOG_INFO("server.loading", "Constellation: указатель спавнов — {} точек на {} картах",
             n, uint32(_spawns.size()));
+
+        // КАРТА — ЭТО ДАННЫЕ. МИР СПРАШИВАЮТ В МОМЕНТ КАСАНИЯ.
+        //
+        // Решение оператора, 2026-09-01: «зачем искать что собирать?? там простые условия —
+        // квест, кого-то убил, у ресурсов руды и травы свои точки спавна», «да даже скан на
+        // ближайших торговцев и квестодателей должен быть осознанным — если согласно карты
+        // он тут должен быть».
+        //
+        // Прежняя версия обходила сетку вокруг каждого спутника, чтобы узнать то, что
+        // записано в таблице и не меняется. Здесь это заменено указателем, который строится
+        // один раз: предмет задания -> виды объектов, дающих его -> где эти объекты стоят.
+        //
+        // ХРАНИМ spawnId, А НЕ ОДНУ КООРДИНАТУ (Кодекс). По идентификатору спавна живой
+        // объект берётся прямым обращением к карте, без единого обхода сетки; по одной лишь
+        // координате пришлось бы снова искать перебором.
+        //
+        // И указатель — ПЛАНИРОВЩИК, А НЕ ИСТОЧНИК ПРАВДЫ. Кодекс перечислил, чего строка в
+        // таблице не знает: в пуле из многих записей в мире живёт одна; фазы, личные спавны,
+        // группы появления, игровые события, разные сложности; объекты, созданные сценарием
+        // на лету, в таблице отсутствуют вовсе; а доступность сундука зависит ещё и от самого
+        // игрока (ActivateToQuest). Поэтому правда берётся у мира — но ОДИН РАЗ, по приходу.
+        uint32 g = 0, links = 0, locked = 0, noItems = 0, rejectedLogged = 0;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
+        {
+            std::vector<uint32> const* qi = sObjectMgr->GetGameObjectQuestItemList(data.id);
+            if (!qi || qi->empty())
+                { ++noItems; continue; }    // объект не даёт ни одного предмета задания
+            GameObjectTemplate const* tpl = sObjectMgr->GetGameObjectTemplate(data.id);
+            if (!tpl || !OpenableByHand(tpl))
+            {
+                // СОСТАВ ОТВЕРГНУТЫХ ЗАМКОВ — ЧТОБЫ ПРАВИЛО ВЫВЕСТИ, А НЕ УГАДАТЬ.
+                //
+                // Этот фильтр дважды за день выключил способность целиком. Замер: отсеяно
+                // 7068 точек, и у каждого спутника с целью-предметом видов объектов НОЛЬ —
+                // отсеяно ровно нужное. Печатаем первое условие замка простыми числами.
+                //
+                // Прошлая версия этой же строки роняла пробный мир: она собирала текст в
+                // цикле через StringFormat прямо при загрузке. Ворота её и не пустили.
+                // Здесь только числа и никакой сборки строк.
+                if (tpl && rejectedLogged < 12 && sObjectMgr->GetGameObjectQuestItemList(data.id))
+                {
+                    uint32 const lockId = tpl->GetLockId();
+                    if (LockEntry const* lock = lockId ? sLockStore.LookupEntry(lockId) : nullptr)
+                    {
+                        ++rejectedLogged;
+                        TC_LOG_INFO("server.loading",
+                            "Constellation ЗАМОК: вид {} замок {} — ключи {} {} {}, условия {} {} {}, навыки {} {} {}",
+                            data.id, lockId,
+                            uint32(lock->Type[0]), uint32(lock->Type[1]), uint32(lock->Type[2]),
+                            lock->Index[0], lock->Index[1], lock->Index[2],
+                            uint32(lock->Skill[0]), uint32(lock->Skill[1]), uint32(lock->Skill[2]));
+                    }
+                }
+                ++locked; continue;         // заперто профессией/ключом — не наш случай
+            }
+            _goSpawns[data.mapId][data.id].push_back(GatherSpawn{ spawnId, data.id, data.spawnPoint,
+                data.phaseUseFlags, uint16(data.phaseId), data.phaseGroup });
+            for (uint32 item : *qi)
+                { _itemFromGo[item].insert(data.id); ++links; }
+            ++g;
+        }
+        TC_LOG_INFO("server.loading",
+            "Constellation: указатель объектов сбора — {} точек на {} картах, {} связей предмет->объект; "
+            "отсеяно замком {}, без предметов задания {}",
+            g, uint32(_goSpawns.size()), links, locked, noItems);
     }
 
     // Сдача: поздороваться, сдать, выбрать награду — теми же опкодами, что клиент.
@@ -3883,6 +4236,140 @@ public:
         return true;
     }
 
+    // ГОДИТСЯ ЛИ ОБЪЕКТ ДЛЯ ОТКРЫТИЯ РУКАМИ.
+    //
+    // Зачем вообще: прямой опкод использования не спрашивает профессию — обработчик лишь
+    // проверяет досягаемость и зовёт Use. Значит спутник вскрыл бы траву или руду без
+    // травничества, чего живой игрок не может, и инвариант «играем действиями клиента»
+    // был бы нарушён.
+    //
+    // ЭТО ПРАВИЛО Я ПИСАЛ ДВАЖДЫ И ДВАЖДЫ НЕВЕРНО. Первая версия отвергала любой замок и
+    // выключила способность целиком. Вторая требовала, чтобы КАЖДЫЙ заполненный вариант
+    // был «просто открыть» с нулевым навыком — и отсеяла 7068 точек из 15553, ровно те,
+    // что были нужны: у каждого спутника с целью-предметом видов объектов оказалось ноль.
+    //
+    // Настоящая семантика (Кодекс, по Spell::CanOpenLock): восемь слотов замка — это
+    // АЛЬТЕРНАТИВЫ, а не требования. Ядро возвращает успех на ПЕРВОМ подошедшем варианте.
+    // Сундук, который открывается и рукой, и травничеством, открывается рукой — а моё
+    // правило отвергало его из-за второго варианта.
+    //
+    // И величину навыка ядро спрашивает НЕ ВСЕГДА: только если тип замка вообще
+    // отображается в профессию через SkillByLockType. Для «просто открыть» ненулевое поле
+    // навыка ядром игнорируется — а я на него смотрел.
+    //
+    // Поэтому список из четырёх известных «открыть» тоже не нужен: разделение на навык и
+    // не-навык уже сделано в самой игре, и спрашиваем мы его, а не свою память.
+    static bool OpenableByHand(GameObjectTemplate const* tpl)
+    {
+        uint32 const lockId = tpl->GetLockId();
+        if (!lockId)
+            return true;                    // замка нет — открывается всем
+        LockEntry const* lock = sLockStore.LookupEntry(lockId);
+        if (!lock)
+            return false;
+
+        bool populated = false;
+        for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+        {
+            if (lock->Type[i] == LOCK_KEY_NONE)
+                continue;                   // слот пуст
+            populated = true;
+            if (lock->Type[i] == LOCK_KEY_SKILL
+                && lock->Index[i] != LOCKTYPE_LOCKPICKING
+                && SkillByLockType(LockType(lock->Index[i])) == SKILL_NONE)
+                return true;                // этого варианта достаточно — руками можно
+        }
+        return !populated;                  // все слоты пусты — тоже замок без требований
+    }
+
+    // КУДА ИДТИ ЗА ПРЕДМЕТОМ ЗАДАНИЯ — ОТВЕЧАЕТ УКАЗАТЕЛЬ, А НЕ ОБХОД МИРА.
+    //
+    // Здесь стоял обход сетки вокруг спутника, и это была ошибка формы: я скопировал вид
+    // боевого поиска, тогда как надо было копировать вид поиска принимающего — тот уже ходит
+    // по указателю, построенному один раз. Оператор назвал это прямо: «зачем искать что
+    // собирать?? у ресурсов руды и травы свои точки спавна».
+    //
+    // Возвращает НЕ живой объект, а кандидата: идентификатор спавна и место. Живой объект
+    // берётся по приходу, по этому же идентификатору, без единого обхода.
+    bool FindGatherCandidate(Companion& c, Player* self) const
+    {
+        std::set<uint32> wanted, wantedItems;
+        WantedEntries(self, wanted, nullptr, nullptr, nullptr, nullptr, &wantedItems);
+
+        // какие виды объектов дают хоть один из нужных предметов
+        std::set<uint32> entries;
+        for (uint32 item : wantedItems)
+            if (auto it = _itemFromGo.find(item); it != _itemFromGo.end())
+                entries.insert(it->second.begin(), it->second.end());
+
+        auto mapIt = _goSpawns.find(self->GetMapId());
+        uint32 onMap = 0, phased = 0;
+        if (mapIt != _goSpawns.end())
+            for (uint32 entry : entries)
+                if (auto e = mapIt->second.find(entry); e != mapIt->second.end())
+                    onMap += uint32(e->second.size());
+
+        // ПОЧЕМУ НЕ НАШЛОСЬ — ПО РАЗУ НА КАЖДОГО. Замер показал 15 спутников с целями-
+        // предметами, добываемыми с объектов, и НОЛЬ попыток сбора; различить «нечего
+        // искать», «вида нет на карте» и «отсеяла фаза» по нынешним строкам нельзя.
+        if (!c.GatherDiagDone && !wantedItems.empty())
+        {
+            c.GatherDiagDone = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ОТБОР {}: нужных предметов {}, видов объектов {}, точек на карте {}",
+                self->GetName(), uint32(wantedItems.size()), uint32(entries.size()), onMap);
+        }
+
+        if (wantedItems.empty() || entries.empty() || mapIt == _goSpawns.end())
+            return false;
+
+        float best = 0.0f;
+        bool found = false;
+        for (uint32 entry : entries)
+        {
+            auto entryIt = mapIt->second.find(entry);
+            if (entryIt == mapIt->second.end())
+                continue;
+            for (GatherSpawn const& sp : entryIt->second)
+            {
+            if (auto back = c.GatherBackoff.find(sp.SpawnId); back != c.GatherBackoff.end() && back->second)
+                continue;                       // недавно не вышло — этот пока мимо
+
+            // ЧУЖАЯ ФАЗА ОТСЕИВАЕТСЯ ЗДЕСЬ, А НЕ ПО ПРИХОДУ.
+            //
+            // Ядро само отвечает, увидит ли этот спутник спавн с такими полями фазы —
+            // PhasingHandler::InDbPhaseShift. Это проверка по множеству, без запроса к миру.
+            // Иначе спутник шёл бы к объекту, которого для него не существует, тратил
+            // тридцать секунд и заносил точку в отсрочку — тихий отказ, выглядящий как
+            // «дошёл и стоит».
+            if (!PhasingHandler::InDbPhaseShift(self, sp.PhaseUseFlags, sp.PhaseId, sp.PhaseGroup))
+                { ++phased; continue; }
+            // ДАЛЬШЕ, ЧЕМ УСПЕЕМ ДОЙТИ, — НЕ БЕРЁМ (Кодекс).
+            //
+            // Отбор брал ближайшую точку по ВСЕЙ карте без предела, а само намерение даёт
+            // на дорогу 45 секунд и сдаётся за 20 без продвижения. Точка за полкилометра
+            // гарантированно кончится отказом и отсрочкой — то есть холостым походом.
+            // При скорости бега около семи ярдов в секунду 45 секунд это чуть больше
+            // трёхсот ярдов; берём двести с запасом на неровности пути.
+            float const d = self->GetExactDist2d(sp.Where.GetPositionX(), sp.Where.GetPositionY());
+            if (d > 200.0f)
+                continue;
+            if (!found || d < best)
+            {
+                best = d;
+                found = true;
+                c.GatherSpawnId = sp.SpawnId;
+                c.GatherEntry = sp.Entry;
+                c.GatherPos = sp.Where;
+            }
+            }
+        }
+        if (!found && phased)
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ОТБОР {}: все {} точек отсеяны фазой", self->GetName(), phased);
+        return found;
+    }
+
     Creature* FindObjectiveTarget(Companion& c, Player* self) const
     {
         // СО СЛОМАННЫМ СНАРЯЖЕНИЕМ ЦЕЛЬ НЕ ИЩЕМ ВОВСЕ.
@@ -4059,7 +4546,16 @@ public:
     // Ближайший квестодатель, У КОТОРОГО ЕСТЬ ЧТО ПРЕДЛОЖИТЬ ИМЕННО ЭТОМУ спутнику.
     // Восклицательный знак над головой — это QuestGiverStatus, который ядро считает
     // для клиента; спрашиваем ровно его, а не таблицу связей.
-    Creature* NearestQuestGiver(Companion const& c, Player* self) const
+    // ПОЧЕМУ НЕ БЕРУТСЯ КВЕСТЫ — ПРИБОР, А НЕ ДОГАДКА.
+    //
+    // За все часы работы состав взял ОДИН квест, при этом у 70 спутников из 122 квестодатель
+    // стоит в пределах тридцати ярдов. Значит отбор кого-то отвергает, а какой именно
+    // проверкой — по журналу не видно вовсе: у этого пути нет ни одной строки, кроме успеха.
+    //
+    // Тот же приём, что вскрыл боевую воронку: по разу на КАЖДОГО спутника печатаем, сколько
+    // существ рядом и сколько отсеяла каждая проверка. Один раз на спутника — 122 строки за
+    // прогон, дальше молчок.
+    Creature* NearestQuestGiver(Companion& c, Player* self) const
     {
         std::list<Creature*> around;
         Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().QuestGiverRange);
@@ -4068,22 +4564,65 @@ public:
 
         Creature* best = nullptr;
         float bestDist = Cfg().QuestGiverRange + 1.0f;
+        uint32 seen = 0, dead = 0, nothingToOffer = 0, blacklisted = 0, noLos = 0;
         for (Creature* creature : around)
         {
+            ++seen;
             if (!creature->IsAlive())
-                continue;
-            if (self->GetQuestDialogStatus(creature) == QuestGiverStatus::None)
-                continue;
+                { ++dead; continue; }
+            // «НЕ NONE» — ЭТО НЕ «ЕСТЬ ЧТО ПРЕДЛОЖИТЬ». ЭТО БЫЛА ГЛАВНАЯ ОШИБКА.
+            //
+            // GetQuestDialogStatus возвращает не ответ «да/нет», а МАСКУ всего, что этот
+            // NPC значит для игрока прямо сейчас (Player.cpp: две ветки — по принимаемым
+            // квестам и по выдаваемым). В неё попадают, среди прочего:
+            //
+            //   * Reward — у спутника есть НЕЗАВЕРШЁННЫЙ квест, который этот NPC ПРИНИМАЕТ.
+            //     В клиенте это серый вопросительный знак, а не восклицательный;
+            //   * Future — квест у NPC есть, но уровнем спутник до него не дорос;
+            //   * *Turnin, *RewardComplete* — «принеси готовое», тоже не выдача.
+            //
+            // Проверка «!= None» принимала всё это за «есть что взять». Отсюда измеренное
+            // расхождение: 56 спутников из 122 квестодателя ВЫБИРАЛИ, шли к нему, открывали
+            // разговор — и брать там было нечего, потому что выбран был ПРИНИМАЮЩИЙ их же
+            // текущего квеста. За весь день при этом взят ОДИН квест.
+            //
+            // Берём только биты, означающие «выдаёт квест ПРЯМО СЕЙЧАС». Future
+            // сознательно исключён: спутник дорастёт и вернётся сам.
+            QuestGiverStatus const st = self->GetQuestDialogStatus(creature);
+            QuestGiverStatus const offers =
+                  QuestGiverStatus::Quest              | QuestGiverStatus::Trivial
+                | QuestGiverStatus::DailyQuest         | QuestGiverStatus::TrivialDailyQuest
+                | QuestGiverStatus::RepeatableQuest    | QuestGiverStatus::TrivialRepeatableQuest
+                | QuestGiverStatus::MetaQuest          | QuestGiverStatus::TrivialMetaQuest
+                | QuestGiverStatus::JourneyQuest       | QuestGiverStatus::TrivialJourneyQuest
+                | QuestGiverStatus::LegendaryQuest     | QuestGiverStatus::TrivialLegendaryQuest
+                | QuestGiverStatus::ImportantQuest     | QuestGiverStatus::TrivialImportantQuest
+                | QuestGiverStatus::CovenantCallingQuest;
+            if ((st & offers) == QuestGiverStatus::None)
+                { ++nothingToOffer; continue; }
             if (c.GiverUnreachable.count(creature->GetGUID()))
-                continue;               // уже пробовали дойти и не вышло
+                { ++blacklisted; continue; }   // уже пробовали дойти и не вышло
             if (!self->IsWithinLOSInMap(creature))
-                continue;
+                { ++noLos; continue; }
             float d = self->GetExactDist2d(creature);
             if (d < bestDist)
             {
                 bestDist = d;
                 best = creature;
             }
+        }
+        if (!c.GiverDiagDone)
+        {
+            c.GiverDiagDone = true;
+            uint32 used = 0;
+            for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                if (self->GetQuestSlotQuestId(slot))
+                    ++used;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation КВЕСТОДАТЕЛЬ {}: рядом существ {}, мертвы {}, нечего предложить {}, "
+                "в чёрном списке {}, не видно {}, ВЫБРАН {}; в журнале квестов {}, радиус {:.0f}",
+                self->GetName(), seen, dead, nothingToOffer, blacklisted, noLos,
+                best ? best->GetName() : "никто", used, Cfg().QuestGiverRange);
         }
         return best;
     }
@@ -4781,12 +5320,31 @@ private:
     uint32 _questsTurnedIn = 0;
     mutable bool _fightDiagDone = false;
     uint32 _hops = 0;                   // сколько раз дошли до цели промежуточными прыжками
+
     mutable bool _rejDiagDone = false;
     mutable bool _whyDone = false;
     uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
     uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
+    // Поля фазы храним ВМЕСТЕ с точкой: фаза — это «версия места», и спавн, объявленный
+    // в чужой фазе, для этого спутника не существует. Отсеять его надо ДО выхода, а не
+    // обнаружить по приходу (оператор: «боты знают, на какой они стадии, значит могу
+    // сопоставить, что они ДОЛЖНЫ видеть» — ядро отвечает на это готовым помощником).
+    struct GatherSpawn
+    {
+        uint32 SpawnId; uint32 Entry; Position Where;
+        uint8 PhaseUseFlags; uint16 PhaseId; uint32 PhaseGroup;
+    };
+    // КАРТА -> ВИД -> ТОЧКИ, А НЕ КАРТА -> ВСЕ ТОЧКИ.
+    //
+    // Плоский список был моей же ошибкой в новом костюме: обход сетки я убрал, но вместо
+    // него проходил ВЕСЬ указатель карты у каждого спутника раз в секунду — на стартовых
+    // картах это тысячи записей на 122 спутника. Замер: ядро 98 %, 35 переходов за восемь
+    // минут, ноль сбора. Указатель существ так не устроен изначально: там ключом стоит вид,
+    // и перебираются только нужные.
+    std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _goSpawns;
+    std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
