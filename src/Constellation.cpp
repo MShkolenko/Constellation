@@ -216,6 +216,7 @@ struct Companion
     uint32 GiverMs = 0;                 // сколько уже идём к нему
     float GiverDist = 0.0f;             // и с какой дистанции начали — меряем прогресс
     std::set<ObjectGuid> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
+    uint32 GiverForgetMs = 0;           // и когда забыть этот список — «навсегда» было ошибкой
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
     uint32 FightMs = 0;                 // накопитель между решениями в бою
     Behavior Mode = Behavior::Idle;     // ровно одно намерение за раз
@@ -255,6 +256,9 @@ struct Companion
     uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
     uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
     float EngageRange = 0.0f;           // с какой дистанции драться: 0 = ещё не считали
+    ObjectGuid ApproachFor;             // для кого посчитана точка подхода
+    float ApproachX = 0.0f, ApproachY = 0.0f, ApproachZ = 0.0f;
+    uint32 ApproachMs = 0;              // и когда пересчитать: цель могла отойти
     ObjectGuid VendorGuid;              // торговец, к которому идём
     uint32 VendCooldownMs = 0;          // не искать торговца каждый такт, если не нашли
     uint32 VendScanMs = 0;              // и не обходить сетку каждый такт ВООБЩЕ
@@ -288,6 +292,8 @@ struct Companion
     uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
     uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
     uint32 EnderScanMs = 0;             // когда искать заново
+    uint32 IdleScanMs = 0;              // «стою» не перебирает мир на каждом такте
+    bool FightDiagDone = false;         // диагностика боевого поиска — по разу на КАЖДОГО
     Position TurnInPos;                 // и где он стоит
     // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
     // любая новая неудача переписывала таймер, а по его истечении набор очищался
@@ -307,6 +313,9 @@ struct Companion
     uint8 JumpsLeft = 3;                // прыжков в запасе
     uint32 JumpCooldownMs = 0;          // истратил три — минуту без прыжков
     bool UnstickLeft = true;            // в какую сторону отступать следующей
+    uint32 NoPathMs = 0;                // сколько ещё не трогать построитель маршрута
+    uint8 NoPathFails = 0;              // подряд идущих отказов — отступ растёт с ними
+    bool RawTarget = false;             // боковая точка не далась — идём на самого NPC
     bool Stalled = false;               // отступать больше некуда — решает автомат
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
 };
@@ -893,6 +902,9 @@ public:
             }
             c.StuckMs = 0;
             c.UnstickTries = 0;
+            c.NoPathFails = 0;
+            c.NoPathMs = 0;
+            c.RawTarget = false;        // дошли — в следующий раз снова вежливо, сбоку
             c.Stalled = false;          // дошли — тупика больше нет (Кодекс)
             return false;
         }
@@ -948,9 +960,81 @@ public:
             // полигона нет, и построитель отвечал NOPATH (в живом журнале — «тип A»).
             // Спутник упирался в угол аббатства и стоял. Настоящий Z известен КАЖДОМУ
             // месту вызова — берём его.
+            // ПРОВАЛ ПОСТРОИТЕЛЯ ОБЯЗАН ОТСТУПАТЬ, А НЕ ДОЛБИТЬСЯ.
+            //
+            // Вот из-за чего встал ВЕСЬ состав и мир упёрся в ядро. Список точек ниже
+            // заполняется только при УСПЕХЕ; при отказе он остаётся ПУСТЫМ — а условие
+            // пересчёта прямо над этим срабатывает как раз на пустом списке. Значит
+            // неудачный поиск повторялся КАЖДЫЙ такт, четыре раза в секунду, бесконечно.
+            //
+            // Неудачный поиск по навигационной сетке — самый дорогой запрос из всех:
+            // Detour обходит ВСЮ достижимую сетку, прежде чем ответить «нет». Успешный
+            // останавливается, найдя цель. Полсотни спутников в отказе растянули такт
+            // мира до секунд, после чего перестали двигаться и те, у кого маршрут был:
+            // замер показал 0 сдвинувшихся из 122 и одну строку журнала за десять секунд.
+            //
+            // Отступ нарастающий — 3, 6, 12, 24 секунды, дальше 24. Цель за это время
+            // никуда не убежит, а такт освобождается. Тот, кто так и не дойдёт, будет
+            // отмечен «не дойти» по общему правилу и займётся другим делом.
+            if (c.NoPathMs > 0)
+            {
+                uint32 const backoff = uint32(dt * 1000.0f);
+                c.NoPathMs = (c.NoPathMs <= backoff) ? 0 : c.NoPathMs - backoff;
+                StopMoving(c, self);
+                return false;
+            }
+            // ХОДИТЬ ДАЛЕКО НАДО ПРЫЖКАМИ, А НЕ ОДНИМ ВОПРОСОМ.
+            //
+            // Замер на боевом 2026-09-01, после того как пробный шаг на пять ярдов удался
+            // у 15 спутников из 18: сетка ПОД НОГАМИ в порядке, беда в конце пути. А концы
+            // эти — настоящие места принимающих, сверенные с базой: Горнек -598 -4248 39,
+            // Лантан Перилон 10302 -6229 26.7. Оба конца законные, и всё равно тип A.
+            //
+            // Расстояния при отказах: 241, 244, 271, 300 ярдов. Записи по Легиону называют
+            // потолок сглаженного пути в 296 ярдов и решают это отдельной процедурой
+            // «идти далеко»: если весь путь не строится, просить путь до ПРОМЕЖУТОЧНОЙ
+            // точки, половиня досягаемость, пока сетка не ответит. Здесь этой процедуры не
+            // было — я просил весь путь одним вызовом и сдавался.
+            //
+            // Вторая группа отказов той же природы: Фелендрен Изгнанный стоит на ВЕРШИНЕ
+            // Академии Фалтриена (z=110), спутники — у подножия (z=25). Целиком такой путь
+            // не строится, а до подножия башни — строится.
+            //
+            // Высоту промежуточной точки берём ОТ СВОЕГО ЯРУСА вниз, а не от неба: та же
+            // ошибка Тельдрассила, что уже стоила Легиону 121 тупика.
             PathGenerator path(self);
-            if (!path.CalculatePath(tx, ty, tz, false)
-                || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
+            PathGenerator hop(self);
+            bool built = path.CalculatePath(tx, ty, tz, false)
+                && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT));
+            Movement::PointsArray const* pts = built ? &path.GetPath() : nullptr;
+            float aimX = tx, aimY = ty;
+            if (!built)
+            {
+                float const whole = self->GetExactDist2d(tx, ty);
+                float const ang = self->GetAbsoluteAngle(tx, ty);
+                for (float reach = std::min(whole * 0.5f, 150.0f); reach >= 15.0f; reach *= 0.5f)
+                {
+                    float const hx = self->GetPositionX() + std::cos(ang) * reach;
+                    float const hy = self->GetPositionY() + std::sin(ang) * reach;
+                    if (!MapManager::IsValidMapCoord(self->GetMapId(), hx, hy))
+                        continue;
+                    float hz = self->GetMap()->GetHeight(self->GetPhaseShift(), hx, hy,
+                                                         self->GetPositionZ() + 5.0f);
+                    if (hz <= INVALID_HEIGHT)
+                        continue;
+                    if (hop.CalculatePath(hx, hy, hz, false)
+                        && !(hop.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
+                    {
+                        built = true;
+                        pts = &hop.GetPath();
+                        aimX = hx;
+                        aimY = hy;
+                        ++_hops;
+                        break;
+                    }
+                }
+            }
+            if (!built)
             {
                 ++_noPath;
                 if (_noPathLogged < 20)
@@ -958,20 +1042,105 @@ public:
                     // прежняя диагностика стояла на ОДНОМ глобальном флаге и напечаталась
                     // за всю жизнь сервера ровно один раз — то есть скрыла масштаб беды
                     ++_noPathLogged;
-                    TC_LOG_INFO("server.worldserver", "Constellation STEP {}: маршрута нет, тип {:X}, точек {}",
-                        self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()));
+                    // КООРДИНАТЫ ОБОИХ КОНЦОВ, ИНАЧЕ ОТКАЗ НЕРАЗЛИЧИМ.
+                    //
+                    // Тип A — это NOPATH|SHORTCUT: Detour не нашёл полигона под НАЧАЛОМ
+                    // либо под КОНЦОМ пути и вернул прямую из двух точек. Это две разные
+                    // болезни с разным лечением, а прежняя строка печатала только тип и
+                    // число точек — по ней их не различить. Клетки сетки на местах стоянки
+                    // проверены и существуют, значит подозрение на конец пути; но
+                    // подозрение не доказательство, поэтому печатаем оба конца и разницу
+                    // высот, которая и уводит точку с сетки.
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation STEP {}: маршрута нет, тип {:X}, точек {}, карта {}, "
+                        "я {:.0f} {:.0f} {:.1f} -> цель {:.0f} {:.0f} {:.1f}, по плоскости {:.0f}, по высоте {:.1f}",
+                        self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()),
+                        self->GetMapId(),
+                        self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
+                        tx, ty, tz, self->GetExactDist2d(tx, ty), tz - self->GetPositionZ());
                 }
+                // РАЗБРОС ОБЯЗАТЕЛЕН: без него 122 спутника, вставшие одновременно,
+                // повторяют тяжёлый поиск ОДНИМ ЗАЛПОМ — реже, но всё так же кучно, и
+                // такт мира снова проваливается раз в три секунды вместо постоянно.
+                // Замечание Кодекса; лестница тоже его: 3, 6, 12, 24 секунды.
+                // ЗАВИСШЕГО В ВОЗДУХЕ НАДО ВЕРНУТЬ НА ЗЕМЛЮ, ИНАЧЕ ОН ТАМ НАВСЕГДА.
+                //
+                // Ошибка с высотой (см. шаг движения ниже) уже подняла часть состава над
+                // землёй, и сама по себе её починка их не опустит: из воздуха маршрут не
+                // строится, а спускаться спутник умеет только маршрутом. Замкнутый круг,
+                // и в нём на боевом сидело трое из измеренной выборки.
+                //
+                // Поэтому на ПЕРВОМ же отказе спрашиваем у карты настоящую высоту под
+                // ногами и, если мы выше неё больше чем на два ярда, отправляемся вниз.
+                // Запрос дорогой, но он случается только при отказе построителя, а не на
+                // такте — то самое различие, которым мы уже дважды за сутки упирали мир
+                // в ядро.
+                // ПОД НОГАМИ ИЛИ ПОД ЦЕЛЬЮ — ОПЫТ, КОТОРЫЙ ЭТО РАЗЛИЧАЕТ.
+                //
+                // Тип A (NOPATH|SHORTCUT) означает, что Detour не нашёл полигона под ОДНИМ
+                // из концов пути, но не говорит, под каким. Замер: все двадцать отказов — с
+                // большой разницей высот, ни одного с разницей меньше пяти ярдов, при этом
+                // расстояние по плоскости от 29 до 300 ярдов. То есть виновата высота, а не
+                // дальность, — но чья, наша или цели, из этого не следует.
+                //
+                // Спрашиваем маршрут на пять ярдов вперёд по своему же направлению. Такая
+                // цель заведомо на той же поверхности, что и мы. Провалился и он — значит
+                // полигона нет ПОД НАМИ, и лечить надо своё положение. Удался — значит наше
+                // место в порядке, и дело в конце пути.
+                //
+                // Один лишний вызов на ПЕРВЫЙ отказ, дальше отступание. Не на такте.
+                if (!c.NoPathFails)
+                {
+                    PathGenerator probe(self);
+                    float const px = self->GetPositionX() + std::cos(self->GetOrientation()) * 5.0f;
+                    float const py = self->GetPositionY() + std::sin(self->GetOrientation()) * 5.0f;
+                    bool const okNear = probe.CalculatePath(px, py, self->GetPositionZ(), false)
+                        && !(probe.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT));
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation STEP {}: пробный шаг на 5 ярдов {}, тип {:X} — {}",
+                        self->GetName(), okNear ? "УДАЛСЯ" : "ПРОВАЛИЛСЯ",
+                        uint32(probe.GetPathType()),
+                        okNear ? "сетка под ногами есть, беда в конце пути"
+                               : "сетки под ногами НЕТ, беда в нашем положении");
+                }
+                if (!c.NoPathFails)
+                {
+                    float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
+                        self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
+                    if (gz > INVALID_HEIGHT && self->GetPositionZ() - gz > 2.0f)
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation STEP {}: висел на {:.1f} над землёй ({:.1f} -> {:.1f}), спускаю",
+                            self->GetName(), self->GetPositionZ() - gz, self->GetPositionZ(), gz);
+                        Position down(self->GetPositionX(), self->GetPositionY(), gz, self->GetOrientation());
+                        SendMove(c, self, down, 0);
+                        c.Moving = false;
+                    }
+                }
+                c.RawTarget = true;     // боковая точка не далась — дальше идём в центр
+                if (c.NoPathFails < 4)
+                    ++c.NoPathFails;
+                static uint32 const backoffLadder[5] = { 0, 3000, 6000, 12000, 24000 };
+                c.NoPathMs = backoffLadder[c.NoPathFails]
+                           + uint32(self->GetGUID().GetCounter() % 1500u);
                 if (!Unstick(c, self, tx, ty))
                     c.Stalled = true;
                 StopMoving(c, self);
                 return false;
             }
+            c.NoPathFails = 0;              // маршрут нашёлся — отступ снимаем,
+            c.NoPathMs = 0;                 // но НЕ признак «иди в центр»: снять его на
+                                            // удачном маршруте значило бы снова подсунуть
+                                            // ту же непроходимую боковую точку — качели,
+                                            // которые Кодекс и разглядел прямо в коде
             c.Waypoints.clear();
-            for (G3D::Vector3 const& v : path.GetPath())
+            for (G3D::Vector3 const& v : *pts)
                 c.Waypoints.emplace_back(v.x, v.y, v.z);
             c.WaypointIndex = 0;
-            c.PathTargetX = tx;
-            c.PathTargetY = ty;
+            // ЦЕЛЬ ПЕРЕСЧЁТА — ТА ТОЧКА, КУДА МЫ РЕАЛЬНО ИДЁМ. При прыжке это его конец,
+            // а не далёкая цель: иначе условие пересчёта считало бы, что мы уже у цели.
+            c.PathTargetX = aimX;
+            c.PathTargetY = aimY;
         }
 
         // идём к текущей точке маршрута; дошли — берём следующую
@@ -989,9 +1158,34 @@ public:
         float angle = self->GetAbsoluteAngle(wp.GetPositionX(), wp.GetPositionY());
         float legLen = self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY());
         float go = std::min(step, legLen);
+
+        // ВЫСОТА БЕРЁТСЯ ПО ДОЛЕ ПРОЙДЕННОГО ОТРЕЗКА, А НЕ У ЕГО ДАЛЬНЕГО КОНЦА.
+        //
+        // Здесь стояло просто wp.GetPositionZ(), и это была основополагающая ошибка,
+        // ломавшая ХОЖДЕНИЕ ЦЕЛИКОМ. Шаг за такт — около полутора ярдов, а отрезок
+        // маршрута бывает в десятки. На ровном месте подмена высоты безвредна, но на
+        // склоне, на лестнице или на помосте первый же шаг мгновенно поднимал спутника
+        // на высоту КОНЦА отрезка, хотя по плоскости он сдвинулся на метр. Он оказывался
+        // в воздухе — и это необратимо: полигона под точкой в воздухе нет, Detour отвечает
+        // NOPATH|SHORTCUT (в журнале «тип A, точек 2»), и спутник не может построить
+        // маршрут больше НИКОГДА.
+        //
+        // Замер на боевом, 2026-09-01: трое стоят над своими же соседями на том же
+        // пятачке — Kaelor на 45,6 ярда выше, Elenwe на 42,8, Thragan на 35 над четырьмя
+        // соседями. За пять минут 24 попытки пойти и НОЛЬ приходов. Отсюда же и «20 с без
+        // продвижения», и «до принимающего не дойти»: идти было некуда, потому что идти
+        // было неоткуда.
+        //
+        // Точки маршрута лежат на навигационной сетке, то есть на земле. Значит линейная
+        // доля между своей высотой и высотой следующей точки идёт по земле и никуда не
+        // взлетает. Опрашивать карту на каждом шаге не нужно и нельзя: это тот самый
+        // дорогой запрос, который уже упирал мир в ядро.
+        float const part = (legLen > 0.01f) ? (go / legLen) : 1.0f;
+        float const nz = self->GetPositionZ()
+                       + (wp.GetPositionZ() - self->GetPositionZ()) * part;
         Position next(self->GetPositionX() + std::cos(angle) * go,
                       self->GetPositionY() + std::sin(angle) * go,
-                      wp.GetPositionZ(), angle);
+                      nz, angle);
         SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
         c.Moving = true;
         return true;
@@ -1165,9 +1359,29 @@ public:
             c.FollowCooldownMs = (c.FollowCooldownMs <= diff) ? 0 : c.FollowCooldownMs - diff;
         if (c.EnderScanMs)
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
+        if (c.IdleScanMs)
+            c.IdleScanMs = (c.IdleScanMs <= diff) ? 0 : c.IdleScanMs - diff;
         if (c.TravelCooldownMs)
             c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
             c.VendCooldownMs   = (c.VendCooldownMs   <= diff) ? 0 : c.VendCooldownMs   - diff;
+
+            // ЧЁРНЫЙ СПИСОК КВЕСТОДАТЕЛЕЙ ЗАБЫВАЕТСЯ ЧЕРЕЗ ПЯТЬ МИНУТ.
+            //
+            // «Навсегда» было ошибкой, и она остановила весь состав за ночь: пары неудач у
+            // лестницы хватало, чтобы все квестодатели зоны попали в список, и спутник
+            // переставал брать квесты вообще. Замер утром: двенадцать групп сдали свой
+            // первый квест и встали, незакрытых квестов НИ У КОГО.
+            //
+            // Недостижимость не вечна: спутник смещается, NPC ходит, фаза меняется.
+            // Пять минут — достаточно, чтобы не долбиться, и мало, чтобы не выпасть из игры.
+            if (c.GiverForgetMs <= diff)
+            {
+                if (!c.GiverUnreachable.empty())
+                    c.GiverUnreachable.clear();
+                c.GiverForgetMs = 300000;
+            }
+            else
+                c.GiverForgetMs -= diff;
         if (c.TravelScanMs)
             c.TravelScanMs = (c.TravelScanMs <= diff) ? 0 : c.TravelScanMs - diff;
         if (c.RestSkipMs)
@@ -1257,10 +1471,28 @@ public:
         {
             case Behavior::Idle:
             {
+                // «СТОЮ» НЕ ИМЕЕТ ПРАВА ПЕРЕБИРАТЬ МИР ЧЕТЫРЕ РАЗА В СЕКУНДУ.
+                //
+                // Два поиска ниже — самые дорогие в этом состоянии: FindTurnIn проходит
+                // весь журнал заданий, обратные связи квестов и указатель мест появления,
+                // а FindObjectiveTarget вдобавок обходит сетку и по нескольку раз
+                // просматривает найденное целиком. Оба звались БЕЗ ограничения, и пока
+                // спутнику нечем заняться — а таких сейчас большинство — это 122 × 4
+                // полных перебора в секунду на единственном потоке мира. Кодекс перечислил
+                // их по строкам как главных претендентов после построителя маршрута; замер
+                // согласен: ядро поднялось с 45 % до 84 % ровно по мере того, как состав
+                // скапливался в «стою».
+                //
+                // Раз в секунду достаточно: цель за это время не появится и не исчезнет
+                // незаметно. Разброс — чтобы 122 спутника не перебирали мир одним залпом.
+                bool const idleScan = (c.IdleScanMs == 0);
+                if (idleScan)
+                    c.IdleScanMs = 1000 + (c.Guid.GetCounter() % 250u);
+
                 // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
                 // занимает место и не даёт взять следующий, а награда — это опыт,
                 // без которого спутник останется первого уровня навсегда.
-                if (Cfg().Quests && FindTurnIn(c, self))
+                if (Cfg().Quests && idleScan && FindTurnIn(c, self))
                 {
                     Switch(c, self, Behavior::TurningIn, "есть что сдать");
                     return;
@@ -1336,7 +1568,7 @@ public:
                         c.VendCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
                     }
                 }
-                if (Creature* target = Cfg().Fight ? FindObjectiveTarget(c, self) : nullptr)
+                if (Creature* target = (Cfg().Fight && idleScan) ? FindObjectiveTarget(c, self) : nullptr)
                 {
                     c.TargetGuid = target->GetGUID();
                     c.LastDist = self->GetExactDist2d(target);
@@ -1465,8 +1697,9 @@ public:
                 // себя значит завести вторую истину, которая разойдётся с первой.
                 if (!self->GetNPCIfCanInteractWith(c.VendorGuid, UNIT_NPC_FLAG_NONE, UNIT_NPC_FLAG_2_NONE))
                 {
-                    StepToward(c, self, vendor->GetPositionX(), vendor->GetPositionY(),
-                        vendor->GetPositionZ(), 2.0f, dt);
+                    float vx, vy, vz;
+                    ApproachPoint(c, vendor, self, vx, vy, vz, diff);
+                    StepToward(c, self, vx, vy, vz, vendor->GetCombatReach() + 2.0f, dt);
                     // СРОК: не дошёл за две минуты — бросаем и живём дальше. Стоять
                     // столбом у недостижимого торговца хуже, чем ходить сломанным.
                     // ТУПИК РАСПОЗНАЁМ СРАЗУ, А НЕ ЧЕРЕЗ ДВЕ МИНУТЫ.
@@ -1736,8 +1969,10 @@ public:
                     // видим, но ядро говорит «далеко» — подходим к НЕМУ САМОМУ, со
                     // всеми тремя координатами: он может стоять выше или ниже нас, и
                     // именно это здесь и происходит
-                    StepToward(c, self, ender->GetPositionX(), ender->GetPositionY(),
-                        ender->GetPositionZ(), 2.0f, dt);
+                    // К ТОЧКЕ НА ПОДХОДЕ, А НЕ В САМОГО ПРИНИМАЮЩЕГО (задача 0013).
+                    float ax, ay, az;
+                    ApproachPoint(c, ender, self, ax, ay, az, diff);
+                    StepToward(c, self, ax, ay, az, ender->GetCombatReach() + 2.0f, dt);
                     if (c.Stalled || c.ModeMs > 60000)
                     {
                         c.TurnInBackoff[c.TurnInQuest] = 60000;
@@ -2149,6 +2384,62 @@ public:
                 self->GetName(), uint32(self->GetClass()), kind, id, si->SpellLevel,
                 amount, power, si->CalcCastTime(), why, shape);
         }
+    }
+
+    // ТОЧКА, В КОТОРУЮ НАДО ИДТИ, ЧТОБЫ ЗАГОВОРИТЬ — НЕ САМА ЦЕЛЬ.
+    //
+    // Задача 0013, поставленная оператором 11.08 и до сегодня несделанная: «боты должны
+    // использовать внутриигровое расстояние, а не стремиться встать точкой в точку».
+    // Симптом, который он описал с экрана утром 01.09: спутник стоит лицом к принимающему,
+    // видит его — и не делает последних шагов. Потому что шёл в его координаты, а там
+    // стоит он сам.
+    //
+    // Берём готовое из ядра, как задача и требовала. GetContactPoint строит точку на луче
+    // ОТ цели В НАШУ сторону, а GetNearPoint под ним правит высоту по рельефу
+    // (UpdateAllowedPositionZ) и, если точка не в прямой видимости, обходит по кругу до
+    // видимой. Своей тригонометрией ни того ни другого не получить.
+    //
+    // Полтора ярда — это уже ПОВЕРХ габаритов: GetNearPoint2D добавляет размеры обоих
+    // объектов сам. Порог ядра при этом GetCombatReach() + 4, так что запас честный.
+    // СЧИТАЕМ ОДИН РАЗ НА ЦЕЛЬ, А НЕ ЧЕТЫРЕ РАЗА В СЕКУНДУ.
+    //
+    // GetNearPoint под GetContactPoint при отсутствии прямой видимости ОБХОДИТ цель по
+    // кругу мелкими шагами, проверяя видимость на каждом. Замер на живом сервере: вызов
+    // на каждом такте у каждого идущего спутника снова упёр мир в 107 % ядра, автомат
+    // выдавал одну строку за десять секунд, и все 122 стояли. Это второй раз за сутки,
+    // когда я кладу дорогой поиск в горячий такт, — первый был с поиском торговца.
+    //
+    // Пересчитываем раз в три секунды или при смене цели: NPC за это время далеко не уйдёт.
+    void ApproachPoint(Companion& c, WorldObject const* target, Player* self,
+                       float& x, float& y, float& z, uint32 diff)
+    {
+        // ТОЧКА СБОКУ — ВЕЖЛИВОСТЬ, А НЕ ТРЕБОВАНИЕ.
+        //
+        // GetContactPoint проверяет ВИДИМОСТЬ, а маршрут строится по НАВИГАЦИОННОЙ
+        // СЕТКЕ — это разные механизмы, и точка в полутора ярдах сбоку от NPC бывает
+        // видна, но недостижима: другой полигон, стена между, неудобная высота. Ровно
+        // это и сказал оператор своими словами — «они его видят, но не подходят».
+        //
+        // Поэтому после первого же отказа построителя идём НА САМОГО NPC. Его
+        // собственные координаты по построению лежат на сетке — он там стоит, — и до
+        // сегодняшнего утра именно так состав и ходил: 896 побед и 331 сданный квест
+        // за ночь. Останавливаемся всё равно за stopAt, так что упереться в него нельзя.
+        if (c.ApproachMs)
+            c.ApproachMs = (c.ApproachMs <= diff) ? 0 : c.ApproachMs - diff;
+        if (c.RawTarget)
+        {
+            x = target->GetPositionX();
+            y = target->GetPositionY();
+            z = target->GetPositionZ();
+            return;
+        }
+        if (c.ApproachFor != target->GetGUID() || !c.ApproachMs)
+        {
+            target->GetContactPoint(self, c.ApproachX, c.ApproachY, c.ApproachZ, 1.5f);
+            c.ApproachFor = target->GetGUID();
+            c.ApproachMs = 3000;
+        }
+        x = c.ApproachX; y = c.ApproachY; z = c.ApproachZ;
     }
 
     // ВЫБОР БОЕВОГО УМЕНИЯ — ВОПРОСАМИ К ЯДРУ, БЕЗ ЕДИНОГО ЗАШИТОГО НОМЕРА.
@@ -2878,6 +3169,9 @@ public:
         c.Stalled = false;              // новое намерение — новая попытка дойти
         c.StuckMs = 0;
         c.UnstickTries = 0;
+        c.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
+        c.NoPathMs = 0;
+        c.RawTarget = false;
         c.UnstickTotal = 0;
         if (to != Behavior::ApproachingTarget && to != Behavior::Attacking)
             c.TargetGuid.Clear();
@@ -3021,8 +3315,9 @@ public:
             }
             else if (!self->CanInteractWithQuestGiver(going))
             {
-                StepToward(c, self, going->GetPositionX(), going->GetPositionY(),
-                    going->GetPositionZ(), 3.0f, diff / 1000.0f);
+                float gx, gy, gz;
+                ApproachPoint(c, going, self, gx, gy, gz, diff);
+                StepToward(c, self, gx, gy, gz, going->GetCombatReach() + 2.0f, diff / 1000.0f);
 
                 // ГРАНИЦЫ ДОРОГИ. Без них спутник топчется у лестницы вечно: шаг формально
                 // удаётся, Stalled не взводится, автомат стоит, боёв нет. Это была живая
@@ -3070,6 +3365,11 @@ public:
         //
         // ДАЛЕКО — ЭТО ПОВОД ПОДОЙТИ, А НЕ ПОВОД СДАТЬСЯ. Здесь стоял голый return, и
         // спутник вечно стоял в пятнадцати ярдах от NPC с восклицательным знаком.
+        // ПРИДЯ — ПОВЕРНУТЬСЯ. На проверку дистанции это не влияет, но это то, что делает
+        // игрок, и это видно в клиенте: спутник, говорящий с NPC спиной, выглядит поломкой.
+        if (self->CanInteractWithQuestGiver(giver))
+            self->SetFacingToObject(giver);
+
         if (!self->CanInteractWithQuestGiver(giver))
         {
             if (c.Mode == Behavior::Idle)
@@ -3402,7 +3702,8 @@ public:
     //   * ВЫСОТЕ POI НЕ ВЕРИТЬ НИКОГДА: единственный её потребитель в ядре (.go quest)
     //     сам её выбрасывает и берёт землю (cs_go.cpp:293); 709 из 4473 точек несут
     //     ноль, а ноль против настоящих 383 не попадает даже в 50-ярдовое окно поиска
-    //     полигона — маршрут молча выродится в прямую. Землю ищем от MAX_HEIGHT;
+    //     полигона — маршрут молча выродится в прямую. Землю ищем ОТ СВОЕГО ЯРУСА вниз,
+    //     а MAX_HEIGHT только запасным: см. опыт Легиона в разборе ниже по коду;
     //   * NavigationPlayerConditionID и PlayerConditionID обязательны к проверке,
     //     Flags/SpawnTrackingID/UiMapID ядро само не читает — игнорируем;
     //   * указатель GetQuestPOIData НЕ ДЕРЖАТЬ между тактами: .reload quest_poi чистит
@@ -3444,7 +3745,26 @@ public:
         }
         if (!MapManager::IsValidMapCoord(self->GetMapId(), x, y))
             return false;
-        float z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y, MAX_HEIGHT);
+        // ВЫСОТУ СПРАШИВАЕМ ОТ СВОЕГО ЯРУСА, А НЕ ОТ НЕБА.
+        //
+        // Здесь стоял GetHeight(..., MAX_HEIGHT) — самая верхняя поверхность в столбце.
+        // Ровно эта ошибка стоила Легиону 121 тупика за одно окно (заметки 2026-08-13,
+        // раздел «Teldrassil: зона — ЯРУСЫ»): на мировом древе верхняя поверхность это
+        // ветка далеко над целью, и каждая проба возвращала 0x8 — полигон не найден.
+        //
+        // То же самое здесь и сегодня: спутник стоит на земле у Шпиля на z≈25, а точка
+        // задания приходит с z=110 — это КРЫША здания, а не пол, по которому он может
+        // идти. Замер: все двадцать отказов построителя с большой разницей высот, ни
+        // одного с разницей меньше пяти ярдов.
+        //
+        // Починка та же, что сработала на Легионе: искать ВНИЗ от собственного яруса
+        // спутника. На ровной местности это тот же ответ, что и MAX_HEIGHT, поэтому
+        // MAX_HEIGHT остаётся запасным — если своя высота не дала ничего, значит цель
+        // выше нас, и тогда пусть будет хоть какая-то.
+        float z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y,
+                                            self->GetPositionZ() + 5.0f);
+        if (z <= INVALID_HEIGHT)
+            z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y, MAX_HEIGHT);
         if (z <= INVALID_HEIGHT)
             return false;
         out->Relocate(x, y, z);
@@ -3583,9 +3903,15 @@ public:
         std::set<uint32> wanted, wantedItems;
         uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
         WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet, &wantedItems);
-        if (!_fightDiagDone && slotsUsed)
+        // ДИАГНОСТИКА ПО РАЗУ НА КАЖДОГО, А НЕ ПО РАЗУ НА ВЕСЬ МОДУЛЬ.
+        //
+        // Флаг был один на всех, и за целый прогон печаталась РОВНО ОДНА строка — про
+        // Гаррика. По ней нельзя сказать ничего о составе: у него нашлось ноль целей-убить,
+        // а у скольких ещё — неизвестно. Пять гипотез подряд разбились об это, поэтому
+        // флаг переезжает в спутника: 122 строки один раз, и картина видна целиком.
+        if (!c.FightDiagDone && slotsUsed)
         {
-            _fightDiagDone = true;
+            c.FightDiagDone = true;
             TC_LOG_INFO("server.worldserver",
                 "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}",
                 self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()));
@@ -4454,6 +4780,7 @@ private:
     uint32 _transitions = 0;
     uint32 _questsTurnedIn = 0;
     mutable bool _fightDiagDone = false;
+    uint32 _hops = 0;                   // сколько раз дошли до цели промежуточными прыжками
     mutable bool _rejDiagDone = false;
     mutable bool _whyDone = false;
     uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
