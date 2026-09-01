@@ -57,6 +57,7 @@
 #include "Bag.h"
 #include "ItemPackets.h"
 #include "NPCPackets.h"
+#include "SmartScriptMgr.h"
 #include "PhasingHandler.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
@@ -195,7 +196,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering, Talking };
 
 struct Companion
 {
@@ -312,6 +313,25 @@ struct Companion
     // экземпляров — личных, фазовых, — и запрет по GUID промахивается мимо следующего.
     // Причины разные и сроки разные: не дойти, ещё не возродился, не та фаза, брать нечего.
     std::unordered_map<uint32, uint32> GatherBackoff;
+    // ЦЕЛЬ, С КОТОРОЙ НАДО ГОВОРИТЬ, А НЕ ДРАТЬСЯ.
+    //
+    // Замер 2026-09-01: шесть спутников нежити стоят кучей на кладбище с квестом
+    // «The Wakening», у которого все три цели записаны типом «существо», но с описанием
+    // «Speak with ...». Модуль читал тип и шёл их УБИВАТЬ — а они дружественные, и убить
+    // их нельзя. То же держит тауренов с десятью такими целями.
+    ObjectGuid TalkCandidate;           // нашлась при поиске боевой цели
+    ObjectGuid TalkGuid;                // к кому идём говорить
+    uint32 TalkMs = 0;                  // сколько уже идём
+    float TalkDist = 0.0f;              // и с какого расстояния начали
+    uint32 Talked = 0;                  // сколько разговоров дало зачёт
+    std::unordered_map<uint32, uint32> TalkBackoff;   // ВИД -> когда пробовать снова: это
+                                        // про «у него нет пункта, дающего зачёт», и такое
+                                        // свойство общее у всех особей вида
+    std::set<ObjectGuid> TalkUnreachable;   // а «не дойти» — свойство КОНКРЕТНОЙ особи:
+                                        // запрет по виду глушил бы и всех остальных, и все
+                                        // задания, где этот вид встречается (Кодекс)
+    uint32 FrozenMs = 0;                // сколько стоим под запретом движения
+    bool FrozenNoted = false;           // и сказали ли об этом хоть раз
     Position TurnInPos;                 // и где он стоит
     // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
     // любая новая неудача переписывала таймер, а по его истечении набор очищался
@@ -939,14 +959,62 @@ public:
         else
             c.StuckMs += uint32(dt * 1000.0f);
 
+        // ЭТОТ ОТКАЗ БЫЛ МОЛЧАЛИВЫМ, И ЭТО ЕГО ГЛАВНАЯ БЕДА.
+        //
+        // Замер 2026-09-01: у сбора 116 отказов «не дойти» против 19 удач, и в каждом
+        // расстояние не менялось ВООБЩЕ — 63 и через двадцать секунд 63, — при нуле
+        // отказов построителя маршрута. То есть спутник не шёл и не жаловался. Причина
+        // здесь: помеченный как падающий, плавающий или обездвиженный не двигается, а
+        // журнал об этом не знает. Считаем и называем причину — по разу на спутника.
+        //
+        // И лечим то, что лечится: «падаю» у спутника без клиента залипает — клиент бы
+        // прислал пакет приземления, а его нет. Если мы под этим флагом стоим на месте
+        // дольше трёх секунд, спрашиваем у карты высоту под ногами и встаём на неё.
+        // Это тот же приём, что уже вернул на землю зависших в воздухе.
         static uint32 const FORBIDDEN = MOVEMENTFLAG_SWIMMING | MOVEMENTFLAG_FALLING
             | MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY | MOVEMENTFLAG_ROOT;
-        if ((self->GetUnitMovementFlags() & FORBIDDEN) || self->GetTransport()
-            || self->IsInWater() || self->IsFalling() || self->IsFlying())
+        // МЕЛКОВОДЬЕ — НЕ ПРЕПЯТСТВИЕ. Здесь стояло IsInWater(), а оно истинно и когда
+        // спутник стоит по щиколотку у берега. Замер после включения этой диагностики:
+        // «шаг запрещён — вода 1» у всех застрявших на сборе, при нуле прочих причин, и
+        // расстояние до цели не менялось ни на ярд за двадцать секунд. Настоящее плавание
+        // и так отсекается флагом MOVEMENTFLAG_SWIMMING в списке запрещённых выше.
+        bool const badFlags = (self->GetUnitMovementFlags() & FORBIDDEN) != 0;
+        if (badFlags || self->GetTransport()
+            || self->IsFalling() || self->IsFlying())
         {
+            c.FrozenMs += uint32(dt * 1000.0f);
+            if (!c.FrozenNoted)
+            {
+                c.FrozenNoted = true;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЗАМЕР {}: шаг запрещён — флаги {:X}, транспорт {}, "
+                    "падение {}, полёт {} (вода {} — уже не помеха)",
+                    self->GetName(), self->GetUnitMovementFlags(),
+                    self->GetTransport() ? 1 : 0,
+                    self->IsFalling() ? 1 : 0, self->IsFlying() ? 1 : 0,
+                    self->IsInWater() ? 1 : 0);
+            }
+
+            if (c.FrozenMs > 3000 && (self->IsFalling() || badFlags))
+            {
+                c.FrozenMs = 0;
+                float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
+                    self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
+                if (gz > INVALID_HEIGHT)
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ЗАМЕР {}: снимаю залипшее падение, {:.1f} -> {:.1f}",
+                        self->GetName(), self->GetPositionZ(), gz);
+                    Position down(self->GetPositionX(), self->GetPositionY(), gz,
+                                  self->GetOrientation());
+                    SendMove(c, self, down, 0);
+                    c.Moving = false;
+                }
+            }
             StopMoving(c, self);
             return false;               // не наш случай; выручит срок состояния
         }
+        c.FrozenMs = 0;
 
         if (c.StuckMs > 2500)
         {
@@ -1386,6 +1454,15 @@ public:
             else
                 { it->second -= diff; ++it; }
         }
+        for (auto it = c.TalkBackoff.begin(); it != c.TalkBackoff.end(); )
+        {
+            if (it->second <= diff)
+                it = c.TalkBackoff.erase(it);
+            else
+                { it->second -= diff; ++it; }
+        }
+        if (c.TalkUnreachable.size() > 40)
+            c.TalkUnreachable.clear();
         if (c.TravelCooldownMs)
             c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
             c.VendCooldownMs   = (c.VendCooldownMs   <= diff) ? 0 : c.VendCooldownMs   - diff;
@@ -1602,6 +1679,26 @@ public:
                     Switch(c, self, Behavior::ApproachingTarget, "нашлась цель квеста");
                     return;
                 }
+                // БИТЬ НЕКОГО, НО МОЖЕТ БЫТЬ ЕСТЬ С КЕМ ПОГОВОРИТЬ.
+                //
+                // Кандидата отметил поиск боевой цели: цель задания, которую ядро не
+                // считает атакуемой и у которой есть беседа. Выше боя намеренно не ставим —
+                // если по заданию надо кого-то убить, это полезнее; но если убить некого,
+                // разговор закрывает цель, которую иначе не закрыть ничем.
+                if (!c.TalkCandidate.IsEmpty())
+                {
+                    if (Creature* who = ObjectAccessor::GetCreature(*self, c.TalkCandidate))
+                    {
+                        c.TalkGuid = c.TalkCandidate;
+                        c.TalkCandidate.Clear();
+                        c.TalkMs = 0;
+                        c.TalkDist = self->GetExactDist(who);
+                        Switch(c, self, Behavior::Talking, "надо поговорить, а не драться");
+                        return;
+                    }
+                    c.TalkCandidate.Clear();
+                }
+
                 // БИТЬ НЕКОГО — МОЖЕТ, НУЖНОЕ ПРОСТО ЛЕЖИТ НА ЗЕМЛЕ.
                 //
                 // Ниже боя намеренно: если задание закрывается убийством, драться полезнее —
@@ -2197,6 +2294,193 @@ public:
                 }
                 c.GatherSpawnId = 0;
                 Switch(c, self, Behavior::Idle, "собрал");
+                return;
+            }
+            // РАЗГОВОР КАК СПОСОБ ЗАКРЫТЬ ЦЕЛЬ ЗАДАНИЯ.
+            //
+            // Такие цели записаны в базе типом «существо» — тем же, что «убить N волков», —
+            // и отличаются только описанием «Speak with ...», которого модуль не читает.
+            // Поэтому шесть спутников нежити ходили УБИВАТЬ Лилиан Восс и двух её товарищей
+            // и стояли кучей на кладбище. Признак берём у ядра: цель задания, которую
+            // IsValidAttackTarget отвергает и у которой есть флаг беседы.
+            //
+            // Зачёт выдаёт ВЫБОР ПУНКТА, а не сам подход: у всех троих правило
+            // «выбран пункт меню -> применить заклинание на говорящего». Поэтому здесь
+            // ровно то, что делает клиент: подойти, открыть беседу, перебрать пункты.
+            case Behavior::Talking:
+            {
+                Creature* who = ObjectAccessor::GetCreature(*self, c.TalkGuid);
+                if (!who || !who->IsAlive())
+                {
+                    c.TalkGuid.Clear();
+                    Switch(c, self, Behavior::Idle, "собеседник исчез");
+                    return;
+                }
+
+                if (!self->CanInteractWithQuestGiver(who) && !self->GetNPCIfCanInteractWith(
+                        c.TalkGuid, UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE))
+                {
+                    float tx, ty, tz;
+                    ApproachPoint(c, who, self, tx, ty, tz, diff);
+                    StepToward(c, self, tx, ty, tz, who->GetCombatReach() + 2.0f, dt);
+
+                    if (c.NoPathMs > 0)
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation РЕЧЬ {}: к {} ({}) маршрута нет",
+                            self->GetName(), who->GetName(), who->GetEntry());
+                        c.TalkUnreachable.insert(c.TalkGuid);
+                        c.TalkGuid.Clear();
+                        Switch(c, self, Behavior::Idle, "к собеседнику нет дороги");
+                        return;
+                    }
+                    c.TalkMs += slice;
+                    float const now = self->GetExactDist(who);
+                    bool const noProgress = c.TalkMs >= 20000 && now > c.TalkDist - 1.0f;
+                    if (c.Stalled || noProgress || c.TalkMs >= 45000)
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation РЕЧЬ {}: до {} ({}) не дойти за {} с, было {:.0f}, стало {:.0f}",
+                            self->GetName(), who->GetName(), who->GetEntry(),
+                            c.TalkMs / 1000, c.TalkDist, now);
+                        c.TalkUnreachable.insert(c.TalkGuid);
+                        c.TalkGuid.Clear();
+                        Switch(c, self, Behavior::Idle, "до собеседника не дойти");
+                    }
+                    return;
+                }
+
+                // ПРИШЛИ. Поворачиваемся — так делает игрок, и это видно в клиенте.
+                self->SetFacingToObject(who);
+
+                std::string const name = who->GetName();
+                uint32 const entry = who->GetEntry();
+
+                // ПЕРЕБИРАТЬ ПУНКТЫ БЕСЕДЫ НЕЛЬЗЯ. ЭТО БЫЛ ИСПОЛНИТЕЛЬ ЧЕГО УГОДНО.
+                //
+                // Первая версия выбирала подряд все пункты меню, пока цель не закроется.
+                // Кодекс отказал в выкладке и перечислил, что один такой пакет исполняет
+                // НЕМЕДЛЕННО, без всякого следующего: снятие денег за пункт, отключение
+                // получения опыта, произвольный сценарий существа — а значит телепорт,
+                // уничтожение предметов и даже убийство персонажа. Я собирался запустить
+                // это на ста двадцати двух живых персонажах.
+                //
+                // Правильный отбор берётся из САМИХ ДАННЫХ, а не из моей эвристики. У
+                // существа есть его правила (SmartAIMgr отдаёт их модулю), и среди них
+                // видно, какой пункт даёт зачёт: событие «выбран пункт меню» с действием
+                // «применить заклинание» или «выдать зачёт убийства». Пара «отправитель +
+                // действие» из правила совпадает с такими же полями пункта меню — по ним
+                // и опознаём. Всё остальное не трогаем ВООБЩЕ: телепорт, торговля, обучение,
+                // плата за пункт в этот список по построению не попадут.
+                std::set<std::pair<uint32, uint32>> allowed;
+                for (SmartScriptHolder const& e :
+                     sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE))
+                {
+                    if (e.GetEventType() != SMART_EVENT_GOSSIP_SELECT)
+                        continue;
+                    uint32 const act = e.GetActionType();
+                    if (act != SMART_ACTION_CALL_KILLEDMONSTER && act != SMART_ACTION_SELF_CAST)
+                        continue;
+                    allowed.insert({ e.event.gossip.sender, e.event.gossip.action });
+                }
+                if (allowed.empty())
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation РЕЧЬ {}: у {} ({}) нет пункта, дающего зачёт — не трогаю",
+                        self->GetName(), name, entry);
+                    c.TalkBackoff[entry] = 600000;
+                    c.TalkGuid.Clear();
+                    Switch(c, self, Behavior::Idle, "говорить не о чем");
+                    return;
+                }
+
+                // ТОЧНОЕ ПРОДВИЖЕНИЕ, А НЕ «ВИД ИСЧЕЗ ИЗ СПИСКА» (Кодекс).
+                //
+                // Прежняя проверка смотрела, остался ли вид в общем наборе нужных. Она лгала
+                // в обе стороны: цель могла закрыться в тот же такт по другой причине, а при
+                // двух заданиях на один вид не менялась вовсе. Запоминаем счётчики именно
+                // тех целей, что ссылаются на это существо, и сверяем их же.
+                std::vector<std::pair<std::pair<uint32, uint32>, int32>> before;
+                for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                {
+                    uint32 const qid = self->GetQuestSlotQuestId(slot);
+                    if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                        continue;
+                    Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+                    if (!q)
+                        continue;
+                    for (QuestObjective const& obj : q->GetObjectives())
+                        if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == entry)
+                            before.push_back({ { qid, obj.ID }, self->GetQuestObjectiveData(qid, obj.ID) });
+                }
+
+                {
+                    WorldPacket raw(CMSG_TALK_TO_GOSSIP);
+                    WorldPackets::NPC::Hello hello(std::move(raw));
+                    hello.Unit = c.TalkGuid;
+                    c.Session->HandleGossipHelloOpcode(hello);
+                }
+
+                // Меню читаем ТЕКУЩЕЕ и сразу: снимок устаревает, а устаревший номер пункта
+                // может попасть в сценарий уже другим действием (Кодекс).
+                GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
+                uint32 const menuId = menu.GetMenuId();
+                int32 pick = -1;
+                // СВЕРЯЕМ ТО ЖЕ, ЧТО СВЕРЯЕТ ЯДРО, А НЕ ПОХОЖЕЕ ПО НАЗВАНИЮ.
+                //
+                // Первая версия сравнивала с полями Sender и Action самого пункта — они так
+                // называются, и это сбило. Замер: «разрешённых пунктов 1, выбран -1» у всех
+                // восьмидесяти разговоров, то есть список строился верно, а совпадения не
+                // находилось никогда.
+                //
+                // На деле обработчик передаёт сценарию НОМЕР МЕНЮ и OrderIndex пункта
+                // (NPCHandler.cpp: OnGossipSelect(player, packet.GossipID, item->OrderIndex)),
+                // а сценарий сверяет их со своими sender и action (SmartScript.cpp:3563).
+                // По ним и опознаём.
+                for (GossipMenuItem const& item : menu.GetMenuItems())
+                {
+                    if (!allowed.count({ menuId, item.OrderIndex }))
+                        continue;
+                    // и сверх того — структурные признаки безопасности (Кодекс)
+                    if (item.BoxCoded || item.BoxMoney != 0 || item.ActionMenuID != 0
+                        || item.ActionPoiID != 0 || item.SpellID
+                        || item.OptionNpc != GossipOptionNpc::None)
+                        continue;
+                    pick = item.GossipOptionID;
+                    break;
+                }
+
+                bool done = false;
+                if (pick >= 0)
+                {
+                    WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
+                    WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
+                    sel.GossipUnit = c.TalkGuid;
+                    sel.GossipID = menuId;
+                    sel.GossipOptionID = pick;
+                    c.Session->HandleGossipSelectOptionOpcode(sel);
+
+                    for (auto const& [key, was] : before)
+                        if (self->GetQuestObjectiveData(key.first, key.second) > was)
+                            { done = true; break; }
+                }
+
+                if (done)
+                {
+                    ++c.Talked;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation РЕЧЬ {}: поговорил с {} ({}), пункт {}; всего разговоров {}",
+                        self->GetName(), name, entry, pick, c.Talked);
+                }
+                else
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation РЕЧЬ {}: {} ({}) — разрешённых пунктов {}, выбран {}, зачёта нет",
+                        self->GetName(), name, entry, uint32(allowed.size()), pick);
+                    c.TalkBackoff[entry] = 120000;
+                }
+                c.TalkGuid.Clear();
+                Switch(c, self, Behavior::Idle, done ? "поговорил" : "разговор без толку");
                 return;
             }
             case Behavior::Attacking:
@@ -3423,6 +3707,7 @@ public:
             case Behavior::Travelling:        return "иду к месту задания";
             case Behavior::TurningIn:         return "сдаю квест";
             case Behavior::Gathering:         return "иду собирать";
+            case Behavior::Talking:           return "иду говорить";
         }
         return "?";
     }
@@ -4412,6 +4697,10 @@ public:
         Cell::VisitGridObjects(self, searcher, Cfg().FightRange);
 
         uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0;
+        // сбрасываем перед КАЖДЫМ проходом: иначе прошлый кандидат живёт в состоянии до
+        // тех пор, пока его не употребят, и спутник идёт к тому, кого рядом уже нет (Кодекс)
+        c.TalkCandidate.Clear();
+        float talkDist = -1.0f;
         uint32 lastEntry = 0, lastFaction = 0;
         Creature* best = nullptr;
         float bestDist = Cfg().FightRange + 1.0f;
@@ -4426,7 +4715,12 @@ public:
             // Второе спрашивается у ядра тем же списком, что оно шлёт клиенту, когда тот
             // запрашивает сведения о существе. Обратный индекс не нужен: перебор существ
             // вокруг уже идёт, и вопрос задаётся ровно тем, кто попался на глаза.
-            bool suitable = wanted.count(creature->GetEntry()) != 0;
+            // РАЗЛИЧАЕМ, ОТКУДА ЦЕЛЬ. Разговор годится только для целей «убить N существ»,
+            // ошибочно размеченных как бой. Существо, с которого нужен ПРЕДМЕТ, — не тот
+            // случай, и вести с ним беседу нельзя: это расширило бы исполнение сценариев
+            // далеко за пределы разобранного (Кодекс).
+            bool const byMonster = wanted.count(creature->GetEntry()) != 0;
+            bool suitable = byMonster;
             if (!suitable && !wantedItems.empty())
                 if (std::vector<uint32> const* qi = sObjectMgr->GetCreatureQuestItemList(
                         creature->GetEntry(), self->GetMap()->GetDifficultyID()))
@@ -4446,6 +4740,24 @@ public:
                 { ++rejBusy; ++rejected; continue; }
             if (!self->IsValidAttackTarget(creature))
             {
+                // С НИМ НАДО ГОВОРИТЬ, А НЕ ДРАТЬСЯ — И ЭТО ВИДНО ПО ЯДРУ, А НЕ ПО ОПИСАНИЮ.
+                //
+                // Цель задания, которую ядро отказывается считать атакуемой и у которой
+                // есть беседа, — это «поговорить с», как бы ни был записан тип цели.
+                // Признак взят у самой игры: IsValidAttackTarget плюс флаг беседы.
+                // Зачёт такие NPC выдают по ВЫБОРУ ПУНКТА в окне разговора: у Лилиан Восс
+                // и двух других стоит правило «выбран пункт меню -> применить заклинание
+                // на говорящего», и это единственный путь закрыть цель.
+                // БЛИЖАЙШИЙ, А НЕ ПОСЛЕДНИЙ ВСТРЕЧЕННЫЙ: порядок обхода сетки — не политика
+                // выбора цели (Кодекс). И только от целей «убить», не от добытчиков предметов.
+                if (byMonster && creature->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP)
+                    && !c.TalkBackoff.count(creature->GetEntry())
+                    && !c.TalkUnreachable.count(creature->GetGUID()))
+                {
+                    float const d = self->GetExactDist(creature);
+                    if (talkDist < 0.0f || d < talkDist)
+                        { talkDist = d; c.TalkCandidate = creature->GetGUID(); }
+                }
                 ++rejInvalid; ++rejected;
                 lastEntry = creature->GetEntry(); lastFaction = creature->GetFaction();
                 // Разбираем ОТКАЗ ЯДРА по составляющим, вместо догадок: повторяем те же
