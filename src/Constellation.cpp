@@ -2372,13 +2372,15 @@ public:
                 // действие» из правила совпадает с такими же полями пункта меню — по ним
                 // и опознаём. Всё остальное не трогаем ВООБЩЕ: телепорт, торговля, обучение,
                 // плата за пункт в этот список по построению не попадут.
-                std::set<std::pair<uint32, uint32>> allowed;
+                std::set<std::pair<uint32, uint32>> allowed, scripted;
                 for (SmartScriptHolder const& e :
                      sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE))
                 {
                     if (e.GetEventType() != SMART_EVENT_GOSSIP_SELECT)
                         continue;
                     uint32 const act = e.GetActionType();
+                    // ВСЕ пары со сценарием — чтобы знать, на что НЕ нажимать по дороге
+                    scripted.insert({ e.event.gossip.sender, e.event.gossip.action });
                     if (act != SMART_ACTION_CALL_KILLEDMONSTER && act != SMART_ACTION_SELF_CAST)
                         continue;
                     allowed.insert({ e.event.gossip.sender, e.event.gossip.action });
@@ -2426,43 +2428,94 @@ public:
                 GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
                 uint32 const menuId = menu.GetMenuId();
                 int32 pick = -1;
-                // СВЕРЯЕМ ТО ЖЕ, ЧТО СВЕРЯЕТ ЯДРО, А НЕ ПОХОЖЕЕ ПО НАЗВАНИЮ.
+                // РАЗГОВОР ДВУХШАГОВЫЙ, И ЭТО ВИДНО В ДАННЫХ.
                 //
-                // Первая версия сравнивала с полями Sender и Action самого пункта — они так
-                // называются, и это сбило. Замер: «разрешённых пунктов 1, выбран -1» у всех
-                // восьмидесяти разговоров, то есть список строился верно, а совпадения не
-                // находилось никогда.
+                // Существо привязано к одному меню, а зачёт лежит в другом: Лилиан Восс
+                // открывает 12483, а правило ждёт выбора в 12484; у Маршала Редпата 12485
+                // против 12486, у Валдреда Морея 12487 против 12489. Первый шаг разговора —
+                // это переход в следующее окно, и только там нужный пункт.
                 //
-                // На деле обработчик передаёт сценарию НОМЕР МЕНЮ и OrderIndex пункта
-                // (NPCHandler.cpp: OnGossipSelect(player, packet.GossipID, item->OrderIndex)),
-                // а сценарий сверяет их со своими sender и action (SmartScript.cpp:3563).
-                // По ним и опознаём.
-                for (GossipMenuItem const& item : menu.GetMenuItems())
+                // Прежний защитный фильтр отвергал пункты с переходом в подменю — то есть
+                // ровно тот шаг, без которого до цели не дойти. Замер: «разрешённых пунктов
+                // 1, выбран -1» у всех восьмидесяти разговоров.
+                //
+                // Переход разрешаем, но НЕ любой: только в то меню, которое само числится в
+                // разрешённых по данным. Такой пункт ничего не делает, кроме открытия
+                // следующего окна, и увести в торговлю или телепорт не может.
+                //
+                // Сверяем при этом то же, что сверяет ядро: обработчик передаёт сценарию
+                // номер меню и OrderIndex пункта (NPCHandler.cpp), а сценарий сличает их со
+                // своими sender и action (SmartScript.cpp:3563) — не поля Sender/Action
+                // самого пункта, как я решил вначале по созвучию имён.
+                std::set<uint32> wantMenus;
+                for (auto const& [m, o] : allowed)
+                    wantMenus.insert(m);
+
+                auto safeOption = [](GossipMenuItem const& item) -> bool
                 {
-                    if (!allowed.count({ menuId, item.OrderIndex }))
-                        continue;
-                    // и сверх того — структурные признаки безопасности (Кодекс)
-                    if (item.BoxCoded || item.BoxMoney != 0 || item.ActionMenuID != 0
-                        || item.ActionPoiID != 0 || item.SpellID
-                        || item.OptionNpc != GossipOptionNpc::None)
-                        continue;
-                    pick = item.GossipOptionID;
-                    break;
-                }
+                    return !item.BoxCoded && item.BoxMoney == 0 && item.ActionPoiID == 0
+                        && !item.SpellID && item.OptionNpc == GossipOptionNpc::None;
+                };
 
                 bool done = false;
-                if (pick >= 0)
+                pick = -1;
+                for (uint8 hop = 0; hop < 3 && !done; ++hop)
                 {
+                    GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
+                    uint32 const menuId = menu.GetMenuId();
+
+                    // 1) есть ли прямо здесь пункт, дающий зачёт
+                    pick = -1;
+                    for (GossipMenuItem const& item : menu.GetMenuItems())
+                        if (allowed.count({ menuId, item.OrderIndex }) && safeOption(item)
+                            && item.ActionMenuID == 0)
+                            { pick = item.GossipOptionID; break; }
+
+                    if (pick >= 0)
+                    {
+                        WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
+                        WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
+                        sel.GossipUnit = c.TalkGuid;
+                        sel.GossipID = menuId;
+                        sel.GossipOptionID = pick;
+                        c.Session->HandleGossipSelectOptionOpcode(sel);
+
+                        for (auto const& [key, was] : before)
+                            if (self->GetQuestObjectiveData(key.first, key.second) > was)
+                                { done = true; break; }
+                        break;
+                    }
+
+                    // 2) иначе ищем переход ИМЕННО в нужное меню
+                    // ПЕРЕХОД БЫВАЕТ НЕ ОДИН. У Валдреда Морея цепочка 12487 -> 12488 -> 12489,
+                    // и прямого пункта в нужное меню из первого окна просто нет. Замер: у него
+                    // одного 24 отказа «выбран -1», при двенадцати удачных разговорах с теми,
+                    // у кого переход соседний.
+                    //
+                    // Поэтому разрешаем и промежуточный переход, но с жёстким условием: на
+                    // этот пункт НЕ навешено ни одного правила сценария. Тогда он физически
+                    // не может сделать ничего, кроме открытия следующего окна — ни каста, ни
+                    // телепорта, ни платы. Сначала всё же пробуем прямой путь в нужное меню.
+                    int32 step = -1;
+                    uint32 stepMenu = menuId;
+                    for (GossipMenuItem const& item : menu.GetMenuItems())
+                        if (item.ActionMenuID != 0 && wantMenus.count(item.ActionMenuID)
+                            && safeOption(item))
+                            { step = item.GossipOptionID; break; }
+                    if (step < 0)
+                        for (GossipMenuItem const& item : menu.GetMenuItems())
+                            if (item.ActionMenuID != 0 && safeOption(item)
+                                && !scripted.count({ menuId, item.OrderIndex }))
+                                { step = item.GossipOptionID; break; }
+                    if (step < 0)
+                        break;                  // дальше идти некуда — не тычемся наугад
+
                     WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
                     WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
                     sel.GossipUnit = c.TalkGuid;
-                    sel.GossipID = menuId;
-                    sel.GossipOptionID = pick;
+                    sel.GossipID = stepMenu;
+                    sel.GossipOptionID = step;
                     c.Session->HandleGossipSelectOptionOpcode(sel);
-
-                    for (auto const& [key, was] : before)
-                        if (self->GetQuestObjectiveData(key.first, key.second) > was)
-                            { done = true; break; }
                 }
 
                 if (done)
@@ -2475,7 +2528,7 @@ public:
                 else
                 {
                     TC_LOG_INFO("server.worldserver",
-                        "Constellation РЕЧЬ {}: {} ({}) — разрешённых пунктов {}, выбран {}, зачёта нет",
+                        "Constellation РЕЧЬ {}: {} ({}) — разрешённых пар {}, выбран {}, зачёта нет",
                         self->GetName(), name, entry, uint32(allowed.size()), pick);
                     c.TalkBackoff[entry] = 120000;
                 }
