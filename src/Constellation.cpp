@@ -2491,9 +2491,10 @@ public:
                     // три других состояния его слушают. Торговля не слушала — значит
                     // недостижимый торговец означал две минуты бега в стену вместо трёх
                     // секунд. Разбор поймал это сравнением с Travelling.
-                    if (c.Stalled && FindReachableApproach(c, self, vendor))
-                        return;
-                    if (c.Stalled || c.ModeMs > 120000)
+                    bool const vendorDone = c.Stalled || c.ModeMs > 120000;
+                    if (vendorDone && FindReachableApproach(c, self, vendor))
+                        { c.ModeMs = 0; return; }       // нашли обход — даём дойти до него
+                    if (vendorDone)
                     {
                         LogApproachFailure(c, self, vendor, "торговцу");
                         c.VendCooldownMs = 300000;
@@ -2796,9 +2797,10 @@ public:
                     float ax, ay, az;
                     ApproachPoint(c, ender, self, ax, ay, az, diff);
                     StepToward(c, self, ax, ay, az, ender->GetCombatReach() + 2.0f, dt);
-                    if (c.Stalled && FindReachableApproach(c, self, ender))
-                        return;
-                    if (c.Stalled || c.ModeMs > 60000)
+                    bool const enderDone = c.Stalled || c.ModeMs > 60000;
+                    if (enderDone && FindReachableApproach(c, self, ender))
+                        { c.ModeMs = 0; return; }
+                    if (enderDone)
                     {
                         LogApproachFailure(c, self, ender, "принимающему");
                         c.TurnInBackoff[c.TurnInQuest] = 60000;
@@ -3127,11 +3129,12 @@ public:
                         return;
                     }
                     c.TalkMs += slice;
-                    float const now = self->GetExactDist(who);
+                    float const now = ProgressDist(c, self, who);
                     bool const noProgress = c.TalkMs >= 20000 && now > c.TalkDist - 1.0f;
-                    if (c.Stalled && FindReachableApproach(c, self, who))
-                        return;
-                    if (c.Stalled || noProgress || c.TalkMs >= 45000)
+                    bool const talkDone = c.Stalled || noProgress || c.TalkMs >= 45000;
+                    if (talkDone && FindReachableApproach(c, self, who))
+                        { c.TalkMs = 0; c.TalkDist = ProgressDist(c, self, who); return; }
+                    if (talkDone)
                     {
                         LogApproachFailure(c, self, who, "собеседнику");
                         TC_LOG_INFO("server.worldserver",
@@ -5051,11 +5054,12 @@ public:
                 // удаётся, Stalled не взводится, автомат стоит, боёв нет. Это была живая
                 // регрессия, замеченная оператором в клиенте.
                 c.GiverMs += diff;
-                float const now = self->GetExactDist(going);
+                float const now = ProgressDist(c, self, going);
                 bool const noProgress = c.GiverMs >= 20000 && now > c.GiverDist - 1.0f;
-                if (c.Stalled && FindReachableApproach(c, self, going))
-                    return;
-                if (c.Stalled || noProgress || c.GiverMs >= 30000)
+                bool const giverDone = c.Stalled || noProgress || c.GiverMs >= 30000;
+                if (giverDone && FindReachableApproach(c, self, going))
+                    { c.GiverMs = 0; c.GiverDist = ProgressDist(c, self, going); return; }
+                if (giverDone)
                 {
                     LogApproachFailure(c, self, going, "квестодателю");
                     TC_LOG_INFO("server.worldserver",
@@ -6586,12 +6590,23 @@ public:
     // ярдов по восьми направлениям, высота — от карты у самой точки, на той же поверхности,
     // что и NPC; берём первую с полным путём. Дорого (до 24 построений) — один раз за
     // намерение и только в тупике.
+    // СКОЛЬКО НАМ ЕЩЁ ИДТИ — ДО ТОЙ ТОЧКИ, КУДА МЫ ИДЁМ (Кодекс). Пока держится точка обхода,
+    // расстояние до самого NPC не убывает — путь ведёт вбок и вокруг, — и проверка «двадцать
+    // секунд без продвижения» оборвала бы именно тот заход, ради которого обход и затевался.
+    float ProgressDist(Companion const& c, Player* self, WorldObject const* target) const
+    {
+        if (c.RingHeld && c.ApproachFor == target->GetGUID())
+            return self->GetExactDist(c.ApproachX, c.ApproachY, c.ApproachZ);
+        return self->GetExactDist(target);
+    }
+
     bool FindReachableApproach(Companion& c, Player* self, WorldObject const* target)
     {
         if (c.RingTried || !target)
             return false;
         c.RingTried = true;
         static float const rings[3] = { 3.0f, 5.0f, 8.0f };
+        uint32 probed = 0, offGround = 0, offSurface = 0, noRoute = 0, lastType = 0;
         for (float r : rings)
             for (uint32 k = 0; k < 8; ++k)
             {
@@ -6602,13 +6617,16 @@ public:
                     continue;
                 float const z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y,
                                                           target->GetPositionZ() + 3.0f, true, 20.0f);
-                if (z <= INVALID_HEIGHT || std::fabs(z - target->GetPositionZ()) > 6.0f)
-                    continue;               // не та поверхность
+                if (z <= INVALID_HEIGHT)
+                    { ++offGround; continue; }
+                if (std::fabs(z - target->GetPositionZ()) > 6.0f)
+                    { ++offSurface; continue; }         // не та поверхность
+                ++probed;
                 PathGenerator path(self);
-                if (!path.CalculatePath(x, y, z, false))
-                    continue;
-                if (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_INCOMPLETE))
-                    continue;
+                bool const built = path.CalculatePath(x, y, z, false);
+                lastType = uint32(path.GetPathType());      // и при отказе тоже — это главный случай
+                if (!built || (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_INCOMPLETE)))
+                    { ++noRoute; continue; }
                 c.ApproachX = x;
                 c.ApproachY = y;
                 c.ApproachZ = z;
@@ -6629,6 +6647,9 @@ public:
                     self->GetName(), target->GetName(), target->GetEntry(), r, x, y, z, z - self->GetPositionZ());
                 return true;
             }
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПОДХОД {}: вокруг {} ({}) годной точки нет — проверено {}, без земли {}, не та поверхность {}, без маршрута {} (последний тип {:X})",
+            self->GetName(), target->GetName(), target->GetEntry(), probed, offGround, offSurface, noRoute, lastType);
         return false;
     }
 
