@@ -67,6 +67,7 @@
 #include "PathGenerator.h"
 #include "ObjectAccessor.h"
 #include "ConditionMgr.h"
+#include "Corpse.h"
 #include "MapManager.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -77,6 +78,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
+#include "AreaTriggerPackets.h"
 #include "Player.h"
 #include "RBAC.h"
 #include "ScriptMgr.h"
@@ -85,7 +87,9 @@
 
 #include "StringConvert.h"
 
+#include <algorithm>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <random>
 #include <set>
@@ -129,6 +133,7 @@ struct Settings
     float MaxStepUp       = 2.0f;
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
+    int32 QuestMaxAbove   = 2;          // жёлтое берём; выше на столько уровней — уже красное
     float RestBelowPct    = 55.0f;      // ниже этого — отдыхаем
     float ResumeAbovePct  = 85.0f;      // и не встаём, пока не поднимемся сюда
     uint32 RestMaxMs      = 120000;     // но не дольше двух минут
@@ -166,6 +171,7 @@ struct Settings
         QuestGiverRange = sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
         // широко: цель ищется по округе, а не на длину руки — к ней ходят
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
+        QuestMaxAbove   = sConfigMgr->GetIntDefault("Constellation.QuestMaxAbove", 2);
         // ГИСТЕРЕЗИС, А НЕ ОДИН ПОРОГ (Кодекс, разбор плана): входить и выходить по
         // одному числу — значит дёргаться на границе и засорять журнал переходами.
         RestBelowPct    = sConfigMgr->GetFloatDefault("Constellation.RestBelowPct", 55.0f);
@@ -301,6 +307,30 @@ struct Companion
     bool GiverDiagDone = false;         // и то же для поиска квестодателя
     bool GatherDiagDone = false;        // и для отбора точки сбора
     bool TalkDiagDone = false;          // и для самого разговора
+    bool RedNoted = false;              // сказали ли хоть раз, что пропускаем красные
+    bool ImmuneNoted = false;           // и что цель ещё невосприимчива к игрокам
+    bool CondNoted = false;             // и что цель не отвечает условиям заклинания
+    // ОТМЕТКИ ГИБЕЛЕЙ, А НЕ СЧЁТЧИК С ТАЙМЕРОМ (Кодекс): таймер, который каждая смерть
+    // ставит заново, считает тремя за десять минут даже смерти на 0-й, 9-й и 18-й.
+    std::deque<uint32> DeathAt;         // время гибелей, мс игрового времени
+    uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
+    bool FleeNoted = false;             // и сказали ли об этом
+    bool CorpseRunNoted = false;        // сказали ли, что бежим к своему телу
+    uint32 CorpseRunMs = 0;             // сколько уже бежим
+    uint32 ReclaimWaitMs = 0;           // сказали ли, что ждём срок подъёма
+    bool DeathCounted = false;          // эта гибель уже записана в окно
+    uint8 CorpseTries = 0;              // отказов подъёма у тела: две — и к целительнице
+    bool CorpseGaveUp = false;          // до тела не добежать или подъём не вышел
+    bool RevivePicked = false;          // тихое место у тела выбрано
+    Position RevivePos;                 // и вот оно
+    Position FleeTo;                    // ВЫБРАННАЯ точка отхода — она не двигается за нами
+    bool FleeHasPoint = false;
+    uint32 FleePauseMs = 0;             // отход не удался — не долбиться
+    uint32 FleeTotalMs = 0;             // общий бюджет отхода: смена точки его не обнуляет
+    // ОСОБЬ, КОТОРАЯ СЕЙЧАС НЕ ПОДХОДИТ, НО ПОДОЙДЁТ ПОТОМ (Кодекс): условие заклинания
+    // бывает временным — ленивый батрак снова засыпает через пять минут. Вечный запрет
+    // (TalkUnreachable) вычеркнул бы его навсегда, поэтому здесь запрет со сроком.
+    std::map<ObjectGuid, uint32> TalkRetry;
     // КАНДИДАТ, А НЕ ЖИВОЙ УКАЗАТЕЛЬ. Живой объект берётся по приходу, по идентификатору
     // спавна; до этого мы знаем только, ГДЕ он записан на карте.
     uint32 GatherSpawnId = 0;           // идентификатор точки появления объекта
@@ -323,7 +353,33 @@ struct Companion
     ObjectGuid TalkGuid;                // к кому идём говорить
     uint32 TalkMs = 0;                  // сколько уже идём
     float TalkDist = 0.0f;              // и с какого расстояния начали
-    uint32 Talked = 0;                  // сколько разговоров дало зачёт
+    uint32 Talked = 0;                  // сколько разговоров и применений дало зачёт
+    uint8 ToolFruitless = 0;            // применений подряд без зачёта (предохранитель)
+    uint32 EquipScanMs = 0;             // когда снова смотреть сумки на предмет обновок
+    uint32 Equipped = 0;                // сколько вещей надето за жизнь
+    // ОЖИДАНИЕ ЗАЧЁТА ПОСЛЕ ПОПЫТКИ (Кодекс о применении предметов): заклинание бывает с
+    // временем произнесения и ставится ядром в очередь (Player::RequestSpellCast), поэтому
+    // результат меряется не в том же вызове, а по окну. Предохранитель считает ОКНА без
+    // зачёта, а не отправленные пакеты — отказ по откату или занятости попыткой не является.
+    uint32 ToolWaitMs = 0;              // сколько ещё ждать зачёта (0 = попытка не сделана)
+    uint32 ToolFruitlessEntry = 0;      // для какого вида считаем отставленных особей
+    uint8 ToolGiveUps = 0;              // сколько особей этого вида отставлено подряд
+    uint8 ToolActionFruitless = 0;      // отставленных особей подряд по ВСЕМ видам (Легион, 0012)
+    uint32 ToolActionMs = 0;            // и пауза всему действию, когда их накопилось шесть
+    float WalkBest = 1.0e9f;            // лучшее расстояние до точки в этом режиме
+    uint32 WalkStuckMs = 0;             // сколько подряд не приближаемся к ней
+    std::vector<std::pair<std::pair<uint32, uint32>, int32>> ToolWas;   // счётчики целей ДО попытки
+    uint32 ToolWasEntry = 0;            // по какому виду снят снимок: зачёт, пришедший после окна,
+                                        // сверяется с ним перед СЛЕДУЮЩЕЙ попыткой (Кодекс)
+    // ТОРГОВЕЦ ПО КАРТЕ: когда в обзоре никого, идём к ближайшему из указателя спавнов —
+    // так же, как к принимающему квест. VendorGuid заполняется, когда он показался.
+    uint32 VendorEntry = 0;             // к какому виду торговца идём (0 = ни к какому)
+    Position VendorPos;                 // и где он стоит по таблице
+    float VendorDist = 0.0f;            // с какого расстояния пошли: срок считается от него
+    uint32 VendorScanMs = 0;            // обзор сетки у его точки — не чаще раза в 2 с
+    float TurnInDist = 0.0f;            // с какого расстояния пошли сдавать: срок от него
+    std::unordered_map<uint32, uint32> TriggerSentMs;   // зона осмотра -> не слать повторно, мс
+    float TravelStop = 10.0f;           // на каком расстоянии от точки считать «пришёл»
     std::unordered_map<uint32, uint32> TalkBackoff;   // ВИД -> когда пробовать снова: это
                                         // про «у него нет пункта, дающего зачёт», и такое
                                         // свойство общее у всех особей вида
@@ -1334,6 +1390,209 @@ public:
             return;                     // отпустили дух; переносом займётся ядро
         }
 
+        // ЗАБЕГ К ТЕЛУ, И ПОДЪЁМ В ТИХОМ МЕСТЕ РЯДОМ С НИМ.
+        //
+        // Ядро уже перенесло призрака на кладбище, поэтому вести его туда нечего — он там.
+        // Игрок делает обратное: бежит к телу и поднимается на нём, чтобы не пробиваться от
+        // кладбища заново через возродившихся мобов. Так и здесь.
+        //
+        // Подъём — не в самой точке смерти: ядро разрешает поднять тело с 39 ярдов, и в этом
+        // круге почти всегда есть место подальше от того, кто нас убил. Точка выбирается один
+        // раз за смерть: дюжина кандидатов по кольцу, у каждого проверяется земля, обрыв и
+        // вода, выигрывает тот, до чьих ближайших враждебных дальше всего.
+        //
+        // Условия подъёма сторожит само ядро (MiscHandler.cpp): дух отпущен, тело есть,
+        // тридцать секунд после отпускания прошли, и мы в радиусе. Мы доходим и просим.
+        // СМЕРТЕЛЬНОЕ МЕСТО НЕ ОТМЕНЯЕТ ЗАБЕГ — ОНО УЖЕСТОЧАЕТ ТРЕБОВАНИЕ К ТОЧКЕ.
+        //
+        // Первая редакция при трёх гибелях в окне пропускала забег и шла к целительнице —
+        // то есть обратно на кладбище, где спутника и убивают. Условие работало против
+        // собственной цели: именно там выбор тихой точки и нужен.
+        bool const deadly = c.DeathAt.size() >= 3;
+        if (!c.CorpseGaveUp && self->HasCorpse()
+            && self->GetCorpseLocation().GetMapId() == self->GetMapId())
+        {
+            WorldLocation const& body = self->GetCorpseLocation();
+            float const toBody = self->GetExactDist2d(body.GetPositionX(), body.GetPositionY());
+
+            // ПОДАЛЬШЕ ОТ УБИЙЦЫ, НО В РАДИУСЕ ПОДЪЁМА. Выбираем, только когда тело уже
+            // близко: сетка вокруг призрака загружена именно здесь.
+            // ВЫБИРАЕМ, ТОЛЬКО ДОЙДЯ ДО ТЕЛА (Кодекс на выходе). Обзор врагов идёт на 90
+            // ярдов от НАС; если выбирать за 45 ярдов до тела, враг в тридцати ярдах от
+            // кандидата окажется в ста пяти от нас и в обзор не попадёт — «тихая» точка
+            // перестанет что-либо значить. С двенадцати ярдов кандидат не дальше 42, враг
+            // у него не дальше 72, и всё это внутри обзора.
+            if (!c.RevivePicked && toBody < 12.0f)
+            {
+                std::list<Creature*> near;
+                Trinity::AnyUnitInObjectRangeCheck check(self, 90.0f);
+                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                Cell::VisitGridObjects(self, searcher, 90.0f);
+
+                // ВРАЖДЕБЕН ЛИ ОН МНЕ, А НЕ «МОГУ ЛИ Я ЕГО БИТЬ». Точку выбирает ПРИЗРАК, а
+                // мёртвый не может атаковать никого — IsValidAttackTarget отвечал «нет» про
+                // всех, и любое место читалось тихим: «ближайший враг не найден» там, где
+                // прибор гибели в той же точке насчитывал четырнадцать враждебных.
+                auto quietness = [&](float x, float y) -> float
+                {
+                    float worst = 1000.0f;
+                    for (Creature* cr : near)
+                        if (cr->IsAlive() && cr->IsHostileTo(self))
+                            worst = std::min(worst, cr->GetExactDist2d(x, y));
+                    return worst;
+                };
+
+                // ДВА КОЛЬЦА И ШЕСТНАДЦАТЬ НАПРАВЛЕНИЙ. Радиус подъёма 39 ярдов — это большой
+                // круг, и одного кольца из двенадцати точек мало, чтобы в нём нашлось тихое
+                // место. Ближнее кольцо предпочтительнее: меньше бежать.
+                float bestScore = quietness(body.GetPositionX(), body.GetPositionY());
+                Position bestPos(body.GetPositionX(), body.GetPositionY(), body.GetPositionZ());
+                for (float ring : { 18.0f, 30.0f })
+                    for (int i = 0; i < 16; ++i)
+                    {
+                        float const ang = float(i) * (2.0f * float(M_PI) / 16.0f);
+                        float const rx = body.GetPositionX() + ring * std::cos(ang);
+                        float const ry = body.GetPositionY() + ring * std::sin(ang);
+                        float const rz = self->GetMap()->GetHeight(self->GetPhaseShift(), rx, ry,
+                            body.GetPositionZ() + 5.0f, true);
+                        if (rz <= INVALID_HEIGHT || std::fabs(rz - body.GetPositionZ()) > 20.0f)
+                            continue;                   // нет земли или обрыв
+                        if (self->GetMap()->IsInWater(self->GetPhaseShift(), rx, ry, rz))
+                            continue;                   // в воде не поднимаются
+                        float const score = quietness(rx, ry);
+                        if (score > bestScore + 1.0f)   // +1: при равной тишине ближнее лучше
+                            { bestScore = score; bestPos.Relocate(rx, ry, rz); }
+                    }
+
+                // ГДЕ УЖЕ УБИВАЛИ ТРИЖДЫ — ГОДИТСЯ ТОЛЬКО ПО-НАСТОЯЩЕМУ ТИХОЕ МЕСТО.
+                // Иначе подъём будет означать новую гибель через секунды, и круг продолжится.
+                if (deadly && bestScore < 30.0f)
+                {
+                    c.CorpseGaveUp = true;
+                    c.ReviveMs = 0;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: у тела тихого места нет (ближайший враг в {:.0f}) — иду к целительнице",
+                        self->GetName(), bestScore);
+                    return;
+                }
+
+                c.RevivePos = bestPos;
+                c.RevivePicked = true;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ТЕЛО {}: поднимусь в {:.0f} {:.0f} {:.0f} — {:.0f} ярдов от тела, "
+                    "ближайший враг {}",
+                    self->GetName(), bestPos.GetPositionX(), bestPos.GetPositionY(), bestPos.GetPositionZ(),
+                    bestPos.GetExactDist2d(body.GetPositionX(), body.GetPositionY()),
+                    bestScore > 900.0f ? std::string("не найден") : Trinity::StringFormat("в {:.0f} ярдах", bestScore));
+            }
+
+            float const tx = c.RevivePicked ? c.RevivePos.GetPositionX() : body.GetPositionX();
+            float const ty = c.RevivePicked ? c.RevivePos.GetPositionY() : body.GetPositionY();
+            float const tz = c.RevivePicked ? c.RevivePos.GetPositionZ() : body.GetPositionZ();
+            float const toSpot = self->GetExactDist2d(tx, ty);
+
+            if (toSpot > 6.0f)
+            {
+                if (!c.CorpseRunNoted)
+                {
+                    c.CorpseRunNoted = true;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: бегу к своему телу, {:.0f} ярдов",
+                        self->GetName(), toBody);
+                }
+                StepToward(c, self, tx, ty, tz, 5.0f, dt);
+                c.ReviveMs = 0;                 // духом бежим каждый такт, а не раз в две секунды
+                // БЕГ — НЕ ПОПЫТКА ВОСКРЕШЕНИЯ (Кодекс на выходе). ReviveTries считает вызовы
+                // Revive и рассчитан на одну попытку в две секунды; ежетактный бег исчерпывал
+                // его за пять секунд, и спутник уходил ждать пять минут. У бега свой предел
+                // по времени и свой счётчик отказов подъёма.
+                c.ReviveTries = 0;
+                if (!c.Stalled && c.CorpseRunMs < 300000)
+                {
+                    c.CorpseRunMs += uint32(dt * 1000.0f);
+                    return;
+                }
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ТЕЛО {}: до тела не добежать — иду к целительнице", self->GetName());
+                c.CorpseGaveUp = true;
+            }
+            else
+            {
+                Corpse* body2 = self->GetCorpse();
+                if (!body2)
+                {
+                    c.CorpseGaveUp = true;      // тела уже нет — только целительница
+                    c.ReviveMs = 0;
+                    return;
+                }
+
+                // РАДИУС ЯДРО МЕРЯЕТ В ПРОСТРАНСТВЕ (Кодекс): кольцо в 28 ярдов плюс перепад
+                // высоты до 20 плюс остановка в шести давали до 39.45 при пределе 39. Если
+                // мы формально дошли, но по пространству далеко — подходим к самому телу.
+                if (!body2->IsWithinDistInMap(self, 35.0f, true))
+                {
+                    StepToward(c, self, body.GetPositionX(), body.GetPositionY(),
+                        body.GetPositionZ(), 4.0f, dt);
+                    c.ReviveMs = 0;
+                    c.ReviveTries = 0;
+                    c.CorpseRunMs += uint32(dt * 1000.0f);
+                    if (c.CorpseRunMs < 300000 && !c.Stalled)
+                        return;
+                    c.CorpseGaveUp = true;
+                    return;
+                }
+
+                // ЗАДЕРЖКА ПОДЪЁМА — 30, 60 ИЛИ 120 СЕКУНД (Кодекс: Player.cpp:161), и ждать
+                // её не значит получить отказ. Спрашиваем ядро о сроке и ждём остаток молча.
+                time_t const ready = body2->GetGhostTime()
+                    + time_t(self->GetCorpseReclaimDelay(body2->GetType() == CORPSE_RESURRECTABLE_PVP));
+                time_t const now = GameTime::GetGameTime();
+                if (ready > now)
+                {
+                    c.ReviveMs = uint32(std::min<time_t>(ready - now, 5) * 1000);
+                    c.ReviveTries = 0;
+                    if (!c.ReclaimWaitMs)
+                    {
+                        c.ReclaimWaitMs = 1;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ТЕЛО {}: жду {} с до подъёма",
+                            self->GetName(), uint32(ready - now));
+                    }
+                    return;
+                }
+
+                WorldPacket raw(CMSG_RECLAIM_CORPSE);
+                WorldPackets::Misc::ReclaimCorpse reclaim(std::move(raw));
+                reclaim.CorpseGUID = body2->GetGUID();
+                c.Session->HandleReclaimCorpse(reclaim);
+                c.ReviveTries = 0;              // подъём у тела считается своим счётчиком
+                if (self->IsAlive())
+                {
+                    ++_revived;
+                    c.ReviveGaveUp = false;
+                    RepairIfBroken(self, "после смерти");
+                    c.BrokenNoted = false;
+                    c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
+                    Switch(c, self, Behavior::Recovering, "поднялся у своего тела");
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: поднялся у своего тела", self->GetName());
+                    return;
+                }
+                // ОТКАЗ, И ЭТО УЖЕ НАСТОЯЩИЙ ОТКАЗ: срок вышел, расстояние проверено.
+                // Две такие попытки — и на кладбище (оператор).
+                c.ReviveMs = 3000;
+                if (++c.CorpseTries >= 2)
+                {
+                    c.CorpseGaveUp = true;
+                    c.ReviveMs = 0;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: две попытки подняться не прошли — иду к целительнице",
+                        self->GetName());
+                }
+                return;
+            }
+        }
+
         Creature* healer = nullptr;
         float best = 100000.0f;
         std::list<Creature*> near;
@@ -1373,7 +1632,16 @@ public:
             // спутник рано или поздно молча перестаёт быть бойцом (легионовский урок).
             RepairIfBroken(self, "после смерти");
             c.BrokenNoted = false;
-            c.TravelCooldownMs = 300000;    // после смерти не бежать туда же сразу (Кодекс)
+
+            // ГИБЕЛИ ПОДРЯД — ЭТО НЕ НЕВЕЗЕНИЕ, ЭТО НЕ ТА ЗОНА.
+            //
+            // Считаем их в скользящем окне: победа его обнуляет (см. ветку победы), а три
+            // гибели за десять минут означают, что спутник возрождается там же, где его
+            // убивают, и выйти оттуда сам не может — отдыхать нельзя, он в бою; драться
+            // нельзя, всё сломано. Так Эмрик набрал 86 гибелей за четверть часа.
+            // НЕ ЗАТИРАЕМ ДЛИННУЮ ОТСРОЧКУ КОРОТКОЙ (Кодекс): если камень уже поставил
+            // четверть часа, обычные пять минут после смерти его не укорачивают.
+            c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
             // и не возвращаться к убийце на половине здоровья — сперва отдышаться
             Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
             TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
@@ -1463,6 +1731,25 @@ public:
         }
         if (c.TalkUnreachable.size() > 40)
             c.TalkUnreachable.clear();
+        if (c.EquipScanMs)
+            c.EquipScanMs = (c.EquipScanMs <= diff) ? 0 : c.EquipScanMs - diff;
+        for (auto it = c.TriggerSentMs.begin(); it != c.TriggerSentMs.end();)
+            if (it->second <= diff) it = c.TriggerSentMs.erase(it); else { it->second -= diff; ++it; }
+        if (c.ToolActionMs)
+            c.ToolActionMs = (c.ToolActionMs <= diff) ? 0 : c.ToolActionMs - diff;
+        for (auto it = c.TalkRetry.begin(); it != c.TalkRetry.end();)
+            if (it->second <= diff) it = c.TalkRetry.erase(it); else { it->second -= diff; ++it; }
+        if (c.FleePauseMs)
+            c.FleePauseMs = (c.FleePauseMs <= diff) ? 0 : c.FleePauseMs - diff;
+        // ОКНО ГИБЕЛЕЙ ИСТЕКАЕТ САМО (Кодекс на выходе). Чистка только при новой смерти
+        // означала, что три давние гибели держат место «смертельным» навсегда: следующая
+        // одиночная гибель сразу читала три и пропускала забег к телу.
+        if (!c.DeathAt.empty())
+        {
+            uint32 const nowMs = GameTime::GetGameTimeMS();
+            while (!c.DeathAt.empty() && getMSTimeDiff(c.DeathAt.front(), nowMs) > 600000)
+                c.DeathAt.pop_front();
+        }
         if (c.TravelCooldownMs)
             c.TravelCooldownMs = (c.TravelCooldownMs <= diff) ? 0 : c.TravelCooldownMs - diff;
             c.VendCooldownMs   = (c.VendCooldownMs   <= diff) ? 0 : c.VendCooldownMs   - diff;
@@ -1526,10 +1813,68 @@ public:
 
         if (!self->IsAlive())
         {
+            // ГИБЕЛЬ СЧИТАЕТСЯ ЗДЕСЬ, ОДИН РАЗ, И НЕЗАВИСИМО ОТ СПОСОБА ПОДЪЁМА (Кодекс).
+            // Раньше отметка ставилась только при подъёме у целительницы, поэтому круг
+            // «поднялся у тела -> снова погиб» никогда не доходил до трёх — и ни отход, ни
+            // камень не включались вовсе. И сброс забега висел на условии «умер не в стою»,
+            // хотя переход живой->мёртвый от режима не зависит.
+            if (!c.DeathCounted)
+            {
+                c.DeathCounted = true;
+                uint32 const nowMs = GameTime::GetGameTimeMS();
+                c.DeathAt.push_back(nowMs);
+
+                // ГДЕ И ОТ КОГО — ПИШЕМ КАЖДУЮ ГИБЕЛЬ, ПОКА НЕ ЗНАЕМ ПРИЧИНЫ.
+                //
+                // Камень отсюда убран: он переносит к трактиру и спасением из боя не является
+                // (оператор; журнал Легиона, задача 0014 — это шаг маршрута, не выход). А что
+                // именно добивает спутника на кладбище, пока НЕИЗВЕСТНО, и придумывать
+                // следующее средство вслепую значит повторить ту же ошибку. Поэтому здесь
+                // прибор: зона, место, и три ближайших враждебных с их уровнями.
+                {
+                    std::string who;
+                    std::list<Creature*> near;
+                    Trinity::AnyUnitInObjectRangeCheck check(self, 50.0f);
+                    Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                    Cell::VisitGridObjects(self, searcher, 50.0f);
+                    std::vector<std::pair<float, Creature*>> hostiles;
+                    for (Creature* cr : near)
+                        if (cr->IsAlive() && cr->IsHostileTo(self))
+                            hostiles.push_back({ self->GetExactDist(cr), cr });
+                    std::sort(hostiles.begin(), hostiles.end(),
+                        [](auto const& a, auto const& b) { return a.first < b.first; });
+                    for (size_t i = 0; i < hostiles.size() && i < 3; ++i)
+                        who += Trinity::StringFormat("{} ({}, сырой ур {} / для нас {}, {:.0f} ярд){}",
+                            hostiles[i].second->GetName(), hostiles[i].second->GetEntry(),
+                            uint32(hostiles[i].second->GetLevel()),
+                            uint32(hostiles[i].second->GetLevelForTarget(self)), hostiles[i].first,
+                            i + 1 < hostiles.size() && i < 2 ? "; " : "");
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ГИБЕЛЬ {} (ур {}): зона {}, место {:.0f} {:.0f} {:.0f}, "
+                        "гибелей в окне {}, рядом враждебных {} — {}",
+                        self->GetName(), uint32(self->GetLevel()), self->GetZoneId(),
+                        self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
+                        uint32(c.DeathAt.size()), uint32(hostiles.size()),
+                        who.empty() ? std::string("никого") : who);
+                }
+                while (!c.DeathAt.empty() && getMSTimeDiff(c.DeathAt.front(), nowMs) > 600000)
+                    c.DeathAt.pop_front();      // скользящее окно в десять минут
+                c.CorpseRunNoted = false;
+                c.CorpseRunMs = 0;
+                c.CorpseTries = 0;
+                c.CorpseGaveUp = false;
+                c.RevivePicked = false;
+                c.ReclaimWaitMs = 0;
+            }
             if (c.Mode != Behavior::Idle)
             {
                 if (c.Mode == Behavior::Attacking || c.Mode == Behavior::ApproachingTarget)
                     LogFightOutcome(self, ObjectAccessor::GetCreature(*self, c.TargetGuid), "ПОГИБ", c);
+                // ПОГИБ ПО ДОРОГЕ НА СДАЧУ — не идти той же дорогой четверть часа. Бриенна
+                // 5-го уровня шла сдавать «Hero's Call: Westfall!» в Западный край, гибла
+                // и через минуту шла снова: минутная отсрочка короче самой дороги.
+                if (c.Mode == Behavior::TurningIn && c.TurnInQuest)
+                    c.TurnInBackoff[c.TurnInQuest] = 900000;
                 Switch(c, self, Behavior::Idle, "погиб");
             }
             // умерли по дороге — не бежать той же дорогой снова (Кодекс, проход 5):
@@ -1538,6 +1883,7 @@ public:
             Revive(c, self, dt);
             return;
         }
+        c.DeathCounted = false;             // живы — следующая гибель будет новой
         // не управляем собой (транспорт, контроль) — пакет с нашим guid относился бы
         // к другому существу
         if (self->GetUnitBeingMoved() != self)
@@ -1592,6 +1938,146 @@ public:
                 bool const idleScan = (c.IdleScanMs == 0);
                 if (idleScan)
                     c.IdleScanMs = 1000 + (c.Guid.GetCounter() % 250u);
+
+                // ОБНОВКИ — ПЕРВЫМ ДЕЛОМ И НЕЧАСТО: раз в полминуты, одна за проход.
+                // Ничего не переключает, просто улучшает всё, что будет дальше.
+                if (idleScan && !c.EquipScanMs)
+                {
+                    c.EquipScanMs = 30000 + (c.Guid.GetCounter() % 5000u);
+                    EquipUpgrades(c, self);
+                }
+                // В БОЮ, А ДРАТЬСЯ НЕЧЕМ — ОТХОДИМ, А НЕ СТОИМ.
+                //
+                // Замер: спутник шестого уровня набрал 46 гибелей за восемь минут, стоя у
+                // целительницы душ со сломанным оружием. Он в бою, поэтому отдых отвергается;
+                // драться нечем, поэтому цель не ищется; уйти он не умел. Камень возвращения
+                // тут не спасает: его каст длится десять секунд и рвётся от первого удара.
+                //
+                // Поэтому первым делом — уйти. Направление берём от того, кто на нас напал:
+                // прочь от ближайшего. Мобы отцепляются на своём поводке, бой спадает, и
+                // дальше работают и отдых, и камень, и всё остальное.
+                if (self->IsInCombat() && BrokenForFight(c, self) && !c.FleePauseMs)
+                {
+                    Unit* nearest = nullptr;
+                    float best = 1000.0f;
+                    for (Unit* a : self->getAttackers())
+                    {
+                        float const d = self->GetExactDist(a);
+                        if (d < best)
+                            { best = d; nearest = a; }
+                    }
+                    if (!nearest)
+                        nearest = self->getAttackerForHelper();
+                    if (!nearest)
+                    {
+                        // БОЙ БЕЗ НАПАДАЮЩИХ — не пустая ветка, а выход из него (Кодекс):
+                        // иначе спутник вечно «в бою», не отдыхает и не уходит.
+                        self->CombatStop(true);
+                        c.FleeMs = 0;
+                        c.FleeHasPoint = false;
+                    }
+                    else
+                    {
+                        c.FleeMs += slice;
+                        if (!c.FleeNoted)
+                        {
+                            c.FleeNoted = true;
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ОТХОД {}: в бою с {} ({}), драться нечем — отхожу",
+                                self->GetName(), nearest->GetName(), nearest->GetEntry());
+                        }
+                        // ТОЧКА ВЫБИРАЕТСЯ ОДИН РАЗ И НЕ ДВИГАЕТСЯ ЗА НАМИ (Кодекс). Прежняя
+                        // «сорок ярдов от текущего места» была убегающим горизонтом: цель
+                        // смещалась на каждом шаге, и путь строился заново.
+                        //
+                        // Направление тоже не одно: восемь кандидатов веером от «прочь от
+                        // нападающего», и берётся первый, у которого есть высота, нет воды и
+                        // рядом нет других враждебных. Это строка 9 каталога Легиона —
+                        // «безопасное направление» — в honest минимальном виде.
+                        c.FleeTotalMs += slice;     // ОБЩИЙ бюджет отхода, его смена точки не трогает
+                        if (c.FleeTotalMs >= 90000)
+                        {
+                            c.FleePauseMs = 300000;
+                            c.FleeHasPoint = false;
+                            c.FleeMs = c.FleeTotalMs = 0;
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ОТХОД {}: полторы минуты не отрываюсь — жду пять минут",
+                                self->GetName());
+                            return;
+                        }
+                        if (!c.FleeHasPoint || c.FleeMs >= 30000)
+                        {
+                            c.FleeMs = c.FleeHasPoint ? 0 : c.FleeMs;   // сменили точку — время заново
+                            c.FleeHasPoint = false;
+                            float const away = nearest->GetAbsoluteAngle(self);
+                            static float const fan[8] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, 1.9f, -1.9f, 2.6f };
+                            for (float off : fan)
+                            {
+                                float const ang = away + off;
+                                float const fx = self->GetPositionX() + 45.0f * std::cos(ang);
+                                float const fy = self->GetPositionY() + 45.0f * std::sin(ang);
+                                float const fz = self->GetMap()->GetHeight(self->GetPhaseShift(),
+                                    fx, fy, self->GetPositionZ() + 5.0f, true);
+                                if (fz <= INVALID_HEIGHT || std::fabs(fz - self->GetPositionZ()) > 20.0f)
+                                    continue;               // нет земли или обрыв
+                                if (self->GetMap()->IsInWater(self->GetPhaseShift(), fx, fy, fz))
+                                    continue;               // в воду не бежим
+                                // и не в другой лагерь: рядом с точкой не должно быть враждебных
+                                Position cand(fx, fy, fz);
+                                bool crowded = false;
+                                std::list<Creature*> near;
+                                Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
+                                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                                Cell::VisitGridObjects(self, searcher, 60.0f);
+                                for (Creature* cr : near)
+                                    if (cr->IsAlive() && self->IsValidAttackTarget(cr)
+                                        && cr->GetExactDist2d(fx, fy) < 15.0f)
+                                        { crowded = true; break; }
+                                if (crowded)
+                                    continue;
+                                c.FleeTo = cand;
+                                c.FleeHasPoint = true;
+                                break;
+                            }
+                            if (!c.FleeHasPoint)
+                            {
+                                // ни одно направление не годится — не мечемся, ждём
+                                c.FleePauseMs = 300000;
+                                c.FleeMs = 0;
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ОТХОД {}: некуда отойти — жду пять минут", self->GetName());
+                                return;
+                            }
+                        }
+                        if (c.FleeHasPoint)
+                        {
+                            StepToward(c, self, c.FleeTo.GetPositionX(), c.FleeTo.GetPositionY(),
+                                c.FleeTo.GetPositionZ(), 0.0f, dt);
+                            // НАСТОЯЩИЙ ПРЕДЕЛ (Кодекс): минута отхода — и пять минут покоя,
+                            // а не бесконечный шаг после «истечения» срока.
+                            if (c.Stalled || c.FleeMs >= 60000)
+                            {
+                                c.FleePauseMs = 300000;
+                                c.FleeHasPoint = false;
+                                c.FleeMs = 0;
+                            }
+                            return;
+                        }
+                    }
+                }
+                else if (!self->IsInCombat() && (c.FleeMs || c.FleeNoted || c.FleeHasPoint))
+                {
+                    // ВЫШЛИ ИЗ БОЯ — пробуем камень сразу, не дожидаясь следующей гибели (Кодекс)
+                    c.FleeMs = 0; c.FleeTotalMs = 0; c.FleeNoted = false; c.FleeHasPoint = false;
+                }
+
+                // СТОИМ ВНУТРИ ЗОНЫ ОСМОТРА? Трое людей стояли у самой шахты Фаргодип с
+                // квестом «побывать в шахте» — ядро ждало пакет клиента, которого нет.
+                if (idleScan)
+                {
+                    TouchAreaTriggers(c, self);
+                    ReconcileLateCredit(c, self);   // поздний рост счётчика — до любого нового «бесплодно»
+                }
 
                 // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
                 // занимает место и не даёт взять следующий, а награда — это опыт,
@@ -1665,9 +2151,22 @@ public:
                                                    : "торговец рядом, чинюсь мимоходом");
                             return;
                         }
-                        // НИКОГО ПОБЛИЗОСТИ. Это не ошибка, а измеряемый предел первой
-                        // версии: искать по всей карте она не умеет. Считаем и молчим
-                        // пять минут, чтобы не перебирать сетку каждый такт.
+                        // НИКОГО В ОБЗОРЕ — ИДЁМ ПО КАРТЕ, если поход того стоит: ради
+                        // сломанного оружия или полных сумок, не ради потёртости. Пятеро
+                        // людей стояли так часами: сломаны, ремонтник за 150-300 ярдов.
+                        if ((helpless || stuffed) && FindMenderByMap(self, stuffed, helpless, &c.VendorEntry, &c.VendorPos))
+                        {
+                            c.VendorGuid.Clear();
+                            c.VendorScanMs = 0;
+                            c.VendorDist = self->GetExactDist2d(c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY());
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ТОРГ {}: в обзоре никого — иду к {} за {:.0f} ярдов ({})",
+                                self->GetName(), c.VendorEntry, c.VendorDist, helpless ? "чиниться" : "продавать");
+                            Switch(c, self, Behavior::Vending,
+                                helpless ? "бить нечем, иду чиниться по карте" : "сумки полны, иду продавать по карте");
+                            return;
+                        }
+                        // и по карте никого: считаем и молчим пять минут
                         ++c.VendNoVendor;
                         c.VendCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
                     }
@@ -1731,6 +2230,14 @@ public:
                     }
                     c.TravelScanMs = 2000;  // впустую — не перебирать точки каждый такт
                 }
+                // ОЧЕРЕДИ ПО РАССТОЯНИЮ ЗДЕСЬ БОЛЬШЕ НЕТ (оператор, 2026-09-02: «если то
+                // что ты писал про расстояние — откати, теперь есть светофор»).
+                //
+                // Она была лечением симптома: Бриенна с готовым «Hero's Call: Westfall!»
+                // шла сдавать его в Западный край первым делом и гибла по дороге. Причина
+                // же не в расстоянии, а в том, что такое задание вообще не по ней — и это
+                // теперь решается при ВЗЯТИИ, цветом. Сдаём готовое сразу, как игрок;
+                // от бесконечных походов остались бюджет по прогрессу и отсрочка при гибели.
                 Position owner;
                 if (Cfg().Follow && !c.FollowCooldownMs && FollowTargetPos(c, self, &owner)
                     && self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY()) <= Cfg().FollowMaxRange)
@@ -1821,8 +2328,68 @@ public:
 
             case Behavior::Vending:
             {
-                Creature* vendor = ObjectAccessor::GetCreature(*self, c.VendorGuid);
-                if (!vendor || !vendor->IsAlive())
+                Creature* vendor = c.VendorGuid.IsEmpty() ? nullptr : ObjectAccessor::GetCreature(*self, c.VendorGuid);
+                if (vendor && !vendor->IsAlive())
+                    vendor = nullptr;
+                // ПО КАРТЕ: торговца ещё не видно — идём к его точке, у точки ищем в обзоре.
+                // Тот же порядок, что у принимающего квест: точка из указателя, обзор в
+                // сорок ярдов раз в две секунды, срок от расстояния.
+                if (!vendor && c.VendorEntry)
+                {
+                    if (c.VendorScanMs)
+                        c.VendorScanMs = (c.VendorScanMs <= slice) ? 0 : c.VendorScanMs - slice;
+                    float const d = self->GetExactDist2d(c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY());
+                    if (!c.VendorScanMs && d < 60.0f)
+                    {
+                        c.VendorScanMs = 2000;
+                        std::list<Creature*> near;
+                        Trinity::AnyUnitInObjectRangeCheck check(self, 40.0f);
+                        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                        Cell::VisitGridObjects(self, searcher, 40.0f);
+                        float best = 100000.0f;
+                        for (Creature* cr : near)
+                        {
+                            if (cr->GetEntry() != c.VendorEntry || !cr->IsAlive())
+                                continue;
+                            float const d3 = self->GetExactDist(cr);
+                            if (d3 < best)
+                                { best = d3; vendor = cr; }
+                        }
+                        if (vendor)
+                        {
+                            c.VendorGuid = vendor->GetGUID();
+                            c.VendorEntry = 0;
+                        }
+                    }
+                    if (!vendor)
+                    {
+                        if (d > 6.0f)
+                        {
+                            StepToward(c, self, c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY(),
+                                c.VendorPos.GetPositionZ(), 5.0f, dt);
+                            // бюджет по прогрессу, как у сдачи: полминуты без приближения — конец
+                            if (d < c.WalkBest - 1.0f)
+                                { c.WalkBest = d; c.WalkStuckMs = 0; }
+                            else
+                                c.WalkStuckMs += slice;
+                            if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
+                            {
+                                c.VendCooldownMs = 300000;
+                                c.VendorEntry = 0;
+                                Switch(c, self, Behavior::Idle, "до торговца по карте не дойти");
+                            }
+                        }
+                        else
+                        {
+                            // пришли на точку, а его нет: не та фаза, не возродился, ушёл маршрутом
+                            c.VendCooldownMs = 300000;
+                            c.VendorEntry = 0;
+                            Switch(c, self, Behavior::Idle, "торговца на его точке нет");
+                        }
+                        return;
+                    }
+                }
+                if (!vendor)
                 {
                     c.VendorGuid.Clear();
                     Switch(c, self, Behavior::Idle, "торговец пропал");
@@ -1910,6 +2477,7 @@ public:
 
             case Behavior::Travelling:
             {
+                TouchAreaTriggers(c, self);
                 // дошли настолько, что цель уже видно — дальше обычным порядком
                 if (Creature* target = FindObjectiveTarget(c, self))
                 {
@@ -1923,14 +2491,14 @@ public:
                 // ограничен только внутри одного захода и повторялся вечно). Область
                 // пуста — выбита или её наполняет скрипт волнами; откладываем ЭТОТ
                 // квест на десять минут, остальным дорога открыта.
-                if (self->GetExactDist2d(c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY()) <= 12.0f)
+                if (self->GetExactDist2d(c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY()) <= c.TravelStop + 2.0f)
                 {
                     c.TravelBackoff[c.TravelQuest] = 600000;
                     Switch(c, self, Behavior::Idle, "пришёл — целей нет, отложил квест");
                     return;
                 }
                 StepToward(c, self, c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY(),
-                    c.TravelPos.GetPositionZ(), 10.0f, dt);
+                    c.TravelPos.GetPositionZ(), c.TravelStop, dt);
                 // СРОК щедрый: до цели бывает и двести ярдов, а бежим мы шагами по 4 Гц
                 if (c.Stalled || c.ModeMs > 180000)
                 {
@@ -2125,9 +2693,18 @@ public:
                 {
                     StepToward(c, self, c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY(),
                         c.TurnInPos.GetPositionZ(), 5.0f, dt);
-                    if (c.Stalled || c.ModeMs > 60000)
+                    // БЮДЖЕТ ПО ПРОГРЕССУ, А НЕ ПО ПРЯМОЙ (Кодекс, и журнал Легиона 0006:640):
+                    // прямая — не длина маршрута, и срок «от расстояния» там уже откатывали.
+                    // Мера — приближаемся ли: полминуты без нового лучшего расстояния —
+                    // дороги нет; и общий потолок четыре минуты. Плоская минута не давала
+                    // дойти дальше 250 ярдов, срок от прямой обманул бы на извилистом пути.
+                    if (d < c.WalkBest - 1.0f)
+                        { c.WalkBest = d; c.WalkStuckMs = 0; }
+                    else
+                        c.WalkStuckMs += slice;
+                    if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
                     {
-                        c.TurnInBackoff[c.TurnInQuest] = 60000;
+                        c.TurnInBackoff[c.TurnInQuest] = 300000;   // пять минут: дорога, а не рывок
                         Switch(c, self, Behavior::Idle, "до принимающего не дойти");
                     }
                     return;
@@ -2317,12 +2894,105 @@ public:
                     return;
                 }
 
-                if (!self->CanInteractWithQuestGiver(who) && !self->GetNPCIfCanInteractWith(
-                        c.TalkGuid, UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE))
+                // КАК ЗАКРЫВАЕТСЯ ЦЕЛЬ — ГОВОРЯТ ДАННЫЕ СУЩЕСТВА, И ПО НИМ ЖЕ МЕРЯЕТСЯ «ДОШЁЛ».
+                //
+                // Замер 2026-09-02: четверо людей 4-го уровня 36 раз подряд «иду
+                // взаимодействовать -> стою (до собеседника не дойти)» у раненых пехотинцев
+                // «Fear No Evil»: подходили на 7 ярдов и стояли 45 секунд. Приход мерился
+                // вопросом ядра «можно ли говорить» — а у пехотинца нет ни беседы, ни
+                // квестов: его правило добавляет ему флаг КЛИКА (SmartAI: ADD_NPC_FLAG
+                // 0x1000000), и зачёт даёт заклинание клика (npc_spellclick_spells: 50047 ->
+                // 93072 при взятом квесте). Значит «дошёл?» спрашивается по-разному:
+                //   * беседа/квесты — у ядра, тем же вопросом, что задаёт обработчик;
+                //   * клик — дистанция взаимодействия (INTERACTION_DISTANCE), как у клиента;
+                //   * предмет — дальность ЕГО заклинания или радиус его области.
+                bool const gossip = who->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP) || who->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER);
+                bool const click = !gossip && who->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK);
+                uint32 clickCastMs = 0;
+                bool clickTied = false;
+                std::set<uint32> wantedNow;
+                if (click)
+                    WantedEntries(self, wantedNow);
+                if (click && !ClickGivesCredit(who->GetEntry(), wantedNow, self, &clickCastMs, &clickTied))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) не даёт зачёта или небезопасен — не трогаю",
+                        self->GetName(), who->GetName(), who->GetEntry());
+                    c.TalkBackoff[who->GetEntry()] = 600000;
+                    c.TalkGuid.Clear();
+                    Switch(c, self, Behavior::Idle, "клик не по правилам");
+                    return;
+                }
+                uint32 toolSpell = 0;
+                Item* tool = (!gossip && !click) ? QuestToolFor(self, who->GetEntry(), &toolSpell) : nullptr;
+                SpellInfo const* toolInfo = tool ? sSpellMgr->GetSpellInfo(toolSpell, DIFFICULTY_NONE) : nullptr;
+                if (!gossip && !click && !toolInfo)
+                {
+                    // ЭТО СВОЙСТВО ОСОБИ, А НЕ ВИДА. Правило раненого пехотинца СНИМАЕТ с него
+                    // флаг клика, как только его подняли: поднятый кем-то другим выглядит
+                    // «незакрываемым», а рядом стоят семнадцать целых. Запрет по виду глушил
+                    // весь квест на десять минут — так и вышло на живом у четверых людей.
+                    // Отставляем особь; вид — только когда подряд не вышло с четырьмя.
+                    c.TalkUnreachable.insert(c.TalkGuid);
+                    if (c.ToolFruitlessEntry != who->GetEntry())
+                        { c.ToolFruitlessEntry = who->GetEntry(); c.ToolGiveUps = 0; }
+                    bool const wholeKind = ++c.ToolGiveUps >= 4;
+                    if (wholeKind)
+                    {
+                        c.ToolGiveUps = 0;
+                        c.TalkBackoff[who->GetEntry()] = 600000;
+                    }
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: у {} ({}) ни беседы, ни клика, ни предмета от квеста — отставляю {}",
+                        self->GetName(), who->GetName(), who->GetEntry(), wholeKind ? "вид" : "особь");
+                    c.TalkGuid.Clear();
+                    c.ToolWaitMs = 0;
+                    Switch(c, self, Behavior::Idle, "закрыть нечем");
+                    return;
+                }
+
+                // ДИСТАНЦИЯ ПРИХОДА. У предмета с явной целью — дальность заклинания минус
+                // запас; у предмета-области — часть её радиуса: «Spray Water» (80208) на
+                // пожары виноградника бьёт по области с условием «цель — триггер пожара»
+                // (conditions: 13/80208 -> 31/3/42940), а сам триггер невыбираем
+                // (UNIT_FLAG_UNINTERACTIBLE) — клиент шлёт его без цели, стоя рядом.
+                float reach = who->GetCombatReach() + 2.0f;
+                bool toolUnit = false;
+                if (toolInfo)
+                {
+                    toolUnit = toolInfo->NeedsExplicitUnitTarget();
+                    if (toolUnit)
+                        reach = std::clamp(toolInfo->GetMaxRange(false, self) - 2.0f, 3.0f, 25.0f);
+                    else
+                    {
+                        float const radius = toolInfo->GetEffects().empty() ? 0.0f
+                            : toolInfo->GetEffect(EFFECT_0).CalcRadius(self);
+                        reach = radius > 1.0f ? std::clamp(radius * 0.6f, 2.0f, 15.0f) : 4.0f;
+                    }
+                }
+                else if (click)
+                    reach = INTERACTION_DISTANCE - 0.5f;
+
+                // ДОШЁЛ — для клика и предмета ТОЧНОЕ расстояние до самой цели, без прибавки
+                // радиусов (Кодекс: IsWithinDist3d прибавляет радиус игрока). И идём тогда
+                // к САМОЙ цели, а не к точке подхода: та лежит в ~4.5 ярдах от цели, и
+                // остановка «в reach от неё» оставляла бы до цели вдвое больше.
+                bool const arrived = gossip
+                    ? (self->CanInteractWithQuestGiver(who) || self->GetNPCIfCanInteractWith(
+                          c.TalkGuid, UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE) != nullptr)
+                    : self->GetExactDist(who) <= reach;
+                if (!arrived && !c.ToolWaitMs)
                 {
                     float tx, ty, tz;
-                    ApproachPoint(c, who, self, tx, ty, tz, diff);
-                    StepToward(c, self, tx, ty, tz, who->GetCombatReach() + 2.0f, dt);
+                    if (gossip)
+                        ApproachPoint(c, who, self, tx, ty, tz, diff);
+                    else
+                    {
+                        tx = who->GetPositionX();
+                        ty = who->GetPositionY();
+                        tz = who->GetPositionZ();
+                    }
+                    StepToward(c, self, tx, ty, tz, gossip ? reach : std::max(1.0f, reach - 1.0f), dt);
 
                     if (c.NoPathMs > 0)
                     {
@@ -2355,6 +3025,179 @@ public:
 
                 std::string const name = who->GetName();
                 uint32 const entry = who->GetEntry();
+
+                // ОКНО ОЖИДАНИЯ ЗАЧЁТА — общее для клика и предмета. Успех меряется ростом
+                // счётчика цели, а не отсутствием ошибки; ждём до трёх секунд (время
+                // произнесения плюс очередь ядра). Окно без зачёта — бесплодная попытка.
+                if (c.ToolWaitMs)
+                {
+                    c.ToolWaitMs = (c.ToolWaitMs <= slice) ? 0 : c.ToolWaitMs - slice;
+                    bool credited = false;
+                    for (auto const& [key, before] : c.ToolWas)
+                        if (self->GetQuestObjectiveData(key.first, key.second) > before)
+                            { credited = true; break; }
+                    if (credited)
+                    {
+                        ++c.Talked;
+                        c.ToolFruitless = 0;
+                        c.ToolGiveUps = 0;
+                        c.ToolActionFruitless = 0;
+                        c.ToolWaitMs = 0;
+                        c.ToolWas.clear();
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ПРИМЕНЕНИЕ {}: {} ({}) — зачёт; всего {}",
+                            self->GetName(), name, entry, c.Talked);
+                        c.TalkGuid.Clear();
+                        Switch(c, self, Behavior::Idle, "закрыл цель");
+                        return;
+                    }
+                    if (c.ToolWaitMs)
+                        return;             // окно ещё идёт
+                    // ПРЕДОХРАНИТЕЛЬ ИЗ ЛЕГИОНА, С ПОПРАВКОЙ КОДЕКСА: считаем окна без зачёта,
+                    // не отправки. Два окна на одной особи — отставляем ЕЁ (пожар уже потушен,
+                    // пехотинец уже поднят); четыре особи подряд — отставляем вид на две минуты.
+                    // На Легионе шесть ботов сутки лупили дубинкой БОДРСТВУЮЩИХ батраков:
+                    // 606 успешных применений, ноль продвижения.
+                    if (++c.ToolFruitless >= 2)
+                    {
+                        c.ToolFruitless = 0;
+                        c.TalkUnreachable.insert(c.TalkGuid);
+                        if (c.ToolFruitlessEntry != entry)
+                            { c.ToolFruitlessEntry = entry; c.ToolGiveUps = 0; }
+                        if (++c.ToolGiveUps >= 4)
+                        {
+                            c.ToolGiveUps = 0;
+                            c.TalkBackoff[entry] = 120000;
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ПРИМЕНЕНИЕ {}: четыре особи {} ({}) без зачёта — отставляю вид",
+                                self->GetName(), name, entry);
+                        }
+                        else
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ПРИМЕНЕНИЕ {}: {} ({}) два окна без зачёта — отставляю особь",
+                                self->GetName(), name, entry);
+                        // ПРЕДОХРАНИТЕЛЬ НА ВСЁ ДЕЙСТВИЕ (Легион, 0012; Кодекс): шесть
+                        // отставленных особей подряд по любым видам — пять минут без разговоров
+                        // и применений вовсе, чтобы одна ошибочная связка не ходила по кругу.
+                        if (++c.ToolActionFruitless >= 6)
+                        {
+                            c.ToolActionFruitless = 0;
+                            c.ToolActionMs = 300000;
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ПРИМЕНЕНИЕ {}: шесть особей подряд без зачёта — пять минут без взаимодействий",
+                                self->GetName());
+                        }
+                        c.TalkGuid.Clear();
+                        Switch(c, self, Behavior::Idle, "без зачёта");
+                        return;
+                    }
+                    // первое окно без зачёта: остаёмся и пробуем ещё раз с этой же особью
+                }
+
+                // СТАРЫЙ СНИМОК СВЕРЯЕТСЯ ДО НОВОГО (Кодекс): рост после окна гасит предохранители,
+                // но зачётом не считается — причина не доказана. Попытка идёт своим чередом.
+                ReconcileLateCredit(c, self);
+
+                if (click)
+                {
+                    SnapshotObjectives(self, entry, c.ToolWas);
+                    c.ToolWasEntry = entry;
+                    WorldPacket raw(CMSG_SPELL_CLICK);
+                    WorldPackets::Spells::SpellClick sc(std::move(raw));
+                    sc.SpellClickUnitGuid = c.TalkGuid;
+                    sc.TryAutoDismount = false;
+                    c.Session->HandleSpellClick(sc);
+                    c.ToolWaitMs = std::max<uint32>(4000, clickCastMs + 2500);   // окно от времени произнесения
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) с {:.1f} ярдов, связь с зачётом {}",
+                        self->GetName(), name, entry, self->GetExactDist(who), clickTied ? "прямая" : "через сценарий");
+                    return;
+                }
+
+                if (toolInfo)
+                {
+                    // ПРЕДВАРИТЕЛЬНЫЕ УСЛОВИЯ вместо подсчёта отказов попытками (Кодекс):
+                    // занят другим заклинанием, общий откат, откат предмета — ждём, не шлём.
+                    // УСЛОВИЯ ЗАКЛИНАНИЯ ИЗ БАЗЫ — ТОТ ЖЕ ВОПРОС, ЧТО ЗАДАЁТ ЯДРО ПЕРЕД КАСТОМ.
+                    //
+                    // Замер: 79 применений ведра пробуждения по ленивым батракам и три зачёта.
+                    // Условие лежит в данных: заклинание 19938 требует, чтобы на ЦЕЛИ висела
+                    // аура сна 17743 (conditions 17/19938 -> тип 1, цель 1). Спящий её имеет,
+                    // бодрствующий нет, и по бодрствующему каст просто не проходит. Ядро
+                    // спрашивает это в Spell::CheckCast; спросим и мы — до отправки, а не
+                    // после. Правило общее: любое условие на цель у любого квестового предмета.
+                    {
+                        ConditionSourceInfo cond(self, who);
+                        if (!sConditionMgr->IsObjectMeetingNotGroupedConditions(
+                                CONDITION_SOURCE_TYPE_SPELL, toolInfo->Id, cond))
+                        {
+                            if (!c.CondNoted)
+                            {
+                                c.CondNoted = true;
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ПРИМЕНЕНИЕ {}: {} ({}) не отвечает условиям заклинания {} — не трачу",
+                                    self->GetName(), name, entry, toolSpell);
+                            }
+                            c.TalkRetry[c.TalkGuid] = 60000;    // условие временное — и запрет тоже
+                            c.TalkGuid.Clear();
+                            Switch(c, self, Behavior::Idle, "цель не по условиям");
+                            return;
+                        }
+                    }
+                    if (self->IsNonMeleeSpellCast(false) || self->GetSpellHistory()->HasGlobalCooldown(toolInfo)
+                        || !self->GetSpellHistory()->IsReady(toolInfo, tool->GetEntry()))
+                    {
+                        c.TalkMs += slice;
+                        if (c.TalkMs >= 60000)
+                        {
+                            c.TalkBackoff[entry] = 60000;
+                            c.TalkGuid.Clear();
+                            Switch(c, self, Behavior::Idle, "предмет не готов минуту");
+                        }
+                        return;
+                    }
+                    SnapshotObjectives(self, entry, c.ToolWas);
+                    c.ToolWasEntry = entry;
+                    // ЛИЧНОСТЬ ПРЕДМЕТА — ДО ВЫЗОВА: успешное применение может израсходовать
+                    // и уничтожить его (Spell::TakeCastItem), и указатель после обработчика
+                    // трогать нельзя (Кодекс: use-after-free в первой редакции).
+                    uint32 const toolEntry = tool->GetEntry();
+                    WorldPacket raw(CMSG_USE_ITEM);
+                    WorldPackets::Spells::UseItem use(std::move(raw));
+                    use.PackSlot = tool->GetBagSlot();
+                    use.Slot = tool->GetSlot();
+                    use.CastItem = tool->GetGUID();
+                    use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
+                        SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), toolSpell,
+                        self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+                    use.Cast.SpellID = int32(toolSpell);
+                    // ЦЕЛЬ — ПО КОНТРАКТУ ЗАКЛИНАНИЯ, а не «всегда существо»: явная цель,
+                    // точка на земле или вовсе без цели (область вокруг себя).
+                    if (toolUnit)
+                    {
+                        use.Cast.Target.Flags = TARGET_FLAG_UNIT;
+                        use.Cast.Target.Unit = c.TalkGuid;
+                    }
+                    else if (toolInfo->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION)
+                    {
+                        use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
+                        WorldPackets::Spells::TargetLocation loc;
+                        loc.Location = who->GetPosition();
+                        use.Cast.Target.DstLocation = loc;
+                    }
+                    else
+                        use.Cast.Target.Flags = TARGET_FLAG_NONE;
+                    tool = nullptr;
+                    uint32 const castMs = toolInfo->CalcCastTime();
+                    c.Session->HandleUseItemOpcode(use);
+                    c.ToolWaitMs = std::max<uint32>(4000, castMs + 2500);   // окно от времени произнесения
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: предмет {} (закл. {}, {}) на {} ({}) с {:.1f} ярдов",
+                        self->GetName(), toolEntry, toolSpell,
+                        toolUnit ? "по цели" : (use.Cast.Target.Flags == TARGET_FLAG_DEST_LOCATION ? "по месту" : "без цели"),
+                        name, entry, self->GetExactDist(who));
+                    return;
+                }
 
                 // ПЕРЕБИРАТЬ ПУНКТЫ БЕСЕДЫ НЕЛЬЗЯ. ЭТО БЫЛ ИСПОЛНИТЕЛЬ ЧЕГО УГОДНО.
                 //
@@ -2573,7 +3416,10 @@ public:
                     bool const won = k.Kills > c.KillsAtStart && k.LastKilled == c.FightVictim;
                     char const* how;
                     if (won)
+                    {
                         how = "ПОБЕДА";
+                        c.DeathAt.clear();          // выиграл — значит зона по нему
+                    }
                     else if (victim)
                         how = "цель мертва, но добили не мы";
                     else
@@ -3729,6 +4575,19 @@ public:
                 c.Session->HandleAttackStopOpcode(stop);
             }
         }
+        // ВЫХОД ИЗ РАЗГОВОРА ЛЮБЫМ ПУТЁМ — окно ожидания и снимок счётчиков его не переживают
+        // (Кодекс): иначе следующий разговор с другой целью начинался бы со старым окном и
+        // зачёл бы чужой рост счётчика или записал бы бесплодное окно новой особи. Здесь, а
+        // не в каждом из девяти выходов, потому что и гибель проходит через Switch.
+        if (c.Mode == Behavior::Talking && to != Behavior::Talking)
+        {
+            c.ToolWaitMs = 0;           // окно — не переживает; снимок ToolWas остаётся: он помечен
+            c.ToolFruitless = 0;        // видом и нужен, чтобы увидеть зачёт, пришедший после окна
+        }
+        if (c.Mode == Behavior::Vending && to != Behavior::Vending)
+            c.VendorEntry = 0;          // поход по карте кончился — любым исходом
+        c.WalkBest = 1.0e9f;            // бюджет прогресса начинается заново в каждом режиме
+        c.WalkStuckMs = 0;
         c.Mode = to;
         c.ModeMs = 0;
         if (to != Behavior::TurningIn)
@@ -3760,7 +4619,7 @@ public:
             case Behavior::Travelling:        return "иду к месту задания";
             case Behavior::TurningIn:         return "сдаю квест";
             case Behavior::Gathering:         return "иду собирать";
-            case Behavior::Talking:           return "иду говорить";
+            case Behavior::Talking:           return "иду взаимодействовать";
         }
         return "?";
     }
@@ -4016,15 +4875,51 @@ public:
                 uint32(menu.GetMenuItemCount()), refused, noTemplate, cannotTake);
         }
 
+        // ПОРЯДОК ВЫБОРА — ПО СВЕТОФОРУ, А НЕ ПО ПОРЯДКУ В МЕНЮ (оператор, 2026-09-02).
+        //
+        // Ядро отдаёт пункты в своём порядке, и первая версия брала первый попавшийся. Игрок
+        // так не делает: он смотрит на цвет. Берём лучший цвет из предложенных, красное не
+        // берём вовсе — «не доросли». При равном цвете сохраняется порядок ядра.
+        // ОДНОРАЗОВЫЕ ВПЕРЕДИ ПОВТОРЯЕМЫХ (Кодекс: защита от голодания). Повторяемое задание
+        // можно брать бесконечно, и серое повторяемое навсегда заслонило бы жёлтое одноразовое —
+        // цепочка встала бы. Поэтому ключ выбора двойной: сперва одноразовые, внутри — по цвету.
+        uint32 questId = 0;
+        Quest const* quest = nullptr;
+        uint8 bestColour = 4, bestRank = 255;
+        uint32 skippedRed = 0, skippedUnknown = 0, offered = 0;
         for (uint8 i = 0; i < menu.GetMenuItemCount(); ++i)
         {
-            uint32 questId = menu.GetItem(i).QuestId;
-            if (c.QuestRefused.count(questId))
+            uint32 const qid = menu.GetItem(i).QuestId;
+            if (c.QuestRefused.count(qid))
                 continue;                       // уже пробовали и не вышло
-            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-            if (!quest || !self->CanTakeQuest(quest, false))
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q || !self->CanTakeQuest(q, false))
                 continue;
-
+            ++offered;
+            uint8 const colour = QuestColour(self, q);
+            if (colour == 4)
+                { ++skippedUnknown; continue; } // уровень не определён — откладываем
+            if (colour == 3)
+                { ++skippedRed; continue; }     // красное — не по нам
+            uint8 const rank = uint8((q->IsRepeatable() || q->IsDailyOrWeekly() ? 10 : 0) + colour);
+            if (rank < bestRank)
+                { bestRank = rank; bestColour = colour; questId = qid; quest = q; }
+        }
+        if ((skippedRed || skippedUnknown) && !c.RedNoted)
+        {
+            c.RedNoted = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СВЕТОФОР {} (ур. {}): у {} ({}) пропущено красных {}, неизвестных {}, взято {}",
+                self->GetName(), uint32(self->GetLevel()), giver->GetName(), giver->GetEntry(),
+                skippedRed, skippedUnknown, questId);
+        }
+        // ВЕСЬ ПРИЛАВОК НЕ ПО НАМ — К ЭТОМУ КВЕСТОДАТЕЛЮ БОЛЬШЕ НЕ ХОДИМ (Кодекс). Иначе
+        // ближайший, у которого всё красное, выбирался бы снова и снова вместо соседнего с
+        // подходящим заданием. Запрет по особи и не навсегда: уровень растёт, цвет меняется.
+        if (!quest && offered)
+            c.GiverUnreachable.insert(giver->GetGUID());
+        if (quest)
+        {
             WorldPacket rawAccept(CMSG_QUEST_GIVER_ACCEPT_QUEST);
             WorldPackets::Quest::QuestGiverAcceptQuest accept(std::move(rawAccept));
             accept.QuestGiverGUID = giver->GetGUID();
@@ -4034,8 +4929,10 @@ public:
             QuestStatus st = self->GetQuestStatus(questId);
             if (st == QUEST_STATUS_INCOMPLETE || st == QUEST_STATUS_COMPLETE)
             {
-                TC_LOG_INFO("server.worldserver", "Constellation: {} took quest {} '{}' from {}",
-                    self->GetName(), questId, quest->GetLogTitle(), giver->GetName());
+                static char const* const colourName[4] = { "серое", "зелёное", "жёлтое", "красное" };
+                TC_LOG_INFO("server.worldserver", "Constellation: {} взял квест {} '{}' у {} — {}, ур. задания {} при своём {}",
+                    self->GetName(), questId, quest->GetLogTitle(), giver->GetName(),
+                    colourName[bestColour < 4 ? bestColour : 3], self->GetQuestLevel(quest), uint32(self->GetLevel()));
                 ++_questsTaken;
             }
             else
@@ -4095,6 +4992,7 @@ public:
                 c.TurnInQuest = qid;
                 c.TurnInEntry = 0;              // 0 = сдать самому себе, никуда не идти
                 c.TurnInPos = self->GetPosition();
+                c.TurnInDist = 0.0f;
                 return true;
             }
 
@@ -4121,6 +5019,7 @@ public:
                 c.TurnInQuest = qid;
                 c.TurnInEntry = enderEntry;
                 c.TurnInPos = *bestSpawn;
+                c.TurnInDist = bestDist;
                 return true;
             }
 
@@ -4162,6 +5061,46 @@ public:
         }
         TC_LOG_INFO("server.loading", "Constellation: указатель спавнов — {} точек на {} картах",
             n, uint32(_spawns.size()));
+
+        // ЗОНЫ ОСМОТРА. Цель «побывать в …» (тип 10) ядро засчитывает ТОЛЬКО по пакету
+        // клиента CMSG_AREA_TRIGGER (HandleAreaTriggerOpcode), сверив IsInAreaTrigger; само
+        // вхождение сервер не замечает. У спутника клиента нет — пакет шлёт модуль, когда
+        // стоит внутри. Обратный указатель квест -> зоны, из тех же таблиц, что у ядра.
+        // ТОЛЬКО ЧИСТЫЕ ЗОНЫ. Обработчик пакета делает не одну вещь: до зачёта он зовёт
+        // сценарий зоны (areatrigger_scripts), после — телепорт (areatrigger_teleport) и
+        // PvP-зоны. Зона, которая одновременно и квестовая, и телепортная, переместила бы
+        // персонажа (Кодекс). Такие в указатель не попадают вовсе.
+        uint32 t = 0, skipped = 0;
+        for (AreaTriggerEntry const* at : sAreaTriggerStore)
+            if (std::unordered_set<uint32> const* qs = sObjectMgr->GetQuestsForAreaTrigger(at->ID))
+            {
+                if (sObjectMgr->GetAreaTrigger(at->ID) || sObjectMgr->GetAreaTriggerScriptId(at->ID))
+                    { ++skipped; continue; }
+                for (uint32 q : *qs)
+                    { _questTriggers[q].push_back(at); ++t; }
+            }
+        TC_LOG_INFO("server.loading", "Constellation: зоны осмотра — {} связок у {} квестов, отброшено телепортных/скриптовых {}",
+            t, uint32(_questTriggers.size()), skipped);
+
+        // ТОРГОВЦЫ И РЕМОНТНИКИ — ПО КАРТЕ. Обзор сетки на сто ярдов находил их только
+        // тем, кто и так стоит рядом; трое людей 5-го уровня со сломанным оружием стояли
+        // у шахты Фаргодип часами, а ремонтник гарнизона Вестбрук — в трёхстах ярдах.
+        uint32 m = 0;
+        for (auto const& [mapId, byEntry] : _spawns)
+            for (auto const& [entry, points] : byEntry)
+            {
+                CreatureTemplate const* tpl = sObjectMgr->GetCreatureTemplate(entry);
+                if (!tpl)
+                    continue;
+                bool const sells = (tpl->npcflag & uint64(UNIT_NPC_FLAG_VENDOR)) != 0;
+                bool const fixes = (tpl->npcflag & uint64(UNIT_NPC_FLAG_REPAIR)) != 0;
+                if (!sells && !fixes)
+                    continue;
+                for (Position const& pos : points)
+                    { _menders[mapId].push_back(Mender{ entry, tpl->faction, pos, sells, fixes }); ++m; }
+            }
+        TC_LOG_INFO("server.loading", "Constellation: указатель торговцев — {} точек на {} картах",
+            m, uint32(_menders.size()));
 
         // КАРТА — ЭТО ДАННЫЕ. МИР СПРАШИВАЮТ В МОМЕНТ КАСАНИЯ.
         //
@@ -4505,14 +5444,36 @@ public:
             QuestPOIData const* poi = sObjectMgr->GetQuestPOIData(int32(questId));
             for (QuestObjective const& obj : quest->GetObjectives())
             {
-                if (obj.Type != QUEST_OBJECTIVE_MONSTER || obj.ObjectID <= 0)
+                // ТРИ ВИДА ЦЕЛЕЙ, К КОТОРЫМ ЕСТЬ ДОРОГА: убить (номер существа), собрать
+                // (номер предмета — метка квеста на карте показывает, где он падает) и
+                // побывать (зона осмотра — её координаты знает таблица зон, тип 10).
+                bool const isMonster = obj.Type == QUEST_OBJECTIVE_MONSTER && obj.ObjectID > 0;
+                bool const isItem = obj.Type == QUEST_OBJECTIVE_ITEM && obj.ObjectID > 0;
+                bool const isTrigger = obj.Type == QUEST_OBJECTIVE_AREATRIGGER;
+                if (!isMonster && !isItem && !isTrigger)
                     continue;
-                if (self->GetQuestObjectiveData(obj) >= obj.Amount)
+                if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
                     continue;
 
                 Position dest;
                 bool got = false;
-                if (poi)
+                float stop = 10.0f;
+                if (isTrigger)
+                {
+                    auto tit = _questTriggers.find(questId);
+                    float bestT = 100000.0f;
+                    if (tit != _questTriggers.end())
+                        for (AreaTriggerEntry const* at : tit->second)
+                        {
+                            if (at->ContinentID != self->GetMapId())
+                                continue;
+                            float const dd = self->GetExactDist2d(at->Pos.X, at->Pos.Y);
+                            if (dd < bestT)
+                                { bestT = dd; dest.Relocate(at->Pos.X, at->Pos.Y, at->Pos.Z); got = true; }
+                        }
+                    stop = 3.0f;                // в самую зону, а не к её краю
+                }
+                else if (poi)
                 {
                     // Кодекс, проход 6: (1) негодный лучший блоб раньше уводил на
                     // запасной путь, не дав шанса ОСТАЛЬНЫМ кандидатам — теперь точка
@@ -4558,13 +5519,13 @@ public:
                             }
                         }
                 }
-                if (!got)
+                if (!got && isMonster)
                     got = SpawnDestination(self, uint32(obj.ObjectID), &dest);
                 if (!got)
                     continue;
                 float d = self->GetExactDist2d(dest.GetPositionX(), dest.GetPositionY());
                 if (d < bestDist)
-                    { bestDist = d; best = dest; found = true; c.TravelQuest = questId; }
+                    { bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop; }
             }
         }
         // ближе FightRange идти незачем: там цель и так увидит обычный поиск
@@ -4572,6 +5533,413 @@ public:
             return false;
         c.TravelPos = best;
         return true;
+    }
+
+    // НАДЕТЬ ЛУЧШЕЕ ИЗ ТОГО, ЧТО ЛЕЖИТ В СУМКАХ. Задача 0009, часть А, по журналу Легиона.
+    //
+    // Там это записано как рецепт, который строится первым и без внешних данных: для
+    // каждого слота обойти сумки и взять лучший предмет, у которого ядро само сказало
+    // «можно» (CanUseItem), который не сломан и уровнем выше надетого. Спутник до этого
+    // собирал добычу и не надевал ничего — поднимался с 5 на 7 в стартовом тряпье.
+    //
+    // И там же урок, из-за которого сравнивать ОДИН уровень предмета нельзя: на Легионе
+    // так одели рогов и хантеров в оружие не того типа, и умения отказали —
+    // SPELL_FAILED_EQUIPPED_ITEM_CLASS. Поэтому занятый оружейный слот меняем только на
+    // оружие того же вида (тип в инвентаре и подкласс совпадают): меч остаётся мечом.
+    // lazy: настоящая проверка — Item::IsFitToSpellRequirements против выбранного
+    // умения из палитры; это часть Б, вместе с ролью и веткой талантов.
+    //
+    // Пустой слот заполняем чем угодно пригодным: что угодно лучше, чем ничего.
+    // Одна обновка за проход — проход дешёвый, но незачем делать его тяжёлым.
+    bool EquipUpgrades(Companion& c, Player* self)
+    {
+        auto consider = [&](Item* item) -> bool
+        {
+            if (!item || item->IsBroken())
+                return false;
+            if (item->GetTemplate()->GetInventoryType() == INVTYPE_BAG)
+                return false;           // сумку меряют вместимостью, а не уровнем (Кодекс)
+            if (self->CanUseItem(item) != EQUIP_ERR_OK)
+                return false;
+            uint8 const dst = self->FindEquipSlot(item, NULL_SLOT, true);
+            if (dst == NULL_SLOT)
+                return false;
+
+            Item* worn = self->GetItemByPos(INVENTORY_SLOT_BAG_0, dst);
+            if (worn)
+            {
+                if (item->GetItemLevel(self) <= worn->GetItemLevel(self))
+                    return false;
+                bool const weaponSlot = dst == EQUIPMENT_SLOT_MAINHAND
+                    || dst == EQUIPMENT_SLOT_OFFHAND || dst == EQUIPMENT_SLOT_RANGED;
+                if (weaponSlot
+                    && (item->GetTemplate()->GetInventoryType() != worn->GetTemplate()->GetInventoryType()
+                        || item->GetTemplate()->GetSubClass() != worn->GetTemplate()->GetSubClass()))
+                    return false;           // меч остаётся мечом (урок Легиона)
+            }
+
+            uint32 const wasLevel = worn ? worn->GetItemLevel(self) : 0;
+            uint32 const entry = item->GetEntry();
+            uint8 const bagSlot = item->GetBagSlot(), slot = item->GetSlot();
+
+            // ТЕМ ЖЕ ОПКОДОМ, ЧТО КЛИК ПРАВОЙ КНОПКОЙ. Обработчик требует РОВНО одну запись
+            // в Inv.Items — иначе отвергает (ItemHandler.cpp: Inv.Items.size() != 1).
+            WorldPacket raw(CMSG_AUTO_EQUIP_ITEM);
+            WorldPackets::Item::AutoEquipItem eq(std::move(raw));
+            eq.PackSlot = bagSlot;
+            eq.Slot = slot;
+            eq.Inv.Items.push_back({ bagSlot, slot });
+            c.Session->HandleAutoEquipItemOpcode(eq);
+
+            // ПРАВДА ИЗ СОСТОЯНИЯ: лежит ли теперь в слоте именно этот предмет
+            Item* now = self->GetItemByPos(INVENTORY_SLOT_BAG_0, dst);
+            if (now && now->GetEntry() == entry)
+            {
+                ++c.Equipped;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation НАДЕЛ {}: {} (ур. {}) в слот {} вместо ур. {}; всего надето {}",
+                    self->GetName(), entry, now->GetItemLevel(self), uint32(dst), wasLevel, c.Equipped);
+                return true;
+            }
+            TC_LOG_INFO("server.worldserver",
+                "Constellation НАДЕЛ {}: {} в слот {} не надет — ядро отказало ({})",
+                self->GetName(), entry, uint32(dst), uint32(self->CanUseItem(item)));
+            return false;
+        };
+
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (consider(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i)))
+                return true;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                    if (consider(bag->GetItemByPos(j)))
+                        return true;
+        return false;
+    }
+
+    // ПРЕДМЕТ, КОТОРЫЙ ВЫДАЛ САМ КВЕСТ, И ЕГО ЗАКЛИНАНИЕ ПРИМЕНЕНИЯ.
+    //
+    // Легион, задача 0012: «неразличимы по всем свойствам, на которые можно фильтровать» —
+    // ведро для тушения, камень возвращения и вяленое мясо дают одинаковые нули по цели и
+    // дальности. Поэтому источник истины один: квест, в котором эта цель числится, и его
+    // собственный SourceItem. Тогда применить камень возвращения к костру становится
+    // невозможно ПО ПОСТРОЕНИЮ, а не по удачно подобранному условию.
+    Item* QuestToolFor(Player* self, uint32 targetEntry, uint32* spellOut) const
+    {
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q || !q->GetSrcItemId())
+                continue;
+            bool mine = false;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == targetEntry
+                    && self->GetQuestObjectiveData(qid, obj.ID) < obj.Amount)
+                    { mine = true; break; }
+            if (!mine)
+                continue;
+            Item* tool = self->GetItemByEntry(q->GetSrcItemId());
+            if (!tool)
+                continue;
+            // РОВНО ОДНО ЗАКЛИНАНИЕ «ПРИ ИСПОЛЬЗОВАНИИ». Ядро не выбирает первое: оно лишь
+            // проверяет, что присланный клиентом номер есть среди эффектов предмета
+            // (Player::CastItemUseSpell), а выбор делает клиент. У предмета с двумя такими
+            // эффектами модулю выбирать не из чего — такой пропускаем (Кодекс).
+            uint32 useSpell = 0, useCount = 0;
+            for (ItemEffectEntry const* eff : tool->GetEffects())
+                if (eff && eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0
+                    && uint32(eff->SpellID) != useSpell)
+                    { useSpell = uint32(eff->SpellID); ++useCount; }
+            if (useCount == 1)
+                { *spellOut = useSpell; return tool; }
+        }
+        return nullptr;
+    }
+
+    // СЧЁТЧИКИ ЦЕЛЕЙ ПО ЭТОМУ СУЩЕСТВУ — ДО ПОПЫТКИ. Успех меряется их ростом.
+    void SnapshotObjectives(Player* self, uint32 entry,
+        std::vector<std::pair<std::pair<uint32, uint32>, int32>>& out) const
+    {
+        out.clear();
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
+                for (QuestObjective const& obj : q->GetObjectives())
+                    if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == entry)
+                        out.push_back({ { qid, obj.ID }, self->GetQuestObjectiveData(qid, obj.ID) });
+        }
+    }
+
+    // ПЕРЕМЕЩАЕТ ЛИ ИЛИ ПОДЧИНЯЕТ ЗАКЛИНАНИЕ — по его эффектам, на один уровень вызова вглубь.
+    static bool SpellMovesOrControls(SpellInfo const* si, Difficulty diff, int depth = 2)
+    {
+        if (!si)
+            return false;
+        for (SpellEffectInfo const& eff : si->GetEffects())
+        {
+            switch (eff.Effect)
+            {
+                case SPELL_EFFECT_INSTAKILL:
+                case SPELL_EFFECT_TELEPORT_UNITS:
+                case SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER:
+                case SPELL_EFFECT_SUMMON_PLAYER:
+                    return true;
+                default:
+                    break;
+            }
+            switch (eff.ApplyAuraName)
+            {
+                case SPELL_AURA_CONTROL_VEHICLE:
+                case SPELL_AURA_MOD_CHARM:
+                case SPELL_AURA_MOD_POSSESS:
+                case SPELL_AURA_MOD_POSSESS_PET:
+                case SPELL_AURA_AOE_CHARM:
+                    return true;
+                default:
+                    break;
+            }
+            if (depth > 0 && eff.TriggerSpell
+                && SpellMovesOrControls(sSpellMgr->GetSpellInfo(eff.TriggerSpell, diff), diff, depth - 1))
+                return true;
+        }
+        return false;
+    }
+
+    // БЕЗОПАСЕН ЛИ КЛИК ПО ЭТОМУ ВИДУ — ПО ДАННЫМ, А НЕ ПО ВЕРЕ. Кодекс: HandleSpellClick
+    // исполняет ВСЕ подходящие строки npc_spellclick_spells, а это бывает вход в транспорт,
+    // подчинение, телепорт. Два условия, оба из таблиц: (1) ни одно заклинание клика, включая
+    // вызываемые им, не перемещает и не подчиняет; (2) у существа есть правило «попадание
+    // заклинанием -> зачёт убийства» (SmartAI: SPELLHIT, затем по цепочке link —
+    // CALL_KILLEDMONSTER), то есть клик и есть задуманный путь зачёта. Раненый пехотинец
+    // (50047): клик -> 93072, правило SPELLHIT 93097 -> LINK -> CALL_KILLEDMONSTER 50047.
+    // Зачёт должен ложиться на вид, который спутнику НУЖЕН (цель незакрытого задания), а не
+    // на какой угодно. Связь «заклинание клика -> заклинание попадания» проверяется, когда она
+    // видна в данных (само заклинание или вызываемое им), и только ОТМЕЧАЕТСЯ, когда не видна:
+    // у раненого пехотинца клик 93072 «Get Our Boys Back Dummy» произносит 93097 из
+    // сценария на C++ (spell_quest.cpp), и никакая таблица этого не покажет. Остаток риска —
+    // клик, который ничего не даёт, — закрывает предохранитель по окнам.
+    bool ClickGivesCredit(uint32 entry, std::set<uint32> const& wanted, Player* self,
+                          uint32* castMs, bool* tied) const
+    {
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        std::set<uint32> hitSpells;
+        for (auto const& pair : sObjectMgr->GetSpellClickInfoMapBounds(entry))
+        {
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(pair.second.spellId, diff);
+            if (!si || SpellMovesOrControls(si, diff))
+                return false;
+            hitSpells.insert(si->Id);
+            for (SpellEffectInfo const& eff : si->GetEffects())
+                if (eff.TriggerSpell)
+                    hitSpells.insert(eff.TriggerSpell);
+            if (castMs)
+                *castMs = std::max(*castMs, si->CalcCastTime());
+        }
+        if (hitSpells.empty())
+            return false;
+        auto const script = sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE);
+        std::unordered_map<uint32, SmartScriptHolder const*> byId;
+        for (SmartScriptHolder const& e : script)
+            byId[e.event_id] = &e;
+        // ЗАЧЁТ ЧАСТО ЛЕЖИТ НЕ В САМОМ ПРАВИЛЕ, А В ЕГО СПИСКЕ ДЕЙСТВИЙ. Замер на живом:
+        // непокорный тролль (34830) — «попадание 66306 -> ВЫПОЛНИТЬ СПИСОК 3483000», и уже в
+        // списке, пунктом четвёртым, «выдать зачёт 34830». Семерым гоблинам отказали именно
+        // потому, что цепочка обрывалась на границе списка.
+        auto listGives = [&](uint32 listId) -> bool
+        {
+            if (!listId)
+                return false;
+            for (SmartScriptHolder const& a : sSmartScriptMgr->GetScript(int32(listId), SMART_SCRIPT_TYPE_TIMED_ACTIONLIST))
+                if (a.GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
+                    && wanted.count(a.action.killedMonster.creature))
+                    return true;
+            return false;
+        };
+        bool found = false, direct = false;
+        for (SmartScriptHolder const& e : script)
+        {
+            if (e.GetEventType() != SMART_EVENT_SPELLHIT)
+                continue;
+            bool const spellTied = e.event.spellHit.spell == 0 || hitSpells.count(e.event.spellHit.spell) != 0;
+            SmartScriptHolder const* cur = &e;
+            for (int hop = 0; cur && hop < 8; ++hop)
+            {
+                bool gives = cur->GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
+                    && wanted.count(cur->action.killedMonster.creature);
+                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_TIMED_ACTIONLIST)
+                    gives = listGives(cur->action.timedActionList.id);
+                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_RANDOM_TIMED_ACTIONLIST)
+                    for (uint32 listId : cur->action.randTimedActionList.actionLists)
+                        if (listGives(listId))
+                            { gives = true; break; }
+                if (gives)
+                {
+                    found = true;
+                    direct = direct || spellTied;
+                    break;
+                }
+                if (!cur->link)
+                    break;
+                auto it = byId.find(cur->link);
+                cur = (it == byId.end()) ? nullptr : it->second;
+            }
+        }
+        if (tied)
+            *tied = direct;
+        if (!found)
+            return false;
+        if (direct)
+            return true;
+        // СВЯЗЬ НЕ ВИДНА В ДАННЫХ — ТОЛЬКО ПО ЯВНОМУ СПИСКУ (Кодекс, третий проход). Правило
+        // «попадание -> зачёт» у существа есть, но заклинание попадания не совпадает ни с
+        // заклинанием клика, ни с вызываемыми им: связь живёт в сценарии на C++. Такие
+        // виды допускаются поимённо, с указанием, где связь прочитана. Всё прочее — «не трогаю».
+        static std::set<uint32> const opaqueClickAllow = {
+            50047,  // Injured Stormwind Infantry, «Fear No Evil»: клик 93072 «Get Our Boys Back
+                    // Dummy» -> spell_quest.cpp: OnCast -> 93097 «Renewed Life» на себя ->
+                    // SmartAI SPELLHIT 93097 -> CALL_KILLEDMONSTER 50047 создателю
+        };
+        return opaqueClickAllow.count(entry) != 0;
+    }
+
+    // ПРОДВИЖЕНИЕ, ЗАМЕЧЕННОЕ ПОСЛЕ ОКНА. Снимок хранится до следующей сверки — на каждом
+    // проходе «стою» и перед каждой новой попыткой. Рост счётчика после окна НЕ доказывает,
+    // что это наше применение (ту же цель мог убить кто-то другой), поэтому зачётом не
+    // считается; но предохранители сбрасывает: ложное «бесплодно» хуже неучтённого успеха
+    // (Кодекс, третий проход).
+    bool ReconcileLateCredit(Companion& c, Player* self) const
+    {
+        if (c.ToolWas.empty())
+            return false;
+        bool grew = false;
+        for (auto const& [key, before] : c.ToolWas)
+            if (self->GetQuestObjectiveData(key.first, key.second) > before)
+                { grew = true; break; }
+        if (!grew)
+            return false;
+        c.ToolWas.clear();
+        c.ToolFruitless = 0;
+        c.ToolGiveUps = 0;
+        c.ToolActionFruitless = 0;
+        c.ToolActionMs = 0;
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПРИМЕНЕНИЕ {}: по виду {} продвижение после окна — причина не доказана, предохранители сброшены",
+            self->GetName(), c.ToolWasEntry);
+        return true;
+    }
+
+    // ВОЙТИ В ЗОНУ ОСМОТРА — ЭТО ПАКЕТ, А НЕ ФАКТ. Ядро проверит IsInAreaTrigger само и
+    // откажет, если мы снаружи; повторно в ту же зону не шлём минуту.
+    void TouchAreaTriggers(Companion& c, Player* self) const
+    {
+        if (_questTriggers.empty() || !self->IsAlive() || self->GetOutdoorPvP())
+            return;                     // в PvP-зоне пакет зоны идёт в её обработчик — не наш случай
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            auto it = _questTriggers.find(qid);
+            if (it == _questTriggers.end())
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q)
+                continue;
+            bool unmet = false;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_AREATRIGGER && self->GetQuestObjectiveData(obj) < 1)
+                    { unmet = true; break; }
+            if (!unmet)
+                continue;
+            for (AreaTriggerEntry const* at : it->second)
+            {
+                if (at->ContinentID != self->GetMapId() || c.TriggerSentMs.count(at->ID))
+                    continue;
+                if (!self->IsInAreaTrigger(at))
+                    continue;
+                c.TriggerSentMs[at->ID] = 60000;
+                WorldPacket raw(CMSG_AREA_TRIGGER);
+                WorldPackets::AreaTrigger::AreaTrigger pkt(std::move(raw));
+                pkt.AreaTriggerID = int32(at->ID);
+                pkt.Entered = true;
+                pkt.FromClient = true;
+                c.Session->HandleAreaTriggerOpcode(pkt);
+                bool done = true;
+                for (QuestObjective const& obj : q->GetObjectives())
+                    if (obj.Type == QUEST_OBJECTIVE_AREATRIGGER && self->GetQuestObjectiveData(obj) < 1)
+                        { done = false; break; }
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ОСМОТР {}: вошёл в зону {} квеста {} '{}' — {}",
+                    self->GetName(), at->ID, qid, q->GetLogTitle(), done ? "зачёт" : "без зачёта");
+            }
+        }
+    }
+
+    // БЛИЖАЙШИЙ ТОРГОВЕЦ ПО КАРТЕ, умеющий нужное и не враждебный по своей фракции.
+    bool FindMenderByMap(Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
+    {
+        auto it = _menders.find(self->GetMapId());
+        if (it == _menders.end())
+            return false;
+        FactionTemplateEntry const* mine = self->GetFactionTemplateEntry();
+        Mender const* best = nullptr;
+        float bestD = 600.0f;               // дальше — не поход, а переезд
+        for (Mender const& m : it->second)
+        {
+            if ((needSell && !m.Sells) || (needRepair && !m.Fixes))
+                continue;
+            if (mine)
+                if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(m.Faction))
+                    if (mine->IsHostileTo(theirs))
+                        continue;
+            float const d = self->GetExactDist2d(m.Where.GetPositionX(), m.Where.GetPositionY());
+            if (d < bestD)
+                { bestD = d; best = &m; }
+        }
+        if (!best)
+            return false;
+        *entry = best->Entry;
+        *pos = best->Where;
+        return true;
+    }
+
+    // СВЕТОФОР ЗАДАНИЯ — ТОТ ЖЕ, ЧТО ВИДИТ ИГРОК В ЖУРНАЛЕ.
+    //
+    // Оператор, 2026-09-02: «в Легионе делали выбор как у игрока подсветками светофора —
+    // красный не трогаем, не доросли; сначала серые и зелёные, после жёлтые».
+    //
+    // Числа берём у ядра, а не выдумываем. Уровень задания ДЛЯ ЭТОГО персонажа считает
+    // Player::GetQuestLevel — с учётом content tuning и того, что задание чужой фракции
+    // выдаёт максимум своей полосы. Порог серого — ровно тот, которым ядро метит Trivial
+    // в GetQuestDialogStatus: свой уровень выше уровня задания больше чем на
+    // Quests.LowLevelHideDiff (по умолчанию 4).
+    //
+    // 0 — серое, 1 — зелёное, 2 — жёлтое, 3 — оранжевое/красное, 4 — уровень неизвестен.
+    // Берём по возрастанию: сперва безопасное; красное и неизвестное не трогаем вовсе.
+    uint8 QuestColour(Player* self, Quest const* quest) const
+    {
+        int32 const my = int32(self->GetLevel());
+        int32 const q = self->GetQuestLevel(quest);
+        if (q <= 0)
+            return 4;                   // НЕИЗВЕСТНО — это не «легко» (Кодекс): ноль означает,
+                                        // что данных настройки контента нет, а не что задание
+                                        // по нам. При правиле «красное не трогаем» неизвестное
+                                        // откладывается и попадает в журнал, а не берётся молча.
+        int32 const hide = int32(sWorld->getIntConfig(CONFIG_QUEST_LOW_LEVEL_HIDE_DIFF));
+        if (my > q + hide)
+            return 0;                   // серое
+        if (q < my)
+            return 1;                   // зелёное
+        if (q == my)
+            return 2;                   // жёлтое
+        return (q - my <= Cfg().QuestMaxAbove) ? 2 : 3;      // чуть выше — ещё жёлтое; дальше красное
     }
 
     // ГОДИТСЯ ЛИ ОБЪЕКТ ДЛЯ ОТКРЫТИЯ РУКАМИ.
@@ -4803,8 +6171,35 @@ public:
                 // на говорящего», и это единственный путь закрыть цель.
                 // БЛИЖАЙШИЙ, А НЕ ПОСЛЕДНИЙ ВСТРЕЧЕННЫЙ: порядок обхода сетки — не политика
                 // выбора цели (Кодекс). И только от целей «убить», не от добытчиков предметов.
-                if (byMonster && creature->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP)
+                // НЕ ТОЛЬКО ГОВОРЯЩИЕ. Цель задания, которую ядро отказывается считать
+                // атакуемой, бывает двух видов, и оба закрываются не боем:
+                //   * с беседой — выбором пункта разговора (нежить, «The Wakening»);
+                //   * без беседы — ПРИМЕНЕНИЕМ ПРЕДМЕТА, который выдал сам квест. Так
+                //     устроен «Extinguishing Hope» у людей: восемь «пожаров» — существа,
+                //     которые тушат ведром. На Легионе это доведено до конца (задача 0012),
+                //     и там же записано, что опознавать предмет по свойствам заклинания
+                //     БЕСПОЛЕЗНО — два фильтра подряд умерли, потому что ведро неотличимо
+                //     от камня возвращения. Спрашивать надо КВЕСТ: GetSrcItemId().
+                // НЕВОСПРИИМЧИВЫЙ К ИГРОКАМ — НЕ СОБЕСЕДНИК, А ЕЩЁ НЕ ГОТОВАЯ ЦЕЛЬ.
+                //
+                // Замер: 153 подхода к пленному разведчику Гнилопастных (38142) и столько же
+                // «закрыть нечем». Сценарий (zone_durotar.cpp) объясняет: это цель УБИЙСТВА,
+                // которую держат невосприимчивой к игрокам, пока тюремщик не выведет пленника;
+                // потом флаг снимают, и его бьют. «Не атакуется» тут значит «ещё рано», а не
+                // «поговори со мной» — и разговор ему предлагать бессмысленно.
+                if (byMonster && creature->IsImmuneToPC())
+                {
+                    if (c.TalkUnreachable.insert(creature->GetGUID()).second && !c.ImmuneNoted)
+                    {
+                        c.ImmuneNoted = true;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ПРИМЕНЕНИЕ {}: {} ({}) пока невосприимчив к игрокам — не собеседник, жду",
+                            self->GetName(), creature->GetName(), creature->GetEntry());
+                    }
+                }
+                else if (byMonster && !c.ToolActionMs
                     && !c.TalkBackoff.count(creature->GetEntry())
+                    && !c.TalkRetry.count(creature->GetGUID())
                     && !c.TalkUnreachable.count(creature->GetGUID()))
                 {
                     float const d = self->GetExactDist(creature);
@@ -5692,6 +7087,9 @@ private:
     uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
+    std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
+    struct Mender { uint32 Entry; uint32 Faction; Position Where; bool Sells; bool Fixes; };
+    std::unordered_map<uint32, std::vector<Mender>> _menders;                          // карта -> торговцы
     // Поля фазы храним ВМЕСТЕ с точкой: фаза — это «версия места», и спавн, объявленный
     // в чужой фазе, для этого спутника не существует. Отсеять его надо ДО выхода, а не
     // обнаружить по приходу (оператор: «боты знают, на какой они стадии, значит могу
