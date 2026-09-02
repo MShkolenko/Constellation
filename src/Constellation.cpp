@@ -58,6 +58,7 @@
 #include "ItemPackets.h"
 #include "NPCPackets.h"
 #include "SmartScriptMgr.h"
+#include "DisableMgr.h"
 #include "PhasingHandler.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
@@ -133,6 +134,7 @@ struct Settings
     float MaxStepUp       = 2.0f;
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
+    float GiverSeekRange  = 600.0f;     // квестодатель по карте: дальше — не поход, а переезд (0 = выключено; Кодекс: 600, как у торговца)
     int32 QuestMaxAbove   = 2;          // жёлтое берём; выше на столько уровней — уже красное
     bool  SellByWeaponSkill = false;    // продавать оружие без навыка класса — после чтения строк навыков
     float RestBelowPct    = 55.0f;      // ниже этого — отдыхаем
@@ -172,6 +174,7 @@ struct Settings
         QuestGiverRange = sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
         // широко: цель ищется по округе, а не на длину руки — к ней ходят
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
+        GiverSeekRange  = sConfigMgr->GetFloatDefault("Constellation.GiverSeekRange", 600.0f);
         QuestMaxAbove   = sConfigMgr->GetIntDefault("Constellation.QuestMaxAbove", 2);
         SellByWeaponSkill = sConfigMgr->GetBoolDefault("Constellation.SellByWeaponSkill", false);
         // ГИСТЕРЕЗИС, А НЕ ОДИН ПОРОГ (Кодекс, разбор плана): входить и выходить по
@@ -204,7 +207,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering, Talking };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering, Talking, SeekingGiver };
 
 struct Companion
 {
@@ -227,7 +230,7 @@ struct Companion
     ObjectGuid GiverGuid;               // квестодатель, к которому идём (пусто = никуда)
     uint32 GiverMs = 0;                 // сколько уже идём к нему
     float GiverDist = 0.0f;             // и с какой дистанции начали — меряем прогресс
-    std::set<ObjectGuid> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
+    std::map<ObjectGuid, uint32> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
     uint32 GiverForgetMs = 0;           // и когда забыть этот список — «навсегда» было ошибкой
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
     uint32 FightMs = 0;                 // накопитель между решениями в бою
@@ -304,6 +307,7 @@ struct Companion
     uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
     uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
     uint32 EnderScanMs = 0;             // когда искать заново
+    uint32 LiveEnderMs = 0;             // и когда искать ЖИВОГО принимающего без точки появления
     uint32 IdleScanMs = 0;              // «стою» не перебирает мир на каждом такте
     bool FightDiagDone = false;         // диагностика боевого поиска — по разу на КАЖДОГО
     bool GiverDiagDone = false;         // и то же для поиска квестодателя
@@ -382,6 +386,17 @@ struct Companion
     Position VendorPos;                 // и где он стоит по таблице
     float VendorDist = 0.0f;            // с какого расстояния пошли: срок считается от него
     uint32 VendorScanMs = 0;            // обзор сетки у его точки — не чаще раза в 2 с
+    // КВЕСТОДАТЕЛЬ ПО КАРТЕ: когда в обзоре никто ничего не предлагает, идём к ближайшему
+    // из указателя, у кого ядро дало бы квест по светофору. SeekEntry = 0 — ни к кому.
+    uint32 SeekEntry = 0;               // к какому виду квестодателя идём
+    ObjectGuid::LowType SeekSpawn = 0;  // и к какой именно его точке
+    Position SeekPos;                   // и где она по таблице
+    uint32 SeekCooldownMs = 0;          // между походами — пять минут
+    std::unordered_map<ObjectGuid::LowType, uint32> SeekBackoff;   // точка -> сколько не ходить к ней снова
+    uint32 IdleDiagMs = 0;              // прибор «ПРОСТОЙ» — раз в пять минут
+    uint32 LastPathType = 0;            // тип последнего отказа построителя — для строки «не подойти»
+    bool RingTried = false;             // обход точек вокруг NPC в этом намерении уже был
+    bool RingHeld = false;              // и найденная точка держится до прихода или отказа
     float TurnInDist = 0.0f;            // с какого расстояния пошли сдавать: срок от него
     std::unordered_map<uint32, uint32> TriggerSentMs;   // зона осмотра -> не слать повторно, мс
     float TravelStop = 10.0f;           // на каком расстоянии от точки считать «пришёл»
@@ -1184,6 +1199,7 @@ public:
             if (!built)
             {
                 ++_noPath;
+                c.LastPathType = uint32(path.GetPathType());
                 if (_noPathLogged < 20)
                 {
                     // прежняя диагностика стояла на ОДНОМ глобальном флаге и напечаталась
@@ -1718,6 +1734,8 @@ public:
             c.FollowCooldownMs = (c.FollowCooldownMs <= diff) ? 0 : c.FollowCooldownMs - diff;
         if (c.EnderScanMs)
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
+        if (c.LiveEnderMs)
+            c.LiveEnderMs = (c.LiveEnderMs <= diff) ? 0 : c.LiveEnderMs - diff;
         if (c.IdleScanMs)
             c.IdleScanMs = (c.IdleScanMs <= diff) ? 0 : c.IdleScanMs - diff;
         for (auto it = c.GatherBackoff.begin(); it != c.GatherBackoff.end(); )
@@ -1742,6 +1760,12 @@ public:
             if (it->second <= diff) it = c.TriggerSentMs.erase(it); else { it->second -= diff; ++it; }
         if (c.ToolActionMs)
             c.ToolActionMs = (c.ToolActionMs <= diff) ? 0 : c.ToolActionMs - diff;
+        if (c.SeekCooldownMs)
+            c.SeekCooldownMs = (c.SeekCooldownMs <= diff) ? 0 : c.SeekCooldownMs - diff;
+        if (c.IdleDiagMs)
+            c.IdleDiagMs = (c.IdleDiagMs <= diff) ? 0 : c.IdleDiagMs - diff;
+        for (auto it = c.SeekBackoff.begin(); it != c.SeekBackoff.end();)
+            if (it->second <= diff) it = c.SeekBackoff.erase(it); else { it->second -= diff; ++it; }
         for (auto it = c.TalkRetry.begin(); it != c.TalkRetry.end();)
             if (it->second <= diff) it = c.TalkRetry.erase(it); else { it->second -= diff; ++it; }
         for (auto it = c.EquipRefused.begin(); it != c.EquipRefused.end();)
@@ -1774,14 +1798,10 @@ public:
             //
             // Недостижимость не вечна: спутник смещается, NPC ходит, фаза меняется.
             // Пять минут — достаточно, чтобы не долбиться, и мало, чтобы не выпасть из игры.
-            if (c.GiverForgetMs <= diff)
-            {
-                if (!c.GiverUnreachable.empty())
-                    c.GiverUnreachable.clear();
-                c.GiverForgetMs = 300000;
-            }
-            else
-                c.GiverForgetMs -= diff;
+            // СРОК — У КАЖДОЙ ЗАПИСИ СВОЙ, ДЕСЯТЬ МИНУТ (Кодекс): общая очистка раз в пять минут
+            // возвращала в выбор всех разом, и недостижимый выбирался снова по расписанию.
+            for (auto it = c.GiverUnreachable.begin(); it != c.GiverUnreachable.end();)
+                if (it->second <= diff) it = c.GiverUnreachable.erase(it); else { it->second -= diff; ++it; }
 
 
         if (c.TravelScanMs)
@@ -2251,6 +2271,43 @@ public:
                     }
                     c.TravelScanMs = 2000;  // впустую — не перебирать точки каждый такт
                 }
+                // ДЕЛАТЬ НЕЧЕГО — СКАЗАТЬ ПОЧЕМУ, И ПОЙТИ ЗА КВЕСТОМ ПО КАРТЕ.
+                //
+                // Сюда доходит тот, у кого нет ни готового к сдаче, ни цели, ни собеседника, ни
+                // точки сбора, ни дороги к цели. Замер 2026-09-02: таких 33 из 122, и все стояли
+                // молча. Прибор — раз в пять минут; поход — к ближайшему квестодателю карты, у
+                // которого ядро дало бы квест по светофору (в обзоре таких уже нет).
+                if (Cfg().Quests && Cfg().TakeQuests && idleScan)
+                {
+                    uint32 unmetNow = 0;
+                    std::set<uint32> wantedNow;
+                    WantedEntries(self, wantedNow, nullptr, nullptr, nullptr, &unmetNow);
+                    if (!unmetNow && c.TalkCandidate.IsEmpty())
+                    {
+                        if (!c.IdleDiagMs)
+                        {
+                            c.IdleDiagMs = 300000;
+                            LogIdle(c, self);
+                        }
+                        if (!c.SeekCooldownMs && Cfg().GiverSeekRange > 0.0f)
+                        {
+                            uint32 qid = 0;
+                            if (FindGiverByMap(c, self, &c.SeekEntry, &c.SeekSpawn, &c.SeekPos, &qid))
+                            {
+                                Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+                                CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(c.SeekEntry);
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ПОХОД {}: в обзоре никто ничего не предлагает — иду к {} ({}) за {:.0f} ярдов: у него {} '{}'",
+                                    self->GetName(), ct ? ct->Name : std::string("?"), c.SeekEntry,
+                                    self->GetExactDist2d(c.SeekPos.GetPositionX(), c.SeekPos.GetPositionY()),
+                                    qid, q ? q->GetLogTitle() : std::string(""));
+                                Switch(c, self, Behavior::SeekingGiver, "иду к квестодателю по карте");
+                                return;
+                            }
+                            c.SeekCooldownMs = 300000;      // никого подходящего — не перебирать карту каждые пять секунд
+                        }
+                    }
+                }
                 // ОЧЕРЕДИ ПО РАССТОЯНИЮ ЗДЕСЬ БОЛЬШЕ НЕТ (оператор, 2026-09-02: «если то
                 // что ты писал про расстояние — откати, теперь есть светофор»).
                 //
@@ -2434,8 +2491,11 @@ public:
                     // три других состояния его слушают. Торговля не слушала — значит
                     // недостижимый торговец означал две минуты бега в стену вместо трёх
                     // секунд. Разбор поймал это сравнением с Travelling.
+                    if (c.Stalled && FindReachableApproach(c, self, vendor))
+                        return;
                     if (c.Stalled || c.ModeMs > 120000)
                     {
+                        LogApproachFailure(c, self, vendor, "торговцу");
                         c.VendCooldownMs = 300000;
                         c.VendorGuid.Clear();
                         Switch(c, self, Behavior::Idle, "не дошёл до торговца");
@@ -2493,6 +2553,42 @@ public:
                 c.VendCooldownMs = 60000 + (c.Guid.GetCounter() % 47) * 1000;
                 c.VendorGuid.Clear();
                 Switch(c, self, Behavior::Idle, "торговля закончена");
+                return;
+            }
+
+            // ПОХОД К КВЕСТОДАТЕЛЮ ПО КАРТЕ — та же форма, что у торговца по карте: точка из
+            // указателя, бюджет по прогрессу, тупик. Дошли в обзор — дальше обычный порядок:
+            // Hello, меню ядра, светофор. Вид на десять минут в отсрочку, чтобы не выбрать его
+            // же снова, если у самого квестодателя окажется нечего брать.
+            case Behavior::SeekingGiver:
+            {
+                float const d = self->GetExactDist2d(c.SeekPos.GetPositionX(), c.SeekPos.GetPositionY());
+                if (d <= 25.0f)
+                {
+                    c.SeekBackoff[c.SeekSpawn] = 600000;
+                    // СРОК СТАВИТСЯ И ПРИ УДАЧНОМ ПРИХОДЕ (Кодекс): иначе, если у пришедшего
+                    // нечего взять, следующий поход начинался бы тут же к соседней точке —
+                    // цепочка походов вместо дела.
+                    c.SeekCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
+                    c.QuestMs = Cfg().QuestIntervalMs;      // спросить квестодателя на следующем же такте
+                    Switch(c, self, Behavior::Idle, "дошёл до квестодателя по карте");
+                    return;
+                }
+                StepToward(c, self, c.SeekPos.GetPositionX(), c.SeekPos.GetPositionY(),
+                    c.SeekPos.GetPositionZ(), 20.0f, dt);
+                if (d < c.WalkBest - 1.0f)
+                    { c.WalkBest = d; c.WalkStuckMs = 0; }
+                else
+                    c.WalkStuckMs += slice;
+                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПОХОД {}: до квестодателя {} по карте не дойти — осталось {:.0f} ярдов, тупик {}, без прогресса {} с, всего {} с",
+                        self->GetName(), c.SeekEntry, d, c.Stalled ? 1 : 0, c.WalkStuckMs / 1000, c.ModeMs / 1000);
+                    c.SeekBackoff[c.SeekSpawn] = 600000;
+                    c.SeekCooldownMs = 300000;
+                    Switch(c, self, Behavior::Idle, "до квестодателя по карте не дойти");
+                }
                 return;
             }
 
@@ -2700,8 +2796,11 @@ public:
                     float ax, ay, az;
                     ApproachPoint(c, ender, self, ax, ay, az, diff);
                     StepToward(c, self, ax, ay, az, ender->GetCombatReach() + 2.0f, dt);
+                    if (c.Stalled && FindReachableApproach(c, self, ender))
+                        return;
                     if (c.Stalled || c.ModeMs > 60000)
                     {
+                        LogApproachFailure(c, self, ender, "принимающему");
                         c.TurnInBackoff[c.TurnInQuest] = 60000;
                         Switch(c, self, Behavior::Idle, "к принимающему не подойти вплотную");
                     }
@@ -2944,8 +3043,10 @@ public:
                     Switch(c, self, Behavior::Idle, "клик не по правилам");
                     return;
                 }
-                uint32 toolSpell = 0;
-                Item* tool = (!gossip && !click) ? QuestToolFor(self, who->GetEntry(), &toolSpell) : nullptr;
+                uint32 toolSpell = 0, toolQuest = 0;
+                std::set<uint32> toolCredits;
+                Item* tool = (!gossip && !click)
+                    ? QuestToolFor(self, who->GetEntry(), &toolSpell, who, &toolQuest, &toolCredits) : nullptr;
                 SpellInfo const* toolInfo = tool ? sSpellMgr->GetSpellInfo(toolSpell, DIFFICULTY_NONE) : nullptr;
                 if (!gossip && !click && !toolInfo)
                 {
@@ -3028,8 +3129,11 @@ public:
                     c.TalkMs += slice;
                     float const now = self->GetExactDist(who);
                     bool const noProgress = c.TalkMs >= 20000 && now > c.TalkDist - 1.0f;
+                    if (c.Stalled && FindReachableApproach(c, self, who))
+                        return;
                     if (c.Stalled || noProgress || c.TalkMs >= 45000)
                     {
+                        LogApproachFailure(c, self, who, "собеседнику");
                         TC_LOG_INFO("server.worldserver",
                             "Constellation РЕЧЬ {}: до {} ({}) не дойти за {} с, было {:.0f}, стало {:.0f}",
                             self->GetName(), who->GetName(), who->GetEntry(),
@@ -3177,7 +3281,13 @@ public:
                         }
                         return;
                     }
-                    SnapshotObjectives(self, entry, c.ToolWas);
+                    // СНИМОК — ПО ЗАСЧИТЫВАЕМЫМ ЦЕЛЯМ, А НЕ ПО НОМЕРУ СУЩЕСТВА: у раненого горца
+                    // номер 37080, а зачёт идёт маркеру 37079 — снимок по 37080 был бы пуст, и
+                    // всякий успех читался бы как «без зачёта».
+                    if (toolQuest)
+                        SnapshotQuestObjectives(self, toolQuest, toolCredits, c.ToolWas);
+                    else
+                        SnapshotObjectives(self, entry, c.ToolWas);
                     c.ToolWasEntry = entry;
                     // ЛИЧНОСТЬ ПРЕДМЕТА — ДО ВЫЗОВА: успешное применение может израсходовать
                     // и уничтожить его (Spell::TakeCastItem), и указатель после обработчика
@@ -3827,6 +3937,11 @@ public:
             x = target->GetPositionX();
             y = target->GetPositionY();
             z = target->GetPositionZ();
+            return;
+        }
+        if (c.RingHeld && c.ApproachFor == target->GetGUID())
+        {
+            x = c.ApproachX; y = c.ApproachY; z = c.ApproachZ;   // точка обхода — до прихода или отказа
             return;
         }
         if (c.ApproachFor != target->GetGUID() || !c.ApproachMs)
@@ -4764,6 +4879,8 @@ public:
         }
         if (c.Mode == Behavior::Vending && to != Behavior::Vending)
             c.VendorEntry = 0;          // поход по карте кончился — любым исходом
+        if (c.Mode == Behavior::SeekingGiver && to != Behavior::SeekingGiver)
+            c.SeekEntry = 0;            // и поход к квестодателю по карте — тоже
         c.WalkBest = 1.0e9f;            // бюджет прогресса начинается заново в каждом режиме
         c.WalkStuckMs = 0;
         c.Mode = to;
@@ -4773,6 +4890,8 @@ public:
         if (to != Behavior::Attacking)
             { c.VictimHp = 0; c.NoDamageMs = 0; c.DamageVictim.Clear(); }
         c.Stalled = false;              // новое намерение — новая попытка дойти
+        c.RingTried = false;            // и обход точек вокруг NPC снова доступен (помост)
+        c.RingHeld = false;
         c.StuckMs = 0;
         c.UnstickTries = 0;
         c.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
@@ -4798,6 +4917,7 @@ public:
             case Behavior::TurningIn:         return "сдаю квест";
             case Behavior::Gathering:         return "иду собирать";
             case Behavior::Talking:           return "иду взаимодействовать";
+            case Behavior::SeekingGiver:      return "иду к квестодателю по карте";
         }
         return "?";
     }
@@ -4933,14 +5053,17 @@ public:
                 c.GiverMs += diff;
                 float const now = self->GetExactDist(going);
                 bool const noProgress = c.GiverMs >= 20000 && now > c.GiverDist - 1.0f;
+                if (c.Stalled && FindReachableApproach(c, self, going))
+                    return;
                 if (c.Stalled || noProgress || c.GiverMs >= 30000)
                 {
+                    LogApproachFailure(c, self, going, "квестодателю");
                     TC_LOG_INFO("server.worldserver",
                         "Constellation: {} — до квестодателя {} ({}) не дойти за {} с, "
                         "было {:.1f} ярдов, стало {:.1f}; больше не пробую",
                         self->GetName(), going->GetName(), going->GetEntry(),
                         c.GiverMs / 1000, c.GiverDist, now);
-                    c.GiverUnreachable.insert(c.GiverGuid);   // иначе выберем его снова
+                    c.GiverUnreachable[c.GiverGuid] = 600000;   // иначе выберем его снова
                     c.GiverGuid.Clear();
                     c.GiverMs = 0;
                     StopMoving(c, self);
@@ -5095,7 +5218,7 @@ public:
         // ближайший, у которого всё красное, выбирался бы снова и снова вместо соседнего с
         // подходящим заданием. Запрет по особи и не навсегда: уровень растёт, цвет меняется.
         if (!quest && offered)
-            c.GiverUnreachable.insert(giver->GetGUID());
+            c.GiverUnreachable[giver->GetGUID()] = 600000;
         if (quest)
         {
             WorldPacket rawAccept(CMSG_QUEST_GIVER_ACCEPT_QUEST);
@@ -5174,10 +5297,12 @@ public:
                 return true;
             }
 
-            bool anyEnder = false;
+            bool anyEnder = false, summoned = false;
             for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
             {
                 anyEnder = true;            // принимающий В МИРЕ есть — приговора не будет
+                if (!_spawnedSomewhere.count(enderEntry))
+                    summoned = true;        // его нигде не ставят — значит призывают
                 auto mapIt = _spawns.find(self->GetMapId());
                 if (mapIt == _spawns.end())
                     continue;
@@ -5199,6 +5324,56 @@ public:
                 c.TurnInPos = *bestSpawn;
                 c.TurnInDist = bestDist;
                 return true;
+            }
+
+            // ПРИНИМАЮЩИЙ, КОТОРОГО ПРИЗЫВАЮТ, СТОИТ РЯДОМ, А НЕ НА ТОЧКЕ.
+            //
+            // Тариндрелла (49480) принимает «The Woodland Protector» у семерых ночных эльфов и
+            // не имеет в мире НИ ОДНОЙ точки появления: её призывает Дентария заклинанием при
+            // сдаче предыдущего квеста, а держит spell_area (аура 92237 на площади 257, пока
+            // квест в журнале). Такой NPC ходит за игроком — и найти его можно только живым.
+            // Обзор дорогой, поэтому: лишь для видов, которых нет в мире нигде, не чаще раза в
+            // десять секунд, и с отсрочкой квесту, если рядом никого.
+            if (summoned && !c.LiveEnderMs)
+            {
+                c.LiveEnderMs = 10000;
+                std::list<Creature*> near;
+                Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
+                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                Cell::VisitGridObjects(self, searcher, 60.0f);
+                Creature* live = nullptr;
+                float bestLive = 100000.0f;
+                for (Creature* cr : near)
+                {
+                    if (!cr->IsAlive())
+                        continue;
+                    // ЧУЖОЙ ЛИЧНЫЙ ПРИЗЫВ — НЕ НАШ ПРИНИМАЮЩИЙ. Такой NPC принадлежит другому
+                    // игроку, и ядро всё равно не даст с ним говорить (WorldObject::_privateObjectOwner).
+                    if (cr->IsPrivateObject() && cr->GetPrivateObjectOwner() != self->GetGUID())
+                        continue;
+                    bool mine = false;
+                    for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
+                        if (cr->GetEntry() == enderEntry && !_spawnedSomewhere.count(enderEntry))
+                            { mine = true; break; }
+                    if (!mine)
+                        continue;
+                    float const d = self->GetExactDist(cr);
+                    if (d < bestLive)
+                        { bestLive = d; live = cr; }
+                }
+                if (live)
+                {
+                    c.TurnInQuest = qid;
+                    c.TurnInEntry = live->GetEntry();
+                    c.TurnInGuid = live->GetGUID();
+                    c.TurnInPos = live->GetPosition();
+                    c.TurnInDist = bestLive;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation СДАЧА {}: принимающий {} ({}) квеста {} нигде не появляется — он призван и стоит в {:.0f} ярдах, иду к нему",
+                        self->GetName(), live->GetName(), live->GetEntry(), qid, bestLive);
+                    return true;
+                }
+                c.TurnInBackoff[qid] = 300000;      // призванного рядом нет — не искать каждый обзор
             }
 
             // ПРИГОВОР — ТОЛЬКО ЗА УСТРОЙСТВО КВЕСТА, А НЕ ЗА ТО, ГДЕ МЫ СТОИМ.
@@ -5239,6 +5414,13 @@ public:
         }
         TC_LOG_INFO("server.loading", "Constellation: указатель спавнов — {} точек на {} картах",
             n, uint32(_spawns.size()));
+
+        // КТО ВООБЩЕ ГДЕ-НИБУДЬ ПОЯВЛЯЕТСЯ. Нужен, чтобы отличить «принимающий на другой
+        // карте» (подождём, дойдём) от «принимающего нет в мире ни одной точки» (его
+        // призывают, и искать его надо живым рядом, а не по таблице).
+        for (auto const& [mapId, byEntry] : _spawns)
+            for (auto const& [entry, points] : byEntry)
+                _spawnedSomewhere.insert(entry);
 
         // ЗАЧЁТ ЧЕРЕЗ ДРУГОЕ СУЩЕСТВО. Player::KilledMonsterCredit смотрит KillCredit[0..1]
         // шаблона убитого: цель квеста 39262 не появляется в мире никогда, её засчитывают
@@ -5290,6 +5472,27 @@ public:
             }
         TC_LOG_INFO("server.loading", "Constellation: указатель торговцев — {} точек на {} картах",
             m, uint32(_menders.size()));
+
+        // КВЕСТОДАТЕЛИ — ПО КАРТЕ. Обзор в тридцать ярдов находит только тех, кто и так рядом;
+        // опустевший хаб оставлял спутника стоять при квестодателе в 52 ярдах (Теронис,
+        // Аэлдон Санбранд). Связи «существо -> квесты» здесь выбирают КУДА ИДТИ; что взять,
+        // по-прежнему решается у самого квестодателя по меню, собранному ядром.
+        // ПО ТОЧКАМ СПАВНА, А НЕ ПО ВИДАМ (Кодекс): отсрочка после неудачи относится к одной
+        // точке — плохая точка одного вида не должна запрещать другую того же вида.
+        uint32 gq = 0;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureTemplate const* tpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tpl || !(tpl->npcflag & uint64(UNIT_NPC_FLAG_QUESTGIVER)))
+                continue;
+            auto const rel = sObjectMgr->GetCreatureQuestRelations(data.id);
+            if (rel.begin() == rel.end())
+                continue;
+            _givers[data.mapId].push_back(Giver{ data.id, tpl->faction, data.spawnPoint, spawnId });
+            ++gq;
+        }
+        TC_LOG_INFO("server.loading", "Constellation: указатель квестодателей — {} точек на {} картах",
+            gq, uint32(_givers.size()));
 
 
         // КАРТА — ЭТО ДАННЫЕ. МИР СПРАШИВАЮТ В МОМЕНТ КАСАНИЯ.
@@ -5935,8 +6138,26 @@ public:
     // дальности. Поэтому источник истины один: квест, в котором эта цель числится, и его
     // собственный SourceItem. Тогда применить камень возвращения к костру становится
     // невозможно ПО ПОСТРОЕНИЮ, а не по удачно подобранному условию.
-    Item* QuestToolFor(Player* self, uint32 targetEntry, uint32* spellOut) const
+    // РОВНО ОДНО ЗАКЛИНАНИЕ «ПРИ ИСПОЛЬЗОВАНИИ». Ядро не выбирает первое: оно лишь проверяет,
+    // что присланный клиентом номер есть среди эффектов предмета (Player::CastItemUseSpell),
+    // а выбор делает клиент. У предмета с двумя такими эффектами модулю выбирать не из
+    // чего — такой пропускаем (Кодекс). 0 — «не одно».
+    static uint32 UseSpellOf(Item const* tool)
     {
+        uint32 useSpell = 0, useCount = 0;
+        for (ItemEffectEntry const* eff : tool->GetEffects())
+            if (eff && eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0
+                && uint32(eff->SpellID) != useSpell)
+                { useSpell = uint32(eff->SpellID); ++useCount; }
+        return useCount == 1 ? useSpell : 0;
+    }
+
+    Item* QuestToolFor(Player* self, uint32 targetEntry, uint32* spellOut,
+                       Creature const* who = nullptr, uint32* questOut = nullptr,
+                       std::set<uint32>* creditsOut = nullptr) const
+    {
+        if (questOut)
+            *questOut = 0;
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
             uint32 const qid = self->GetQuestSlotQuestId(slot);
@@ -5955,19 +6176,86 @@ public:
             Item* tool = self->GetItemByEntry(q->GetSrcItemId());
             if (!tool)
                 continue;
-            // РОВНО ОДНО ЗАКЛИНАНИЕ «ПРИ ИСПОЛЬЗОВАНИИ». Ядро не выбирает первое: оно лишь
-            // проверяет, что присланный клиентом номер есть среди эффектов предмета
-            // (Player::CastItemUseSpell), а выбор делает клиент. У предмета с двумя такими
-            // эффектами модулю выбирать не из чего — такой пропускаем (Кодекс).
-            uint32 useSpell = 0, useCount = 0;
-            for (ItemEffectEntry const* eff : tool->GetEffects())
-                if (eff && eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0
-                    && uint32(eff->SpellID) != useSpell)
-                    { useSpell = uint32(eff->SpellID); ++useCount; }
-            if (useCount == 1)
+            if (uint32 const useSpell = UseSpellOf(tool))
                 { *spellOut = useSpell; return tool; }
         }
+        if (!who)
+            return nullptr;
+
+        // ПО КОНТРАКТУ ЗАКЛИНАНИЯ ПРЕДМЕТА. Цель задания бывает невидимым маркером зачёта,
+        // который не появляется в мире никогда: «Kill Credit Bunny - Wounded Coldridge…» (37079)
+        // у девяти дварфов с «Aid for the Wounded». Зачёт даёт заклинание предмета от квеста
+        // (эффект KILL_CREDIT с номером маркера — Spell::EffectKillCredit награждает игрока), а
+        // КОГО им лечить, названо в условиях самого заклинания: conditions 13/69855 -> существо
+        // 37080, раненый горец, двадцать точек в долине. Ровно эти два вопроса и задаём: даёт
+        // ли заклинание зачёт нужной цели, и назван ли этот вид его целью.
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q || !q->GetSrcItemId())
+                continue;
+            Item* tool = self->GetItemByEntry(q->GetSrcItemId());
+            if (!tool)
+                continue;
+            uint32 const useSpell = UseSpellOf(tool);
+            if (!useSpell)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell, diff);
+            if (!si || SpellMovesOrControls(si, diff))
+                continue;                       // предмет, который переносит или управляет, — не инструмент
+            std::set<uint32> unmet;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER && obj.ObjectID > 0
+                    && self->GetQuestObjectiveData(qid, obj.ID) < obj.Amount)
+                    unmet.insert(uint32(obj.ObjectID));
+            if (unmet.empty())
+                continue;
+            // ПУТЬ ЧЕРЕЗ ПРАВИЛО СУЩЕСТВА («попадание -> зачёт») здесь СОЗНАТЕЛЬНО НЕ ВКЛЮЧЁН
+            // (Кодекс): это другой контракт, и известный пример — тотем троллей (25165) —
+            // требует ещё и боя; одним применением его не закрыть.
+            std::set<uint32> credits;
+            if (!SpellContractFits(si, who->GetEntry(), unmet, &credits))
+                continue;
+            if (creditsOut)
+                *creditsOut = credits;
+            *spellOut = useSpell;
+            if (questOut)
+                *questOut = qid;
+            return tool;
+        }
         return nullptr;
+    }
+
+    // ЕСТЬ ЛИ ВООБЩЕ ЧЕМ РАБОТАТЬ — дешёвый предварительный вопрос перед обходом существ.
+    bool AnyToolQuest(Player* self) const
+    {
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (q && q->GetSrcItemId() && self->GetItemByEntry(q->GetSrcItemId()))
+                return true;
+        }
+        return false;
+    }
+
+    // СНИМОК ПО ЗАСЧИТЫВАЕМЫМ ЦЕЛЯМ КВЕСТА — для предмета, выбранного по контракту заклинания:
+    // засчитывается маркер, а не тот, на кого применили; и именно те цели, чьи номера
+    // заклинание засчитывает, а не все цели квеста подряд (Кодекс).
+    void SnapshotQuestObjectives(Player* self, uint32 qid, std::set<uint32> const& credits,
+        std::vector<std::pair<std::pair<uint32, uint32>, int32>>& out) const
+    {
+        out.clear();
+        if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER && obj.ObjectID > 0 && credits.count(uint32(obj.ObjectID)))
+                    out.push_back({ { qid, obj.ID }, self->GetQuestObjectiveData(qid, obj.ID) });
     }
 
     // СЧЁТЧИКИ ЦЕЛЕЙ ПО ЭТОМУ СУЩЕСТВУ — ДО ПОПЫТКИ. Успех меряется их ростом.
@@ -6054,53 +6342,8 @@ public:
         }
         if (hitSpells.empty())
             return false;
-        auto const script = sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE);
-        std::unordered_map<uint32, SmartScriptHolder const*> byId;
-        for (SmartScriptHolder const& e : script)
-            byId[e.event_id] = &e;
-        // ЗАЧЁТ ЧАСТО ЛЕЖИТ НЕ В САМОМ ПРАВИЛЕ, А В ЕГО СПИСКЕ ДЕЙСТВИЙ. Замер на живом:
-        // непокорный тролль (34830) — «попадание 66306 -> ВЫПОЛНИТЬ СПИСОК 3483000», и уже в
-        // списке, пунктом четвёртым, «выдать зачёт 34830». Семерым гоблинам отказали именно
-        // потому, что цепочка обрывалась на границе списка.
-        auto listGives = [&](uint32 listId) -> bool
-        {
-            if (!listId)
-                return false;
-            for (SmartScriptHolder const& a : sSmartScriptMgr->GetScript(int32(listId), SMART_SCRIPT_TYPE_TIMED_ACTIONLIST))
-                if (a.GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
-                    && wanted.count(a.action.killedMonster.creature))
-                    return true;
-            return false;
-        };
-        bool found = false, direct = false;
-        for (SmartScriptHolder const& e : script)
-        {
-            if (e.GetEventType() != SMART_EVENT_SPELLHIT)
-                continue;
-            bool const spellTied = e.event.spellHit.spell == 0 || hitSpells.count(e.event.spellHit.spell) != 0;
-            SmartScriptHolder const* cur = &e;
-            for (int hop = 0; cur && hop < 8; ++hop)
-            {
-                bool gives = cur->GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
-                    && wanted.count(cur->action.killedMonster.creature);
-                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_TIMED_ACTIONLIST)
-                    gives = listGives(cur->action.timedActionList.id);
-                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_RANDOM_TIMED_ACTIONLIST)
-                    for (uint32 listId : cur->action.randTimedActionList.actionLists)
-                        if (listGives(listId))
-                            { gives = true; break; }
-                if (gives)
-                {
-                    found = true;
-                    direct = direct || spellTied;
-                    break;
-                }
-                if (!cur->link)
-                    break;
-                auto it = byId.find(cur->link);
-                cur = (it == byId.end()) ? nullptr : it->second;
-            }
-        }
+        bool direct = false;
+        bool const found = HitChainCredits(entry, hitSpells, wanted, &direct);
         if (tied)
             *tied = direct;
         if (!found)
@@ -6193,6 +6436,402 @@ public:
     }
 
     // БЛИЖАЙШИЙ ТОРГОВЕЦ ПО КАРТЕ, умеющий нужное и не враждебный по своей фракции.
+    // ПРАВИЛО СУЩЕСТВА «ПОПАДАНИЕ -> ЗАЧЁТ», прослеженное по связям и спискам действий. Общее
+    // для клика и для предмета: hitSpells — чем в него попадут; tied — совпало ли заклинание
+    // правила с одним из них (иначе связь живёт в сценарии на C++ и в данных не видна).
+    bool HitChainCredits(uint32 entry, std::set<uint32> const& hitSpells, std::set<uint32> const& wanted, bool* tied) const
+    {
+        auto const script = sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE);
+        std::unordered_map<uint32, SmartScriptHolder const*> byId;
+        for (SmartScriptHolder const& e : script)
+            byId[e.event_id] = &e;
+        // ЗАЧЁТ ЧАСТО ЛЕЖИТ НЕ В САМОМ ПРАВИЛЕ, А В ЕГО СПИСКЕ ДЕЙСТВИЙ. Замер на живом:
+        // непокорный тролль (34830) — «попадание 66306 -> ВЫПОЛНИТЬ СПИСОК 3483000», и уже в
+        // списке, пунктом четвёртым, «выдать зачёт 34830». Семерым гоблинам отказали именно
+        // потому, что цепочка обрывалась на границе списка.
+        auto listGives = [&](uint32 listId) -> bool
+        {
+            if (!listId)
+                return false;
+            for (SmartScriptHolder const& a : sSmartScriptMgr->GetScript(int32(listId), SMART_SCRIPT_TYPE_TIMED_ACTIONLIST))
+                if (a.GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
+                    && wanted.count(a.action.killedMonster.creature))
+                    return true;
+            return false;
+        };
+        bool found = false, direct = false;
+        for (SmartScriptHolder const& e : script)
+        {
+            if (e.GetEventType() != SMART_EVENT_SPELLHIT)
+                continue;
+            bool const spellTied = e.event.spellHit.spell == 0 || hitSpells.count(e.event.spellHit.spell) != 0;
+            SmartScriptHolder const* cur = &e;
+            for (int hop = 0; cur && hop < 8; ++hop)
+            {
+                bool gives = cur->GetActionType() == SMART_ACTION_CALL_KILLEDMONSTER
+                    && wanted.count(cur->action.killedMonster.creature);
+                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_TIMED_ACTIONLIST)
+                    gives = listGives(cur->action.timedActionList.id);
+                if (!gives && cur->GetActionType() == SMART_ACTION_CALL_RANDOM_TIMED_ACTIONLIST)
+                    for (uint32 listId : cur->action.randTimedActionList.actionLists)
+                        if (listGives(listId))
+                            { gives = true; break; }
+                if (gives)
+                {
+                    found = true;
+                    direct = direct || spellTied;
+                    break;
+                }
+                if (!cur->link)
+                    break;
+                auto it = byId.find(cur->link);
+                cur = (it == byId.end()) ? nullptr : it->second;
+            }
+        }
+        if (tied)
+            *tied = direct;
+        return found;
+    }
+
+    // ЗАПИСЬ «ЦЕЛЬ — СУЩЕСТВО НОМЕР N» — в двух видах, старом и нынешнем.
+    static bool UnitEntryCondition(Condition const& cond, uint32 entry)
+    {
+        if (cond.NegativeCondition || cond.ConditionTarget != 0)
+            return false;                   // «НЕ такая-то» — не список; о заклинателе — не о цели
+        bool const legacy = cond.ConditionType == CONDITION_OBJECT_ENTRY_GUID_LEGACY && cond.ConditionValue1 == 3;
+        bool const modern = cond.ConditionType == CONDITION_OBJECT_ENTRY_GUID && cond.ConditionValue1 == TYPEID_UNIT;
+        return (legacy || modern) && (!entry || cond.ConditionValue2 == entry);
+    }
+
+    // ОДНО СОВПАВШЕЕ УСЛОВИЕ — НЕ СПИСОК РАЗРЕШЁННЫХ (Кодекс). Условия эффекта разложены по
+    // группам ElseGroup: внутри группы они соединены И, между группами — ИЛИ. Значит запись
+    // «цель — существо N» годится, только если в её ЖЕ группе нет такой же записи о ДРУГОМ
+    // существе: тогда группа для нашего существа невыполнима, и ядро цель отвергнет.
+    static bool GroupNamesTarget(ConditionContainer const& conds, uint32 entry)
+    {
+        for (Condition const& cond : conds)
+        {
+            if (!UnitEntryCondition(cond, entry))
+                continue;
+            bool clash = false;
+            for (Condition const& other : conds)
+                if (other.ElseGroup == cond.ElseGroup && UnitEntryCondition(other, 0)
+                    && other.ConditionValue2 != entry)
+                    { clash = true; break; }
+            if (!clash)
+                return true;
+        }
+        return false;
+    }
+
+    // КОНТРАКТ ЦЕЛИ И ЗАЧЁТ — ИЗ ОДНОГО МЕСТА (Кодекс, вторая проверка).
+    //
+    // Прежняя редакция собирала зачёты по всем эффектам и всем вызываемым заклинаниям, а
+    // условия на цель — отдельно и так же широко. Тогда зачёт ОДНОГО эффекта сходился бы с
+    // условием ЧУЖОГО, и предмет применялся бы не к тому существу. Правило теперь связное:
+    // эффект называет наше существо целью, а зачёт нужному маркеру стоит либо в ТОМ ЖЕ
+    // заклинании (обычный случай: один эффект бьёт по существу, другой награждает игрока —
+    // Spell::EffectKillCredit требует, чтобы целью был игрок), либо в том заклинании, которое
+    // ЭТОТ ЖЕ эффект вызывает, — то есть ровно в ветви, которой цель и передаётся.
+    void CreditsOf(SpellInfo const* si, std::set<uint32> const& unmet, std::set<uint32>& out) const
+    {
+        for (SpellEffectInfo const& eff : si->GetEffects())
+            if (eff.IsEffect(SPELL_EFFECT_KILL_CREDIT) || eff.IsEffect(SPELL_EFFECT_KILL_CREDIT2))
+                if (eff.MiscValue > 0 && unmet.count(uint32(eff.MiscValue)))
+                    out.insert(uint32(eff.MiscValue));
+    }
+
+    bool SpellContractFits(SpellInfo const* si, uint32 entry, std::set<uint32> const& unmet,
+                           std::set<uint32>* creditsOut, uint32 depth = 0) const
+    {
+        std::set<uint32> own;
+        CreditsOf(si, unmet, own);
+        for (SpellEffectInfo const& eff : si->GetEffects())
+        {
+            if (!eff.ImplicitTargetConditions || !GroupNamesTarget(*eff.ImplicitTargetConditions, entry))
+                continue;
+            std::set<uint32> credits = own;
+            if (eff.TriggerSpell)
+                if (SpellInfo const* t = sSpellMgr->GetSpellInfo(eff.TriggerSpell, DIFFICULTY_NONE))
+                    CreditsOf(t, unmet, credits);
+            if (!credits.empty())
+            {
+                if (creditsOut)
+                    *creditsOut = credits;
+                return true;
+            }
+        }
+        // вызываемое заклинание может нести и условие, и зачёт — тогда оно само себе контракт
+        if (depth < 1)
+            for (SpellEffectInfo const& eff : si->GetEffects())
+                if (eff.TriggerSpell)
+                    if (SpellInfo const* t = sSpellMgr->GetSpellInfo(eff.TriggerSpell, DIFFICULTY_NONE))
+                        if (SpellContractFits(t, entry, unmet, creditsOut, depth + 1))
+                            return true;
+        return false;
+    }
+
+    // ---------------------------------------------------------------- помост
+    // ОБХОД ТОЧЕК ВОКРУГ NPC С НАСТОЯЩИМ МАРШРУТОМ.
+    //
+    // Трое нежити стояли в шести ярдах от Смотрителя Кейса по плоскости и в пяти с половиной
+    // ПО ВЫСОТЕ: он на помосте склепа, они у подножия. Ядро мерит взаимодействие в
+    // пространстве (GetNPCIfCanInteractWith: радиус существа плюс четыре ярда), точка контакта
+    // в полутора ярдах от него не строится — и по 22 круга «есть что сдать -> не подойти
+    // вплотную» у каждого. Первая мысль — один пакет движения прямо в точку контакта — была
+    // отвергнута Кодексом, и правильно: прямая видимость не доказывает проходимость, а
+    // такой пакет проведёт сквозь стену или уронит с края. Поэтому не шаг, а ПОИСК: вокруг
+    // NPC — на ступенях, на краю помоста, с другой стороны — может найтись точка, до
+    // которой ПОЛНЫЙ маршрут есть и откуда ядро уже ответит «можно». Кольца в 3, 5 и 8
+    // ярдов по восьми направлениям, высота — от карты у самой точки, на той же поверхности,
+    // что и NPC; берём первую с полным путём. Дорого (до 24 построений) — один раз за
+    // намерение и только в тупике.
+    bool FindReachableApproach(Companion& c, Player* self, WorldObject const* target)
+    {
+        if (c.RingTried || !target)
+            return false;
+        c.RingTried = true;
+        static float const rings[3] = { 3.0f, 5.0f, 8.0f };
+        for (float r : rings)
+            for (uint32 k = 0; k < 8; ++k)
+            {
+                float const a = float(k) * 6.2831853f / 8.0f;
+                float const x = target->GetPositionX() + std::cos(a) * r;
+                float const y = target->GetPositionY() + std::sin(a) * r;
+                if (!MapManager::IsValidMapCoord(self->GetMapId(), x, y))
+                    continue;
+                float const z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y,
+                                                          target->GetPositionZ() + 3.0f, true, 20.0f);
+                if (z <= INVALID_HEIGHT || std::fabs(z - target->GetPositionZ()) > 6.0f)
+                    continue;               // не та поверхность
+                PathGenerator path(self);
+                if (!path.CalculatePath(x, y, z, false))
+                    continue;
+                if (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_INCOMPLETE))
+                    continue;
+                c.ApproachX = x;
+                c.ApproachY = y;
+                c.ApproachZ = z;
+                c.ApproachFor = target->GetGUID();
+                // ДЕРЖИМ ДО ПРИХОДА ИЛИ ДО ОТКАЗА, А НЕ ДВАДЦАТЬ СЕКУНД (Кодекс): путь в обход
+                // помоста бывает много длиннее, чем прямая до точки, и по истечении срока
+                // подход снова взял бы недостижимую точку контакта — при том что второй обход
+                // уже запрещён.
+                c.ApproachMs = 0;
+                c.RingHeld = true;
+                c.RawTarget = false;
+                c.Stalled = false;
+                c.NoPathFails = 0;
+                c.NoPathMs = 0;
+                c.UnstickTries = 0;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОДХОД {}: к {} ({}) точка контакта недостижима — нашлась точка в {:.0f} ярдах от него ({:.0f} {:.0f} {:.1f}), по высоте от меня {:+.1f}, иду к ней",
+                    self->GetName(), target->GetName(), target->GetEntry(), r, x, y, z, z - self->GetPositionZ());
+                return true;
+            }
+        return false;
+    }
+
+    // ОТКАЗ ПОДХОДА — С ЧИСЛАМИ, а не одной фразой: по плоскости и по высоте, сколько раз
+    // построитель отказал и каким типом, упёрлись ли, видно ли.
+    void LogApproachFailure(Companion const& c, Player* self, WorldObject const* target, char const* whom) const
+    {
+        if (!target)
+            return;
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПОДХОД {}: к {} {} ({}) не подойти — по плоскости {:.1f}, по высоте {:+.1f}, отказов маршрута {}, последний тип {:X}, тупик {}, видно {}, {} с",
+            self->GetName(), whom, target->GetName(), target->GetEntry(),
+            self->GetExactDist2d(target), target->GetPositionZ() - self->GetPositionZ(),
+            uint32(c.NoPathFails), c.LastPathType, c.Stalled ? 1 : 0,
+            self->IsWithinLOSInMap(target) ? 1 : 0, c.ModeMs / 1000);
+    }
+
+    // ---------------------------------------------------------------- прибор «ПРОСТОЙ»
+    // ПЕРВЫЕ ВОРОТА ЯДРА, КОТОРЫЕ НЕ ПРОПУСКАЮТ КВЕСТ, — по именам и В ПОРЯДКЕ ЯДРА.
+    //
+    // Тот же ряд, что у Player::CanTakeQuest в этом форке (Player.cpp:14393), а не
+    // придуманный: иначе прибор назвал бы не те ворота (Кодекс). Итог ядра — контроль:
+    // расхождение с найденным печатается как расхождение, а не как «ядро даёт».
+    char const* FirstFailingGate(Player* self, Quest const* q) const
+    {
+        char const* gate = nullptr;
+        if (DisableMgr::IsDisabledFor(DISABLE_TYPE_QUEST, q->GetQuestId(), self)) gate = "выключен";
+        else if (!self->SatisfyQuestStatus(q, false))          gate = "статус";
+        else if (!self->SatisfyQuestExclusiveGroup(q, false))  gate = "группа";
+        else if (!self->SatisfyQuestClass(q, false))           gate = "класс";
+        else if (!self->SatisfyQuestRace(q, false))            gate = "раса";
+        else if (!self->SatisfyQuestLevel(q, false))           gate = "уровень";
+        else if (!self->SatisfyQuestSkill(q, false))           gate = "навык";
+        else if (!self->SatisfyQuestReputation(q, false))      gate = "репутация";
+        else if (!self->SatisfyQuestDependentQuests(q, false)) gate = "предыдущие";
+        else if (!self->SatisfyQuestTimed(q, false))           gate = "срок";
+        else if (!self->SatisfyQuestDay(q, false))             gate = "день";
+        else if (!self->SatisfyQuestWeek(q, false))            gate = "неделя";
+        else if (!self->SatisfyQuestMonth(q, false))           gate = "месяц";
+        else if (!self->SatisfyQuestSeasonal(q, false))        gate = "сезон";
+        else if (!self->SatisfyQuestConditions(q, false))      gate = "условия";
+        else if (!self->SatisfyQuestExpansion(q, false))       gate = "дополнение";
+        bool const core = self->CanTakeQuest(q, false);
+        if (gate && !core)
+            return gate;
+        if (!gate && core)
+            return self->SatisfyQuestLog(false) ? "ядро даёт" : "ядро даёт, но журнал полон";
+        return gate ? "не классифицировано" : "иное";
+    }
+
+    // ПОЧЕМУ СТОИМ — раз в пять минут у того, кому делать нечего. Прежний прибор печатался по
+    // разу при первом поиске и устаревал: 33 из 122 стояли молча. Связи «существо -> квесты»
+    // здесь только ПЕЧАТАЮТСЯ.
+    void LogIdle(Companion const& c, Player* self) const
+    {
+        std::string waiting;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
+                continue;
+            char const* why = "ждёт";
+            if (c.Impossible.count(qid))
+                why = "закрыть нечем";
+            else if (c.TurnInBackoff.count(qid))
+                why = "отсрочка";
+            else
+            {
+                bool spawn = false, ender = false;
+                auto mapIt = _spawns.find(self->GetMapId());
+                for (auto const& [_, e] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
+                {
+                    ender = true;
+                    if (mapIt != _spawns.end() && mapIt->second.count(e))
+                        spawn = true;
+                }
+                why = !ender ? "принимающего-существа нет" : (spawn ? "принимающий на карте" : "у принимающего нет точки на карте");
+            }
+            waiting += std::to_string(qid) + " (" + why + ") ";
+        }
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
+        Cell::VisitGridObjects(self, searcher, 60.0f);
+        uint32 printed = 0;
+        for (Creature* cr : around)
+        {
+            if (printed >= 6)
+                break;
+            auto const rel = sObjectMgr->GetCreatureQuestRelations(cr->GetEntry());
+            if (rel.begin() == rel.end())
+                continue;
+            std::string quests;
+            uint32 k = 0;
+            for (uint32 qid : rel)
+            {
+                if (++k > 4)
+                    { quests += "…"; break; }
+                Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+                if (!q)
+                    continue;
+                static char const* const colourName[5] = { "серое", "зелёное", "жёлтое", "красное", "цвет?" };
+                quests += std::to_string(qid) + " " + colourName[std::min<uint8>(QuestColour(self, q), 4)]
+                        + "/" + FirstFailingGate(self, q) + (c.QuestRefused.count(qid) ? " (отказной)" : "") + "; ";
+            }
+            ++printed;
+            // СВОИ ФИЛЬТРЫ — ОТДЕЛЬНО ОТ ВОРОТ ЯДРА (Кодекс): чёрный список и отказные — модуля,
+            // и без них строка обвинила бы ядро.
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРОСТОЙ {} (ур. {}, зона {}): {} ({}) в {:.0f} ярдах, видно {}, в чёрном списке {}, статус {:X}: {}",
+                self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), cr->GetName(), cr->GetEntry(),
+                self->GetExactDist2d(cr), self->IsWithinLOSInMap(cr) ? 1 : 0,
+                c.GiverUnreachable.count(cr->GetGUID()) ? 1 : 0,
+                uint64(self->GetQuestDialogStatus(cr)), quests);
+            // МЕНЮ ЗДЕСЬ НЕ СПРАШИВАЕМ, И ЭТО РЕШЕНИЕ, А НЕ УПУЩЕНИЕ (Кодекс, вторая проверка).
+            //
+            // Первая редакция слала отсюда Hello и беседу, чтобы показать меню, которое ядро
+            // собрало бы игроку. Но эти обработчики не только печатают: они запускают сценарии
+            // приветствия и меняют состояние меню у персонажа. Прибор обязан быть немым, иначе
+            // он лечит то, что измеряет. Настоящее меню и так видно в строке РАЗГОВОР, которую
+            // печатает сам путь взятия квеста, когда спутник до квестодателя доходит.
+        }
+        TC_LOG_INFO("server.worldserver",
+            // ПЛОЩАДЬ, А НЕ ТОЛЬКО ЗОНА: ауры по местности ядро вешает по ПЛОЩАДИ
+            // (Player::UpdateAreaDependentAuras), и призванный принимающий держится именно ими.
+            "Constellation ПРОСТОЙ {} (ур. {}, зона {}, площадь {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
+            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), self->GetAreaId(), printed,
+            waiting.empty() ? "-" : waiting);
+    }
+
+    // ---------------------------------------------------------------- квестодатель по карте
+    // КАКОЙ КВЕСТ ЯДРО ДАЛО БЫ У ЭТОГО ВИДА — по воротам ядра и светофору. Связи «существо ->
+    // квесты» выбирают, КУДА ИДТИ, а не что брать: у самого квестодателя спутник, как и
+    // прежде, шлёт Hello, читает меню, собранное ядром, и берёт по цвету.
+    uint32 TakeableQuestAt(Player* self, Companion const& c, uint32 entry) const
+    {
+        for (uint32 qid : sObjectMgr->GetCreatureQuestRelations(entry))
+        {
+            if (c.QuestRefused.count(qid))
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q || self->GetQuestStatus(qid) != QUEST_STATUS_NONE)
+                continue;
+            if (!self->CanTakeQuest(q, false))
+                continue;
+            if (QuestColour(self, q) >= 3)
+                continue;                       // красное и неизвестное — не по нам
+            return qid;
+        }
+        return 0;
+    }
+
+    bool FindGiverByMap(Companion const& c, Player* self, uint32* entry, ObjectGuid::LowType* spawn,
+                        Position* pos, uint32* questOut) const
+    {
+        auto it = _givers.find(self->GetMapId());
+        if (it == _givers.end())
+            return false;
+        FactionTemplateEntry const* mine = self->GetFactionTemplateEntry();
+        Giver const* best = nullptr;
+        float bestD = Cfg().GiverSeekRange;
+        uint32 bestQuest = 0;
+        std::unordered_map<uint32, uint32> byEntry;     // вид -> квест (0 = ничего): ядро спрашиваем раз на вид
+        for (Giver const& g : it->second)
+        {
+            float const d = self->GetExactDist2d(g.Where.GetPositionX(), g.Where.GetPositionY());
+            if (d > bestD + 0.01f || d < Cfg().QuestGiverRange)
+                continue;                       // дальше лучшего — не нужен; в обзоре — уже спрошен и молчит
+            if (c.SeekBackoff.count(g.SpawnId))
+                continue;
+            uint32 qid = 0;
+            auto known = byEntry.find(g.Entry);
+            if (known != byEntry.end())
+                qid = known->second;
+            else
+            {
+                bool hostile = false;
+                if (mine)
+                    if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(g.Faction))
+                        hostile = mine->IsHostileTo(theirs);
+                if (!hostile)
+                    qid = TakeableQuestAt(self, c, g.Entry);
+                byEntry[g.Entry] = qid;
+            }
+            if (!qid)
+                continue;
+            // УСТОЙЧИВЫЙ ВЫБОР (Кодекс): при равном расстоянии — меньший номер точки, а не
+            // порядок контейнера.
+            if (best && std::fabs(d - bestD) <= 0.01f && g.SpawnId > best->SpawnId)
+                continue;
+            bestD = d;
+            best = &g;
+            bestQuest = qid;
+        }
+        if (!best)
+            return false;
+        *entry = best->Entry;
+        *spawn = best->SpawnId;
+        *pos = best->Where;
+        *questOut = bestQuest;
+        return true;
+    }
+
     bool FindMenderByMap(Companion const& c, Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
     {
         auto it = _menders.find(self->GetMapId());
@@ -6435,6 +7074,7 @@ public:
         c.TalkCandidate.Clear();
         float talkDist = -1.0f;
         uint32 lastEntry = 0, lastFaction = 0;
+        bool const anyTool = AnyToolQuest(self);   // есть ли предмет от квеста, которым вообще можно работать
         Creature* best = nullptr;
         float bestDist = Cfg().FightRange + 1.0f;
         for (Creature* creature : around)
@@ -6468,6 +7108,26 @@ public:
                     for (uint32 item : *qi)
                         if (wantedItems.count(item))
                             { suitable = true; break; }
+            // ЦЕЛЬ ПО КОНТРАКТУ ЗАКЛИНАНИЯ ПРЕДМЕТА. Существо не в списке нужных — нужен маркер
+            // зачёта, которого в мире нет, — но заклинание предмета от квеста называет это
+            // существо целью и даёт зачёт маркеру (QuestToolFor, второй проход). Только не
+            // боевая цель, в нашей фазе, восприимчивая к игрокам и не отставленная.
+            if (!suitable && anyTool && !c.ToolActionMs
+                && self->GetPhaseShift().CanSee(creature->GetPhaseShift())
+                && !self->IsValidAttackTarget(creature) && !creature->IsImmuneToPC()
+                && !c.TalkBackoff.count(creature->GetEntry())
+                && !c.TalkRetry.count(creature->GetGUID())
+                && !c.TalkUnreachable.count(creature->GetGUID()))
+            {
+                uint32 sp = 0, qh = 0;
+                if (QuestToolFor(self, creature->GetEntry(), &sp, creature, &qh) && qh)
+                {
+                    float const d = self->GetExactDist(creature);
+                    if (talkDist < 0.0f || d < talkDist)
+                        { talkDist = d; c.TalkCandidate = creature->GetGUID(); }
+                }
+                continue;
+            }
             if (!suitable)
                 continue;
             ++matched;
@@ -6643,7 +7303,7 @@ public:
         Cell::VisitGridObjects(self, searcher, Cfg().QuestGiverRange);
 
         Creature* best = nullptr;
-        float bestDist = Cfg().QuestGiverRange + 1.0f;
+        float bestDist = Cfg().QuestGiverRange + 1001.0f;   // невидимые идут с надбавкой в тысячу ярдов — после всех видимых
         uint32 seen = 0, dead = 0, nothingToOffer = 0, blacklisted = 0, noLos = 0;
         for (Creature* creature : around)
         {
@@ -6682,9 +7342,15 @@ public:
                 { ++nothingToOffer; continue; }
             if (c.GiverUnreachable.count(creature->GetGUID()))
                 { ++blacklisted; continue; }   // уже пробовали дойти и не вышло
-            if (!self->IsWithinLOSInMap(creature))
-                { ++noLos; continue; }
-            float d = self->GetExactDist2d(creature);
+            // НЕ ВИДНО — НЕ ЗНАЧИТ НЕ ДОЙТИ. Проверка видимости стояла ПОСЛЕ проверки «предлагает
+            // ли» и отсеивала единственного предлагающего: у гнома Ноббина Невин Твистренч в
+            // восьми ярдах за стенкой мастерской — «не видно 1», «выбран никто», и так у семи
+            // гномов. Дорога строится по сетке, а не по лучу; у похода к нему свой срок и
+            // чёрный список. Видимых предпочитаем; невидимого берём, когда видимых нет.
+            bool const visible = self->IsWithinLOSInMap(creature);
+            if (!visible)
+                ++noLos;
+            float d = self->GetExactDist2d(creature) + (visible ? 0.0f : 1000.0f);
             if (d < bestDist)
             {
                 bestDist = d;
@@ -7408,8 +8074,11 @@ private:
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
-    std::unordered_map<uint32, std::vector<uint32>> _creditedBy;   // цель -> существа, чьи KillCredit на неё указывают
+    std::unordered_map<uint32, std::vector<uint32>> _creditedBy;
+    std::unordered_set<uint32> _spawnedSomewhere;   // виды, у которых есть хоть одна точка появления   // цель -> существа, чьи KillCredit на неё указывают
     struct Mender { uint32 Entry; uint32 Faction; Position Where; bool Sells; bool Fixes; };
+    struct Giver { uint32 Entry; uint32 Faction; Position Where; ObjectGuid::LowType SpawnId; };
+    std::unordered_map<uint32, std::vector<Giver>> _givers;      // карта -> квестодатели по таблице
     std::unordered_map<uint32, std::vector<Mender>> _menders;                          // карта -> торговцы
     // Поля фазы храним ВМЕСТЕ с точкой: фаза — это «версия места», и спавн, объявленный
     // в чужой фазе, для этого спутника не существует. Отсеять его надо ДО выхода, а не
