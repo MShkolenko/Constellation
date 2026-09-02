@@ -134,6 +134,7 @@ struct Settings
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
     int32 QuestMaxAbove   = 2;          // жёлтое берём; выше на столько уровней — уже красное
+    bool  SellByWeaponSkill = false;    // продавать оружие без навыка класса — после чтения строк навыков
     float RestBelowPct    = 55.0f;      // ниже этого — отдыхаем
     float ResumeAbovePct  = 85.0f;      // и не встаём, пока не поднимемся сюда
     uint32 RestMaxMs      = 120000;     // но не дольше двух минут
@@ -172,6 +173,7 @@ struct Settings
         // широко: цель ищется по округе, а не на длину руки — к ней ходят
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
         QuestMaxAbove   = sConfigMgr->GetIntDefault("Constellation.QuestMaxAbove", 2);
+        SellByWeaponSkill = sConfigMgr->GetBoolDefault("Constellation.SellByWeaponSkill", false);
         // ГИСТЕРЕЗИС, А НЕ ОДИН ПОРОГ (Кодекс, разбор плана): входить и выходить по
         // одному числу — значит дёргаться на границе и засорять журнал переходами.
         RestBelowPct    = sConfigMgr->GetFloatDefault("Constellation.RestBelowPct", 55.0f);
@@ -357,6 +359,9 @@ struct Companion
     uint8 ToolFruitless = 0;            // применений подряд без зачёта (предохранитель)
     uint32 EquipScanMs = 0;             // когда снова смотреть сумки на предмет обновок
     uint32 Equipped = 0;                // сколько вещей надето за жизнь
+    std::map<std::pair<ObjectGuid, uint8>, uint32> EquipRefused;   // предмет+слот -> сколько ещё не пробовать, мс
+    std::map<ObjectGuid, uint32> SellRefused;   // предмет, который ядро отказалось купить -> мс до новой попытки
+    std::map<uint32, uint32> VendorNoSell;      // вид торговца, отказавшего во всём -> мс, пока он не продавец
     // ОЖИДАНИЕ ЗАЧЁТА ПОСЛЕ ПОПЫТКИ (Кодекс о применении предметов): заклинание бывает с
     // временем произнесения и ставится ядром в очередь (Player::RequestSpellCast), поэтому
     // результат меряется не в том же вызове, а по окну. Предохранитель считает ОКНА без
@@ -708,7 +713,7 @@ public:
                 continue;
             // Команда оператора — идём за обеими услугами сразу, но не требуем ни одной:
             // это ручная проверка, а не автоматика, и отказ «никого нет» тут информативнее.
-            Creature* vendor = FindVendorNear(self, false, false);
+            Creature* vendor = FindVendorNear(c, self, false, false);
             if (!vendor)
                 { ++nobody; continue; }
             c.VendorGuid = vendor->GetGUID();
@@ -1739,6 +1744,12 @@ public:
             c.ToolActionMs = (c.ToolActionMs <= diff) ? 0 : c.ToolActionMs - diff;
         for (auto it = c.TalkRetry.begin(); it != c.TalkRetry.end();)
             if (it->second <= diff) it = c.TalkRetry.erase(it); else { it->second -= diff; ++it; }
+        for (auto it = c.EquipRefused.begin(); it != c.EquipRefused.end();)
+            if (it->second <= diff) it = c.EquipRefused.erase(it); else { it->second -= diff; ++it; }
+        for (auto it = c.SellRefused.begin(); it != c.SellRefused.end();)
+            if (it->second <= diff) it = c.SellRefused.erase(it); else { it->second -= diff; ++it; }
+        for (auto it = c.VendorNoSell.begin(); it != c.VendorNoSell.end();)
+            if (it->second <= diff) it = c.VendorNoSell.erase(it); else { it->second -= diff; ++it; }
         if (c.FleePauseMs)
             c.FleePauseMs = (c.FleePauseMs <= diff) ? 0 : c.FleePauseMs - diff;
         // ОКНО ГИБЕЛЕЙ ИСТЕКАЕТ САМО (Кодекс на выходе). Чистка только при новой смерти
@@ -1944,7 +1955,8 @@ public:
                 if (idleScan && !c.EquipScanMs)
                 {
                     c.EquipScanMs = 30000 + (c.Guid.GetCounter() % 5000u);
-                    EquipUpgrades(c, self);
+                    if (!EquipBags(c, self))
+                        EquipUpgrades(c, self);
                 }
                 // В БОЮ, А ДРАТЬСЯ НЕЧЕМ — ОТХОДИМ, А НЕ СТОИМ.
                 //
@@ -2129,32 +2141,39 @@ public:
                     bool const helpless = CannotFight(self) && BrokenCount(self) > 0;
                     bool const stuffed = FreeBagSpace(self) <= 2;
                     bool const worn = DamagedCount(self) > 0;
+                    // ХЛАМ — ТРЕТИЙ ПОВОД. Два замера подряд: походов ноль, потому что до «сумки
+                    // почти полны» состав не доходит, а правило продажи так и не срабатывает.
+                    // Шесть и больше стопок, которые правило продало бы, — идём продавать.
+                    uint32 const sellable = (!stuffed && !helpless) ? SellableCount(c, self) : 0;
+                    bool const clutter = sellable >= 6;                                  // продавец в обзоре
+                    bool const clutterFar = sellable >= std::max<uint32>(12, BagCapacity(self) / 4);   // поход по карте
 
                     // МИМОХОДОМ: изношен, но дееспособен — только если торговец уже рядом.
                     // Двадцать ярдов это «прохожу мимо», а не «схожу-ка я за тридцать».
                     bool passingBy = false;
                     if (worn && !helpless && !stuffed)
-                        if (Creature* near = FindVendorNear(self, false, true))
+                        if (Creature* near = FindVendorNear(c, self, false, true))
                             passingBy = self->IsWithinDistInMap(near, 20.0f);
 
-                    if (helpless || stuffed || passingBy)
+                    if (helpless || stuffed || clutter || passingBy)
                     {
                         // ИЩЕМ ТОГО, КТО УМЕЕТ НУЖНОЕ. Полные сумки требуют продавца,
                         // поломка — ремонтника; идти к тому, кто не умеет, значит вернуться
                         // ни с чем и повторить через минуту (Кодекс).
-                        if (Creature* vendor = FindVendorNear(self, stuffed, helpless || passingBy))
+                        if (Creature* vendor = FindVendorNear(c, self, stuffed || clutter, helpless || passingBy))
                         {
                             c.VendorGuid = vendor->GetGUID();
                             Switch(c, self, Behavior::Vending,
                                 helpless ? "бить нечем, иду чиниться"
                                          : stuffed ? "сумки полны, иду продавать"
-                                                   : "торговец рядом, чинюсь мимоходом");
+                                                   : clutter ? "хлам в сумках, иду продавать"
+                                                             : "торговец рядом, чинюсь мимоходом");
                             return;
                         }
                         // НИКОГО В ОБЗОРЕ — ИДЁМ ПО КАРТЕ, если поход того стоит: ради
                         // сломанного оружия или полных сумок, не ради потёртости. Пятеро
                         // людей стояли так часами: сломаны, ремонтник за 150-300 ярдов.
-                        if ((helpless || stuffed) && FindMenderByMap(self, stuffed, helpless, &c.VendorEntry, &c.VendorPos))
+                        if ((helpless || stuffed || clutterFar) && FindMenderByMap(c, self, stuffed || clutterFar, helpless, &c.VendorEntry, &c.VendorPos))
                         {
                             c.VendorGuid.Clear();
                             c.VendorScanMs = 0;
@@ -2163,7 +2182,9 @@ public:
                                 "Constellation ТОРГ {}: в обзоре никого — иду к {} за {:.0f} ярдов ({})",
                                 self->GetName(), c.VendorEntry, c.VendorDist, helpless ? "чиниться" : "продавать");
                             Switch(c, self, Behavior::Vending,
-                                helpless ? "бить нечем, иду чиниться по карте" : "сумки полны, иду продавать по карте");
+                                helpless ? "бить нечем, иду чиниться по карте"
+                                         : stuffed ? "сумки полны, иду продавать по карте"
+                                                   : "хлам в сумках, иду продавать по карте");
                             return;
                         }
                         // и по карте никого: считаем и молчим пять минут
@@ -3939,7 +3960,7 @@ public:
     // needSell/needRepair — ЗАЧЕМ идём. Кодекс: без этого бот с полными сумками мог уйти
     // к ремонтнику, ничего не продать, поставить минутный таймер и вернуться — и так по
     // кругу вечно. Услуга, за которой идём, теперь обязательна, а вторая — приятный бонус.
-    Creature* FindVendorNear(Player* self, bool needSell, bool needRepair) const
+    Creature* FindVendorNear(Companion const& c, Player* self, bool needSell, bool needRepair) const
     {
         Creature* both = nullptr; float bothDist = 100000.0f;
         Creature* any = nullptr;  float anyDist = 100000.0f;
@@ -3956,6 +3977,8 @@ public:
             // ГОДИТСЯ, ТОЛЬКО ЕСЛИ УМЕЕТ ТО, ЗАЧЕМ ИДЁМ.
             if (needSell && !sells)
                 continue;
+            if (needSell && c.VendorNoSell.count(cr->GetEntry()))
+                continue;                           // недавно отказал во всём — не продавец
             if (needRepair && !fixes)
                 continue;
             if (!sells && !fixes)
@@ -3981,21 +4004,166 @@ public:
     // ЧТО ПРОДАЁМ: только серое, только с ненулевой ценой и только не нужное заданию.
     // Ядро проверит своё (чужой предмет, непустая сумка, открытый лут, возвратный), но
     // «это ещё пригодится» оно за нас не решит — это наша обязанность.
+    // ПРОДАЖА ПО ПРАВИЛУ ОПЕРАТОРА (2026-09-02): «неподходящие предметы тоже надо продавать;
+    // оставлять подходящие предметы только +2 уровня от персонажа». До этого продавалось
+    // только серое: за двадцать минут ноль продаж при 456 стопках в сумках у состава.
+    //
+    //   защищено  = нужно активному квесту | начинает квест | класс «квест» | камень
+    //               возвращения | сумка | надето | расходник (пока модуль их не применяет)
+    //   продаётся = есть цена И не защищено И (серое | непригодно никогда | нужен уровень > наш+2)
+    //
+    // «Непригодно никогда» спрашивается у ядра ЕГО вопросом — CanUseItem по ШАБЛОНУ с
+    // пропущенной проверкой уровня: класс, раса, навык брони и оружия, нужное заклинание,
+    // фракция. Перегрузка по предмету проверяет текущий уровень и назвала бы непригодным всё,
+    // что выше нас, — а такое по правилу остаётся, если оно в пределах +2.
+    //
+    // Защита старше причины: серый предмет, начинающий квест, не продаётся. Тип брони — вопрос
+    // надевания, не продажи: воин в тряпках оставит их по этому правилу и перерастёт по
+    // правилу брони (задача 0023, п. 5). Товары ремесла продаются: ни ремесла, ни банка нет.
+    // ВЕРДИКТ ПО ПРЕДМЕТУ — ОДИН ДЛЯ ПРОДАЖИ И ДЛЯ ПОДСЧЁТА ХЛАМА. Две функции с одним
+    // правилом разошлись бы; здесь правило записано один раз и спрашивается дважды.
+    enum class SellVerdict : uint8 { Quest, StartsQuest, Hearthstone, Consumable, Fit, BagKeep, Unsellable, Sell };
+
+    // КАКИЕ НЕНАДЕТЫЕ СУМКИ ОСТАВИТЬ — считается один раз за проход, а не по ходу обхода
+    // (Кодекс: раньше держались первые четыре по порядку, а при пустом слоте — все). Самые
+    // большие — по одной на каждый пустой слот и на каждую надетую, которую они превосходят.
+    std::set<ObjectGuid> BagsToKeep(Player* self) const
+    {
+        std::vector<Item*> loose;
+        std::vector<uint32> worn;
+        uint32 emptySlots = 0;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* w = self->GetBagByPos(b))
+                worn.push_back(GetBagSize(w));
+            else
+                ++emptySlots;
+        auto collect = [&](Item* it) { if (it && it->IsBag() && !it->IsEquipped()) loose.push_back(it); };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            collect(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    collect(GetItemInBag(bag, j));
+        std::sort(loose.begin(), loose.end(), [](Item* a, Item* b)
+            { return a->GetTemplate()->GetContainerSlots() > b->GetTemplate()->GetContainerSlots(); });
+        std::sort(worn.begin(), worn.end());
+        std::set<ObjectGuid> keep;
+        size_t wornIdx = 0;
+        for (Item* it : loose)
+        {
+            if (emptySlots > 0)
+                { keep.insert(it->GetGUID()); --emptySlots; continue; }
+            if (wornIdx < worn.size() && it->GetTemplate()->GetContainerSlots() > worn[wornIdx])
+                { keep.insert(it->GetGUID()); ++wornIdx; continue; }
+            break;                                  // дальше идут не лучше — им к торговцу
+        }
+        return keep;
+    }
+
+    SellVerdict ClassifyForSale(Player* self, Item* it, std::set<ObjectGuid> const& keepBags) const
+    {
+        ItemTemplate const* tpl = it->GetTemplate();
+        uint32 const myLevel = self->GetLevel();
+        // --- защищённое, в порядке важности — и РАНЬШЕ сумочной ветки: сумка, нужная квесту
+        // или начинающая его, — не сумка, а квест
+        if (self->HasQuestForItem(tpl->GetId()) || tpl->GetClass() == ITEM_CLASS_QUEST)
+            return SellVerdict::Quest;
+        if (tpl->GetStartQuest())
+            return SellVerdict::StartsQuest;
+        if (it->IsBag())
+        {
+            if (keepBags.count(it->GetGUID()))
+                return SellVerdict::BagKeep;        // наденется или заменит надетую (BagsToKeep)
+            return tpl->GetSellPrice() ? SellVerdict::Sell : SellVerdict::Unsellable;
+        }
+        if (tpl->GetId() == 6948)
+            return SellVerdict::Hearthstone;
+        if (tpl->GetClass() == ITEM_CLASS_CONSUMABLE)
+            return SellVerdict::Consumable;             // будущая ценность (каталог, стр. 42)
+        // --- причины продать
+        bool const grey = tpl->GetQuality() == ITEM_QUALITY_POOR;
+        // «НИКОГДА» — ДВА ВОПРОСА, И ОБА У ЯДРА. CanUseItem по шаблону отвечает за класс,
+        // расу, фракцию, требуемое заклинание и явный навык — но не за навык подкласса оружия
+        // и не за тип брони: это делает перегрузка по предмету (Player.cpp:11296-11304),
+        // которая заодно проверяет уровень. Повторяем те же два вопроса; «навык выучен»
+        // заменён на «навык существует для расы и класса», иначе то, что ещё выучится у
+        // тренера, ушло бы к торговцу. Маски классов прочитаны из пробного мира 2026-09-02.
+        bool neverUsable = self->CanUseItem(tpl, /*skipRequiredLevelCheck=*/true) != EQUIP_ERR_OK;
+        if (!neverUsable && Cfg().SellByWeaponSkill && tpl->GetClass() == ITEM_CLASS_WEAPON)
+            if (uint32 const skill = tpl->GetSkill())
+                if (!sDB2Manager.GetSkillRaceClassInfo(skill, self->GetRace(), self->GetClass()))
+                    neverUsable = true;                 // жезл у воина, двуручный меч у мага
+        if (!neverUsable && tpl->GetClass() == ITEM_CLASS_ARMOR && tpl->GetInventoryType() != INVTYPE_CLOAK)
+            if (ChrClassesEntry const* cls = sChrClassesStore.LookupEntry(self->GetClass()))
+                if ((cls->ArmorTypeMask & 0x21u) == 0x21u
+                    && !(cls->ArmorTypeMask & (1u << tpl->GetSubClass())))
+                    neverUsable = true;                 // ткань и кожа у воина, латы и щит у мага
+        bool const tooHigh = tpl->GetBaseRequiredLevel() > int32(myLevel) + 2;
+        if (!grey && !neverUsable && !tooHigh)
+            return SellVerdict::Fit;                    // пригодное и по уровню — оставляем
+        return tpl->GetSellPrice() ? SellVerdict::Sell : SellVerdict::Unsellable;
+    }
+
+    // СКОЛЬКО СТОПОК ПРАВИЛО ПРОДАЛО БЫ — повод идти к торговцу, не дожидаясь полных сумок.
+    uint32 SellableCount(Companion const& c, Player* self) const
+    {
+        uint32 count = 0;
+        std::set<ObjectGuid> const keepBags = BagsToKeep(self);
+        auto look = [&](Item* it)
+        {
+            if (it && !it->IsEquipped() && it->GetTemplate()
+                && !c.SellRefused.count(it->GetGUID())     // ядро уже отказало — не повод для похода
+                && ClassifyForSale(self, it, keepBags) == SellVerdict::Sell)
+                ++count;
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            look(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    look(GetItemInBag(bag, j));
+        return count;
+    }
+
+    uint32 BagCapacity(Player* self) const
+    {
+        uint32 cap = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* w = self->GetBagByPos(b))
+                cap += GetBagSize(w);
+        return cap;
+    }
+
     uint32 SellJunkTo(Companion& c, Player* self, Creature* vendor)
     {
         std::vector<Item*> junk;
+        uint32 seenStacks = 0, seenPieces = 0, keptQuest = 0, keptStart = 0, keptStone = 0,
+               keptConsumable = 0, keptFit = 0, unsellable = 0;
+        // СУМКИ ВНЕ СЛОТОВ (оператор: «ненадетые продавать, надевать более вместительные»).
+        // Пустой слот есть — сумку наденет EquipBags на следующем проходе, не продаём; она
+        // больше наименьшей надетой — ждёт замены (замена требует сперва опустошить меньшую,
+        // это задача 0023, п. 10), не продаём; всё остальное — к торговцу.
+        std::set<ObjectGuid> const keepBags = BagsToKeep(self);
+        uint32 keptBag = 0, skippedRefused = 0;
         auto consider = [&](Item* it)
         {
-            if (!it || it->IsBag())
+            if (!it || it->IsEquipped() || !it->GetTemplate())
                 return;
-            ItemTemplate const* tpl = it->GetTemplate();
-            if (!tpl || tpl->GetQuality() != ITEM_QUALITY_POOR)
-                return;
-            if (!tpl->GetSellPrice())
-                return;                 // ядро такое всё равно откажется купить
-            if (self->HasQuestForItem(tpl->GetId()))
-                return;                 // нужное заданию не продаём никогда
-            junk.push_back(it);
+            ++seenStacks;
+            seenPieces += it->GetCount();
+            if (c.SellRefused.count(it->GetGUID()))
+                { ++skippedRefused; return; }       // недавно отказано — не повторяем
+            switch (ClassifyForSale(self, it, keepBags))
+            {
+                case SellVerdict::Quest:       ++keptQuest; return;
+                case SellVerdict::StartsQuest: ++keptStart; return;
+                case SellVerdict::Hearthstone: ++keptStone; return;
+                case SellVerdict::Consumable:  ++keptConsumable; return;
+                case SellVerdict::Fit:         ++keptFit; return;
+                case SellVerdict::BagKeep:     ++keptBag; return;
+                case SellVerdict::Unsellable:  ++unsellable; return;
+                case SellVerdict::Sell:        junk.push_back(it); return;
+            }
         };
         for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
             consider(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
@@ -4021,18 +4189,28 @@ public:
             sell.Amount = it->GetCount();
             c.Session->HandleSellItemOpcode(sell);
             if (self->GetItemByGuid(itemGuid))
+            {
                 ++refused;              // остался у нас — значит не продан
+                c.SellRefused[itemGuid] = 600000;   // десять минут не считать его поводом (Кодекс)
+            }
             else
                 ++sold;
         }
+        // ОТКАЗАЛ ВО ВСЁМ — этот торговец десять минут не продавец: без выкупа или не берёт
+        // такое; иначе поход к нему повторялся бы по кругу
+        if (!junk.empty() && sold == 0)
+            c.VendorNoSell[vendor->GetEntry()] = 600000;
         uint64 const earned = self->GetMoney() > before ? self->GetMoney() - before : 0;
         c.VendSold += sold;
         c.VendEarned += earned;
-        if (sold || refused)
-            TC_LOG_INFO("server.worldserver",
-                "Constellation ТОРГ {}: продал {} предметов у {} ({}), выручил {} медяков; "
-                "отвергнуто ядром {}",
-                self->GetName(), sold, vendor->GetName(), vendor->GetEntry(), earned, refused);
+        // ОДНА СТРОКА НА ВИЗИТ, ВКЛЮЧАЯ ПУСТОЙ: что просмотрено, что продано, что и почему
+        // оставлено. Без неё «ноль продаж» неотличим от «продавать было нечего».
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ТОРГ {}: у {} ({}) просмотрено {} стопок/{} вещей; продано {} за {} мед.; "
+            "оставлено: квест {}, начинает квест {}, камень {}, расходники {}, пригодные <=+2 {}, сумки {}; "
+            "нельзя продать {}; ядро отказало {} (ранее отказанных пропущено {})",
+            self->GetName(), vendor->GetName(), vendor->GetEntry(), seenStacks, seenPieces,
+            sold, earned, keptQuest, keptStart, keptStone, keptConsumable, keptFit, keptBag, unsellable, refused, skippedRefused);
         return sold;
     }
 
@@ -5062,6 +5240,17 @@ public:
         TC_LOG_INFO("server.loading", "Constellation: указатель спавнов — {} точек на {} картах",
             n, uint32(_spawns.size()));
 
+        // ЗАЧЁТ ЧЕРЕЗ ДРУГОЕ СУЩЕСТВО. Player::KilledMonsterCredit смотрит KillCredit[0..1]
+        // шаблона убитого: цель квеста 39262 не появляется в мире никогда, её засчитывают
+        // 39260 и 39261. Обратный указатель нужен для дороги к цели (у самой цели спавнов нет).
+        uint32 credits = 0;
+        for (auto const& [entry, tpl] : sObjectMgr->GetCreatureTemplates())
+            for (uint32 i = 0; i < MAX_KILL_CREDIT; ++i)
+                if (tpl.KillCredit[i])
+                    { _creditedBy[tpl.KillCredit[i]].push_back(entry); ++credits; }
+        TC_LOG_INFO("server.loading", "Constellation: указатель зачёта через других — {} связок у {} целей",
+            credits, uint32(_creditedBy.size()));
+
         // ЗОНЫ ОСМОТРА. Цель «побывать в …» (тип 10) ядро засчитывает ТОЛЬКО по пакету
         // клиента CMSG_AREA_TRIGGER (HandleAreaTriggerOpcode), сверив IsInAreaTrigger; само
         // вхождение сервер не замечает. У спутника клиента нет — пакет шлёт модуль, когда
@@ -5101,6 +5290,7 @@ public:
             }
         TC_LOG_INFO("server.loading", "Constellation: указатель торговцев — {} точек на {} картах",
             m, uint32(_menders.size()));
+
 
         // КАРТА — ЭТО ДАННЫЕ. МИР СПРАШИВАЮТ В МОМЕНТ КАСАНИЯ.
         //
@@ -5224,10 +5414,17 @@ public:
     // и при выборе цели, — просто заданный ещё раз, посреди боя.
     bool StillWanted(Player* self, uint32 entry) const
     {
-        std::set<uint32> wanted, wantedItems;
-        WantedEntries(self, wanted, nullptr, nullptr, nullptr, nullptr, &wantedItems);
+        std::set<uint32> wanted, wantedItems, proxyOk;
+        WantedEntries(self, wanted, nullptr, nullptr, nullptr, nullptr, &wantedItems, &proxyOk);
         if (wanted.count(entry))
             return true;
+        // ПРОКСИ ВСЁ ЕЩЁ НУЖЕН (Кодекс): иначе бой с тем, кто засчитывает цель, обрывался бы
+        // на первой же проверке как «цель набрана» — ещё до убийства.
+        if (!proxyOk.empty())
+            if (CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(entry))
+                for (uint32 i = 0; i < MAX_KILL_CREDIT; ++i)
+                    if (ct->KillCredit[i] && proxyOk.count(ct->KillCredit[i]))
+                        return true;
         // цель могла быть выбрана КАК ИСТОЧНИК ПРЕДМЕТА — тогда её номера в wanted нет,
         // и прежний ответ был бы «не нужна» посреди боя, и бой бросился бы.
         if (!wantedItems.empty())
@@ -5241,7 +5438,7 @@ public:
 
     void WantedEntries(Player* self, std::set<uint32>& wanted, uint32* slotsUsed = nullptr,
         uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr,
-        std::set<uint32>* wantedItems = nullptr) const
+        std::set<uint32>* wantedItems = nullptr, std::set<uint32>* proxyOk = nullptr) const
     {
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
@@ -5275,7 +5472,13 @@ public:
                     continue;                       // эта цель уже набрана
                 if (unmet) ++*unmet;
                 if (isMonster)
+                {
                     wanted.insert(uint32(obj.ObjectID));
+                    // ЗАЧЁТ ЧЕРЕЗ ДРУГОЕ СУЩЕСТВО ядро выдаёт не всегда: у квеста бывает флаг
+                    // «без зачёта прокси» (Кодекс). Такие цели закрываются только прямо.
+                    if (proxyOk && !quest->HasFlagEx(QUEST_FLAGS_EX_NO_CREDIT_FOR_PROXY))
+                        proxyOk->insert(uint32(obj.ObjectID));
+                }
                 else if (wantedItems)
                     wantedItems->insert(uint32(obj.ObjectID));
             }
@@ -5521,6 +5724,24 @@ public:
                 }
                 if (!got && isMonster)
                     got = SpawnDestination(self, uint32(obj.ObjectID), &dest);
+                if (!got && isMonster && !quest->HasFlagEx(QUEST_FLAGS_EX_NO_CREDIT_FOR_PROXY))
+                {
+                    // среди засчитывающих видов — БЛИЖАЙШИЙ спавн, а не первый по порядку (Кодекс)
+                    auto cb = _creditedBy.find(uint32(obj.ObjectID));
+                    if (cb != _creditedBy.end())
+                    {
+                        float nearest = 100000.0f;
+                        for (uint32 crediting : cb->second)
+                        {
+                            Position cand;
+                            if (!SpawnDestination(self, crediting, &cand))
+                                continue;
+                            float const dd = self->GetExactDist2d(cand.GetPositionX(), cand.GetPositionY());
+                            if (dd < nearest)
+                                { nearest = dd; dest = cand; got = true; }
+                        }
+                    }
+                }
                 if (!got)
                     continue;
                 float d = self->GetExactDist2d(dest.GetPositionX(), dest.GetPositionY());
@@ -5561,7 +5782,7 @@ public:
                 return false;           // сумку меряют вместимостью, а не уровнем (Кодекс)
             if (self->CanUseItem(item) != EQUIP_ERR_OK)
                 return false;
-            uint8 const dst = self->FindEquipSlot(item, NULL_SLOT, true);
+            uint8 dst = self->FindEquipSlot(item, NULL_SLOT, true);
             if (dst == NULL_SLOT)
                 return false;
 
@@ -5581,6 +5802,42 @@ public:
             uint32 const wasLevel = worn ? worn->GetItemLevel(self) : 0;
             uint32 const entry = item->GetEntry();
             uint8 const bagSlot = item->GetBagSlot(), slot = item->GetSlot();
+
+            // ТОТ ЖЕ ВОПРОС, ЧТО ЗАДАЁТ ОБРАБОТЧИК, — ДО ОТПРАВКИ. «Можно использовать» и
+            // «можно надеть сюда» — разные вопросы: маг с посохом использовать щит может, а
+            // надеть при двуручном — нет. Замер: 38 отказов подряд по одному предмету у двух
+            // магов, каждые тридцать секунд. Отказ запоминаем по паре предмет+слот.
+            // ПАМЯТЬ ОТКАЗОВ КОРОТКАЯ И ПО GUID (Кодекс): отказ «двуручное в руках» снимается
+            // сменой оружия, навык выучивается, место освобождается — всё без нового уровня.
+            // Десять минут, по паре предмет+слот; временные коды (бой, оглушение, каст) не
+            // запоминаются вовсе — это состояние персонажа, а не свойство предмета.
+            {
+                auto known = c.EquipRefused.find({ item->GetGUID(), dst });
+                if (known != c.EquipRefused.end())
+                    return false;
+            }
+            uint16 dest = 0;
+            InventoryResult const can = self->CanEquipItem(NULL_SLOT, dest, item, true);
+            if (can != EQUIP_ERR_OK)
+            {
+                // ВРЕМЕННОЕ — ЭТО СОСТОЯНИЕ, А НЕ СВОЙСТВО ПРЕДМЕТА (Кодекс): бой, каст,
+                // оглушение, откат оружия, полные сумки — и «двуручное в руках», которое
+                // снимается сменой оружия, а не уровнем. Такое не запоминаем вовсе.
+                bool const transient = can == EQUIP_ERR_NOT_WHILE_DISARMED || can == EQUIP_ERR_CLIENT_LOCKED_OUT
+                    || can == EQUIP_ERR_NOT_DURING_ARENA_MATCH || can == EQUIP_ERR_GENERIC_STUNNED
+                    || can == EQUIP_ERR_NOT_IN_COMBAT || can == EQUIP_ERR_ITEM_COOLDOWN
+                    || can == EQUIP_ERR_2HANDED_EQUIPPED || can == EQUIP_ERR_INV_FULL;
+                if (!transient)
+                    c.EquipRefused[{ item->GetGUID(), dst }] = 600000;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation НАДЕЛ {}: {} в слот {} не надеть — ядро говорит {}{}",
+                    self->GetName(), entry, uint32(dst), uint32(can),
+                    transient ? " (временно)" : " (десять минут не пробую)");
+                return false;
+            }
+            // СЛОТ — ИЗ ОТВЕТА ЯДРА, а не из своего вопроса: именно dest затем использует
+            // обработчик (Кодекс). Две истины рядом разойдутся на кольцах и аксессуарах.
+            dst = uint8(dest & 0xFF);
 
             // ТЕМ ЖЕ ОПКОДОМ, ЧТО КЛИК ПРАВОЙ КНОПКОЙ. Обработчик требует РОВНО одну запись
             // в Inv.Items — иначе отвергает (ItemHandler.cpp: Inv.Items.size() != 1).
@@ -5616,6 +5873,59 @@ public:
                     if (consider(bag->GetItemByPos(j)))
                         return true;
         return false;
+    }
+
+    // СУМКУ — В ПУСТОЙ СЛОТ (оператор: «надевать более вместительные»). Тем же опкодом, что и
+    // любую вещь; обработчик для сумок разрешает только пустой слот (swap = !IsBag), поэтому
+    // замена меньшей сумки на большую — отдельная работа: её надо сперва опустошить
+    // (задача 0023, п. 10). Одна сумка за проход, правда — из состояния слота.
+    bool EquipBags(Companion& c, Player* self)
+    {
+        uint8 emptySlot = NULL_SLOT;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (!self->GetBagByPos(b))
+                { emptySlot = b; break; }
+        if (emptySlot == NULL_SLOT)
+            return false;
+        // САМАЯ ВМЕСТИТЕЛЬНАЯ, А НЕ ПЕРВАЯ ПОПАВШАЯСЯ (Кодекс): иначе в слот идёт маленькая,
+        // а большая потом ждёт замены, которую ещё надо уметь.
+        Item* best = nullptr;
+        auto pick = [&](Item* it)
+        {
+            if (!it || !it->IsBag())
+                return;
+            if (!best || it->GetTemplate()->GetContainerSlots() > best->GetTemplate()->GetContainerSlots())
+                best = it;
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            pick(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    pick(GetItemInBag(bag, j));
+        auto tryBag = [&](Item* it) -> bool
+        {
+            if (!it || !it->IsBag())
+                return false;
+            uint32 const entry = it->GetEntry();
+            uint8 const bagSlot = it->GetBagSlot(), slot = it->GetSlot();
+            WorldPacket raw(CMSG_AUTO_EQUIP_ITEM);
+            WorldPackets::Item::AutoEquipItem eq(std::move(raw));
+            eq.PackSlot = bagSlot;
+            eq.Slot = slot;
+            eq.Inv.Items.push_back({ bagSlot, slot });
+            c.Session->HandleAutoEquipItemOpcode(eq);
+            Item* now = self->GetItemByPos(INVENTORY_SLOT_BAG_0, emptySlot);
+            if (now && now->GetEntry() == entry)
+            {
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СУМКА {}: надел сумку {} на {} ячеек в слот {}",
+                    self->GetName(), entry, it->GetTemplate()->GetContainerSlots(), uint32(emptySlot));
+                return true;
+            }
+            return false;
+        };
+        return tryBag(best);
     }
 
     // ПРЕДМЕТ, КОТОРЫЙ ВЫДАЛ САМ КВЕСТ, И ЕГО ЗАКЛИНАНИЕ ПРИМЕНЕНИЯ.
@@ -5883,7 +6193,7 @@ public:
     }
 
     // БЛИЖАЙШИЙ ТОРГОВЕЦ ПО КАРТЕ, умеющий нужное и не враждебный по своей фракции.
-    bool FindMenderByMap(Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
+    bool FindMenderByMap(Companion const& c, Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
     {
         auto it = _menders.find(self->GetMapId());
         if (it == _menders.end())
@@ -5895,6 +6205,8 @@ public:
         {
             if ((needSell && !m.Sells) || (needRepair && !m.Fixes))
                 continue;
+            if (needSell && c.VendorNoSell.count(m.Entry))
+                continue;                           // недавно отказал во всём — не продавец
             if (mine)
                 if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(m.Faction))
                     if (mine->IsHostileTo(theirs))
@@ -6093,9 +6405,9 @@ public:
             return nullptr;
 
         // какие виды существ нам вообще нужны
-        std::set<uint32> wanted, wantedItems;
+        std::set<uint32> wanted, wantedItems, proxyOk;
         uint32 slotsUsed = 0, incomplete = 0, monsterObjs = 0, unmet = 0;
-        WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet, &wantedItems);
+        WantedEntries(self, wanted, &slotsUsed, &incomplete, &monsterObjs, &unmet, &wantedItems, &proxyOk);
         // ДИАГНОСТИКА ПО РАЗУ НА КАЖДОГО, А НЕ ПО РАЗУ НА ВЕСЬ МОДУЛЬ.
         //
         // Флаг был один на всех, и за целый прогон печаталась РОВНО ОДНА строка — про
@@ -6140,8 +6452,16 @@ public:
             // ошибочно размеченных как бой. Существо, с которого нужен ПРЕДМЕТ, — не тот
             // случай, и вести с ним беседу нельзя: это расширило бы исполнение сценариев
             // далеко за пределы разобранного (Кодекс).
+            // ПРЯМАЯ ЦЕЛЬ И ПРОКСИ — РАЗНЫЕ ВЕЩИ (Кодекс): прокси годится только в БОЙ, и лишь
+            // когда квест не запрещает зачёт через другое существо; в разговор — только прямая.
             bool const byMonster = wanted.count(creature->GetEntry()) != 0;
-            bool suitable = byMonster;
+            bool byProxy = false;
+            if (!byMonster && !proxyOk.empty())
+                if (CreatureTemplate const* ct = creature->GetCreatureTemplate())
+                    for (uint32 i = 0; i < MAX_KILL_CREDIT && !byProxy; ++i)
+                        if (ct->KillCredit[i] && proxyOk.count(ct->KillCredit[i]))
+                            byProxy = true;             // засчитает нужную цель (KillCredit)
+            bool suitable = byMonster || byProxy;
             if (!suitable && !wantedItems.empty())
                 if (std::vector<uint32> const* qi = sObjectMgr->GetCreatureQuestItemList(
                         creature->GetEntry(), self->GetMap()->GetDifficultyID()))
@@ -7088,6 +7408,7 @@ private:
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
+    std::unordered_map<uint32, std::vector<uint32>> _creditedBy;   // цель -> существа, чьи KillCredit на неё указывают
     struct Mender { uint32 Entry; uint32 Faction; Position Where; bool Sells; bool Fixes; };
     std::unordered_map<uint32, std::vector<Mender>> _menders;                          // карта -> торговцы
     // Поля фазы храним ВМЕСТЕ с точкой: фаза — это «версия места», и спавн, объявленный
@@ -7117,6 +7438,42 @@ private:
 
 } // namespace Constellation
 
+// КТО ЧТО НОСИТ — ПЕЧАТАЕМ ДАННЫЕ ДО ТОГО, КАК ПО НИМ ПРОДАВАТЬ (Кодекс: DB2 в репозитории
+// нет, продажа необратима). Маска брони каждого класса и наличие каждого оружейного навыка у
+// классов. Зовётся из OnStartup БЕЗУСЛОВНО — и при выключенном модуле, чтобы читаться в
+// журнале пробного мира до подмены живого.
+void LogWhoWearsWhat()
+{
+    // КТО ЧТО НОСИТ — ПЕЧАТАЕМ ДАННЫЕ, ПРЕЖДЕ ЧЕМ ПО НИМ ПРОДАВАТЬ (Кодекс: DB2 в
+    // репозитории нет, продажа необратима). Маска брони каждого класса и наличие каждого
+    // оружейного навыка у классов; читается в журнале пробного мира до подмены живого.
+    for (uint32 cls = 1; cls <= 13; ++cls)
+    {
+        ChrClassesEntry const* e = sChrClassesStore.LookupEntry(cls);
+        if (!e)
+            continue;
+        std::string bits;
+        for (uint32 b = 0; b <= 6; ++b)
+            bits += (e->ArmorTypeMask & (1u << b)) ? '1' : '0';
+        TC_LOG_INFO("server.loading",
+            "Constellation НОСИТ класс {}: маска брони 0x{:x}, биты 0..6 = {} (0 прочее, 1 ткань, 2 кожа, 3 кольчуга, 4 латы, 5 косметика, 6 щит)",
+            cls, e->ArmorTypeMask, bits);
+    }
+    static std::pair<uint32, char const*> const weaponSkills[] = {
+        { 43, "мечи" }, { 55, "двуручные мечи" }, { 44, "топоры" }, { 172, "двуручные топоры" },
+        { 54, "дробящее" }, { 160, "двуручное дробящее" }, { 229, "древковое" }, { 136, "посохи" },
+        { 173, "кинжалы" }, { 473, "кистевое" }, { 45, "луки" }, { 46, "ружья" }, { 226, "арбалеты" },
+        { 228, "жезлы" }, { 2152, "глефы" }, { 356, "рыбалка" }, { 433, "щит" } };
+    for (auto const& [skill, name] : weaponSkills)
+    {
+        std::string who;
+        for (SkillRaceClassInfoEntry const* r : sDB2Manager.GetSkillRaceClassInfo(skill))
+            who += Trinity::StringFormat("{:x} ", uint32(r->ClassMask));
+        TC_LOG_INFO("server.loading", "Constellation НОСИТ навык {} ({}): маски классов [{}]",
+            skill, name, who.empty() ? std::string("строк нет") : who);
+    }
+}
+
 class constellation_worldscript : public WorldScript
 {
 public:
@@ -7127,6 +7484,7 @@ public:
         TC_LOG_INFO("server.loading", "Constellation {} [{}] - {}", CONSTELLATION_VERSION,
             CONSTELLATION_BUILD_STAMP,
             Constellation::Cfg().Enable ? "enabled" : "present but disabled (Constellation.Enable = 0)");
+        LogWhoWearsWhat();
     }
 
     // сюда ядро зовёт и при старте, и при `.reload config` — значит ключи
