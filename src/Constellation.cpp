@@ -59,6 +59,8 @@
 #include "NPCPackets.h"
 #include "SmartScriptMgr.h"
 #include "DisableMgr.h"
+#include "TaxiPathGraph.h"
+#include "TaxiPackets.h"
 #include "PhasingHandler.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
@@ -134,6 +136,15 @@ struct Settings
     float MaxStepUp       = 2.0f;
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
+    bool  SkipElites      = true;       // одиночка не дерётся с элитными и редкими
+    uint32 MaxAssist      = 2;          // сколько заступников у цели ещё терпимо (0 = не проверять)
+    uint32 StarveMs       = 300000;     // и через сколько без боя порог отступает
+    float KiteYards       = 30.0f;      // на сколько уводить цель от лагеря (0 = не уводить)
+    bool  Flying          = true;       // пользоваться ли полётными путями
+    float FlyIfFartherThan = 400.0f;    // ближе этого лететь незачем
+    float FlyIfSaves      = 250.0f;     // и экономия должна быть заметной
+    uint32 FlyRouteCandidates = 6;      // сколько узлов спросить у графа за раз
+    uint32 WalkCapMs      = 900000;     // страховка от вечной дороги: пятнадцать минут ≈ шесть тысяч ярдов
     float GiverSeekRange  = 600.0f;     // квестодатель по карте: дальше — не поход, а переезд (0 = выключено; Кодекс: 600, как у торговца)
     int32 QuestMaxAbove   = 2;          // жёлтое берём; выше на столько уровней — уже красное
     bool  SellByWeaponSkill = false;    // продавать оружие без навыка класса — после чтения строк навыков
@@ -174,6 +185,17 @@ struct Settings
         QuestGiverRange = sConfigMgr->GetFloatDefault("Constellation.QuestGiverRange", 30.0f);
         // широко: цель ищется по округе, а не на длину руки — к ней ходят
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
+        SkipElites      = sConfigMgr->GetBoolDefault("Constellation.SkipElites", true);
+        MaxAssist       = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.MaxAssist", 2), 0, 20);
+        StarveMs        = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.StarveMs", 300000), 60000, 3600000);
+        KiteYards       = std::clamp(sConfigMgr->GetFloatDefault("Constellation.KiteYards", 30.0f), 0.0f, 60.0f);
+        Flying          = sConfigMgr->GetBoolDefault("Constellation.Flying", true);
+        // НАСТРОЙКИ ПРОВЕРЯЕМ, А НЕ ПРИНИМАЕМ ЛЮБЫЕ (Кодекс): отрицательный порог означал бы
+        // «лететь всегда», а нулевая экономия — «лететь ради самого полёта».
+        FlyIfFartherThan = std::max(100.0f, sConfigMgr->GetFloatDefault("Constellation.FlyIfFartherThan", 400.0f));
+        FlyIfSaves      = std::max(50.0f, sConfigMgr->GetFloatDefault("Constellation.FlyIfSaves", 250.0f));
+        FlyRouteCandidates = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.FlyRouteCandidates", 6), 1, 20);
+        WalkCapMs       = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.WalkCapMs", 900000), 60000, 3600000);
         GiverSeekRange  = sConfigMgr->GetFloatDefault("Constellation.GiverSeekRange", 600.0f);
         QuestMaxAbove   = sConfigMgr->GetIntDefault("Constellation.QuestMaxAbove", 2);
         SellByWeaponSkill = sConfigMgr->GetBoolDefault("Constellation.SellByWeaponSkill", false);
@@ -207,7 +229,7 @@ enum class Stage : uint8
                     // plain Offline re-entered the pipeline under AutoSummon (Codex item 4)
 };
 
-enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering, Talking, SeekingGiver };
+enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, ApproachingTarget, Attacking, TurningIn, Vending, Gathering, Talking, SeekingGiver, TakingFlight };
 
 struct Companion
 {
@@ -242,7 +264,8 @@ struct Companion
     size_t WaypointIndex = 0;
     float PathTargetX = 0.0f, PathTargetY = 0.0f;
     uint32 TurnInQuest = 0;             // что сдаём
-    uint32 TurnInEntry = 0;             // кому
+    uint32 TurnInEntry = 0;
+    bool TurnInPosFromTable = false;    // точка сдачи из указателя (высоту править можно) или от живого             // кому
     ObjectGuid TurnInGuid;              // и кто именно, когда нашёлся
     Position TravelPos;                 // куда идти за целью задания
     uint32 TravelQuest = 0;             // ради какого квеста идём
@@ -306,7 +329,18 @@ struct Companion
     ObjectGuid DamageVictim;            // по кому ведём счёт урона
     uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
     uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
+    ObjectGuid BoundAt;                 // у какого трактирщика привязан камень
+    uint32 InnScanMs = 0;               // когда снова смотреть, нет ли рядом трактирщика
+    uint32 HearthCooldownMs = 0;        // и когда снова пробовать камень
+    uint32 HearthCastMs = 0;            // пока идёт произнесение — стоим смирно, иначе оборвётся
     uint32 TaxiScanMs = 0;              // когда снова смотреть, нет ли рядом полётного мастера
+    ObjectGuid FlightMaster;            // к какому мастеру идём
+    Position FlightMasterPos;           // и где он стоит по таблице
+    uint32 FlightMasterEntry = 0;       // и какого он вида — на месте берём того же
+    uint32 FlightFromNode = 0;          // узел, для которого маршрут проверен
+    uint32 FlightNode = 0;              // куда летим
+    uint32 FlightCooldownMs = 0;        // между попытками улететь
+    float FlightSavedYards = 0.0f;      // сколько ярдов пешком экономим — для журнала
     std::set<ObjectGuid> TaxiDone;      // у кого точка получена или уже была — навсегда
     std::map<ObjectGuid, uint32> TaxiRetry;   // а неудача — со сроком: условия бывают временными
     uint32 EnderScanMs = 0;             // когда искать заново
@@ -318,6 +352,17 @@ struct Companion
     bool TalkDiagDone = false;          // и для самого разговора
     bool RedNoted = false;              // сказали ли хоть раз, что пропускаем красные
     bool ImmuneNoted = false;           // и что цель ещё невосприимчива к игрокам
+    Position KiteTo;                    // куда пятимся, уводя цель от лагеря
+    bool Kiting = false;                // и пятимся ли сейчас
+    uint32 KiteMs = 0;                  // сколько уже пятимся — чтобы не вечно
+    uint32 EngageAssists = 0;           // сколько врагов было у цели, когда мы её брали
+    Position PackCenter;                // и где был их центр — от него и отходим
+    bool PackCenterKnown = false;
+    std::vector<Position> KitePath;     // путь отхода, проверенный построителем
+    size_t KiteIdx = 0;
+    uint32 NoTargetMs = 0;              // сколько уже нет боя: долго — порог стаи отступает
+    bool EliteNoted = false;            // и что элитных в одиночку не берём
+    bool ToughNoted = false;            // и что слишком крепких тоже
     bool CondNoted = false;             // и что цель не отвечает условиям заклинания
     // ОТМЕТКИ ГИБЕЛЕЙ, А НЕ СЧЁТЧИК С ТАЙМЕРОМ (Кодекс): таймер, который каждая смерть
     // ставит заново, считает тремя за десять минут даже смерти на 0-й, 9-й и 18-й.
@@ -1001,7 +1046,15 @@ public:
         c.Moving = false;
     }
 
-    bool StepToward(Companion& c, Player* self, float tx, float ty, float tz, float stopAt, float dt)
+    // ССЫЛКА НА ТОЧКУ НАЗНАЧЕНИЯ (destFix) — И РАЗРЕШЕНИЕ, И МЕСТО ДЛЯ ПОПРАВКИ.
+    //
+    // Её передают только те, кто идёт к точке ИЗ ТАБЛИЦЫ: место задания, точка квестодателя,
+    // торговец, принимающий, объект сбора, полётный мастер. Тогда шагу разрешено один раз
+    // спросить высоту с другого яруса и, если оттуда путь строится, ЗАПИСАТЬ поправку обратно —
+    // иначе следующий заход повторил бы тот же поиск, а «дошёл» мог не признаться никогда
+    // (Кодекс). К живому существу ничего не правим: его высота — его собственная и верная.
+    bool StepToward(Companion& c, Player* self, float tx, float ty, float tz, float stopAt, float dt,
+                    Position* destFix = nullptr)
     {
         // РАССТОЯНИЕ ЗДЕСЬ — В ПРОСТРАНСТВЕ, А НЕ ПО ПЛОСКОСТИ.
         //
@@ -1170,16 +1223,50 @@ public:
             // ошибка Тельдрассила, что уже стоила Легиону 121 тупика.
             PathGenerator path(self);
             PathGenerator hop(self);
+            PathGenerator other(self);      // ЖИВЁТ ДО КОНЦА ВЕТКИ: путь из него используется ниже
             bool built = path.CalculatePath(tx, ty, tz, false)
                 && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT));
             Movement::PointsArray const* pts = built ? &path.GetPath() : nullptr;
             float aimX = tx, aimY = ty;
+
+            // ТА ЖЕ ТОЧКА, НО С ДРУГОГО ЯРУСА — ОДНА ПОПЫТКА (замер: тип 84, «конец пути далеко
+            // от полигона», и разница высот в полсотни ярдов при двадцати пяти по плоскости).
+            // Высоту цели мы ищем ВНИЗ от своего яруса, и это верно на древе; но стоя на уступе
+            // над долиной, вниз находится её дно, куда сетка пути не даёт. Спрашиваем высоту
+            // сверху: если цель на нашем ярусе, это её и вернёт.
+            if (!built && destFix)
+            {
+                // ВЫШЕ СЕБЯ НЕ ЦЕЛИМСЯ (Кодекс). MAX_HEIGHT возвращает САМЫЙ ВЕРХНИЙ слой — это та
+                // самая ошибка Тельдрассила: к крыше и к ветке путь тоже строится, а стоять там
+                // спутнику незачем. Измеренный случай — поверхность НИЖЕ нас — условием сохраняется.
+                float const zAbove = self->GetMap()->GetHeight(self->GetPhaseShift(), tx, ty, MAX_HEIGHT);
+                if (zAbove > INVALID_HEIGHT && zAbove <= self->GetPositionZ() + 5.0f
+                    && std::fabs(zAbove - tz) > 5.0f
+                    && other.CalculatePath(tx, ty, zAbove, false)
+                    && !(other.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT)))
+                {
+                    built = true;
+                    pts = &other.GetPath();
+                    tz = zAbove;
+                    destFix->Relocate(tx, ty, zAbove);      // поправка живёт дальше этого шага
+                    ++_otherTier;
+                }
+            }
             if (!built)
             {
                 float const whole = self->GetExactDist2d(tx, ty);
                 float const ang = self->GetAbsoluteAngle(tx, ty);
-                for (float reach = std::min(whole * 0.5f, 150.0f); reach >= 15.0f; reach *= 0.5f)
+                // ДОЛЯМИ ПУТИ, А НЕ ОТ ПЯТНАДЦАТИ ЯРДОВ. Прежний цикл начинался с половины пути
+                // и требовал reach >= 15: для цели в 25 ярдах он не выполнялся ни разу, и
+                // короткие, но «вертикальные» отказы уходили прямо в тупик (замер).
+                static float const parts[3] = { 0.75f, 0.5f, 0.25f };
+                float lastReach = -1.0f;
+                for (float part : parts)
                 {
+                    float const reach = std::max(5.0f, std::min(whole * part, 150.0f));
+                    if (std::fabs(reach - lastReach) < 0.01f)
+                        continue;               // пол в пять ярдов сравнял доли — второй раз незачем
+                    lastReach = reach;
                     float const hx = self->GetPositionX() + std::cos(ang) * reach;
                     float const hy = self->GetPositionY() + std::sin(ang) * reach;
                     if (!MapManager::IsValidMapCoord(self->GetMapId(), hx, hy))
@@ -1220,11 +1307,13 @@ public:
                     // высот, которая и уводит точку с сетки.
                     TC_LOG_INFO("server.worldserver",
                         "Constellation STEP {}: маршрута нет, тип {:X}, точек {}, карта {}, "
-                        "я {:.0f} {:.0f} {:.1f} -> цель {:.0f} {:.0f} {:.1f}, по плоскости {:.0f}, по высоте {:.1f}",
+                        "я {:.0f} {:.0f} {:.1f} -> цель {:.0f} {:.0f} {:.1f}, по плоскости {:.0f}, по высоте {:.1f}"
+                        " (ярусом выше помогло уже {} раз, промежуточными точками {})",
                         self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()),
                         self->GetMapId(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
-                        tx, ty, tz, self->GetExactDist2d(tx, ty), tz - self->GetPositionZ());
+                        tx, ty, tz, self->GetExactDist2d(tx, ty), tz - self->GetPositionZ(),
+                        _otherTier, _hops);
                 }
                 // РАЗБРОС ОБЯЗАТЕЛЕН: без него 122 спутника, вставшие одновременно,
                 // повторяют тяжёлый поиск ОДНИМ ЗАЛПОМ — реже, но всё так же кучно, и
@@ -1738,8 +1827,20 @@ public:
             c.FollowCooldownMs = (c.FollowCooldownMs <= diff) ? 0 : c.FollowCooldownMs - diff;
         if (c.EnderScanMs)
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
+        // ДАВНО ЛИ НЕ БЫЛО БОЯ: в бою счётчик обнуляется, вне боя растёт. По нему отступает
+        // порог стаи, иначе стайные цели стали бы невыполнимы навсегда (разбор).
+        if (self->IsInCombat())
+            c.NoTargetMs = 0;
+        else if (c.NoTargetMs < 3600000)
+            c.NoTargetMs += diff;
         if (c.TaxiScanMs)
             c.TaxiScanMs = (c.TaxiScanMs <= diff) ? 0 : c.TaxiScanMs - diff;
+        if (c.InnScanMs)
+            c.InnScanMs = (c.InnScanMs <= diff) ? 0 : c.InnScanMs - diff;
+        if (c.HearthCooldownMs)
+            c.HearthCooldownMs = (c.HearthCooldownMs <= diff) ? 0 : c.HearthCooldownMs - diff;
+        if (c.FlightCooldownMs)
+            c.FlightCooldownMs = (c.FlightCooldownMs <= diff) ? 0 : c.FlightCooldownMs - diff;
         for (auto it = c.TaxiRetry.begin(); it != c.TaxiRetry.end();)
             if (it->second <= diff) it = c.TaxiRetry.erase(it); else { it->second -= diff; ++it; }
         if (c.LiveEnderMs)
@@ -1923,6 +2024,23 @@ public:
             return;
         }
         c.DeathCounted = false;             // живы — следующая гибель будет новой
+        // ЛЕТИМ — НЕ ТРОГАЕМ НИЧЕГО. Ядро ведёт персонажа по маршруту, любые наши шаги и пакеты
+        // движения в это время спорили бы с ним.
+        if (self->IsInFlight())
+            return;
+
+        // КАМЕНЬ ЧИТАЕТСЯ ДЕСЯТЬ СЕКУНД И РВЁТСЯ ДВИЖЕНИЕМ, ПОЭТОМУ МЫ СТОИМ — НО ТОЛЬКО ЗДЕСЬ,
+        // ПОСЛЕ СМЕРТИ И ПОЛЁТА (Кодекс). Раньше эта пауза стояла в самом начале такта и на те же
+        // десять секунд глушила обработку гибели и нападения. И снимаем её сразу, как только
+        // читать нечего: бой, чужой каст оборвал, или каста уже нет.
+        if (c.HearthCastMs)
+        {
+            c.HearthCastMs = (c.HearthCastMs <= diff) ? 0 : c.HearthCastMs - diff;
+            if (self->IsInCombat() || !self->IsNonMeleeSpellCast(false))
+                c.HearthCastMs = 0;             // оборвалось или уже закончилось — живём дальше
+            else
+                return;                          // читаем — не мешаем себе же
+        }
         // не управляем собой (транспорт, контроль) — пакет с нашим guid относился бы
         // к другому существу
         if (self->GetUnitBeingMoved() != self)
@@ -2118,6 +2236,7 @@ public:
                     TouchAreaTriggers(c, self);
                     ReconcileLateCredit(c, self);   // поздний рост счётчика — до любого нового «бесплодно»
                     LearnTaxiNode(c, self);         // мимо полётного мастера не проходим молча
+                    BindAtInn(c, self);             // и мимо трактирщика тоже: камень должен вести сюда
                 }
 
                 // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
@@ -2275,6 +2394,15 @@ public:
                 {
                     if (FindObjectiveSpot(c, self))
                     {
+                        // ДАЛЕКО — СНАЧАЛА СМОТРИМ, НЕ БЫСТРЕЕ ЛИ ПО ВОЗДУХУ (оператор: полётные
+                        // мастера не опрашиваются и никто не летает).
+                        if (Cfg().Flying && HearthTowards(c, self, c.TravelPos))
+                            return;             // камень уносит домой, дорога продолжится оттуда
+                        if (Cfg().Flying && PlanFlight(c, self, c.TravelPos))
+                        {
+                            Switch(c, self, Behavior::TakingFlight, "лечу к месту задания");
+                            return;
+                        }
                         Switch(c, self, Behavior::Travelling, "иду за целью задания");
                         return;
                     }
@@ -2303,6 +2431,11 @@ public:
                             uint32 qid = 0;
                             if (FindGiverByMap(c, self, &c.SeekEntry, &c.SeekSpawn, &c.SeekPos, &qid))
                             {
+                                if (Cfg().Flying && PlanFlight(c, self, c.SeekPos))
+                                {
+                                    Switch(c, self, Behavior::TakingFlight, "лечу к квестодателю");
+                                    return;
+                                }
                                 Quest const* q = sObjectMgr->GetQuestTemplate(qid);
                                 CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(c.SeekEntry);
                                 TC_LOG_INFO("server.worldserver",
@@ -2453,13 +2586,13 @@ public:
                         if (d > 6.0f)
                         {
                             StepToward(c, self, c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY(),
-                                c.VendorPos.GetPositionZ(), 5.0f, dt);
+                                c.VendorPos.GetPositionZ(), 5.0f, dt, &c.VendorPos);
                             // бюджет по прогрессу, как у сдачи: полминуты без приближения — конец
                             if (d < c.WalkBest - 1.0f)
                                 { c.WalkBest = d; c.WalkStuckMs = 0; }
                             else
                                 c.WalkStuckMs += slice;
-                            if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
+                            if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                             {
                                 c.VendCooldownMs = 300000;
                                 c.VendorEntry = 0;
@@ -2570,6 +2703,146 @@ public:
             // указателя, бюджет по прогрессу, тупик. Дошли в обзор — дальше обычный порядок:
             // Hello, меню ядра, светофор. Вид на десять минут в отсрочку, чтобы не выбрать его
             // же снова, если у самого квестодателя окажется нечего брать.
+            case Behavior::TakingFlight:
+            {
+                // УЖЕ ЛЕТИМ — НЕ МЕШАЕМ ЯДРУ. Оно ведёт персонажа само; наша работа кончилась.
+                if (self->IsInFlight())
+                    return;
+
+                Creature* master = c.FlightMaster.IsEmpty() ? nullptr
+                                 : ObjectAccessor::GetCreature(*self, c.FlightMaster);
+                if (master && !master->IsAlive())
+                    master = nullptr;
+                if (!master)
+                {
+                    c.FlightMaster.Clear();
+                    float const d = self->GetExactDist2d(c.FlightMasterPos.GetPositionX(), c.FlightMasterPos.GetPositionY());
+                    if (d > 20.0f)
+                    {
+                        StepToward(c, self, c.FlightMasterPos.GetPositionX(), c.FlightMasterPos.GetPositionY(),
+                            c.FlightMasterPos.GetPositionZ(), 15.0f, dt, &c.FlightMasterPos);
+                        if (d < c.WalkBest - 1.0f)
+                            { c.WalkBest = d; c.WalkStuckMs = 0; }
+                        else
+                            c.WalkStuckMs += slice;
+                        if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                        {
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation ПОЛЁТ {}: до полётного мастера не дойти — осталось {:.0f} ярдов",
+                                self->GetName(), d);
+                            c.FlightCooldownMs = 600000;
+                            Switch(c, self, Behavior::Idle, "до полётного мастера не дойти");
+                        }
+                        return;
+                    }
+                    // пришли на точку — ищем его вживую
+                    std::list<Creature*> near;
+                    Trinity::AnyUnitInObjectRangeCheck check(self, 30.0f);
+                    Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+                    Cell::VisitGridObjects(self, searcher, 30.0f);
+                    float best = 100000.0f;
+                    for (Creature* cr : near)
+                        if (cr->IsAlive() && cr->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER)
+                            && cr->GetEntry() == c.FlightMasterEntry)   // ТОТ ЖЕ, для кого считали (Кодекс)
+                        {
+                            float const dd = self->GetExactDist(cr);
+                            if (dd < best)
+                                { best = dd; master = cr; }
+                        }
+                    if (!master)
+                    {
+                        c.FlightCooldownMs = 600000;
+                        Switch(c, self, Behavior::Idle, "полётного мастера на точке нет");
+                        return;
+                    }
+                    c.FlightMaster = master->GetGUID();
+                }
+
+                // ЯДРО РЕШАЕТ, ДОСТАТОЧНО ЛИ БЛИЗКО — тем же вопросом, что задаёт обработчик.
+                if (!self->GetNPCIfCanInteractWith(c.FlightMaster, UNIT_NPC_FLAG_FLIGHTMASTER, UNIT_NPC_FLAG_2_NONE))
+                {
+                    float ax, ay, az;
+                    ApproachPoint(c, master, self, ax, ay, az, diff);
+                    StepToward(c, self, ax, ay, az, master->GetCombatReach() + 2.0f, dt);
+                    bool const done = c.Stalled || c.ModeMs > 120000;
+                    if (done && FindReachableApproach(c, self, master))
+                        { c.ModeMs = 0; return; }
+                    if (done)
+                    {
+                        LogApproachFailure(c, self, master, "полётному мастеру");
+                        c.FlightCooldownMs = 600000;
+                        Switch(c, self, Behavior::Idle, "к полётному мастеру не подойти");
+                    }
+                    return;
+                }
+
+                // УЗЕЛ ВЫВОДИМ ЗАНОВО, ИЗ ЖИВОЙ ПОЗИЦИИ (Кодекс). Обработчик берёт его от того, кто
+                // стоит перед нами, а план считал по строке таблицы: мастер мог сдвинуться, а
+                // рядом стоять другой. Разошлось — перепроверяем маршрут, и только потом летим.
+                uint32 const liveFrom = sObjectMgr->GetNearestTaxiNode(master->GetPositionX(), master->GetPositionY(),
+                                                                       master->GetPositionZ(), master->GetMapId(), self->GetTeam());
+                if (!liveFrom || !self->m_taxi.IsTaximaskNodeKnown(liveFrom))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПОЛЁТ {}: у живого мастера узел {} (ждали {}) — не наш, не лечу",
+                        self->GetName(), liveFrom, c.FlightFromNode);
+                    c.FlightCooldownMs = 600000;
+                    Switch(c, self, Behavior::Idle, "узел мастера не наш");
+                    return;
+                }
+                if (liveFrom != c.FlightFromNode)
+                {
+                    std::vector<uint32> again;
+                    TaxiNodesEntry const* from = sTaxiNodesStore.LookupEntry(liveFrom);
+                    TaxiNodesEntry const* to = sTaxiNodesStore.LookupEntry(c.FlightNode);
+                    if (!from || !to || TaxiPathGraph::GetCompleteNodeRoute(from, to, self, again) < 2)
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ПОЛЁТ {}: живой узел {} не тот, что в плане ({}), и маршрута к {} от него нет",
+                            self->GetName(), liveFrom, c.FlightFromNode, c.FlightNode);
+                        c.FlightCooldownMs = 600000;
+                        Switch(c, self, Behavior::Idle, "маршрута от живого узла нет");
+                        return;
+                    }
+                    c.FlightFromNode = liveFrom;
+                }
+
+                // НАЗЕМНОЕ ДВИЖЕНИЕ КОНЧАЕТСЯ ЗДЕСЬ (Кодекс): после взлёта любой наш пакет
+                // движения спорил бы с маршрутом, который ведёт ядро.
+                StopMoving(c, self);
+                c.Waypoints.clear();
+                c.WaypointIndex = 0;
+                c.Moving = false;
+
+                // ТОТ ЖЕ ПАКЕТ, ЧТО ШЛЁТ КЛИЕНТ. Свой узел ядро выведет из позиции мастера само.
+                WorldPacket raw(CMSG_ACTIVATE_TAXI);
+                WorldPackets::Taxi::ActivateTaxi taxi(std::move(raw));
+                taxi.Vendor = c.FlightMaster;
+                taxi.Node = c.FlightNode;
+                uint64 const moneyWas = self->GetMoney();
+                c.Session->HandleActivateTaxiOpcode(taxi);
+
+                // УСПЕХ — СОСТОЯНИЕ, А НЕ ОТПРАВКА: сокета нет, ответа не будет.
+                if (self->IsInFlight())
+                {
+                    ++_flights;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПОЛЁТ {}: полетел к узлу {}, заплатил {} мед., экономия пешком {:.0f} ярдов; всего перелётов {}",
+                        self->GetName(), c.FlightNode, uint32(moneyWas - self->GetMoney()),
+                        c.FlightSavedYards, _flights);
+                    c.FlightCooldownMs = 60000;
+                    Switch(c, self, Behavior::Idle, "лечу");
+                    return;
+                }
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОЛЁТ {}: ядро не отправило к узлу {} (денег {}, узел наш {})",
+                    self->GetName(), c.FlightNode, moneyWas,
+                    self->m_taxi.IsTaximaskNodeKnown(c.FlightNode) ? 1 : 0);
+                c.FlightCooldownMs = 600000;
+                Switch(c, self, Behavior::Idle, "улететь не вышло");
+                return;
+            }
+
             case Behavior::SeekingGiver:
             {
                 float const d = self->GetExactDist2d(c.SeekPos.GetPositionX(), c.SeekPos.GetPositionY());
@@ -2585,12 +2858,12 @@ public:
                     return;
                 }
                 StepToward(c, self, c.SeekPos.GetPositionX(), c.SeekPos.GetPositionY(),
-                    c.SeekPos.GetPositionZ(), 20.0f, dt);
+                    c.SeekPos.GetPositionZ(), 20.0f, dt, &c.SeekPos);
                 if (d < c.WalkBest - 1.0f)
                     { c.WalkBest = d; c.WalkStuckMs = 0; }
                 else
                     c.WalkStuckMs += slice;
-                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
+                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                 {
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ПОХОД {}: до квестодателя {} по карте не дойти — осталось {:.0f} ярдов, тупик {}, без прогресса {} с, всего {} с",
@@ -2625,12 +2898,24 @@ public:
                     return;
                 }
                 StepToward(c, self, c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY(),
-                    c.TravelPos.GetPositionZ(), c.TravelStop, dt);
+                    c.TravelPos.GetPositionZ(), c.TravelStop, dt, &c.TravelPos);
                 // СРОК щедрый: до цели бывает и двести ярдов, а бежим мы шагами по 4 Гц
-                if (c.Stalled || c.ModeMs > 180000)
+                // ПРОДВИЖЕНИЕ, А НЕ ЧАСЫ (оператор: цепочка ведёт в соседнюю зону, и это норма).
+                // Прежние три минуты означали потолок примерно в тысячу двести ярдов — а метка
+                // следующего хаба бывает и дальше. Судим по тому же, по чему судит поход к
+                // торговцу: приближаемся ли. Часы остаются страховкой от вечного цикла.
+                float const dTravel = self->GetExactDist2d(c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY());
+                if (dTravel < c.WalkBest - 1.0f)
+                    { c.WalkBest = dTravel; c.WalkStuckMs = 0; }
+                else
+                    c.WalkStuckMs += slice;
+                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                 {
                     c.TravelCooldownMs = 120000;
-                    Switch(c, self, Behavior::Idle, c.Stalled ? "до места задания не дойти" : "три минуты в пути без толку");
+                    Switch(c, self, Behavior::Idle,
+                        c.Stalled ? "до места задания не дойти"
+                                  : (c.WalkStuckMs > 30000 ? "полминуты без приближения к месту задания"
+                                                           : "в пути слишком долго"));
                 }
                 return;
             }
@@ -2688,6 +2973,98 @@ public:
                     ? self->IsWithinDistInMap(target, c.EngageRange) && self->IsWithinLOSInMap(target)
                     : self->IsWithinMeleeRange(target);
 
+                // ОТВОД: УТАЩИТЬ ЦЕЛЬ ОТ ЛАГЕРЯ И ТАМ ДОБИТЬ.
+                //
+                // Начинаем, только если при выборе у цели были соседи: тащить одиночку незачем.
+                // Точку берём один раз — прочь от того места, где мы её зацепили, на расчётное
+                // расстояние; идём спиной, лицом к цели, поэтому удары не прерываются.
+                if (Cfg().KiteYards > 0.0f && c.EngageAssists > 0 && self->IsInCombat()
+                    && !c.Kiting && c.KiteMs == 0)
+                {
+                    // ПРОЧЬ ОТ ЦЕНТРА ПАЧКИ, А НЕ ПРОСТО ОТ ЦЕЛИ (разбор), и точку обязан
+                    // одобрить ПОСТРОИТЕЛЬ МАРШРУТА: шаги по прямой протащили бы сквозь
+                    // непроходимое. Идём потом по его же точкам, только спиной.
+                    float const ang = c.PackCenterKnown
+                        ? c.PackCenter.GetAbsoluteAngle(self->GetPositionX(), self->GetPositionY())
+                        : self->GetAbsoluteAngle(target) + float(M_PI);
+                    float const kx = self->GetPositionX() + std::cos(ang) * Cfg().KiteYards;
+                    float const ky = self->GetPositionY() + std::sin(ang) * Cfg().KiteYards;
+                    if (MapManager::IsValidMapCoord(self->GetMapId(), kx, ky))
+                    {
+                        float const kz = self->GetMap()->GetHeight(self->GetPhaseShift(), kx, ky,
+                                                                   self->GetPositionZ() + 3.0f);
+                        PathGenerator back(self);
+                        if (kz > INVALID_HEIGHT && std::fabs(kz - self->GetPositionZ()) < 12.0f
+                            && back.CalculatePath(kx, ky, kz, false)
+                            && !(back.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_INCOMPLETE)))
+                        {
+                            c.KitePath.clear();
+                            for (G3D::Vector3 const& v : back.GetPath())
+                                c.KitePath.emplace_back(v.x, v.y, v.z);
+                            c.KiteIdx = c.KitePath.size() > 1 ? 1 : 0;
+                            c.KiteTo.Relocate(kx, ky, kz);
+                            c.Kiting = !c.KitePath.empty();
+                            c.KiteMs = 1;
+                            c.WalkBest = 100000.0f;
+                            if (c.Kiting)
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ОТВОД {}: у {} ({}) было {} соседей — увожу на {:.0f} ярдов, точек пути {}",
+                                    self->GetName(), target->GetName(), target->GetEntry(),
+                                    c.EngageAssists, Cfg().KiteYards, uint32(c.KitePath.size()));
+                        }
+                    }
+                    if (!c.Kiting)
+                        c.KiteMs = 0xFFFFFFFF;      // некуда пятиться — больше не пробуем в этом бою
+                }
+                if (c.Kiting)
+                {
+                    c.KiteMs += uint32(dt * 1000.0f);
+                    // ЗАСТРЕВАНИЕ ВО ВРЕМЯ ОТВОДА СУДИМ ТЕМ ЖЕ, ЧЕМ И ОБЫЧНЫЙ ШАГ (разбор):
+                    // сдвинулись ли мы на самом деле.
+                    if (self->GetExactDist2d(c.LastX, c.LastY) > 1.0f)
+                    {
+                        c.LastX = self->GetPositionX();
+                        c.LastY = self->GetPositionY();
+                        c.StuckMs = 0;
+                    }
+                    else
+                        c.StuckMs += uint32(dt * 1000.0f);
+
+                    float const left = self->GetExactDist2d(c.KiteTo.GetPositionX(), c.KiteTo.GetPositionY());
+                    // ДОШЛИ, ЗАСТРЯЛИ ИЛИ ЗАТЯНУЛОСЬ — ДЕРЁМСЯ ЗДЕСЬ. И ОБЯЗАТЕЛЬНО ОСТАНАВЛИВАЕМСЯ
+                    // (разбор): иначе сервер продолжает видеть «иду назад».
+                    if (left <= 2.0f || c.KiteMs > 12000 || c.Stalled || c.StuckMs > 3000
+                        || c.KiteIdx >= c.KitePath.size())
+                    {
+                        c.Kiting = false;
+                        StopMoving(c, self);
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ОТВОД {}: отошёл, осталось {:.0f} ярдов ({}), дерусь здесь",
+                            self->GetName(), left,
+                            c.StuckMs > 3000 ? "застрял" : (c.KiteMs > 12000 ? "долго" : "дошёл"));
+                    }
+                    else
+                    {
+                        // ДАЛЬНОБОЙНЫЙ ЧИТАЕТ СТОЯ (оператор и разбор): несмгновенное заклинание во
+                        // время движения не прочитается. Идёт каст — стоим и не мешаем себе; ядро
+                        // само скажет, идёт ли он.
+                        if (self->IsNonMeleeSpellCast(false))
+                        {
+                            StopMoving(c, self);
+                            return;
+                        }
+                        // ШАГ ПО ТОЧКАМ ПОСТРОИТЕЛЯ, А НЕ ПО ПРЯМОЙ (разбор), но спиной — лицом к
+                        // цели, иначе ядро отвергнет каждый замах.
+                        Position const& wp = c.KitePath[c.KiteIdx];
+                        if (self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY()) < 1.5f)
+                            ++c.KiteIdx;
+                        else
+                            StepBackFacing(c, self, wp, target, dt);
+                        if (closeEnough)
+                            TryAttack(c, self, target);
+                        return;
+                    }
+                }
                 if (closeEnough)
                 {
                     if (TryAttack(c, self, target))
@@ -2823,7 +3200,8 @@ public:
                 if (d > 6.0f)
                 {
                     StepToward(c, self, c.TurnInPos.GetPositionX(), c.TurnInPos.GetPositionY(),
-                        c.TurnInPos.GetPositionZ(), 5.0f, dt);
+                        c.TurnInPos.GetPositionZ(), 5.0f, dt,
+                        c.TurnInPosFromTable ? &c.TurnInPos : nullptr);
                     // БЮДЖЕТ ПО ПРОГРЕССУ, А НЕ ПО ПРЯМОЙ (Кодекс, и журнал Легиона 0006:640):
                     // прямая — не длина маршрута, и срок «от расстояния» там уже откатывали.
                     // Мера — приближаемся ли: полминуты без нового лучшего расстояния —
@@ -2833,7 +3211,7 @@ public:
                         { c.WalkBest = d; c.WalkStuckMs = 0; }
                     else
                         c.WalkStuckMs += slice;
-                    if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > 240000)
+                    if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                     {
                         c.TurnInBackoff[c.TurnInQuest] = 300000;   // пять минут: дорога, а не рывок
                         Switch(c, self, Behavior::Idle, "до принимающего не дойти");
@@ -2879,7 +3257,7 @@ public:
                     if (near > 4.0f)
                     {
                         StepToward(c, self, c.GatherPos.GetPositionX(), c.GatherPos.GetPositionY(),
-                                   c.GatherPos.GetPositionZ(), 0.25f, dt);
+                                   c.GatherPos.GetPositionZ(), 0.25f, dt, &c.GatherPos);
 
                         // МАРШРУТА НЕТ — БЕРЁМ ДРУГУЮ ТОЧКУ, А НЕ ЖДЁМ.
                         //
@@ -4254,6 +4632,20 @@ public:
         }
     }
 
+    // КВЕСТ ПРОФЕССИИ, КОТОРОЙ У НАС НЕТ (оператор, 2026-09-03: «брать квесты профессий только
+    // под профессии, которые есть у персонажа; а сейчас таких нет»).
+    //
+    // Навык называет само ядро: SkillByQuestSort по сортировке квеста (SharedDefines.h:6190), и
+    // оно же сверяет по ней RequiredSkillId при загрузке (ObjectMgr.cpp:4858). Второй источник —
+    // сам RequiredSkillId. Дальше вопрос к персонажу: есть ли у него этот навык.
+    static bool ProfessionWeLack(Player* self, Quest const* q)
+    {
+        uint32 skill = SkillByQuestSort(-q->GetZoneOrSort());
+        if (!skill)
+            skill = q->GetRequiredSkill();
+        return skill != 0 && !self->HasSkill(skill);
+    }
+
     // ГОДИТСЯ ЛИ ВЕЩЬ ЭТОМУ ПЕРСОНАЖУ ВООБЩЕ — те же два вопроса, что задаёт продажа, вынесены
     // отдельно, потому что теперь их задаёт и выбор награды. Проверка по шаблону отвечает за
     // класс, расу, фракцию и требуемое заклинание, но НЕ за навык подкласса оружия и не за тип
@@ -5005,6 +5397,11 @@ public:
         c.Stalled = false;              // новое намерение — новая попытка дойти
         c.RingTried = false;            // и обход точек вокруг NPC снова доступен (помост)
         c.RingHeld = false;
+        c.Kiting = false;               // и отвод начинается заново в следующем бою
+        c.KiteMs = 0;
+        c.KitePath.clear();
+        c.KiteIdx = 0;
+        c.PackCenterKnown = false;
         c.StuckMs = 0;
         c.UnstickTries = 0;
         c.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
@@ -5031,6 +5428,7 @@ public:
             case Behavior::Gathering:         return "иду собирать";
             case Behavior::Talking:           return "иду взаимодействовать";
             case Behavior::SeekingGiver:      return "иду к квестодателю по карте";
+            case Behavior::TakingFlight:      return "иду к полётному мастеру";
         }
         return "?";
     }
@@ -5315,6 +5713,10 @@ public:
             // и вне своего события они висят в журнале мёртвым грузом, как 55660 у всех 122.
             if (SeasonalKind(q))
                 continue;
+            // ПРОФЕССИЯ, КОТОРОЙ У НАС НЕТ: её цели — созданные ремеслом предметы, которых в мире
+            // не существует. Семеро пандаренов держат три таких квеста (алхимия, сортировка -181).
+            if (ProfessionWeLack(self, q))
+                continue;
             ++offered;
             uint8 const colour = QuestColour(self, q);
             if (colour == 4)
@@ -5410,6 +5812,7 @@ public:
             if (quest->HasFlag(QUEST_FLAGS_AUTO_COMPLETE))
             {
                 c.TurnInQuest = qid;
+                c.TurnInPosFromTable = false;
                 c.TurnInEntry = 0;              // 0 = сдать самому себе, никуда не идти
                 c.TurnInPos = self->GetPosition();
                 c.TurnInDist = 0.0f;
@@ -5441,6 +5844,7 @@ public:
                 c.TurnInQuest = qid;
                 c.TurnInEntry = enderEntry;
                 c.TurnInPos = *bestSpawn;
+                c.TurnInPosFromTable = true;
                 c.TurnInDist = bestDist;
                 return true;
             }
@@ -5486,6 +5890,7 @@ public:
                     c.TurnInEntry = live->GetEntry();
                     c.TurnInGuid = live->GetGUID();
                     c.TurnInPos = live->GetPosition();
+                    c.TurnInPosFromTable = false;   // это ЖИВОЕ существо: высота у него своя (Кодекс)
                     c.TurnInDist = bestLive;
                     TC_LOG_INFO("server.worldserver",
                         "Constellation СДАЧА {}: принимающий {} ({}) квеста {} нигде не появляется — он призван и стоит в {:.0f} ярдах, иду к нему",
@@ -5615,6 +6020,20 @@ public:
         // опустевший хаб оставлял спутника стоять при квестодателе в 52 ярдах (Теронис,
         // Аэлдон Санбранд). Связи «существо -> квесты» здесь выбирают КУДА ИДТИ; что взять,
         // по-прежнему решается у самого квестодателя по меню, собранному ядром.
+        // ПОЛЁТНЫЕ МАСТЕРА — ПО ТОЧКАМ, С УЗЛОМ, КОТОРЫЙ ЯДРО ВЫВЕДЕТ ИЗ ИХ ПОЗИЦИИ. Номер узла
+        // считаем ровно тем же вызовом, что и обработчик такси, и один раз при загрузке.
+        uint32 fm = 0;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureTemplate const* tpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tpl || !(tpl->npcflag & uint64(UNIT_NPC_FLAG_FLIGHTMASTER)))
+                continue;
+            _flightMasters[data.mapId].push_back(FlightPoint{ data.id, tpl->faction, data.spawnPoint });
+            ++fm;
+        }
+        TC_LOG_INFO("server.loading", "Constellation: указатель полётных мастеров — {} точек на {} картах",
+            fm, uint32(_flightMasters.size()));
+
         // ПО ТОЧКАМ СПАВНА, А НЕ ПО ВИДАМ (Кодекс): отсрочка после неудачи относится к одной
         // точке — плохая точка одного вида не должна запрещать другую того же вида.
         uint32 gq = 0;
@@ -6853,6 +7272,109 @@ public:
         return gate ? "не классифицировано" : "иное";
     }
 
+    // ПРИВЯЗАТЬ КАМЕНЬ У ТРАКТИРЩИКА, МИМО КОТОРОГО ПРОХОДИМ.
+    //
+    // Оператор: камень должен вести в ТЕКУЩИЙ хаб, иначе он бесполезен как оптимизатор дороги.
+    // Опкод тот же, что шлёт клиент по кнопке «сделать эту таверну домом»; ядро само проверит,
+    // что перед нами трактирщик и что мы достаточно близко, а домашнюю точку поставит по нашему
+    // месту (SendBindPoint -> заклинание 3286 -> Spell::EffectBind).
+    void BindAtInn(Companion& c, Player* self)
+    {
+        if (c.InnScanMs)
+            return;
+        c.InnScanMs = 60000 + (c.Guid.GetCounter() % 23) * 1000;   // разброс, как у полётных точек
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 30.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
+        Cell::VisitGridObjects(self, searcher, 30.0f);
+        for (Creature* cr : around)
+        {
+            if (!cr->IsAlive() || !cr->HasNpcFlag(UNIT_NPC_FLAG_INNKEEPER))
+                continue;
+            if (c.BoundAt == cr->GetGUID())
+                return;                     // здесь уже привязаны — второй раз незачем
+            // НОВАЯ ПРИВЯЗКА УНИЧТОЖАЕТ ПРЕЖНЮЮ (Кодекс), поэтому не при каждой встрече: только
+            // когда дом действительно далеко — другая карта или дальше полукилометра. Проходя
+            // мимо соседней таверны того же хаба, ничего не трогаем.
+            bool const homeElsewhere = self->m_homebind.GetMapId() != self->GetMapId()
+                || self->GetExactDist2d(self->m_homebind.GetPositionX(), self->m_homebind.GetPositionY()) > 500.0f;
+            if (!homeElsewhere)
+                { c.BoundAt = cr->GetGUID(); return; }
+            if (!self->GetNPCIfCanInteractWith(cr->GetGUID(), UNIT_NPC_FLAG_INNKEEPER, UNIT_NPC_FLAG_2_NONE))
+                continue;
+            WorldLocation const was = self->m_homebind;
+            WorldPacket raw(CMSG_BINDER_ACTIVATE);
+            WorldPackets::NPC::Hello bind(std::move(raw));
+            bind.Unit = cr->GetGUID();
+            c.Session->HandleBinderActivateOpcode(bind);
+            // УСПЕХ — ПО ТОМУ, ЧТО ТОЧКА ДЕЙСТВИТЕЛЬНО ДРУГАЯ: карта или координаты (Кодекс).
+            // «Стало ближе» — не то же самое и могло бы соврать.
+            bool const bound = self->m_homebind.GetMapId() != was.GetMapId()
+                || std::fabs(self->m_homebind.GetPositionX() - was.GetPositionX()) > 0.5f
+                || std::fabs(self->m_homebind.GetPositionY() - was.GetPositionY()) > 0.5f;
+            // НЕУДАЧУ НЕ ЗАПОМИНАЕМ НАВСЕГДА: иначе второй попытки в этой сессии не будет.
+            if (bound)
+                c.BoundAt = cr->GetGUID();
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРИВЯЗКА {}: у {} ({}) в зоне {} — {}",
+                self->GetName(), cr->GetName(), cr->GetEntry(), self->GetZoneId(),
+                bound ? "дом теперь здесь" : "ядро привязку не дало");
+            return;                         // по одному трактирщику за проход
+        }
+    }
+
+    // КАМЕНЬ КАК ОПТИМИЗАТОР ДОРОГИ, И ТОЛЬКО ОН.
+    //
+    // Уходим камнем, если до цели далеко, а от домашней точки до неё близко: тогда «камень плюс
+    // короткая дорога» короче длинной. Ядро проверит откат и бой само; судим по состоянию —
+    // перенесло нас или нет.
+    bool HearthTowards(Companion& c, Player* self, Position const& target)
+    {
+        if (c.HearthCooldownMs || self->IsInCombat() || self->IsInFlight())
+            return false;
+        if (self->m_homebind.GetMapId() != self->GetMapId())
+            return false;                   // дом на другой карте — это уже не оптимизация
+        float const walkAll = self->GetExactDist2d(target.GetPositionX(), target.GetPositionY());
+        float const fromHome = std::sqrt(std::pow(self->m_homebind.GetPositionX() - target.GetPositionX(), 2.0f)
+                                       + std::pow(self->m_homebind.GetPositionY() - target.GetPositionY(), 2.0f));
+        if (walkAll < Cfg().FlyIfFartherThan || fromHome > walkAll * 0.5f
+            || walkAll - fromHome < Cfg().FlyIfSaves)
+            return false;
+        Item* stone = self->GetItemByEntry(6948);
+        if (!stone)
+            return false;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(8690, DIFFICULTY_NONE);
+        if (!si || !self->GetSpellHistory()->IsReady(si, stone->GetEntry())
+            || self->IsNonMeleeSpellCast(false))
+            return false;
+        WorldPacket raw(CMSG_USE_ITEM);
+        WorldPackets::Spells::UseItem use(std::move(raw));
+        use.PackSlot = stone->GetBagSlot();
+        use.Slot = stone->GetSlot();
+        use.CastItem = stone->GetGUID();
+        use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL, self->GetMapId(),
+            8690, self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        use.Cast.SpellID = 8690;
+        use.Cast.Target.Flags = TARGET_FLAG_NONE;
+        // ГАСИМ ДОРОГУ ДО ОТПРАВКИ: движение оборвало бы собственный перенос.
+        StopMoving(c, self);
+        c.Waypoints.clear();
+        c.WaypointIndex = 0;
+        c.Moving = false;
+        c.Session->HandleUseItemOpcode(use);
+
+        // ПАУЗУ СТАВИМ, ТОЛЬКО ЕСЛИ КАСТ ДЕЙСТВИТЕЛЬНО НАЧАЛСЯ (Кодекс): иначе мы бы честно
+        // простояли десять секунд после отказа ядра.
+        bool const casting = self->IsNonMeleeSpellCast(false);
+        c.HearthCooldownMs = casting ? 600000 : 60000;
+        c.HearthCastMs = casting ? si->CalcCastTime() + 2000 : 0;
+        TC_LOG_INFO("server.worldserver",
+            "Constellation КАМЕНЬ {}: до цели {:.0f} ярдов, от дома до неё {:.0f} — {}",
+            self->GetName(), walkAll, fromHome,
+            casting ? "читаю камень" : "ядро каст не начало");
+        return casting;
+    }
+
     // УЗНАТЬ ПОЛЁТНУЮ ТОЧКУ У МАСТЕРА, МИМО КОТОРОГО ПРОХОДИМ.
     //
     // Игрок, впервые подошедший к полётному мастеру, получает точку одним щелчком по пункту
@@ -6896,6 +7418,25 @@ public:
             hello.Unit = cr->GetGUID();
             c.Session->HandleGossipHelloOpcode(hello);
 
+            // ТОЧКА УЗНАЁТСЯ УЖЕ НА ПРИВЕТСТВИИ, И ЭТО СТРОКА ЯДРА, А НЕ ДОГАДКА.
+            //
+            //     case GossipOptionNpc::Taxinode:
+            //         if (GetSession()->SendLearnNewTaxiNode(creature))
+            //             return;                       <-- Player.cpp:13825
+            //
+            // То есть Hello сам ставит бит в маске, а подготовка меню на этом ЗАВЕРШАЕТСЯ — и
+            // пункта в меню уже нет. Первая редакция искала пункт, не находила и записывала
+            // «нет пункта»: на боевом это дало два таких отказа и ноль узнанных точек, хотя
+            // ядро их, вероятно, и выдало. Спрашиваем маску сразу после приветствия.
+            if (self->m_taxi.IsTaximaskNodeKnown(node))
+            {
+                c.TaxiDone.insert(cr->GetGUID());
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОЛЁТ {}: у {} ({}) точка {} узнана на приветствии; всего точек {}",
+                    self->GetName(), cr->GetName(), cr->GetEntry(), node, KnownTaxiNodes(self));
+                return;
+            }
+
             GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
             int32 pick = -1;
             for (GossipMenuItem const& item : menu.GetMenuItems())
@@ -6925,9 +7466,9 @@ public:
             else
                 c.TaxiRetry[cr->GetGUID()] = 600000;
             TC_LOG_INFO("server.worldserver",
-                "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}",
+                "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}; всего точек {}",
                 self->GetName(), cr->GetName(), cr->GetEntry(), node,
-                got ? "узнана" : "не далась");
+                got ? "узнана выбором пункта" : "не далась", KnownTaxiNodes(self));
             return;                     // по одному мастеру за проход
         }
     }
@@ -6944,6 +7485,107 @@ public:
                 if (mask[i] & (1u << bit))
                     ++known;
         return known;
+    }
+
+    // СТОИТ ЛИ ЛЕТЕТЬ, И ОТКУДА КУДА.
+    //
+    // Считаем полную стоимость, а не одну её часть: дойти до мастера + перелёт + дойти от узла
+    // назначения до цели. Летим, только если это заметно короче прямой ходьбы — иначе перелёт
+    // сам себе помеха. Узел назначения перебираем ТОЛЬКО среди известных и только с настоящим
+    // маршрутом от узла отправления: «ближайший к цели» может оказаться недостижимым (Кодекс).
+    bool PlanFlight(Companion& c, Player* self, Position const& target)
+    {
+        if (c.FlightCooldownMs || self->IsInCombat() || self->IsInFlight())
+            return false;
+        float const walkAll = self->GetExactDist2d(target.GetPositionX(), target.GetPositionY());
+        if (walkAll < Cfg().FlyIfFartherThan)
+            return false;
+        auto it = _flightMasters.find(self->GetMapId());
+        if (it == _flightMasters.end())
+            return false;
+
+        // 1) мастер: ближайший, чей узел мы знаем, и до которого идти много меньше, чем до цели
+        FlightPoint const* master = nullptr;
+        float masterWalk = walkAll * 0.5f;          // дальше половины пути — уже не по дороге
+        uint32 fromNode = 0;
+        FactionTemplateEntry const* mine = self->GetFactionTemplateEntry();
+        for (FlightPoint const& m : it->second)
+        {
+            float const d = self->GetExactDist2d(m.Where.GetPositionX(), m.Where.GetPositionY());
+            if (d > masterWalk)
+                continue;
+            if (mine)
+                if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(m.Faction))
+                    if (mine->IsHostileTo(theirs))
+                        continue;
+            uint32 const node = sObjectMgr->GetNearestTaxiNode(m.Where.GetPositionX(), m.Where.GetPositionY(),
+                                                               m.Where.GetPositionZ(), self->GetMapId(), self->GetTeam());
+            if (!node || !self->m_taxi.IsTaximaskNodeKnown(node))
+                continue;
+            masterWalk = d;
+            master = &m;
+            fromNode = node;
+        }
+        if (!master)
+            return false;
+
+        TaxiNodesEntry const* from = sTaxiNodesStore.LookupEntry(fromNode);
+        if (!from)
+            return false;
+
+        // 2) узел назначения: среди ИЗВЕСТНЫХ на этой карте — тот, от которого до цели идти
+        // меньше всего, и до которого граф действительно строит маршрут.
+        // СНАЧАЛА ОТБИРАЕМ, ПОТОМ СПРАШИВАЕМ ГРАФ (Кодекс): построение маршрута — дорогая
+        // операция, и перебирать ею весь список узлов в такте мира нельзя. Собираем известные
+        // узлы своей карты, сортируем по остатку пути до цели и спрашиваем граф только у
+        // первых нескольких.
+        std::vector<std::pair<float, TaxiNodesEntry const*>> cands;
+        for (TaxiNodesEntry const* to : sTaxiNodesStore)
+        {
+            if (!to || to->ID == fromNode || to->ContinentID != int32(self->GetMapId()))
+                continue;
+            if (!self->m_taxi.IsTaximaskNodeKnown(to->ID))
+                continue;
+            float const tail = std::sqrt(std::pow(to->Pos.X - target.GetPositionX(), 2.0f)
+                                       + std::pow(to->Pos.Y - target.GetPositionY(), 2.0f));
+            if (tail < walkAll)                     // хуже прямой ходьбы нам не нужно
+                cands.push_back({ tail, to });
+        }
+        std::sort(cands.begin(), cands.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+        uint32 bestNode = 0;
+        float bestTail = walkAll;
+        std::vector<uint32> route;
+        uint32 asked = 0;
+        for (auto const& [tail, to] : cands)
+        {
+            if (asked >= Cfg().FlyRouteCandidates)
+                break;
+            ++asked;
+            route.clear();
+            if (TaxiPathGraph::GetCompleteNodeRoute(from, to, self, route) < 2)
+                continue;                           // маршрута нет — этот узел не годится
+            bestTail = tail;
+            bestNode = to->ID;
+            break;                                  // список уже отсортирован: первый годный и лучший
+        }
+        if (!bestNode)
+            return false;
+
+        // 3) стоит ли овчинка выделки: пешком целиком против «до мастера + от узла»
+        float const byAir = masterWalk + bestTail;
+        if (byAir > walkAll * 0.6f || walkAll - byAir < Cfg().FlyIfSaves)
+            return false;
+
+        c.FlightMaster.Clear();
+        c.FlightMasterPos = master->Where;
+        c.FlightMasterEntry = master->Entry;
+        c.FlightFromNode = fromNode;
+        c.FlightNode = bestNode;
+        c.FlightSavedYards = walkAll - byAir;
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПОЛЁТ {}: до цели {:.0f} ярдов пешком; лечу {} -> {} (до мастера {} — {:.0f}, от узла — {:.0f}), экономия {:.0f}",
+            self->GetName(), walkAll, fromNode, bestNode, master->Entry, masterWalk, bestTail, c.FlightSavedYards);
+        return true;
     }
 
     // ПОЧЕМУ СТОИМ — раз в пять минут у того, кому делать нечего. Прежний прибор печатался по
@@ -7084,8 +7726,8 @@ public:
             Quest const* q = sObjectMgr->GetQuestTemplate(qid);
             if (!q || self->GetQuestStatus(qid) != QUEST_STATUS_NONE)
                 continue;
-            if (!self->CanTakeQuest(q, false) || SeasonalKind(q))
-                continue;                       // сезонное — не наша работа (оператор)
+            if (!self->CanTakeQuest(q, false) || SeasonalKind(q) || ProfessionWeLack(self, q))
+                continue;                       // сезонное и чужие профессии — не наша работа
             if (QuestColour(self, q) >= 3)
                 continue;                       // красное и неизвестное — не по нам
             return qid;
@@ -7369,18 +8011,35 @@ public:
         {
             c.FightDiagDone = true;
             TC_LOG_INFO("server.worldserver",
-                "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}",
-                self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()));
+                "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}, радиус зова {:.0f}",
+                self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()),
+                sWorld->getFloatConfig(CONFIG_CREATURE_FAMILY_ASSISTANCE_RADIUS));
         }
         if (wanted.empty() && wantedItems.empty())
             return nullptr;
 
+        // ОБХОД ШИРЕ ВЫБОРА НА РАДИУС ЗОВА (разбор): сосед в десяти ярдах от цели может стоять
+        // за нашей границей поиска, и без него счёт заступников был бы занижен. Кандидатов
+        // по-прежнему берём только внутри FightRange — шире ищем, но не дальше бьём.
+        float const helpR = sWorld->getFloatConfig(CONFIG_CREATURE_FAMILY_ASSISTANCE_RADIUS);
+        // ЗАПАС ОБХОДА — ПО БОЛЬШЕМУ ИЗ ДВУХ РАДИУСОВ (разбор): агро бывает шире зова, и у ядра
+        // его потолок 45 ярдов (Creature::GetAttackDistance).
+        float const margin = std::max(helpR, 45.0f);
         std::list<Creature*> around;
-        Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().FightRange);
+        Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().FightRange + margin);
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
-        Cell::VisitGridObjects(self, searcher, Cfg().FightRange);
+        Cell::VisitGridObjects(self, searcher, Cfg().FightRange + margin);
 
         uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0;
+        uint32 assists = 0, bestAssists = 0xFFFFFFFF;
+        // СПИСОК УГРОЗ — ОДИН РАЗ НА ПРОХОД, А НЕ НА КАЖДОГО КАНДИДАТА (разбор: перебор был
+        // квадратичным). Здесь только те, кто вообще может вступить: живой, враждебный, ещё не
+        // занятый чужим боем.
+        std::vector<Creature*> threats;
+        threats.reserve(around.size());
+        for (Creature* other : around)
+            if (other->IsAlive() && !other->IsInCombat() && other->IsHostileTo(self))
+                threats.push_back(other);
         // сбрасываем перед КАЖДЫМ проходом: иначе прошлый кандидат живёт в состоянии до
         // тех пор, пока его не употребят, и спутник идёт к тому, кого рядом уже нет (Кодекс)
         c.TalkCandidate.Clear();
@@ -7448,6 +8107,81 @@ public:
             // спутник целится в тех, кого на его месте не увидел бы вовсе.
             if (!self->GetPhaseShift().CanSee(creature->GetPhaseShift()))
                 { ++rejPhase; ++rejected; continue; }
+            // НЕ ПО ЗУБАМ — ЭТО ВЕЛИЧИНА ЯДРА, А НЕ ДОГАДКА (замер: 0 побед, 21 гибель).
+            //
+            // CreatureTemplate::Classification различает Normal, Elite, RareElite, Rare, Trivial,
+            // MinusMob. Одиночка без группы берёт только Normal, Trivial и MinusMob: Бренна
+            // пятого уровня ходила умирать к редкому Grik'nir the Cold, у которого 250 жизней
+            // против её 150, и ядро при этом честно считало его «для нас ур 5» — уровень тут не
+            // мера. Мера — вид существа и запас жизней.
+            if (Cfg().SkipElites)
+            {
+                CreatureClassifications const cls = creature->GetCreatureClassification();
+                if (cls != CreatureClassifications::Normal && cls != CreatureClassifications::Trivial
+                    && cls != CreatureClassifications::MinusMob)
+                {
+                    if (!c.EliteNoted)
+                    {
+                        c.EliteNoted = true;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation БОЙ {}: {} ({}) — вид {} (элитный/редкий), в одиночку не беру",
+                            self->GetName(), creature->GetName(), creature->GetEntry(), uint32(cls));
+                    }
+                    ++rejected; continue;
+                }
+                // ЗАПАС ЖИЗНЕЙ МЕРОЙ НЕ БЕРЁМ (оператор): у тканевых он тонок по устройству, и
+                // такой порог заставил бы мага отказываться почти от всего.
+                //
+                // МЕРА — СКОЛЬКО ЗАСТУПНИКОВ У ЦЕЛИ, И СПРАШИВАЕМ ЭТО У ЯДРА ЕГО ЖЕ ВОПРОСОМ:
+                // Creature::CanAssistTo(цель, мы) — тот самый, которым оно отбирает подмогу в
+                // CallAssistance. Радиус его же: CONFIG_CREATURE_FAMILY_ASSISTANCE_RADIUS.
+            }
+            // СКОЛЬКО ВРАГОВ ПОЛУЧИМ, УДАРИВ ЭТОГО — СЧИТАЕМ ВСЕГДА И НЕЗАВИСИМО ОТ ФИЛЬТРА
+            // ЭЛИТНЫХ (разбор: раньше это стояло внутри него, и выключение одного молча
+            // выключало другое, а порядок выбора шёл по устаревшему числу).
+            //
+            // Вопрос один и тот же для обоих источников: «сколько врагов окажется на мне, если я
+            // буду драться ВОТ ТУТ». Поэтому и расстояние, и видимость — до МЕСТА БОЯ, то есть
+            // до самой цели:
+            //   * ПОЗОВУТ — радиус зова ядра и его же условие CanAssistTo, с видимостью до
+            //     зовущего (этого требует AnyAssistCreatureInRangeCheck);
+            //   * ЗАМЕТЯТ САМИ — собственный агро-радиус соседа GetAttackDistance(мы), уже с
+            //     учётом разницы уровней и аур обнаружения.
+            assists = 0;
+            float packX = 0.0f, packY = 0.0f, packZ = 0.0f;
+            for (Creature* other : threats)
+            {
+                if (other == creature)
+                    continue;
+                float const dd = other->GetExactDist(creature);
+                bool const called = helpR > 0.0f && dd <= helpR
+                    && creature->IsWithinLOSInMap(other) && other->CanAssistTo(creature, self);
+                bool const notices = dd <= other->GetAttackDistance(self)
+                    && other->IsWithinLOSInMap(creature);
+                if (called || notices)
+                {
+                    ++assists;
+                    packX += other->GetPositionX();
+                    packY += other->GetPositionY();
+                    packZ += other->GetPositionZ();
+                    if (Cfg().MaxAssist && assists > Cfg().MaxAssist)
+                        break;              // порог превышен — считать дальше незачем
+                }
+            }
+            // ГОЛОДАНИЕ ОТМЕНЯЕТ ПОРОГ (разбор): цели, которые водятся только стаями, иначе стали
+            // бы невыполнимы навсегда. Долго нет боя — берём наименее людную, но элитных всё
+            // равно не берём: это отдельное правило.
+            if (Cfg().MaxAssist && assists > Cfg().MaxAssist && c.NoTargetMs < Cfg().StarveMs)
+            {
+                if (!c.ToughNoted)
+                {
+                    c.ToughNoted = true;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation БОЙ {}: за {} ({}) вступятся {} — беру того, кто с краю",
+                        self->GetName(), creature->GetName(), creature->GetEntry(), assists);
+                }
+                ++rejected; continue;
+            }
             // чужую добычу не отбираем: тот, кто уже с кем-то дерётся, не наш
             if (creature->IsInCombat() && creature->GetVictim() != self)
                 { ++rejBusy; ++rejected; continue; }
@@ -7578,13 +8312,23 @@ public:
             // при ударе. Здесь отсеиваем лишь то, что уже признано недостижимым.
             if (c.Refused.count(creature->GetGUID()))
                 { ++rejLos; ++rejected; continue; }
+            // ЦЕЛЬ ВЫБИРАЕТСЯ ПО ОДИНОЧЕСТВУ, А ПОТОМ УЖЕ ПО БЛИЗОСТИ: так лагерь разбирается
+            // с края по одному, а не начинается с середины (оператор: «цеплять по 1-2»).
             float d = self->GetExactDist2d(creature);
-            if (d < bestDist)
+            if (assists < bestAssists || (assists == bestAssists && d < bestDist))
             {
+                bestAssists = assists;
                 bestDist = d;
                 best = creature;
+                // ЦЕНТР ПАЧКИ — ОТ НЕГО И БУДЕМ ОТХОДИТЬ (разбор): лагерь не всегда за спиной
+                // цели, а вот центр посчитанных соседей указывает на него прямо.
+                c.PackCenterKnown = assists > 0;
+                if (c.PackCenterKnown)
+                    c.PackCenter.Relocate(packX / float(assists), packY / float(assists), packZ / float(assists));
             }
         }
+        if (best)
+            c.EngageAssists = bestAssists;      // с чем шли в бой — по этому решим, отводить ли
         if (!best && matched && !_rejDiagDone)
         {
             _rejDiagDone = true;
@@ -7736,6 +8480,26 @@ public:
         mi.pos.Relocate(pos);
         mi.time = GameTime::GetGameTimeMS();
         c.Session->HandleMovementOpcode(CMSG_MOVE_SET_FACING, mi);
+    }
+
+    // ШАГ СПИНОЙ: идём назад, но смотрим на цель — иначе ядро отвергнет каждый замах
+    // (Unit::UpdateMeleeAttackingState требует IsWithinMeleeRange И HasInArc). Один пакет, как и
+    // обычный шаг: позиция сзади, ориентация на цель.
+    void StepBackFacing(Companion& c, Player* self, Position const& to, Unit* face, float dt)
+    {
+        float const speed = self->GetSpeed(MOVE_WALK) * 0.9f;   // пятимся медленнее, и это к лучшему:
+        float const go = std::min(speed * dt, self->GetExactDist2d(to.GetPositionX(), to.GetPositionY()));
+        if (go <= 0.05f)
+            return;
+        float const ang = self->GetAbsoluteAngle(to.GetPositionX(), to.GetPositionY());
+        float const nx = self->GetPositionX() + std::cos(ang) * go;
+        float const ny = self->GetPositionY() + std::sin(ang) * go;
+        float nz = self->GetMap()->GetHeight(self->GetPhaseShift(), nx, ny, self->GetPositionZ() + 2.0f);
+        if (nz <= INVALID_HEIGHT)
+            nz = self->GetPositionZ();
+        Position next(nx, ny, nz, self->GetAbsoluteAngle(face));    // ЛИЦОМ К ЦЕЛИ
+        SendMove(c, self, next, MOVEMENTFLAG_BACKWARD);
+        c.Moving = true;
     }
 
     void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
@@ -8382,12 +9146,18 @@ private:
     mutable bool _rejDiagDone = false;
     mutable bool _whyDone = false;
     uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
+    uint32 _flights = 0;                // сколько раз состав улетал
+    uint32 _otherTier = 0;              // сколько раз путь дался к цели на другом ярусе
     uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
     std::unordered_map<uint32, std::vector<uint32>> _creditedBy;
-    std::unordered_set<uint32> _spawnedSomewhere;   // виды, у которых есть хоть одна точка появления   // цель -> существа, чьи KillCredit на неё указывают
+    std::unordered_set<uint32> _spawnedSomewhere;   // виды, у которых есть хоть одна точка появления
+    // ГДЕ СТОЯТ ПОЛЁТНЫЕ МАСТЕРА — своя запись, потому что узел ядро выводит из их позиции.
+    struct FlightPoint { uint32 Entry; uint32 Faction; Position Where; };
+    std::unordered_map<uint32, std::vector<FlightPoint>> _flightMasters;   // карта -> где стоят
+    // цель -> существа, чьи KillCredit на неё указывают
     struct Mender { uint32 Entry; uint32 Faction; Position Where; bool Sells; bool Fixes; };
     struct Giver { uint32 Entry; uint32 Faction; Position Where; ObjectGuid::LowType SpawnId; };
     std::unordered_map<uint32, std::vector<Giver>> _givers;      // карта -> квестодатели по таблице
