@@ -176,16 +176,26 @@ inline constexpr std::array<RosterEntry, 122> Roster =
     { "Thornwick", RACE_WORGEN,               CLASS_WARLOCK,       GENDER_MALE },
     { "Ivelle",    RACE_WORGEN,               CLASS_MONK,          GENDER_FEMALE },
     { "Ravenna",   RACE_WORGEN,               CLASS_DRUID,         GENDER_FEMALE },
+    // ПАНДАРЕН — НЕЙТРАЛЬНЫЙ, И ЭТО РЕШАЕТ, ГДЕ ОН РОДИТСЯ (оператор, 2026-09-03: «панды где
+    // появились? если в шторме, надо править»).
+    //
+    // Появлялись в Штормграде, и ядро тут ни при чём: у расы 25 (пандарен Альянса) точка создания
+    // в playercreateinfo и есть Штормград — потому что это персонаж УЖЕ ВЫБРАВШИЙ фракцию, то есть
+    // прошедший Скитающийся остров. Настоящее начало у расы 24: карта 860, (1466, 3466, 182).
+    // Ошибка была в этой росписи, а не в данных.
+    //
+    // Рыцарь смерти остаётся расой 25: у нейтральной расы такого класса нет вовсе
+    // (playercreateinfo: у 24 классы 1,3,4,5,7,8,9,10, у 25 — те же плюс 6).
     // пандарен
-    { "Baoshen",   RACE_PANDAREN_ALLIANCE,    CLASS_WARRIOR,       GENDER_MALE },
-    { "Wenjun",    RACE_PANDAREN_ALLIANCE,    CLASS_HUNTER,        GENDER_MALE },
-    { "Meilin",    RACE_PANDAREN_ALLIANCE,    CLASS_ROGUE,         GENDER_FEMALE },
-    { "Liuwei",    RACE_PANDAREN_ALLIANCE,    CLASS_PRIEST,        GENDER_MALE },
+    { "Baoshen",   RACE_PANDAREN_NEUTRAL,     CLASS_WARRIOR,       GENDER_MALE },
+    { "Wenjun",    RACE_PANDAREN_NEUTRAL,     CLASS_HUNTER,        GENDER_MALE },
+    { "Meilin",    RACE_PANDAREN_NEUTRAL,     CLASS_ROGUE,         GENDER_FEMALE },
+    { "Liuwei",    RACE_PANDAREN_NEUTRAL,     CLASS_PRIEST,        GENDER_MALE },
     { "Xinyi",     RACE_PANDAREN_ALLIANCE,    CLASS_DEATH_KNIGHT,  GENDER_FEMALE },
-    { "Jinhua",    RACE_PANDAREN_ALLIANCE,    CLASS_SHAMAN,        GENDER_FEMALE },
-    { "Shenlong",  RACE_PANDAREN_ALLIANCE,    CLASS_MAGE,          GENDER_MALE },
-    { "Yunmei",    RACE_PANDAREN_ALLIANCE,    CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Taozi",     RACE_PANDAREN_ALLIANCE,    CLASS_MONK,          GENDER_FEMALE },
+    { "Jinhua",    RACE_PANDAREN_NEUTRAL,     CLASS_SHAMAN,        GENDER_FEMALE },
+    { "Shenlong",  RACE_PANDAREN_NEUTRAL,     CLASS_MAGE,          GENDER_MALE },
+    { "Yunmei",    RACE_PANDAREN_NEUTRAL,     CLASS_WARLOCK,       GENDER_FEMALE },
+    { "Taozi",     RACE_PANDAREN_NEUTRAL,     CLASS_MONK,          GENDER_FEMALE },
 }};
 }
 
