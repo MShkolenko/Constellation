@@ -1989,11 +1989,44 @@ public:
                             uint32(hostiles[i].second->GetLevel()),
                             uint32(hostiles[i].second->GetLevelForTarget(self)), hostiles[i].first,
                             i + 1 < hostiles.size() && i < 2 ? "; " : "");
+                    // КТО БИЛ — ИЗ СВОЕЙ ЖЕ ПАМЯТИ, А НЕ ИЗ ОСМОТРА ПОСЛЕ СМЕРТИ.
+                    //
+                    // Осмотр говорил «рядом враждебных 0 — никого» в 32 гибелях из 48, и это
+                    // читалось как «не бой». Журнал рядом говорил обратное: «ПОГИБ — у него 15%».
+                    // Разгадка в расстоянии: лагерь троллей на y≈318-360, а Бренна погибла на
+                    // y=452 — моб сбросил бой и ушёл домой раньше, чем прибор осмотрелся.
+                    // Осмотр мира после смерти в принципе не может назвать убийцу; c.TargetGuid
+                    // может, им же пользуется LogFightOutcome ниже.
+                    // НАША ЦЕЛЬ — это НАМЕРЕНИЕ, а не убийца (Кодекс): спутник мог её ещё не
+                    // ударить, а прилететь могло от второго моба или от обрыва. Кто именно бил и
+                    // чем кончилось, говорит соседняя строка БОЙ — она ведётся по ходу боя, а не
+                    // осмотром после смерти, и потому знает то, чего осмотр знать не может.
+                    std::string foe = "цели не было";
+                    if (Creature* t = ObjectAccessor::GetCreature(*self, c.TargetGuid))
+                        foe = Trinity::StringFormat("{} ({}, {:.0f} ярд, у него {:.0f}%)",
+                            t->GetName(), t->GetEntry(), self->GetExactDist(t), t->GetHealthPct());
+                    else if (!c.TargetGuid.IsEmpty())
+                        foe = "цель уже недоступна";
+
+                    // ОКРУЖЕНИЕ ТРУПА — именно окружение, а не причина урона (Кодекс).
+                    // Землю ищем от своего Z с запасом: трассировка от MAX_HEIGHT цепляет мост
+                    // или платформу НАД трупом и даёт отрицательную бессмыслицу. Ненайденную
+                    // поверхность (INVALID_HEIGHT) называем словом, а не числом в сто тысяч.
+                    ZLiquidStatus const liq = self->GetLiquidStatus();
+                    float const ground = self->GetMap()->GetHeight(self->GetPhaseShift(),
+                        self->GetPositionX(), self->GetPositionY(), self->GetPositionZ() + 2.0f);
+                    std::string const under = ground <= INVALID_HEIGHT
+                        ? std::string("земля не найдена")
+                        : Trinity::StringFormat("до земли {:.1f}", self->GetPositionZ() - ground);
+                    char const* water = (liq & LIQUID_MAP_UNDER_WATER) ? "под водой"
+                                      : (liq & LIQUID_MAP_IN_WATER)    ? "в воде"
+                                      : (liq & LIQUID_MAP_ABOVE_WATER) ? "над водой" : "без воды";
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ГИБЕЛЬ {} (ур {}): зона {}, место {:.0f} {:.0f} {:.0f}, "
-                        "гибелей в окне {}, рядом враждебных {} — {}",
+                        "цель модуля {}, {}, {}, гибелей в окне {}, рядом враждебных {} — {}",
                         self->GetName(), uint32(self->GetLevel()), self->GetZoneId(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
+                        foe, water, under,
                         uint32(c.DeathAt.size()), uint32(hostiles.size()),
                         who.empty() ? std::string("никого") : who);
                 }
@@ -5919,33 +5952,21 @@ public:
             if (!anyEnder && sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).begin()
                              == sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).end())
             {
-                // СЕЗОННОЕ И НЕЗАКРЫВАЕМОЕ — БРОСАЕМ, А НЕ ДЕРЖИМ (Кодекс: одного «не берём»
-                // мало, 55660 уже занимает слот у всех 122). Тем же опкодом, что шлёт клиент;
-                // ядро само откажет, если бросать нельзя (QUEST_FLAGS_EX_NO_ABANDON_ONCE_BEGUN).
-                // Условие узкое НАМЕРЕННО: и сезонный, и уже признанный незакрываемым.
+                // МОДУЛЬ НЕ БРОСАЕТ КВЕСТЫ — НИКАКИЕ (оператор, 2026-09-03).
                 //
-                // И НЕ РАЗДАВАЕМОЕ ЯДРОМ. Замер: 97 бросков 55660 за пятнадцать минут, ноль
-                // взятий модулем, 34 спутника всё равно держат его. Причина в ядре, не у нас:
-                // у квеста стоит QUEST_FLAGS_EX_AUTO_PUSH, а Player::PushQuests (Player.cpp:18609)
-                // раздаёт такие сама — из входа в мир, из повышения уровня и из
-                // Player::UpdateArea (Player.cpp:7560), то есть ПРИ КАЖДОЙ СМЕНЕ ПЛОЩАДИ.
-                // Спутник меняет площадь постоянно, поэтому эту гонку не выиграть по построению.
-                // Слот такой квест занимает (в журнале их 25), но цикл, поток пакетов и сотня
-                // строк в журнале на четверть часа исчезают.
-                if (SeasonalKind(quest) && !quest->IsAutoPush())
-                    for (uint16 slot2 = 0; slot2 < MAX_QUEST_LOG_SIZE; ++slot2)
-                        if (self->GetQuestSlotQuestId(slot2) == qid)
-                        {
-                            WorldPacket rawDrop(CMSG_QUEST_LOG_REMOVE_QUEST);
-                            WorldPackets::Quest::QuestLogRemoveQuest drop(std::move(rawDrop));
-                            drop.Entry = uint8(slot2);
-                            c.Session->HandleQuestLogRemoveQuest(drop);
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation: {} бросил сезонный квест {} '{}' — вне своего события он не закроется, а слот занимает{}",
-                                self->GetName(), qid, quest->GetLogTitle(),
-                                self->GetQuestStatus(qid) == QUEST_STATUS_NONE ? "" : " (ядро не дало)");
-                            break;
-                        }
+                // Здесь стоял единственный сброс: выполненный праздничный квест без принимающего.
+                // Условие было из пяти пунктов и подходило во всей базе к 227 квестам — заглушкам
+                // REUSE и <NYI>, подаркам праздников. Сработало оно за всё время РОВНО на одном,
+                // 55660 'Time Trials', 97 раз, и каждый раз ядро возвращало квест обратно, потому
+                // что раздаёт такие само (QUEST_FLAGS_EX_AUTO_PUSH, Player::PushQuests).
+                //
+                // После того как 55660 закрыли условием уровня в базе мира, живого случая у
+                // правила не осталось — остался только теоретический вред: выполненный праздничный
+                // квест, награду которого выдаёт сценарий, при сбросе потерял бы выполнение.
+                // Мёртвый код, умеющий разрушать прогресс, хуже отсутствия кода.
+                //
+                // Вместо сброса — пометка ниже. Спутник перестаёт ходить к такому квесту, журнал
+                // говорит почему, слот занят одним из двадцати пяти, и НИЧЕГО не разрушено.
                 if (c.Impossible.insert(qid).second)
                     TC_LOG_INFO("server.worldserver", "Constellation: {} — квест {} '{}' закрыть нечем: {}",
                         self->GetName(), qid, quest->GetLogTitle(),
