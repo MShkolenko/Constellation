@@ -376,6 +376,10 @@ struct Companion
     uint8 CorpseTries = 0;              // отказов подъёма у тела: две — и к целительнице
     bool GraveWalkNoted = false;        // строка «иду на кладбище» — раз на смерть
     float GraveWalkLast = 0.0f;         // расстояние до кладбища на прошлом такте: прогресс
+    bool HealerStepNoted = false;       // «застрял в N ярдах от целительницы» — раз на смерть
+    uint8 HealerRings = 0;              // поисков кольца у целительницы в этой смерти: не больше двух
+    Position HealerRefused;             // отвергнутая точка кольца — второму поиску её не предлагать
+    bool HealerRefusedSet = false;
     bool CorpseGaveUp = false;          // до тела не добежать или подъём не вышел
     bool RevivePicked = false;          // тихое место у тела выбрано
     Position RevivePos;                 // и вот оно
@@ -1687,6 +1691,8 @@ public:
                     ++_revived;
                     c.ReviveGaveUp = false;
                     c.GraveWalkNoted = false;
+                    c.HealerStepNoted = false;
+                    c.HealerRings = 0;
                     RepairIfBroken(self, "после смерти");
                     c.BrokenNoted = false;
                     c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
@@ -1774,10 +1780,58 @@ public:
 
         if (!self->IsWithinDistInMap(healer, INTERACTION_DISTANCE))
         {
-            StepToward(c, self, healer->GetPositionX(), healer->GetPositionY(),
-                healer->GetPositionZ(), 2.0f, dt);
-            if (c.Stalled)              // до целительницы не дойти — считаем это попыткой
-                c.ReviveTries += 5;
+            // К ЦЕЛИТЕЛЬНИЦЕ — КАК К ЛЮБОМУ NPC. Ядро пускает с GetCombatReach()+4
+            // (Player.cpp:1903). Пятеро стояли в десяти ярдах от целительницы Рэтчета и
+            // сдавались молча: шаг к её точке по сетке застревал — NPC часто стоят там, куда
+            // путь не строится. У модуля для этого есть свой ход, тот же, что у квестодателей:
+            // точка контакта -> застряли -> достижимая точка рядом (кольца 3/5/8 ярдов) -> шаг.
+            // Прямой ход мимо сетки здесь стоял и снят (оператор): это обход поломки, не починка.
+            float const toHealer = self->GetExactDist(healer);
+            // ДОШЛИ ДО ТОЧКИ КОЛЬЦА, А ДИСТАНЦИИ ВСЁ НЕТ — ТОЧКУ ОТПУСКАЕМ (Кодекс): иначе
+            // ApproachPoint вечно возвращает её, а StepToward тут же «приходит». Отсюда
+            // разрешён ещё один поиск, второй и последний на эту смерть.
+            if (c.RingHeld && c.ApproachFor == healer->GetGUID()
+                && self->GetExactDist2d(c.ApproachX, c.ApproachY) < 2.5f)
+            {
+                // достигнутая, но бесполезная точка — тоже отвергнутая (Кодекс): запомнить
+                // до того, как отпустить, иначе второй поиск предложит её же
+                c.HealerRefused.Relocate(c.ApproachX, c.ApproachY, c.ApproachZ);
+                c.HealerRefusedSet = true;
+                c.RingHeld = false;
+                if (c.HealerRings < 2)
+                    c.RingTried = false;
+            }
+            float ax, ay, az;
+            ApproachPoint(c, healer, self, ax, ay, az, ms);
+            StepToward(c, self, ax, ay, az, 2.0f, dt);
+            if (c.Stalled)
+            {
+                // ОТКАЗ УДЕРЖАННОЙ ТОЧКИ (Кодекс): застряли по дороге к самой точке кольца —
+                // значит, и она не годится; отпускаем, чтобы второй поиск не упёрся в неё же.
+                if (c.RingHeld && c.ApproachFor == healer->GetGUID())
+                {
+                    c.HealerRefused.Relocate(c.ApproachX, c.ApproachY, c.ApproachZ);
+                    c.HealerRefusedSet = true;
+                    c.RingHeld = false;
+                    if (c.HealerRings < 2)
+                        c.RingTried = false;
+                }
+                if (!c.HealerStepNoted)
+                {
+                    c.HealerStepNoted = true;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: до целительницы {} ({:.1f} ярдов) шаг по сетке застрял — ищу точку рядом",
+                        self->GetName(), healer->GetName(), toHealer);
+                }
+                if (c.HealerRings < 2 && !c.RingTried)
+                {
+                    ++c.HealerRings;
+                    if (FindReachableApproach(c, self, healer,
+                                              c.HealerRefusedSet ? &c.HealerRefused : nullptr))
+                        return;         // точка нашлась и удержана — следующий такт шагнёт к ней
+                }
+                c.ReviveTries += 5;     // колец нет или они исчерпаны — находка о карте, считаем попыткой
+            }
             return;
         }
 
@@ -1806,6 +1860,8 @@ public:
             c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
             // и не возвращаться к убийце на половине здоровья — сперва отдышаться
             c.GraveWalkNoted = false;
+            c.HealerStepNoted = false;
+            c.HealerRings = 0;
             Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
             TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
                 self->GetName());
@@ -2012,6 +2068,14 @@ public:
                 c.DeathCounted = true;
                 uint32 const nowMs = GameTime::GetGameTimeMS();
                 c.DeathAt.push_back(nowMs);
+                // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать
+                // в момент самого перехода, а не по косвенным признакам в ветке воскрешения.
+                c.RingHeld = false;
+                c.RingTried = false;
+                c.ApproachFor.Clear();
+                c.HealerRings = 0;
+                c.HealerRefusedSet = false;
+                c.HealerStepNoted = false;
 
                 // ГДЕ И ОТ КОГО — ПИШЕМ КАЖДУЮ ГИБЕЛЬ, ПОКА НЕ ЗНАЕМ ПРИЧИНЫ.
                 //
@@ -7251,7 +7315,8 @@ public:
         return self->GetExactDist(target);
     }
 
-    bool FindReachableApproach(Companion& c, Player* self, WorldObject const* target)
+    bool FindReachableApproach(Companion& c, Player* self, WorldObject const* target,
+                               Position const* avoid = nullptr)
     {
         if (c.RingTried || !target)
             return false;
@@ -7266,6 +7331,10 @@ public:
                 float const y = target->GetPositionY() + std::sin(a) * r;
                 if (!MapManager::IsValidMapCoord(self->GetMapId(), x, y))
                     continue;
+                // ОТВЕРГНУТУЮ ТОЧКУ НЕ ПРЕДЛАГАТЬ СНОВА (Кодекс): поиск детерминирован, и без
+                // этого второй проход из той же позиции вернул бы ту же точку.
+                if (avoid && avoid->GetExactDist2d(x, y) < 2.5f)
+                    continue;           // 2.5, не 2.0: соседи между кольцами 3 и 5 стоят ровно на 2.0
                 float const z = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y,
                                                           target->GetPositionZ() + 3.0f, true, 20.0f);
                 if (z <= INVALID_HEIGHT)
@@ -7727,6 +7796,11 @@ public:
             if (Bag* bag = self->GetBagByPos(b))
                 for (uint32 j = 0; j < GetBagSize(bag); ++j)
                     look(GetItemInBag(bag, j));
+        // РЫЦАРЬ СМЕРТИ: ЗНАЕТ ЛИ 51769. Последнее звено цепочки 12619 — заклинание по кузнице;
+        // предмет 38145 источником не оказался, а character_spell на этом ядре пуста, поэтому
+        // спросить можно только у ядра в памяти. Одно слово в уже существующей строке.
+        if (self->GetClass() == CLASS_DEATH_KNIGHT)
+            wardrobe += Trinity::StringFormat("51769: {}; ", self->HasSpell(51769) ? "знает" : "не знает");
         if (!wardrobe.empty())
             TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
                 self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
