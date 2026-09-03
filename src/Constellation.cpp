@@ -1733,7 +1733,15 @@ public:
             // которым оно нас переносило (GetClosestGraveyard), и идём пешком: призрак
             // быстр, и его никто не трогает. Дорога не считается попыткой — счётчик
             // остаётся для настоящей беды: на кладбище, а целительницы в 60 ярдах нет.
-            WorldSafeLocsEntry const* grave = sObjectMgr->GetClosestGraveyard(*self, self->GetTeam(), self);
+            // ОТ ТРУПА, А НЕ ОТ СЕБЯ. Ядро выбирает кладбище от места смерти и при отпускании
+            // духа (RepopAtGraveyard), и у целительницы (SendSpiritResurrect: corpseGrave).
+            // Призрак, забредший в тупик по дороге к телу, от СВОЕЙ позиции выбирал другое
+            // кладбище — за водой, на другом ярусе, — до которого пути нет; трое ходили так
+            // дважды подряд. От трупа выбирается то, куда его телепортировали, — и потому оно
+            // гораздо вероятнее достижимо. Обратная достижимость при этом НЕ доказана (Кодекс):
+            // навмеш бывает несвязным по ярусам и воде, а путь вперёд мог включать падение.
+            WorldLocation const from = self->HasCorpse() ? self->GetCorpseLocation() : WorldLocation(*self);
+            WorldSafeLocsEntry const* grave = sObjectMgr->GetClosestGraveyard(from, self->GetTeam(), self);
             if (!grave || grave->Loc.GetMapId() != self->GetMapId())
                 return;                 // кладбища на этой карте ядро не знает — ждём как прежде
             float const toGrave = self->GetExactDist2d(grave->Loc.GetPositionX(), grave->Loc.GetPositionY());
@@ -1745,8 +1753,10 @@ public:
                 c.GraveWalkLast = toGrave;
                 c.Stalled = false;      // новое намерение — как в 5459: прежний тупик не наш
                 TC_LOG_INFO("server.worldserver",
-                    "Constellation ТЕЛО {}: целительницы нет в 60 ярдах — иду на кладбище {} ({:.0f} ярдов)",
-                    self->GetName(), grave->ID, toGrave);
+                    "Constellation ТЕЛО {}: целительницы нет в 60 ярдах — иду на кладбище {} ({:.0f} ярдов); "
+                    "труп на карте {} в {:.0f} {:.0f} {:.0f}",
+                    self->GetName(), grave->ID, toGrave, from.GetMapId(),
+                    from.GetPositionX(), from.GetPositionY(), from.GetPositionZ());
             }
             // ПРОГРЕСС — ПО РАССТОЯНИЮ, НЕ ПО ФЛАГУ. c.Stalled липкий: его ставят застревание
             // и неудачный поиск пути, а снимают только «дошёл» и «новое намерение» — ни того,
