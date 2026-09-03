@@ -7377,13 +7377,18 @@ public:
 
     // УЗНАТЬ ПОЛЁТНУЮ ТОЧКУ У МАСТЕРА, МИМО КОТОРОГО ПРОХОДИМ.
     //
-    // Игрок, впервые подошедший к полётному мастеру, получает точку одним щелчком по пункту
-    // беседы — и дальше может к ней летать. Спутники этого не делали ни разу, поэтому их сеть
-    // узлов навсегда оставалась стартовой, а любая дальняя цель упиралась в пеший бюджет.
+    // Игрок, впервые подошедший к полётному мастеру, получает точку — и дальше может к ней
+    // летать. Спутники этого не делали ни разу, поэтому их сеть узлов навсегда оставалась
+    // стартовой, а любая дальняя цель упиралась в пеший бюджет.
     //
-    // Пункт выбирается НЕ ПО ПОРЯДКУ И НЕ ПО ТЕКСТУ, а по его типу: OptionNpc == Taxinode. Этот
-    // тип обработчик ведёт ровно в SendLearnNewTaxiNode и никуда больше — ни денег, ни
-    // сценариев, ни переходов. Никакого перебора пунктов, о котором предупреждал разбор.
+    // ПУТЬ — СВОЙ ОПКОД, А НЕ БЕСЕДА, и это поправка по замеру. Первая редакция искала пункт
+    // беседы с OptionNpc == Taxinode; на боевом это дало семь разговоров и НОЛЬ узнанных точек,
+    // потому что у большинства мастеров меню беседы нет вовсе. У клиента для этого есть
+    // отдельная посылка, и обработчик делает ровно то, что нужно:
+    //
+    //     CMSG_ENABLE_TAXI_NODE -> HandleEnableTaxiNodeOpcode (TaxiHandler.cpp:35)
+    //         -> GetNPCIfCanInteractWith(..., UNIT_NPC_FLAG_FLIGHTMASTER)
+    //         -> SendLearnNewTaxiNode(unit)          // и вот он ставит бит в маске
     //
     // Дёшево: обзор раз в тридцать секунд и только когда спутник свободен, и только если ядро
     // уже разрешает с мастером говорить (тот же вопрос, что задаёт обработчик такси).
@@ -7412,53 +7417,14 @@ public:
             if (!node || self->m_taxi.IsTaximaskNodeKnown(node))
                 { c.TaxiDone.insert(cr->GetGUID()); continue; }   // узел наш — вопрос закрыт навсегда
 
-            // разговор теми же двумя пакетами, что шлёт клиент
-            WorldPacket rawHello(CMSG_TALK_TO_GOSSIP);
-            WorldPackets::NPC::Hello hello(std::move(rawHello));
-            hello.Unit = cr->GetGUID();
-            c.Session->HandleGossipHelloOpcode(hello);
-
-            // ТОЧКА УЗНАЁТСЯ УЖЕ НА ПРИВЕТСТВИИ, И ЭТО СТРОКА ЯДРА, А НЕ ДОГАДКА.
-            //
-            //     case GossipOptionNpc::Taxinode:
-            //         if (GetSession()->SendLearnNewTaxiNode(creature))
-            //             return;                       <-- Player.cpp:13825
-            //
-            // То есть Hello сам ставит бит в маске, а подготовка меню на этом ЗАВЕРШАЕТСЯ — и
-            // пункта в меню уже нет. Первая редакция искала пункт, не находила и записывала
-            // «нет пункта»: на боевом это дало два таких отказа и ноль узнанных точек, хотя
-            // ядро их, вероятно, и выдало. Спрашиваем маску сразу после приветствия.
-            if (self->m_taxi.IsTaximaskNodeKnown(node))
-            {
-                c.TaxiDone.insert(cr->GetGUID());
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation ПОЛЁТ {}: у {} ({}) точка {} узнана на приветствии; всего точек {}",
-                    self->GetName(), cr->GetName(), cr->GetEntry(), node, KnownTaxiNodes(self));
-                return;
-            }
-
-            GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
-            int32 pick = -1;
-            for (GossipMenuItem const& item : menu.GetMenuItems())
-                if (item.OptionNpc == GossipOptionNpc::Taxinode && !item.BoxCoded && item.BoxMoney == 0)
-                    { pick = item.GossipOptionID; break; }
-            if (pick < 0)
-            {
-                // ПУНКТА НЕТ — ЭТО МОЖЕТ БЫТЬ ВРЕМЕННЫМ (Кодекс): фаза, квест, состояние меню.
-                // Поэтому срок, а не приговор; и проход на этом заканчивается — мы уже говорили.
-                c.TaxiRetry[cr->GetGUID()] = 600000;
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation ПОЛЁТ {}: у {} ({}) нет пункта «узнать точку» — пробую через десять минут",
-                    self->GetName(), cr->GetName(), cr->GetEntry());
-                return;
-            }
-
-            WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
-            WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
-            sel.GossipUnit = cr->GetGUID();
-            sel.GossipID = menu.GetMenuId();
-            sel.GossipOptionID = pick;
-            c.Session->HandleGossipSelectOptionOpcode(sel);
+            // СВОЙ ОПКОД, А НЕ БЕСЕДА (ядро, TaxiHandler.cpp:35): у большинства мастеров меню
+            // беседы нет, и пункт «узнать точку» искать негде — отсюда семь «нет пункта» и ноль
+            // узнанных на замере. Клиент для этого шлёт CMSG_ENABLE_TAXI_NODE, а обработчик сам
+            // проверяет, что перед нами полётный мастер, и зовёт SendLearnNewTaxiNode.
+            WorldPacket raw(CMSG_ENABLE_TAXI_NODE);
+            WorldPackets::Taxi::EnableTaxiNode enable(std::move(raw));
+            enable.Unit = cr->GetGUID();
+            c.Session->HandleEnableTaxiNodeOpcode(enable);
 
             bool const got = self->m_taxi.IsTaximaskNodeKnown(node);
             if (got)
@@ -7468,7 +7434,7 @@ public:
             TC_LOG_INFO("server.worldserver",
                 "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}; всего точек {}",
                 self->GetName(), cr->GetName(), cr->GetEntry(), node,
-                got ? "узнана выбором пункта" : "не далась", KnownTaxiNodes(self));
+                got ? "узнана" : "ядро не дало", KnownTaxiNodes(self));
             return;                     // по одному мастеру за проход
         }
     }
@@ -7665,13 +7631,36 @@ public:
         // очередь не дошла, не говорит ничего. Здесь по каждой ненадетой вещи из сумок: что
         // это, куда встаёт, и чей именно ответ её остановил.
         std::string wardrobe;
-        uint32 gearSeen = 0;
+        uint32 gearSeen = 0, toolsSeen = 0;
         auto look = [&](Item* it)
         {
-            if (!it || it->IsEquipped() || !it->GetTemplate() || gearSeen >= 6)
+            if (!it || it->IsEquipped() || !it->GetTemplate())
                 return;
             ItemTemplate const* tpl = it->GetTemplate();
             if (tpl->GetClass() != ITEM_CLASS_WEAPON && tpl->GetClass() != ITEM_CLASS_ARMOR)
+            {
+                // НЕ ОДЕЖДА — НО МОЖЕТ БЫТЬ ИНСТРУМЕНТОМ. Предмет с единственным заклинанием
+                // «при использовании» — это то, чем закрывают цели, которых не закрыть боем.
+                // Печатаем его вместе с заклинанием и с существом, которое это заклинание
+                // называет целью: сведения о заклинании предмета живут в клиентских данных, и
+                // спросить их можно только отсюда.
+                uint32 const useSpell = UseSpellOf(it);
+                if (!useSpell || toolsSeen >= 4)
+                    return;
+                ++toolsSeen;
+                std::string names;
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell, DIFFICULTY_NONE))
+                    for (SpellEffectInfo const& eff : si->GetEffects())
+                        if (eff.ImplicitTargetConditions)
+                            for (Condition const& cond : *eff.ImplicitTargetConditions)
+                                if (UnitEntryCondition(cond, 0))
+                                    names += std::to_string(cond.ConditionValue2) + " ";
+                wardrobe += Trinity::StringFormat("инструмент {} (кл.{}/{}) закл. {}{}{}; ",
+                    it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()), useSpell,
+                    names.empty() ? "" : " по существу ", names);
+                return;
+            }
+            if (gearSeen >= 6)       // предел одежды — только для одежды: у инструментов свой
                 return;
             ++gearSeen;
             // СЛОТ БЕРЁМ ИЗ ОТВЕТА ЯДРА (Кодекс): FindEquipSlot отвечает на свой вопрос, а
@@ -7708,9 +7697,25 @@ public:
         TC_LOG_INFO("server.worldserver",
         // ПЛОЩАДЬ, А НЕ ТОЛЬКО ЗОНА: ауры по местности ядро вешает по ПЛОЩАДИ
             // (Player::UpdateAreaDependentAuras), и призванный принимающий держится именно ими.
-            "Constellation ПРОСТОЙ {} (ур. {}, зона {}, площадь {}, полётных точек {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
-            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), self->GetAreaId(),
+            "Constellation ПРОСТОЙ {} (ур. {}, зона {} «{}», площадь {}, полётных точек {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
+            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), ZoneName(self->GetZoneId()),
+            self->GetAreaId(),
             KnownTaxiNodes(self), printed, waiting.empty() ? "-" : waiting);
+    }
+
+    // ---------------------------------------------------------------- имя зоны из ядра
+    // Имени зоны нет в базе мира: оно живёт в клиентском AreaTable, который ядро уже загрузило.
+    // Спрашиваем ровно так же, как спрашивает само ядро. Русское имя, если оно есть в данных,
+    // иначе английское — обе локали грузятся из data/dbc, если каталоги на месте.
+    static std::string ZoneName(uint32 zoneId)
+    {
+        AreaTableEntry const* area = sAreaTableStore.LookupEntry(zoneId);
+        if (!area)
+            return "?";
+        char const* name = area->AreaName[LOCALE_ruRU];
+        if (!name || !*name)
+            name = area->AreaName[LOCALE_enUS];
+        return name && *name ? name : "?";
     }
 
     // ---------------------------------------------------------------- квестодатель по карте
