@@ -306,6 +306,9 @@ struct Companion
     ObjectGuid DamageVictim;            // по кому ведём счёт урона
     uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
     uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
+    uint32 TaxiScanMs = 0;              // когда снова смотреть, нет ли рядом полётного мастера
+    std::set<ObjectGuid> TaxiDone;      // у кого точка получена или уже была — навсегда
+    std::map<ObjectGuid, uint32> TaxiRetry;   // а неудача — со сроком: условия бывают временными
     uint32 EnderScanMs = 0;             // когда искать заново
     uint32 LiveEnderMs = 0;             // и когда искать ЖИВОГО принимающего без точки появления
     uint32 IdleScanMs = 0;              // «стою» не перебирает мир на каждом такте
@@ -363,7 +366,8 @@ struct Companion
     uint8 ToolFruitless = 0;            // применений подряд без зачёта (предохранитель)
     uint32 EquipScanMs = 0;             // когда снова смотреть сумки на предмет обновок
     uint32 Equipped = 0;                // сколько вещей надето за жизнь
-    std::map<std::pair<ObjectGuid, uint8>, uint32> EquipRefused;   // предмет+слот -> сколько ещё не пробовать, мс
+    std::map<std::pair<ObjectGuid, uint8>, uint32> EquipRefused;
+    ObjectGuid WeaponWas;               // что было в руках: сменилось — отказы пересматриваем   // предмет+слот -> сколько ещё не пробовать, мс
     std::map<ObjectGuid, uint32> SellRefused;   // предмет, который ядро отказалось купить -> мс до новой попытки
     std::map<uint32, uint32> VendorNoSell;      // вид торговца, отказавшего во всём -> мс, пока он не продавец
     // ОЖИДАНИЕ ЗАЧЁТА ПОСЛЕ ПОПЫТКИ (Кодекс о применении предметов): заклинание бывает с
@@ -1734,6 +1738,10 @@ public:
             c.FollowCooldownMs = (c.FollowCooldownMs <= diff) ? 0 : c.FollowCooldownMs - diff;
         if (c.EnderScanMs)
             c.EnderScanMs = (c.EnderScanMs <= diff) ? 0 : c.EnderScanMs - diff;
+        if (c.TaxiScanMs)
+            c.TaxiScanMs = (c.TaxiScanMs <= diff) ? 0 : c.TaxiScanMs - diff;
+        for (auto it = c.TaxiRetry.begin(); it != c.TaxiRetry.end();)
+            if (it->second <= diff) it = c.TaxiRetry.erase(it); else { it->second -= diff; ++it; }
         if (c.LiveEnderMs)
             c.LiveEnderMs = (c.LiveEnderMs <= diff) ? 0 : c.LiveEnderMs - diff;
         if (c.IdleScanMs)
@@ -2109,6 +2117,7 @@ public:
                 {
                     TouchAreaTriggers(c, self);
                     ReconcileLateCredit(c, self);   // поздний рост счётчика — до любого нового «бесплодно»
+                    LearnTaxiNode(c, self);         // мимо полётного мастера не проходим молча
                 }
 
                 // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
@@ -4222,6 +4231,107 @@ public:
         return tpl->GetSellPrice() ? SellVerdict::Sell : SellVerdict::Unsellable;
     }
 
+    // СЕЗОННОЕ — ПО СОРТИРОВКЕ КВЕСТА, А НЕ ПО ПРЕДИКАТУ ЯДРА (замер, 2026-09-03).
+    //
+    // Quest::IsSeasonal() требует ещё и «не повторяемый», а еженедельным ядро ставит
+    // повторяемость само (ObjectMgr.cpp:4799) — поэтому «Time Trials» (сортировка -22, флаг
+    // еженедельного) сезонным для него не является, и первая редакция этой правки не сработала
+    // вовсе. Берём тот же список сортировок, что перечислен в ядре, без оговорки.
+    static bool SeasonalKind(Quest const* q)
+    {
+        switch (-q->GetZoneOrSort())
+        {
+            case QUEST_SORT_SEASONAL:
+            case QUEST_SORT_SPECIAL:
+            case QUEST_SORT_LUNAR_FESTIVAL:
+            case QUEST_SORT_MIDSUMMER:
+            case QUEST_SORT_BREWFEST:
+            case QUEST_SORT_LOVE_IS_IN_THE_AIR:
+            case QUEST_SORT_NOBLEGARDEN:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ГОДИТСЯ ЛИ ВЕЩЬ ЭТОМУ ПЕРСОНАЖУ ВООБЩЕ — те же два вопроса, что задаёт продажа, вынесены
+    // отдельно, потому что теперь их задаёт и выбор награды. Проверка по шаблону отвечает за
+    // класс, расу, фракцию и требуемое заклинание, но НЕ за навык подкласса оружия и не за тип
+    // брони: это делает перегрузка по предмету, которой у награды ещё нет — предмета не
+    // существует, пока его не выдали.
+    bool UsableKind(Player* self, ItemTemplate const* tpl) const
+    {
+        if (!tpl)
+            return false;
+        if (self->CanUseItem(tpl, /*skipRequiredLevelCheck=*/true) != EQUIP_ERR_OK)
+            return false;
+        if (tpl->GetClass() == ITEM_CLASS_WEAPON)
+            if (uint32 const skill = tpl->GetSkill())
+                if (!sDB2Manager.GetSkillRaceClassInfo(skill, self->GetRace(), self->GetClass()))
+                    return false;
+        if (tpl->GetClass() == ITEM_CLASS_ARMOR && tpl->GetInventoryType() != INVTYPE_CLOAK)
+            if (ChrClassesEntry const* cls = sChrClassesStore.LookupEntry(self->GetClass()))
+                if ((cls->ArmorTypeMask & 0x21u) == 0x21u
+                    && !(cls->ArmorTypeMask & (1u << tpl->GetSubClass())))
+                    return false;
+        return true;
+    }
+
+    // КАКУЮ НАГРАДУ ВЫБРАТЬ, КОГДА ПРЕДЛАГАЮТ НЕСКОЛЬКО (оператор, 2026-09-03).
+    //
+    // Раньше бралась первая из списка — не выбор, а заглушка, чтобы ядро не отвергло сдачу с
+    // нулём. Игрок смотрит иначе: годится ли вещь ему по классу, встанет ли она в слот, и лучше
+    // ли того, что там уже надето. Ровно это и спрашиваем; уровень предмета берём у ядра
+    // (ItemTemplate::GetBaseItemLevel), а не выводим из цены. Ничего годного — берём самое
+    // дорогое: его продадут.
+    uint32 PickReward(Player* self, Quest const* quest, LootItemType* typeOut) const
+    {
+        uint32 const count = quest->GetRewChoiceItemsCount();
+        if (typeOut)
+            *typeOut = LootItemType::Item;
+        if (!count)
+            return 0;
+        uint32 best = 0, bestScore = 0, bestPrice = 0;
+        uint32 dearest = 0, dearestPrice = 0, first = 0;
+        for (uint32 i = 0; i < count && i < QUEST_REWARD_CHOICES_COUNT; ++i)
+        {
+            // ЗАПАСНОЙ ПУТЬ ТОЖЕ ОБЯЗАН БЫТЬ ПРЕДМЕТОМ (Кодекс): среди наград бывают валюты, а
+            // пакет уходит с типом «предмет» — несовпадение ядро отвергнет.
+            if (!quest->RewardChoiceItemId[i] || quest->RewardChoiceItemType[i] != LootItemType::Item)
+                continue;
+            if (!first)
+                first = quest->RewardChoiceItemId[i];
+            ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[i]);
+            if (!tpl)
+                continue;
+            uint32 const price = tpl->GetSellPrice();
+            if (price > dearestPrice)
+                { dearestPrice = price; dearest = quest->RewardChoiceItemId[i]; }
+            if (!UsableKind(self, tpl) || tpl->GetInventoryType() == INVTYPE_NON_EQUIP)
+                continue;
+            // НАСКОЛЬКО ЭТО ЛУЧШЕ НАДЕТОГО — ПО ХУДШЕМУ ИЗ ПОДХОДЯЩИХ СЛОТОВ (Кодекс). У колец и
+            // аксессуаров слота два, и новое меняет ХУДШЕЕ; максимум по виду слота отверг бы
+            // годное кольцо из-за второго, хорошего. Пустой подходящий слот — всегда улучшение.
+            // Сравниваем уровень ШАБЛОНА с уровнем ШАБЛОНА надетого: награды ещё не существует,
+            // её масштабирование неизвестно, и мерить её базовый уровень против действующего
+            // уровня надетого значило бы сравнивать разные величины.
+            uint32 worn = 0xFFFFFFFF;
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item* have = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                if (have && have->GetTemplate()->GetInventoryType() == tpl->GetInventoryType())
+                    worn = std::min(worn, have->GetTemplate()->GetBaseItemLevel());
+            }
+            if (worn == 0xFFFFFFFF)
+                worn = 0;                       // такого слота не занято — надеть некуда мешать
+            uint32 const mine = tpl->GetBaseItemLevel();
+            uint32 const score = mine > worn ? (mine - worn) + 1000 : 1;    // апгрейд впереди всего
+            if (score > bestScore || (score == bestScore && price > bestPrice))
+                { bestScore = score; bestPrice = price; best = quest->RewardChoiceItemId[i]; }
+        }
+        return best ? best : (dearest ? dearest : first);
+    }
+
     // СКОЛЬКО СТОПОК ПРАВИЛО ПРОДАЛО БЫ — повод идти к торговцу, не дожидаясь полных сумок.
     uint32 SellableCount(Companion const& c, Player* self) const
     {
@@ -5200,6 +5310,11 @@ public:
             Quest const* q = sObjectMgr->GetQuestTemplate(qid);
             if (!q || !self->CanTakeQuest(q, false))
                 continue;
+            // СЕЗОННОЕ — НЕ НАША РАБОТА (оператор, 2026-09-03: «это категория сезонных квестов,
+            // нас такое сейчас не интересует»). Признак — сортировка квеста; таких в базе 422,
+            // и вне своего события они висят в журнале мёртвым грузом, как 55660 у всех 122.
+            if (SeasonalKind(q))
+                continue;
             ++offered;
             uint8 const colour = QuestColour(self, q);
             if (colour == 4)
@@ -5399,9 +5514,28 @@ public:
             if (!anyEnder && sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).begin()
                              == sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).end())
             {
+                // СЕЗОННОЕ И НЕЗАКРЫВАЕМОЕ — БРОСАЕМ, А НЕ ДЕРЖИМ (Кодекс: одного «не берём»
+                // мало, 55660 уже занимает слот у всех 122). Тем же опкодом, что шлёт клиент;
+                // ядро само откажет, если бросать нельзя (QUEST_FLAGS_EX_NO_ABANDON_ONCE_BEGUN).
+                // Условие узкое НАМЕРЕННО: и сезонный, и уже признанный незакрываемым.
+                if (SeasonalKind(quest))
+                    for (uint16 slot2 = 0; slot2 < MAX_QUEST_LOG_SIZE; ++slot2)
+                        if (self->GetQuestSlotQuestId(slot2) == qid)
+                        {
+                            WorldPacket rawDrop(CMSG_QUEST_LOG_REMOVE_QUEST);
+                            WorldPackets::Quest::QuestLogRemoveQuest drop(std::move(rawDrop));
+                            drop.Entry = uint8(slot2);
+                            c.Session->HandleQuestLogRemoveQuest(drop);
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation: {} бросил сезонный квест {} '{}' — вне своего события он не закроется, а слот занимает{}",
+                                self->GetName(), qid, quest->GetLogTitle(),
+                                self->GetQuestStatus(qid) == QUEST_STATUS_NONE ? "" : " (ядро не дало)");
+                            break;
+                        }
                 if (c.Impossible.insert(qid).second)
-                    TC_LOG_INFO("server.worldserver", "Constellation: {} — квест {} '{}' закрыть нечем: ни принимающего, ни флага самосдачи",
-                        self->GetName(), qid, quest->GetLogTitle());
+                    TC_LOG_INFO("server.worldserver", "Constellation: {} — квест {} '{}' закрыть нечем: {}",
+                        self->GetName(), qid, quest->GetLogTitle(),
+                        SeasonalKind(quest) ? "сезонный, вне своего события" : "ни принимающего, ни флага самосдачи");
             }
         }
         return false;
@@ -5595,16 +5729,19 @@ public:
         WorldPackets::Quest::QuestGiverChooseReward pick(std::move(rawPick));
         pick.QuestGiverGUID = ender ? ender->GetGUID() : self->GetGUID();
         pick.QuestID = c.TurnInQuest;
-        // если квест предлагает выбор, берём ПЕРВУЮ настоящую награду, а не ноль:
-        // с нулём ядро откажет, и спутник вернётся сюда через секунду (Кодекс)
-        pick.Choice.Item.ItemID = quest->GetRewChoiceItemsCount() > 0 ? quest->RewardChoiceItemId[0] : 0;
-        pick.Choice.LootItemType = LootItemType::Item;
+        // ВЫБОР НАГРАДЫ — ОСМЫСЛЕННЫЙ (оператор): годное по классу и лучшее для слота, при
+        // равенстве — дороже; ничего годного — самое дорогое, его продадут.
+        LootItemType rewardType = LootItemType::Item;
+        uint32 const reward = PickReward(self, quest, &rewardType);
+        pick.Choice.Item.ItemID = reward;
+        pick.Choice.LootItemType = rewardType;
         c.Session->HandleQuestgiverChooseRewardOpcode(pick);
 
         if (self->IsQuestRewarded(c.TurnInQuest))
         {
-            TC_LOG_INFO("server.worldserver", "Constellation: {} сдал квест {} '{}' (уровень {})",
-                self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()));
+            TC_LOG_INFO("server.worldserver", "Constellation: {} сдал квест {} '{}' (уровень {}){}",
+                self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()),
+                reward ? Trinity::StringFormat(", выбрал награду {} из {}", reward, quest->GetRewChoiceItemsCount()) : "");
             ++_questsTurnedIn;
             return true;
         }
@@ -5981,6 +6118,16 @@ public:
     // Одна обновка за проход — проход дешёвый, но незачем делать его тяжёлым.
     bool EquipUpgrades(Companion& c, Player* self)
     {
+        // ОРУЖИЕ СМЕНИЛОСЬ — ОТКАЗЫ УСТАРЕЛИ (Кодекс). Главный из них, «двуручное в руках»,
+        // снимается ровно этим; ждать десяти минут после смены оружия незачем.
+        Item* const inHand = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        ObjectGuid const nowHand = inHand ? inHand->GetGUID() : ObjectGuid::Empty;
+        if (nowHand != c.WeaponWas)
+        {
+            c.WeaponWas = nowHand;
+            c.EquipRefused.clear();
+        }
+
         auto consider = [&](Item* item) -> bool
         {
             if (!item || item->IsBroken())
@@ -6030,10 +6177,16 @@ public:
                 // ВРЕМЕННОЕ — ЭТО СОСТОЯНИЕ, А НЕ СВОЙСТВО ПРЕДМЕТА (Кодекс): бой, каст,
                 // оглушение, откат оружия, полные сумки — и «двуручное в руках», которое
                 // снимается сменой оружия, а не уровнем. Такое не запоминаем вовсе.
+                // «ДВУРУЧНОЕ В РУКАХ» ВЫНЕСЕНО ИЗ ВРЕМЕННЫХ — ЗАМЕР ЗАСТАВИЛ. За восемь часов
+                // 1226 строк надевания, из них 1225 — этот самый код по ОДНОМУ предмету у двух
+                // магов с посохами. Он действительно снимается сменой оружия, но держится
+                // ровно столько, сколько носится посох, то есть часами: как «временное» он
+                // означал попытку каждые тридцать секунд без единого шанса. Помним десять
+                // минут, как прочие отказы, — сменивший оружие подождёт их и наденет.
                 bool const transient = can == EQUIP_ERR_NOT_WHILE_DISARMED || can == EQUIP_ERR_CLIENT_LOCKED_OUT
                     || can == EQUIP_ERR_NOT_DURING_ARENA_MATCH || can == EQUIP_ERR_GENERIC_STUNNED
                     || can == EQUIP_ERR_NOT_IN_COMBAT || can == EQUIP_ERR_ITEM_COOLDOWN
-                    || can == EQUIP_ERR_2HANDED_EQUIPPED || can == EQUIP_ERR_INV_FULL;
+                    || can == EQUIP_ERR_INV_FULL;
                 if (!transient)
                     c.EquipRefused[{ item->GetGUID(), dst }] = 600000;
                 TC_LOG_INFO("server.worldserver",
@@ -6700,6 +6853,99 @@ public:
         return gate ? "не классифицировано" : "иное";
     }
 
+    // УЗНАТЬ ПОЛЁТНУЮ ТОЧКУ У МАСТЕРА, МИМО КОТОРОГО ПРОХОДИМ.
+    //
+    // Игрок, впервые подошедший к полётному мастеру, получает точку одним щелчком по пункту
+    // беседы — и дальше может к ней летать. Спутники этого не делали ни разу, поэтому их сеть
+    // узлов навсегда оставалась стартовой, а любая дальняя цель упиралась в пеший бюджет.
+    //
+    // Пункт выбирается НЕ ПО ПОРЯДКУ И НЕ ПО ТЕКСТУ, а по его типу: OptionNpc == Taxinode. Этот
+    // тип обработчик ведёт ровно в SendLearnNewTaxiNode и никуда больше — ни денег, ни
+    // сценариев, ни переходов. Никакого перебора пунктов, о котором предупреждал разбор.
+    //
+    // Дёшево: обзор раз в тридцать секунд и только когда спутник свободен, и только если ядро
+    // уже разрешает с мастером говорить (тот же вопрос, что задаёт обработчик такси).
+    void LearnTaxiNode(Companion& c, Player* self)
+    {
+        if (c.TaxiScanMs)
+            return;
+        // РАЗБРОС ОБЯЗАТЕЛЕН (Кодекс): без него весь состав отсчитывает одинаковые тридцать
+        // секунд от общего старта и обходит сетку одним залпом.
+        c.TaxiScanMs = 30000 + (c.Guid.GetCounter() % 17) * 1000;
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 30.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
+        Cell::VisitGridObjects(self, searcher, 30.0f);
+        for (Creature* cr : around)
+        {
+            if (!cr->IsAlive() || !cr->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER))
+                continue;
+            if (c.TaxiDone.count(cr->GetGUID()) || c.TaxiRetry.count(cr->GetGUID()))
+                continue;
+            // ЯДРО РЕШАЕТ, БЛИЗКО ЛИ. Тот же вопрос, что задаёт HandleActivateTaxiOpcode.
+            if (!self->GetNPCIfCanInteractWith(cr->GetGUID(), UNIT_NPC_FLAG_FLIGHTMASTER, UNIT_NPC_FLAG_2_NONE))
+                continue;
+            uint32 const node = sObjectMgr->GetNearestTaxiNode(cr->GetPositionX(), cr->GetPositionY(),
+                                                               cr->GetPositionZ(), cr->GetMapId(), self->GetTeam());
+            if (!node || self->m_taxi.IsTaximaskNodeKnown(node))
+                { c.TaxiDone.insert(cr->GetGUID()); continue; }   // узел наш — вопрос закрыт навсегда
+
+            // разговор теми же двумя пакетами, что шлёт клиент
+            WorldPacket rawHello(CMSG_TALK_TO_GOSSIP);
+            WorldPackets::NPC::Hello hello(std::move(rawHello));
+            hello.Unit = cr->GetGUID();
+            c.Session->HandleGossipHelloOpcode(hello);
+
+            GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
+            int32 pick = -1;
+            for (GossipMenuItem const& item : menu.GetMenuItems())
+                if (item.OptionNpc == GossipOptionNpc::Taxinode && !item.BoxCoded && item.BoxMoney == 0)
+                    { pick = item.GossipOptionID; break; }
+            if (pick < 0)
+            {
+                // ПУНКТА НЕТ — ЭТО МОЖЕТ БЫТЬ ВРЕМЕННЫМ (Кодекс): фаза, квест, состояние меню.
+                // Поэтому срок, а не приговор; и проход на этом заканчивается — мы уже говорили.
+                c.TaxiRetry[cr->GetGUID()] = 600000;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОЛЁТ {}: у {} ({}) нет пункта «узнать точку» — пробую через десять минут",
+                    self->GetName(), cr->GetName(), cr->GetEntry());
+                return;
+            }
+
+            WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
+            WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
+            sel.GossipUnit = cr->GetGUID();
+            sel.GossipID = menu.GetMenuId();
+            sel.GossipOptionID = pick;
+            c.Session->HandleGossipSelectOptionOpcode(sel);
+
+            bool const got = self->m_taxi.IsTaximaskNodeKnown(node);
+            if (got)
+                c.TaxiDone.insert(cr->GetGUID());
+            else
+                c.TaxiRetry[cr->GetGUID()] = 600000;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}",
+                self->GetName(), cr->GetName(), cr->GetEntry(), node,
+                got ? "узнана" : "не далась");
+            return;                     // по одному мастеру за проход
+        }
+    }
+
+    // СКОЛЬКО ПОЛЁТНЫХ ТОЧЕК МЫ ЗНАЕМ — по маске ядра, теми же битами, что оно и хранит.
+    uint32 KnownTaxiNodes(Player* self) const
+    {
+        // ПО САМОЙ МАСКЕ, А НЕ ПО НОМЕРАМ УЗЛОВ: IsTaximaskNodeKnown индексирует массив без
+        // проверки границ, и перебор номеров вышел бы за него. Считаем взведённые биты.
+        uint32 known = 0;
+        TaxiMask const& mask = self->m_taxi.GetTaxiMask();
+        for (size_t i = 0; i < mask.size(); ++i)          // обход по индексу: begin/end у маски не константные
+            for (uint8 bit = 0; bit < 8; ++bit)
+                if (mask[i] & (1u << bit))
+                    ++known;
+        return known;
+    }
+
     // ПОЧЕМУ СТОИМ — раз в пять минут у того, кому делать нечего. Прежний прибор печатался по
     // разу при первом поиске и устаревал: 33 из 122 стояли молча. Связи «существо -> квесты»
     // здесь только ПЕЧАТАЮТСЯ.
@@ -6772,12 +7018,57 @@ public:
             // он лечит то, что измеряет. Настоящее меню и так видно в строке РАЗГОВОР, которую
             // печатает сам путь взятия квеста, когда спутник до квестодателя доходит.
         }
+        // ГАРДЕРОБ — ПОЧЕМУ НЕ НАДЕТО. Тринадцать рыцарей смерти стоят одетыми, но без оружия,
+        // а модуль печатает только успех надевания и отказ ядра — то есть про вещь, до которой
+        // очередь не дошла, не говорит ничего. Здесь по каждой ненадетой вещи из сумок: что
+        // это, куда встаёт, и чей именно ответ её остановил.
+        std::string wardrobe;
+        uint32 gearSeen = 0;
+        auto look = [&](Item* it)
+        {
+            if (!it || it->IsEquipped() || !it->GetTemplate() || gearSeen >= 6)
+                return;
+            ItemTemplate const* tpl = it->GetTemplate();
+            if (tpl->GetClass() != ITEM_CLASS_WEAPON && tpl->GetClass() != ITEM_CLASS_ARMOR)
+                return;
+            ++gearSeen;
+            // СЛОТ БЕРЁМ ИЗ ОТВЕТА ЯДРА (Кодекс): FindEquipSlot отвечает на свой вопрос, а
+            // обработчик кладёт вещь туда, куда сказал CanEquipItem, — на кольцах и оружии это
+            // разные слоты, и сравнение «лучше надетого» шло бы не с тем предметом.
+            char const* why = "годится";
+            uint16 dest = 0;
+            InventoryResult const useItem = self->CanUseItem(it);
+            InventoryResult const canEquip = self->CanEquipItem(NULL_SLOT, dest, it, true);
+            uint8 slot = canEquip == EQUIP_ERR_OK ? uint8(dest & 0xFF) : self->FindEquipSlot(it, NULL_SLOT, true);
+            if (!UsableKind(self, tpl))          why = "не наш класс/навык";
+            else if (useItem != EQUIP_ERR_OK)    why = "ядро: использовать нельзя";
+            else if (slot == NULL_SLOT)          why = "слота нет";
+            else if (canEquip != EQUIP_ERR_OK)   why = "ядро: надеть нельзя";
+            else if (Item* worn = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (it->GetItemLevel(self) <= worn->GetItemLevel(self))
+                    why = "не лучше надетого";
+            wardrobe += Trinity::StringFormat("{} (кл.{}/{}, вид {}, ур.пр. {}, слот {}): {}; ",
+                it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()),
+                uint32(tpl->GetInventoryType()), it->GetItemLevel(self),
+                slot == NULL_SLOT ? 255 : uint32(slot), why);
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            look(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    look(GetItemInBag(bag, j));
+        if (!wardrobe.empty())
+            TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
+                self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
+
+
         TC_LOG_INFO("server.worldserver",
-            // ПЛОЩАДЬ, А НЕ ТОЛЬКО ЗОНА: ауры по местности ядро вешает по ПЛОЩАДИ
+        // ПЛОЩАДЬ, А НЕ ТОЛЬКО ЗОНА: ауры по местности ядро вешает по ПЛОЩАДИ
             // (Player::UpdateAreaDependentAuras), и призванный принимающий держится именно ими.
-            "Constellation ПРОСТОЙ {} (ур. {}, зона {}, площадь {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
-            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), self->GetAreaId(), printed,
-            waiting.empty() ? "-" : waiting);
+            "Constellation ПРОСТОЙ {} (ур. {}, зона {}, площадь {}, полётных точек {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
+            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), self->GetAreaId(),
+            KnownTaxiNodes(self), printed, waiting.empty() ? "-" : waiting);
     }
 
     // ---------------------------------------------------------------- квестодатель по карте
@@ -6793,8 +7084,8 @@ public:
             Quest const* q = sObjectMgr->GetQuestTemplate(qid);
             if (!q || self->GetQuestStatus(qid) != QUEST_STATUS_NONE)
                 continue;
-            if (!self->CanTakeQuest(q, false))
-                continue;
+            if (!self->CanTakeQuest(q, false) || SeasonalKind(q))
+                continue;                       // сезонное — не наша работа (оператор)
             if (QuestColour(self, q) >= 3)
                 continue;                       // красное и неизвестное — не по нам
             return qid;
