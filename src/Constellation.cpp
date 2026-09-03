@@ -375,6 +375,7 @@ struct Companion
     bool DeathCounted = false;          // эта гибель уже записана в окно
     uint8 CorpseTries = 0;              // отказов подъёма у тела: две — и к целительнице
     bool GraveWalkNoted = false;        // строка «иду на кладбище» — раз на смерть
+    float GraveWalkLast = 0.0f;         // расстояние до кладбища на прошлом такте: прогресс
     bool CorpseGaveUp = false;          // до тела не добежать или подъём не вышел
     bool RevivePicked = false;          // тихое место у тела выбрано
     Position RevivePos;                 // и вот оно
@@ -1741,14 +1742,23 @@ public:
             if (!c.GraveWalkNoted)
             {
                 c.GraveWalkNoted = true;
+                c.GraveWalkLast = toGrave;
+                c.Stalled = false;      // новое намерение — как в 5459: прежний тупик не наш
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ТЕЛО {}: целительницы нет в 60 ярдах — иду на кладбище {} ({:.0f} ярдов)",
                     self->GetName(), grave->ID, toGrave);
             }
+            // ПРОГРЕСС — ПО РАССТОЯНИЮ, НЕ ПО ФЛАГУ. c.Stalled липкий: его ставят застревание
+            // и неудачный поиск пути, а снимают только «дошёл» и «новое намерение» — ни того,
+            // ни другого здесь не бывает. Первый затор на дороге обнулял бы всю дорогу.
+            if (toGrave < c.GraveWalkLast - 1.0f)
+            {
+                c.GraveWalkLast = toGrave;
+                c.ReviveTries = 0;      // стало ближе — это дорога, а не попытка
+                c.Stalled = false;
+            }
             StepToward(c, self, grave->Loc.GetPositionX(), grave->Loc.GetPositionY(),
                 grave->Loc.GetPositionZ(), 4.0f, dt);
-            if (!c.Stalled)
-                c.ReviveTries = 0;      // идём — это дорога, а не попытка
             return;
         }
 
@@ -7811,13 +7821,15 @@ public:
     // ВСЕ ЗОНЫ РАЗОМ — ПО КОМАНДЕ. Имён зон в базе мира нет, а таблице покрытия они нужны
     // для каждой строки, не только для тех, где спутник стоял в момент строки простоя.
     // Тот же шаблон строки, что и в ПРОСТОЙ («зона N «имя»»), чтобы сборщик имён ничего
-    // нового не учил. Только зоны (ParentAreaID == 0): QuestSortID указывает на них.
+    // нового не учил. ВСЕ записи AreaTable, а не только верхний уровень: QuestSortID
+    // указывает и на площади внутри зон — стартовые локации современных рас (6455, 6450,
+    // 4755…) заведены именно так, и фильтр по родителю оставил их без имени.
     bool DumpZones(ChatHandler* handler) const
     {
         uint32 n = 0;
         for (AreaTableEntry const* area : sAreaTableStore)
         {
-            if (!area || area->ParentAreaID != 0)
+            if (!area)
                 continue;
             std::string const name = ZoneName(area->ID);
             if (name == "?")
