@@ -374,6 +374,7 @@ struct Companion
     uint32 ReclaimWaitMs = 0;           // сказали ли, что ждём срок подъёма
     bool DeathCounted = false;          // эта гибель уже записана в окно
     uint8 CorpseTries = 0;              // отказов подъёма у тела: две — и к целительнице
+    bool GraveWalkNoted = false;        // строка «иду на кладбище» — раз на смерть
     bool CorpseGaveUp = false;          // до тела не добежать или подъём не вышел
     bool RevivePicked = false;          // тихое место у тела выбрано
     Position RevivePos;                 // и вот оно
@@ -1684,6 +1685,7 @@ public:
                 {
                     ++_revived;
                     c.ReviveGaveUp = false;
+                    c.GraveWalkNoted = false;
                     RepairIfBroken(self, "после смерти");
                     c.BrokenNoted = false;
                     c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
@@ -1722,7 +1724,33 @@ public:
                 { best = d; healer = cr; }
         }
         if (!healer)
-            return;                     // не видно — ждём, ядро само перенесёт на кладбище
+        {
+            // ОБРАТНО НА КЛАДБИЩЕ — САМИ. Ядро переносит призрака туда ОДИН раз, при
+            // отпускании духа (RepopAtGraveyard); после неудачного бега к телу мы стоим у
+            // трупа, и «ждать, пока перенесёт» значит ждать вечно — 26 «не может
+            // воскреснуть» за окно, все у своих трупов. Спрашиваем у ядра то же кладбище,
+            // которым оно нас переносило (GetClosestGraveyard), и идём пешком: призрак
+            // быстр, и его никто не трогает. Дорога не считается попыткой — счётчик
+            // остаётся для настоящей беды: на кладбище, а целительницы в 60 ярдах нет.
+            WorldSafeLocsEntry const* grave = sObjectMgr->GetClosestGraveyard(*self, self->GetTeam(), self);
+            if (!grave || grave->Loc.GetMapId() != self->GetMapId())
+                return;                 // кладбища на этой карте ядро не знает — ждём как прежде
+            float const toGrave = self->GetExactDist2d(grave->Loc.GetPositionX(), grave->Loc.GetPositionY());
+            if (toGrave <= 20.0f)
+                return;                 // уже там, а целительницы нет — вот это и есть беда
+            if (!c.GraveWalkNoted)
+            {
+                c.GraveWalkNoted = true;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ТЕЛО {}: целительницы нет в 60 ярдах — иду на кладбище {} ({:.0f} ярдов)",
+                    self->GetName(), grave->ID, toGrave);
+            }
+            StepToward(c, self, grave->Loc.GetPositionX(), grave->Loc.GetPositionY(),
+                grave->Loc.GetPositionZ(), 4.0f, dt);
+            if (!c.Stalled)
+                c.ReviveTries = 0;      // идём — это дорога, а не попытка
+            return;
+        }
 
         if (!self->IsWithinDistInMap(healer, INTERACTION_DISTANCE))
         {
@@ -1757,6 +1785,7 @@ public:
             // четверть часа, обычные пять минут после смерти его не укорачивают.
             c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
             // и не возвращаться к убийце на половине здоровья — сперва отдышаться
+            c.GraveWalkNoted = false;
             Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
             TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
                 self->GetName());
@@ -7779,6 +7808,27 @@ public:
         return name && *name ? name : "?";
     }
 
+    // ВСЕ ЗОНЫ РАЗОМ — ПО КОМАНДЕ. Имён зон в базе мира нет, а таблице покрытия они нужны
+    // для каждой строки, не только для тех, где спутник стоял в момент строки простоя.
+    // Тот же шаблон строки, что и в ПРОСТОЙ («зона N «имя»»), чтобы сборщик имён ничего
+    // нового не учил. Только зоны (ParentAreaID == 0): QuestSortID указывает на них.
+    bool DumpZones(ChatHandler* handler) const
+    {
+        uint32 n = 0;
+        for (AreaTableEntry const* area : sAreaTableStore)
+        {
+            if (!area || area->ParentAreaID != 0)
+                continue;
+            std::string const name = ZoneName(area->ID);
+            if (name == "?")
+                continue;
+            TC_LOG_INFO("server.worldserver", "Constellation ЗОНЫ: зона {} «{}»", area->ID, name);
+            ++n;
+        }
+        handler->PSendSysMessage("Constellation: зон выписано в журнал: %u", n);
+        return true;
+    }
+
     // ---------------------------------------------------------------- квестодатель по карте
     // КАКОЙ КВЕСТ ЯДРО ДАЛО БЫ У ЭТОГО ВИДА — по воротам ядра и светофору. Связи «существо ->
     // квесты» выбирают, КУДА ИДТИ, а не что брать: у самого квестодателя спутник, как и
@@ -9381,6 +9431,7 @@ public:
             { "summon",  HandleSummon,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "zones",   HandleZones,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -9410,6 +9461,11 @@ public:
     static bool HandleRepair(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->RepairAll(handler);
+    }
+
+    static bool HandleZones(ChatHandler* handler)
+    {
+        return Constellation::Manager::Instance()->DumpZones(handler);
     }
 
     static bool HandleVend(ChatHandler* handler)
