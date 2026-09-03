@@ -5923,7 +5923,16 @@ public:
                 // мало, 55660 уже занимает слот у всех 122). Тем же опкодом, что шлёт клиент;
                 // ядро само откажет, если бросать нельзя (QUEST_FLAGS_EX_NO_ABANDON_ONCE_BEGUN).
                 // Условие узкое НАМЕРЕННО: и сезонный, и уже признанный незакрываемым.
-                if (SeasonalKind(quest))
+                //
+                // И НЕ РАЗДАВАЕМОЕ ЯДРОМ. Замер: 97 бросков 55660 за пятнадцать минут, ноль
+                // взятий модулем, 34 спутника всё равно держат его. Причина в ядре, не у нас:
+                // у квеста стоит QUEST_FLAGS_EX_AUTO_PUSH, а Player::PushQuests (Player.cpp:18609)
+                // раздаёт такие сама — из входа в мир, из повышения уровня и из
+                // Player::UpdateArea (Player.cpp:7560), то есть ПРИ КАЖДОЙ СМЕНЕ ПЛОЩАДИ.
+                // Спутник меняет площадь постоянно, поэтому эту гонку не выиграть по построению.
+                // Слот такой квест занимает (в журнале их 25), но цикл, поток пакетов и сотня
+                // строк в журнале на четверть часа исчезают.
+                if (SeasonalKind(quest) && !quest->IsAutoPush())
                     for (uint16 slot2 = 0; slot2 < MAX_QUEST_LOG_SIZE; ++slot2)
                         if (self->GetQuestSlotQuestId(slot2) == qid)
                         {
@@ -7426,15 +7435,35 @@ public:
             enable.Unit = cr->GetGUID();
             c.Session->HandleEnableTaxiNodeOpcode(enable);
 
-            bool const got = self->m_taxi.IsTaximaskNodeKnown(node);
+            bool got = self->m_taxi.IsTaximaskNodeKnown(node);
+            std::string why;
+            if (!got)
+            {
+                // ЗОНД (временный): та же работа в обход ворот разговора, и рядом — те самые
+                // величины, которыми ядро принимает решение. Голого bool мало: SendLearnNewTaxiNode
+                // возвращает ИСТИНУ и при curloc == 0, ничего не поставив (TaxiHandler.cpp:134),
+                // поэтому исход разбирается по узлу ядра и его биту, а не по возврату.
+                Player* const sp = c.Session->GetPlayer();
+                uint32 const coreNode = sp ? sObjectMgr->GetNearestTaxiNode(cr->GetPositionX(),
+                    cr->GetPositionY(), cr->GetPositionZ(), cr->GetMapId(), sp->GetTeam()) : 0;
+                bool const wasCore = sp && coreNode && sp->m_taxi.IsTaximaskNodeKnown(coreNode);
+                bool const direct = c.Session->SendLearnNewTaxiNode(cr);
+                bool const nowCore = sp && coreNode && sp->m_taxi.IsTaximaskNodeKnown(coreNode);
+                got = self->m_taxi.IsTaximaskNodeKnown(node);
+                why = Trinity::StringFormat(" [зонд: игрок сессии {}, узел ядра {}, его бит {}->{}, "
+                    "возврат {}, наш бит {}, сторона {}, карта {}, до мастера {:.1f}]",
+                    sp == self ? "тот же" : "ЧУЖОЙ", coreNode, wasCore ? 1 : 0, nowCore ? 1 : 0,
+                    direct ? "да" : "нет", got ? 1 : 0, uint32(self->GetTeam()), cr->GetMapId(),
+                    self->GetDistance(cr));
+            }
             if (got)
                 c.TaxiDone.insert(cr->GetGUID());
             else
                 c.TaxiRetry[cr->GetGUID()] = 600000;
             TC_LOG_INFO("server.worldserver",
-                "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}; всего точек {}",
+                "Constellation ПОЛЁТ {}: у {} ({}) точка {} — {}; всего точек {}{}",
                 self->GetName(), cr->GetName(), cr->GetEntry(), node,
-                got ? "узнана" : "ядро не дало", KnownTaxiNodes(self));
+                got ? "узнана" : "ядро не дало", KnownTaxiNodes(self), why);
             return;                     // по одному мастеру за проход
         }
     }
@@ -7557,6 +7586,82 @@ public:
     // ПОЧЕМУ СТОИМ — раз в пять минут у того, кому делать нечего. Прежний прибор печатался по
     // разу при первом поиске и устаревал: 33 из 122 стояли молча. Связи «существо -> квесты»
     // здесь только ПЕЧАТАЮТСЯ.
+    // ОБХОД СУМОК — ОТДЕЛЬНО ОТ «ДЕЛАТЬ НЕЧЕГО».
+    //
+    // Зовётся из двух мест: из простоя (как и раньше) и из однократной строки DIAG,
+    // которая печатается ЗАНЯТОМУ спутнику. Второе появилось потому, что рыцарь смерти
+    // занят всегда — у него висит цель, которую нечем закрыть, — и первый вызов до него
+    // не доходил никогда.
+    void LogWardrobe(Player* self) const
+    {
+        // ГАРДЕРОБ — ПОЧЕМУ НЕ НАДЕТО. Тринадцать рыцарей смерти стоят одетыми, но без оружия,
+        // а модуль печатает только успех надевания и отказ ядра — то есть про вещь, до которой
+        // очередь не дошла, не говорит ничего. Здесь по каждой ненадетой вещи из сумок: что
+        // это, куда встаёт, и чей именно ответ её остановил.
+        std::string wardrobe;
+        uint32 gearSeen = 0, toolsSeen = 0;
+        auto look = [&](Item* it)
+        {
+            if (!it || it->IsEquipped() || !it->GetTemplate())
+                return;
+            ItemTemplate const* tpl = it->GetTemplate();
+            if (tpl->GetClass() != ITEM_CLASS_WEAPON && tpl->GetClass() != ITEM_CLASS_ARMOR)
+            {
+                // НЕ ОДЕЖДА — НО МОЖЕТ БЫТЬ ИНСТРУМЕНТОМ. Предмет с единственным заклинанием
+                // «при использовании» — это то, чем закрывают цели, которых не закрыть боем.
+                // Печатаем его вместе с заклинанием и с существом, которое это заклинание
+                // называет целью: сведения о заклинании предмета живут в клиентских данных, и
+                // спросить их можно только отсюда.
+                uint32 const useSpell = UseSpellOf(it);
+                if (!useSpell || toolsSeen >= 4)
+                    return;
+                ++toolsSeen;
+                std::string names;
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell, DIFFICULTY_NONE))
+                    for (SpellEffectInfo const& eff : si->GetEffects())
+                        if (eff.ImplicitTargetConditions)
+                            for (Condition const& cond : *eff.ImplicitTargetConditions)
+                                if (UnitEntryCondition(cond, 0))
+                                    names += std::to_string(cond.ConditionValue2) + " ";
+                wardrobe += Trinity::StringFormat("инструмент {} (кл.{}/{}) закл. {}{}{}; ",
+                    it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()), useSpell,
+                    names.empty() ? "" : " по существу ", names);
+                return;
+            }
+            if (gearSeen >= 6)       // предел одежды — только для одежды: у инструментов свой
+                return;
+            ++gearSeen;
+            // СЛОТ БЕРЁМ ИЗ ОТВЕТА ЯДРА (Кодекс): FindEquipSlot отвечает на свой вопрос, а
+            // обработчик кладёт вещь туда, куда сказал CanEquipItem, — на кольцах и оружии это
+            // разные слоты, и сравнение «лучше надетого» шло бы не с тем предметом.
+            char const* why = "годится";
+            uint16 dest = 0;
+            InventoryResult const useItem = self->CanUseItem(it);
+            InventoryResult const canEquip = self->CanEquipItem(NULL_SLOT, dest, it, true);
+            uint8 slot = canEquip == EQUIP_ERR_OK ? uint8(dest & 0xFF) : self->FindEquipSlot(it, NULL_SLOT, true);
+            if (!UsableKind(self, tpl))          why = "не наш класс/навык";
+            else if (useItem != EQUIP_ERR_OK)    why = "ядро: использовать нельзя";
+            else if (slot == NULL_SLOT)          why = "слота нет";
+            else if (canEquip != EQUIP_ERR_OK)   why = "ядро: надеть нельзя";
+            else if (Item* worn = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (it->GetItemLevel(self) <= worn->GetItemLevel(self))
+                    why = "не лучше надетого";
+            wardrobe += Trinity::StringFormat("{} (кл.{}/{}, вид {}, ур.пр. {}, слот {}): {}; ",
+                it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()),
+                uint32(tpl->GetInventoryType()), it->GetItemLevel(self),
+                slot == NULL_SLOT ? 255 : uint32(slot), why);
+        };
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            look(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                    look(GetItemInBag(bag, j));
+        if (!wardrobe.empty())
+            TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
+                self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
+    }
+
     void LogIdle(Companion const& c, Player* self) const
     {
         std::string waiting;
@@ -7626,72 +7731,7 @@ public:
             // он лечит то, что измеряет. Настоящее меню и так видно в строке РАЗГОВОР, которую
             // печатает сам путь взятия квеста, когда спутник до квестодателя доходит.
         }
-        // ГАРДЕРОБ — ПОЧЕМУ НЕ НАДЕТО. Тринадцать рыцарей смерти стоят одетыми, но без оружия,
-        // а модуль печатает только успех надевания и отказ ядра — то есть про вещь, до которой
-        // очередь не дошла, не говорит ничего. Здесь по каждой ненадетой вещи из сумок: что
-        // это, куда встаёт, и чей именно ответ её остановил.
-        std::string wardrobe;
-        uint32 gearSeen = 0, toolsSeen = 0;
-        auto look = [&](Item* it)
-        {
-            if (!it || it->IsEquipped() || !it->GetTemplate())
-                return;
-            ItemTemplate const* tpl = it->GetTemplate();
-            if (tpl->GetClass() != ITEM_CLASS_WEAPON && tpl->GetClass() != ITEM_CLASS_ARMOR)
-            {
-                // НЕ ОДЕЖДА — НО МОЖЕТ БЫТЬ ИНСТРУМЕНТОМ. Предмет с единственным заклинанием
-                // «при использовании» — это то, чем закрывают цели, которых не закрыть боем.
-                // Печатаем его вместе с заклинанием и с существом, которое это заклинание
-                // называет целью: сведения о заклинании предмета живут в клиентских данных, и
-                // спросить их можно только отсюда.
-                uint32 const useSpell = UseSpellOf(it);
-                if (!useSpell || toolsSeen >= 4)
-                    return;
-                ++toolsSeen;
-                std::string names;
-                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell, DIFFICULTY_NONE))
-                    for (SpellEffectInfo const& eff : si->GetEffects())
-                        if (eff.ImplicitTargetConditions)
-                            for (Condition const& cond : *eff.ImplicitTargetConditions)
-                                if (UnitEntryCondition(cond, 0))
-                                    names += std::to_string(cond.ConditionValue2) + " ";
-                wardrobe += Trinity::StringFormat("инструмент {} (кл.{}/{}) закл. {}{}{}; ",
-                    it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()), useSpell,
-                    names.empty() ? "" : " по существу ", names);
-                return;
-            }
-            if (gearSeen >= 6)       // предел одежды — только для одежды: у инструментов свой
-                return;
-            ++gearSeen;
-            // СЛОТ БЕРЁМ ИЗ ОТВЕТА ЯДРА (Кодекс): FindEquipSlot отвечает на свой вопрос, а
-            // обработчик кладёт вещь туда, куда сказал CanEquipItem, — на кольцах и оружии это
-            // разные слоты, и сравнение «лучше надетого» шло бы не с тем предметом.
-            char const* why = "годится";
-            uint16 dest = 0;
-            InventoryResult const useItem = self->CanUseItem(it);
-            InventoryResult const canEquip = self->CanEquipItem(NULL_SLOT, dest, it, true);
-            uint8 slot = canEquip == EQUIP_ERR_OK ? uint8(dest & 0xFF) : self->FindEquipSlot(it, NULL_SLOT, true);
-            if (!UsableKind(self, tpl))          why = "не наш класс/навык";
-            else if (useItem != EQUIP_ERR_OK)    why = "ядро: использовать нельзя";
-            else if (slot == NULL_SLOT)          why = "слота нет";
-            else if (canEquip != EQUIP_ERR_OK)   why = "ядро: надеть нельзя";
-            else if (Item* worn = self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-                if (it->GetItemLevel(self) <= worn->GetItemLevel(self))
-                    why = "не лучше надетого";
-            wardrobe += Trinity::StringFormat("{} (кл.{}/{}, вид {}, ур.пр. {}, слот {}): {}; ",
-                it->GetEntry(), uint32(tpl->GetClass()), uint32(tpl->GetSubClass()),
-                uint32(tpl->GetInventoryType()), it->GetItemLevel(self),
-                slot == NULL_SLOT ? 255 : uint32(slot), why);
-        };
-        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
-            look(self->GetItemByPos(INVENTORY_SLOT_BAG_0, i));
-        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
-            if (Bag* bag = self->GetBagByPos(b))
-                for (uint32 j = 0; j < GetBagSize(bag); ++j)
-                    look(GetItemInBag(bag, j));
-        if (!wardrobe.empty())
-            TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
-                self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
+        LogWardrobe(self);
 
 
         TC_LOG_INFO("server.worldserver",
@@ -8015,6 +8055,7 @@ public:
         if (!c.FightDiagDone && slotsUsed)
         {
             c.FightDiagDone = true;
+            LogWardrobe(self);
             TC_LOG_INFO("server.worldserver",
                 "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}, радиус зова {:.0f}",
                 self->GetName(), slotsUsed, incomplete, monsterObjs, unmet, uint32(wanted.size()),
