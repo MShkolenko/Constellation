@@ -386,6 +386,14 @@ struct Companion
     // навсегда). Без этой памяти учебное оружие остаётся насовсем: обычное сравнение запрещает
     // обратную замену другим видом («меч остаётся мечом»), а зачёт уже получен.
     std::unordered_map<ObjectGuid, uint8> DisplacedByMust;
+    // ОБЪЕКТЫ-ЗАДАЧИ, КОТОРЫЕ УЖЕ СВОЁ ОТРАБОТАЛИ ИЛИ НЕ РАБОТАЮТ ВОВСЕ (Кодекс, задача 90).
+    // GooberDone — применили, и прогресс сдвинулся: больше к нему не ходим.
+    // GooberIdle — применили, и НИЧЕГО не изменилось (дверь, рычаг, реквизит): вернёмся только
+    // если прогресс по квестам изменится сам, то есть если мир вокруг стал другим.
+    std::set<uint32> GooberDone;
+    std::unordered_map<uint32, uint8> GooberIdle;   // сколько раз применили без сдвига целей
+    bool GooberDiagDone = false;
+    bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
     std::set<uint32> KilledOnQuestNoted;
     uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
     bool FleeNoted = false;             // и сказали ли об этом
@@ -3654,6 +3662,12 @@ public:
                     return;
                 }
                 uint32 const spaceBefore = FreeBagSpace(self);
+                // СОСТОЯНИЕ ОБЩЕГО ОБЪЕКТА ДО ПРИМЕНЕНИЯ: не готов — значит его только что
+                // использовал другой, и наш отказ ничего не говорит о самом объекте.
+                bool const wasReady = go->getLootState() == GO_READY;
+                std::vector<std::pair<uint32, int32>> snapBefore;
+                if (c.GatherIsGoober)
+                    snapBefore = QuestSnapshot(self);
                 {
                     WorldPacket raw(CMSG_GAME_OBJ_USE);
                     WorldPackets::GameObject::GameObjUse use(std::move(raw));
@@ -3683,9 +3697,33 @@ public:
                 }
                 else
                 {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
-                        self->GetName(), name, entry);
+                    // ОБЪЕКТ-ЗАДАЧА СУДИТСЯ ПО СДВИГУ ЦЕЛЕЙ, А НЕ ПО ДОБЫЧЕ: он её и не даёт.
+                    // Сдвинул — своё отработал, больше не ходим. Не сдвинул — это дверь,
+                    // рычаг или реквизит, привязанный к квесту: вернёмся, только если мир
+                    // вокруг сам изменится (Кодекс, задача 90).
+                    if (c.GatherIsGoober && QuestSnapshot(self) != snapBefore)
+                    {
+                        c.GooberDone.insert(c.GatherSpawnId);
+                        c.GooberIdle.erase(c.GatherSpawnId);
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation СБОР {}: применил {} ({}) — состояние квестов изменилось, больше не хожу",
+                            self->GetName(), name, entry);
+                    }
+                    else if (c.GatherIsGoober)
+                    {
+                        // НЕУДАЧУ СЧИТАЕМ, ТОЛЬКО ЕСЛИ ОБЪЕКТ БЫЛ ГОТОВ. Иначе это чужое
+                        // применение секунду назад, а не свойство объекта.
+                        uint8 const tries = wasReady ? uint8(++c.GooberIdle[c.GatherSpawnId])
+                                                     : c.GooberIdle[c.GatherSpawnId];
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись, попытка {} из {}{}",
+                            self->GetName(), name, entry, uint32(tries), uint32(GOOBER_TRIES_LOG),
+                            wasReady ? "" : " (объект был занят — не в счёт)");
+                    }
+                    else
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
+                            self->GetName(), name, entry);
                     c.GatherBackoff[c.GatherSpawnId] = 120000;
                 }
                 c.GatherSpawnId = 0;
@@ -6596,9 +6634,20 @@ public:
         // группы появления, игровые события, разные сложности; объекты, созданные сценарием
         // на лету, в таблице отсутствуют вовсе; а доступность сундука зависит ещё и от самого
         // игрока (ActivateToQuest). Поэтому правда берётся у мира — но ОДИН РАЗ, по приходу.
-        uint32 g = 0, links = 0, locked = 0, noItems = 0, rejectedLogged = 0;
+        uint32 g = 0, links = 0, locked = 0, noItems = 0, rejectedLogged = 0, goobers = 0;
         for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
         {
+            // ОБЪЕКТ-ЗАДАЧА С НОМЕРОМ КВЕСТА — ДО ФИЛЬТРА ПО ПРЕДМЕТАМ: предметов он не даёт,
+            // он даёт зачёт скриптом при применении, а к квесту привязан полем ядра.
+            // Замок здесь не смотрим: у объекта-задачи он свой (у Эдикта 1634), и правду о
+            // нём скажет ядро при применении; неудача уйдёт в обычную отсрочку сбора.
+            if (GameObjectTemplate const* gt = sObjectMgr->GetGameObjectTemplate(data.id))
+                if (gt->type == GAMEOBJECT_TYPE_GOOBER && gt->goober.questID)
+                {
+                    _gooberByQuest[data.mapId][gt->goober.questID].push_back(GatherSpawn{ spawnId, data.id,
+                        data.spawnPoint, data.phaseUseFlags, uint16(data.phaseId), data.phaseGroup });
+                    ++goobers;
+                }
             std::vector<uint32> const* qi = sObjectMgr->GetGameObjectQuestItemList(data.id);
             if (!qi || qi->empty())
                 { ++noItems; continue; }    // объект не даёт ни одного предмета задания
@@ -6638,8 +6687,8 @@ public:
         }
         TC_LOG_INFO("server.loading",
             "Constellation: указатель объектов сбора — {} точек на {} картах, {} связей предмет->объект; "
-            "отсеяно замком {}, без предметов задания {}",
-            g, uint32(_goSpawns.size()), links, locked, noItems);
+            "отсеяно замком {}, без предметов задания {}; объектов-задач с номером квеста {}",
+            g, uint32(_goSpawns.size()), links, locked, noItems, goobers);
 
         // ЗАЧЁТ ЧЕРЕЗ НАДЕВАНИЕ — ИНДЕКС ИЗ ДВУХ ХРАНИЛИЩ ЯДРА, ОДИН РАЗ.
         //
@@ -8723,6 +8772,26 @@ public:
     //
     // Возвращает НЕ живой объект, а кандидата: идентификатор спавна и место. Живой объект
     // берётся по приходу, по этому же идентификатору, без единого обхода.
+    static uint8 const GOOBER_TRIES_LOG = 3;    // тот же предел, что и в отборе
+    // СНИМОК СОСТОЯНИЯ КВЕСТОВ — СТРУКТУРНЫЙ, А НЕ СУММА (Кодекс, задача 94: в сумме два
+    // изменения гасят друг друга, переполнение сливает разное в одно, а переход статуса не
+    // виден вовсе). Пара на каждую цель и пара на каждый квест со статусом; порядок обхода
+    // журнала постоянный, поэтому сравнение векторов — это сравнение состояний.
+    // Признак ИЗМЕНЕНИЯ, а не доказательство причины.
+    std::vector<std::pair<uint32, int32>> QuestSnapshot(Player* self) const
+    {
+        std::vector<std::pair<uint32, int32>> out;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (uint32 const qid = self->GetQuestSlotQuestId(slot))
+            {
+                out.emplace_back(0x80000000u | qid, int32(self->GetQuestStatus(qid)));
+                if (Quest const* q = sObjectMgr->GetQuestTemplate(qid))
+                    for (QuestObjective const& obj : q->GetObjectives())
+                        out.emplace_back(uint32(obj.ID), self->GetQuestObjectiveData(obj));
+            }
+        return out;
+    }
+
     bool FindGatherCandidate(Companion& c, Player* self) const
     {
         std::set<uint32> wanted, wantedItems;
@@ -8752,17 +8821,53 @@ public:
                 self->GetName(), uint32(wantedItems.size()), uint32(entries.size()), onMap);
         }
 
-        if (wantedItems.empty() || entries.empty() || mapIt == _goSpawns.end())
+        // ОДИН ПУЛ КАНДИДАТОВ: точки предметов задания плюс объекты-задачи моих незакрытых
+        // квестов — дальше их судят одни и те же проверки (отсрочка, фаза, дальность).
+        std::vector<GatherSpawn const*> pool;
+        if (mapIt != _goSpawns.end())
+            for (uint32 entry : entries)
+                if (auto entryIt = mapIt->second.find(entry); entryIt != mapIt->second.end())
+                    for (GatherSpawn const& sp : entryIt->second)
+                        pool.push_back(&sp);
+        // ТРИ ПОПЫТКИ, А НЕ ОДНА. Объект может быть ОБЩИМ: Эдикт один на семерых, и тому, кто
+        // подошёл вторым, ядро откажет, пока объект активирован. Приговор «ничего не меняет»
+        // с первой неудачи запер бы шестерых навсегда (Кодекс, задача 94). Три — число
+        // ВЫБРАННОЕ, при отсрочке в две минуты это шесть минут попыток.
+        static uint8 const GOOBER_TRIES = GOOBER_TRIES_LOG;
+        uint32 goobers = 0;
+        std::set<uint32> gooberIds;
+        if (auto gm = _gooberByQuest.find(self->GetMapId()); gm != _gooberByQuest.end())
+            for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                if (uint32 const qid = self->GetQuestSlotQuestId(slot))
+                    if (self->GetQuestStatus(qid) == QUEST_STATUS_INCOMPLETE)
+                        if (auto gq = gm->second.find(qid); gq != gm->second.end())
+                            for (GatherSpawn const& sp : gq->second)
+                            {
+                                if (c.GooberDone.count(sp.SpawnId))
+                                    continue;       // своё отработал
+                                if (auto idle = c.GooberIdle.find(sp.SpawnId);
+                                    idle != c.GooberIdle.end() && idle->second >= GOOBER_TRIES)
+                                    continue;       // трижды применили без сдвига целей
+                                pool.push_back(&sp);
+                                gooberIds.insert(sp.SpawnId);
+                                ++goobers;
+                            }
+        // ЧИСЛО ОБЪЕКТОВ-ЗАДАЧ — В ТУ ЖЕ ДИАГНОСТИКУ, и печатаем её даже когда предметов не
+        // нужно вовсе: иначе про goober-кандидатов журнал молчит (Кодекс, задача 90).
+        if (!c.GooberDiagDone && goobers)
+        {
+            c.GooberDiagDone = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ОТБОР {}: объектов-задач по моим квестам {}", self->GetName(), goobers);
+        }
+        if (pool.empty())
             return false;
 
         float best = 0.0f;
         bool found = false;
-        for (uint32 entry : entries)
+        for (GatherSpawn const* pc : pool)
         {
-            auto entryIt = mapIt->second.find(entry);
-            if (entryIt == mapIt->second.end())
-                continue;
-            for (GatherSpawn const& sp : entryIt->second)
+            GatherSpawn const& sp = *pc;
             {
             if (auto back = c.GatherBackoff.find(sp.SpawnId); back != c.GatherBackoff.end() && back->second)
                 continue;                       // недавно не вышло — этот пока мимо
@@ -8793,6 +8898,7 @@ public:
                 c.GatherSpawnId = sp.SpawnId;
                 c.GatherEntry = sp.Entry;
                 c.GatherPos = sp.Where;
+                c.GatherIsGoober = gooberIds.count(sp.SpawnId) > 0;   // признак, а не догадка
             }
             }
         }
@@ -10542,6 +10648,10 @@ private:
     // минут, ноль сбора. Указатель существ так не устроен изначально: там ключом стоит вид,
     // и перебираются только нужные.
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _goSpawns;
+    // ОБЪЕКТЫ-ЗАДАЧИ ПО КВЕСТУ: карта -> квест -> точки GOOBER с goober.questID (задача 0023,
+    // запись 55). Семь панд стояли на «сжечь Эдикт»: зачёт выдаёт скрипт объекта при
+    // применении, а к квесту его привязывает само ядро этим полем — ни одного имени.
+    std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _gooberByQuest;
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
     // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
