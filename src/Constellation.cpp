@@ -9240,6 +9240,281 @@ public:
     }
 
     // ПЕРЕПИСЬ УМЕНИЙ ОДНОГО СПУТНИКА — только чтение, признаки берутся у ядра.
+    // ЦЕПОЧКА К ЦЕЛИ — «ПЕРВЫЙ КВЕСТ» (задача 0023, запись 52). Только читает.
+    //
+    // Замер: восемь панд и двенадцать ДК стоят на точках появления с первым квестом в
+    // журнале. Цель панд — зачёт-существо 54139, которое в мире не появляется никогда:
+    // засчитывается НАДЕВАНИЕ оружия со стойки. Цель ДК — предмет 38631, которого никто не
+    // роняет: он СОЗДАЁТСЯ заклинанием из заготовки, лежащей в сундуке. Модуль знал два
+    // вида целей — убить и собрать — и в обоих случаях честно не находил ничего.
+    //
+    // Оба перехода лежат в данных ядра и не требуют ни одного имени:
+    //   зачёт-существо E <- заклинание с эффектом KILL_CREDIT(E) <- предмет, чей эффект
+    //                       (ItemEffect) произносит его           <- добыча объекта;
+    //   предмет I        <- заклинание с эффектом CREATE_ITEM(I)  <- предмет, чей эффект при
+    //                       применении произносит его, а RequiresSpellFocus говорит, у какого
+    //                       объекта применять                     <- добыча объекта.
+    // Печатаем цепочку по звеньям, с ближайшей точкой и вердиктом замка, ДО правила: прибор
+    // доказывает обе истории на боевом, прежде чем кто-то куда-то пойдёт по их слову.
+    // Обход хранилища заклинаний на каждую цель и хранилища предметов на каждое найденное
+    // заклинание — секунды на консольную команду, и это осознанно: прибор, не такт.
+    void ChainCensus(ChatHandler* handler, std::string const& who)
+    {
+        Player* self = InWorldByName(who);
+        if (!self)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
+            return;
+        }
+        uint32 const mapId = self->GetMapId();
+        auto say = [&](std::string const& text)
+        {
+            std::string const line = "Constellation ЦЕПЬ " + self->GetName() + ": " + text;
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        };
+        // ПРЕДМЕТ -> ОБЪЕКТЫ: НЕ ЧЕРЕЗ УКАЗАТЕЛЬ СБОРА. Тот уже отфильтрован замком, и
+        // отвергнутый сундук в нём выглядел бы как «объекта нет вовсе», а вердикт замка был бы
+        // всегда «можно» (Кодекс, задача 80). Идём по шаблонам объектов напрямую и печатаем
+        // три ответа раздельно: числит ли объект предмет предметом задания, что говорит замок,
+        // и попал ли он в указатель. Отсутствие точки — словом, а не нулём ярдов.
+        auto describeItem = [&](uint32 item, std::string const& how)
+        {
+            uint32 kinds = 0;
+            for (auto const& [entry, tpl] : sObjectMgr->GetGameObjectTemplates())
+            {
+                std::vector<uint32> const* qi = sObjectMgr->GetGameObjectQuestItemList(entry);
+                if (!qi || std::find(qi->begin(), qi->end(), item) == qi->end())
+                    continue;
+                ++kinds;
+                uint32 n = 0;
+                float best = -1.0f;
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
+                {
+                    if (data.id != entry || data.mapId != mapId)
+                        continue;
+                    ++n;
+                    float const d = self->GetExactDist2d(data.spawnPoint.GetPositionX(), data.spawnPoint.GetPositionY());
+                    if (best < 0.0f || d < best)
+                        best = d;
+                }
+                bool indexed = false;
+                if (auto it = _itemFromGo.find(item); it != _itemFromGo.end())
+                    indexed = it->second.count(entry) > 0;
+                say(Trinity::StringFormat(
+                    "  предмет {} ({}) <- объект {} «{}» тип {} замок {} ({}); в указателе сбора {}; точек на этой карте {}, ближайшая {}",
+                    item, how, entry, tpl.name, uint32(tpl.type), tpl.GetLockId(),
+                    OpenableByHand(&tpl) ? "руками можно" : "руками нельзя",
+                    indexed ? "есть" : "НЕТ", n,
+                    best < 0.0f ? std::string("не найдена") : Trinity::StringFormat("{:.0f} ярдов", best)));
+            }
+            if (!kinds)
+                say(Trinity::StringFormat("  предмет {} ({}) — ни один объект не числит его предметом задания", item, how));
+        };
+        // ЗАКЛИНАНИЕ -> ПРЕДМЕТЫ, ЧЬИ ЭФФЕКТЫ ЕГО ПРОИЗНОСЯТ: обратный указатель строится ОДИН
+        // раз на команду, а не обходом хранилища предметов на каждое найденное заклинание
+        // (Кодекс, задача 80).
+        std::unordered_map<uint32, std::vector<std::pair<uint32, int32>>> itemsBySpell;
+        for (auto const& [id, tpl] : sObjectMgr->GetItemTemplateStore())
+            for (ItemEffectEntry const* eff : tpl.Effects)
+                if (eff && eff->SpellID > 0)
+                    itemsBySpell[uint32(eff->SpellID)].emplace_back(id, int32(eff->TriggerType));
+        static std::vector<std::pair<uint32, int32>> const noItems;
+        auto itemsCasting = [&](uint32 spellId) -> std::vector<std::pair<uint32, int32>> const&
+        {
+            auto it = itemsBySpell.find(spellId);
+            return it == itemsBySpell.end() ? noItems : it->second;
+        };
+        auto trigName = [](int32 trig) -> std::string
+        {
+            if (trig == ITEM_SPELLTRIGGER_ON_EQUIP) return "при надевании";
+            if (trig == ITEM_SPELLTRIGGER_ON_USE)   return "при применении";
+            return Trinity::StringFormat("триггер {}", trig);
+        };
+        // фокус заклинания -> ближайший объект-фокус на карте
+        auto nearestFocus = [&](uint32 focus, uint32& entryOut) -> float
+        {
+            float best = -1.0f;
+            entryOut = 0;
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllGameObjectData())
+            {
+                if (data.mapId != mapId)
+                    continue;
+                GameObjectTemplate const* tpl = sObjectMgr->GetGameObjectTemplate(data.id);
+                if (!tpl || tpl->type != GAMEOBJECT_TYPE_SPELL_FOCUS)
+                    continue;
+                if (tpl->spellFocus.spellFocusType != focus && tpl->spellFocus.spellFocusType2 != focus
+                    && tpl->spellFocus.spellFocusType3 != focus && tpl->spellFocus.spellFocusType4 != focus)
+                    continue;
+                float const d = self->GetExactDist2d(data.spawnPoint.GetPositionX(), data.spawnPoint.GetPositionY());
+                if (best < 0.0f || d < best)
+                    { best = d; entryOut = data.id; }
+            }
+            return best;
+        };
+
+        // КТО ВЕДЁТ К ЗАКЛИНАНИЮ — тем же способом, что и .constellation trig: триггер эффекта
+        // (в том числе периодический триггер ауры) или значение скрипта/пустышки, эвристика.
+        // Второе чтение прибора у ДК: 38631 <- 51771 (CREATE_ITEM), но 51771 не произносит ни
+        // один предмет — к нему ведёт 51770 (значение скрипта), а к 51770 — аура 51769, которую
+        // даёт заготовка при применении. Фокус кузни стоит на верхнем звене, не на создающем.
+        // Предел родителей на цель — 30, как у .constellation trig: совпадение по значению
+        // скрипта у малых номеров способно раздуть фронт на сотни (Кодекс, задача 82).
+        static uint32 const MAX_PARENTS = 30, MAX_CLIMB_NODES = 60;
+        auto leadsTo = [&](uint32 target, std::vector<std::pair<uint32, bool>>& out)
+        {
+            sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+            {
+                if (!si || si->Difficulty != DIFFICULTY_NONE || si->Id == target || out.size() >= MAX_PARENTS)
+                    return;
+                for (SpellEffectInfo const& e : si->GetEffects())
+                {
+                    bool const byTrigger = e.TriggerSpell == target;
+                    bool const byValue = (e.Effect == SPELL_EFFECT_SCRIPT_EFFECT || e.Effect == SPELL_EFFECT_DUMMY)
+                        && uint32(e.CalcValue()) == target;
+                    if (byTrigger || byValue)
+                        { out.emplace_back(si->Id, byTrigger); return; }
+                }
+            });
+        };
+        // Фокус ищется полным обходом точек карты — один раз на номер фокуса за команду.
+        std::unordered_map<uint32, std::pair<uint32, float>> focusCache;
+        auto focusText = [&](SpellInfo const* si) -> std::string
+        {
+            if (!si->RequiresSpellFocus)
+                return "фокус не нужен";
+            auto it = focusCache.find(si->RequiresSpellFocus);
+            if (it == focusCache.end())
+            {
+                uint32 focusEntry = 0;
+                float const fd = nearestFocus(si->RequiresSpellFocus, focusEntry);
+                it = focusCache.emplace(si->RequiresSpellFocus, std::make_pair(focusEntry, fd)).first;
+            }
+            return it->second.first
+                ? Trinity::StringFormat("фокус {}: ближайший объект {} в {:.0f} ярдах", si->RequiresSpellFocus, it->second.first, it->second.second)
+                : Trinity::StringFormat("фокус {}: объекта-фокуса на этой карте НЕ НАЙДЕНО", si->RequiresSpellFocus);
+        };
+        // ВВЕРХ ПО ТРИГГЕРАМ от заклинания: на каждом уровне — предметы, его произносящие, и
+        // фокус; глубина три и общий предел узлов, шире не идём — прибор, не поиск по всему
+        // графу. Каждое ребро подписано: «триггер» — связь из данных, «значение, эвристика» —
+        // совпадение числа, которое ещё надо доказать (Кодекс, задача 82). Общий seen прячет
+        // повторные рёбра к уже найденному родителю — вывод неполон, но не ложен.
+        auto climb = [&](uint32 spellId)
+        {
+            std::vector<uint32> frontier{ spellId };
+            std::set<uint32> seen{ spellId };
+            uint32 nodes = 0;
+            for (int depth = 1; depth <= 3 && !frontier.empty(); ++depth)
+            {
+                std::vector<uint32> next;
+                for (uint32 sid : frontier)
+                {
+                    std::vector<std::pair<uint32, bool>> parents;
+                    leadsTo(sid, parents);
+                    if (parents.size() >= MAX_PARENTS)
+                        say(Trinity::StringFormat("    уровень {}: к {} ведут {}+ заклинаний — УСЕЧЕНО по пределу родителей", depth, sid, MAX_PARENTS));
+                    for (auto const& [pid, byTrigger] : parents)
+                    {
+                        if (!seen.insert(pid).second)
+                            continue;
+                        if (++nodes > MAX_CLIMB_NODES)
+                        {
+                            say(Trinity::StringFormat("    УСЕЧЕНО: предел узлов подъёма {} достигнут", MAX_CLIMB_NODES));
+                            return;
+                        }
+                        SpellInfo const* psi = sSpellMgr->GetSpellInfo(pid, DIFFICULTY_NONE);
+                        if (!psi)
+                            continue;
+                        auto const& items = itemsCasting(pid);
+                        say(Trinity::StringFormat("    уровень {}: к {} ведёт заклинание {} «{}» ({}), {} <- предметов с этим эффектом {}",
+                            depth, sid, pid, psi->SpellName->Str[LOCALE_enUS],
+                            byTrigger ? "триггер" : "значение, эвристика",
+                            focusText(psi), uint32(items.size())));
+                        for (auto const& [src, trig] : items)
+                            describeItem(src, trigName(trig));
+                        next.push_back(pid);
+                    }
+                }
+                frontier.swap(next);
+            }
+        };
+
+        uint32 printed = 0;
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = self->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            for (QuestObjective const& obj : quest->GetObjectives())
+            {
+                if (obj.ObjectID <= 0)
+                    continue;
+                if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
+                    continue;
+                ++printed;
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER)
+                {
+                    uint32 const entry = uint32(obj.ObjectID);
+                    uint32 spawns = 0;
+                    for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+                        if (data.id == entry && data.mapId == mapId)
+                            ++spawns;
+                    say(Trinity::StringFormat("квест {} «{}» цель-существо {}: точек на этой карте {}",
+                        questId, quest->GetLogTitle(), entry, spawns));
+                    sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+                    {
+                        if (!si || si->Difficulty != DIFFICULTY_NONE)
+                            return;
+                        for (SpellEffectInfo const& e : si->GetEffects())
+                        {
+                            if ((e.Effect != SPELL_EFFECT_KILL_CREDIT && e.Effect != SPELL_EFFECT_KILL_CREDIT2)
+                                || uint32(e.MiscValue) != entry)
+                                continue;
+                            auto const& items = itemsCasting(si->Id);
+                            say(Trinity::StringFormat("  зачёт {} <- заклинание {} «{}» (KILL_CREDIT), {} <- предметов с этим эффектом {}",
+                                entry, si->Id, si->SpellName->Str[LOCALE_enUS], focusText(si), uint32(items.size())));
+                            for (auto const& [item, trig] : items)
+                                describeItem(item, trigName(trig));
+                            if (items.empty())
+                                climb(si->Id);
+                        }
+                    });
+                }
+                else if (obj.Type == QUEST_OBJECTIVE_ITEM)
+                {
+                    uint32 const item = uint32(obj.ObjectID);
+                    say(Trinity::StringFormat("квест {} «{}» цель-предмет {}:", questId, quest->GetLogTitle(), item));
+                    describeItem(item, "сама цель");
+                    sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+                    {
+                        if (!si || si->Difficulty != DIFFICULTY_NONE)
+                            return;
+                        for (SpellEffectInfo const& e : si->GetEffects())
+                        {
+                            if (e.Effect != SPELL_EFFECT_CREATE_ITEM || uint32(e.ItemType) != item)
+                                continue;
+                            auto const& items = itemsCasting(si->Id);
+                            say(Trinity::StringFormat(
+                                "  предмет {} <- заклинание {} «{}» (CREATE_ITEM), {} <- предметов с этим эффектом {}",
+                                item, si->Id, si->SpellName->Str[LOCALE_enUS], focusText(si), uint32(items.size())));
+                            for (auto const& [src, trig] : items)
+                                describeItem(src, trigName(trig));
+                            if (items.empty())
+                                climb(si->Id);
+                        }
+                    });
+                }
+                else
+                    say(Trinity::StringFormat("квест {} «{}» цель типа {} — цепочку не строю",
+                        questId, quest->GetLogTitle(), uint32(obj.Type)));
+            }
+        }
+        handler->PSendSysMessage("Constellation: у %s незакрытых целей %u", who.c_str(), printed);
+    }
+
     // ТАБЛИЦА СТОИМОСТЕЙ — КРУГ 4b ПРОЕКТА РОТАЦИИ (rotation-spec-v3, §1). Только читает.
     //
     // Для каждого ПЛАТНОГО умения книги: вид ресурса и его максимум у спутника, базовая цена
@@ -10158,6 +10433,7 @@ public:
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "spells",  HandleSpells,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "costs",   HandleCosts,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "chain",   HandleChain,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -10183,6 +10459,12 @@ public:
     static bool HandleCosts(ChatHandler* handler, std::string const& who)
     {
         Constellation::Manager::Instance()->CostCensus(handler, who);
+        return true;
+    }
+
+    static bool HandleChain(ChatHandler* handler, std::string const& who)
+    {
+        Constellation::Manager::Instance()->ChainCensus(handler, who);
         return true;
     }
 
