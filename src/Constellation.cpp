@@ -4527,7 +4527,7 @@ public:
             else if (hurts && !si->NeedsExplicitUnitTarget())        why = "без-цели";
             else if (si->IsAffectingArea() || si->IsTargetingArea()) why = "площадь";
             else if (!si->CanBeUsedInCombat(self))                   why = "нельзя-в-бою";
-            else if (self->GetSpellHistory()->HasCooldown(si))       why = "откат";
+            else if (!self->GetSpellHistory()->IsReady(si))          why = "не-готово-в-этот-миг";
 
             // стоимость: вид ресурса и сколько. Считает ядро, не я.
             int32 amount = 0; uint32 power = uint32(POWER_MANA);
@@ -4723,7 +4723,10 @@ public:
             if (si->CheckTarget(self, victim, false) != SPELL_CAST_OK)
                 continue;
 
-            if (self->GetSpellHistory()->HasCooldown(si))
+            // ГОТОВНОСТЬ — ВОПРОС ЯДРА ЦЕЛИКОМ: SpellHistory::IsReady проверяет блокировку
+            // школы, откат И ЗАРЯДЫ. HasCooldown зарядов не видит, и заклинание с зарядами
+            // считалось готовым всегда.
+            if (!self->GetSpellHistory()->IsReady(si))
                 continue;
 
             // УСЛОВИЕ СОСТОЯНИЯ — ВОПРОС ЯДРА, А НЕ СПИСОК ЗАКЛИНАНИЙ (замер: воин раз за разом
@@ -4748,8 +4751,8 @@ public:
 
             // НА КАКУЮ СТУПЕНЬ. Все вопросы задаём ядру.
             int rung = RUNG_FILL;
-            if (si->GetRecoveryTime() > 0)
-                rung = RUNG_READY;      // откат объявлен; что он пройден, проверено выше
+            if (si->GetRecoveryTime() > 0 || si->ChargeCategoryId)
+                rung = RUNG_READY;      // откат или заряды объявлены; что готово — проверено выше
             if (IsOverTime(si))
             {
                 // УЖЕ ВИСЯЩЕЕ НАДО ИСКЛЮЧАТЬ, А НЕ ПОНИЖАТЬ. Прежняя правка отправляла его
@@ -5479,7 +5482,10 @@ public:
                 continue;               // на себя не ложится — не наш случай
             if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
                 continue;               // условие состояния не выполнено — ядро откажет
-            if (self->GetSpellHistory()->HasCooldown(si))
+            // ГОТОВНОСТЬ — ВОПРОС ЯДРА ЦЕЛИКОМ: SpellHistory::IsReady проверяет блокировку
+            // школы, откат И ЗАРЯДЫ. HasCooldown зарядов не видит, и заклинание с зарядами
+            // считалось готовым всегда.
+            if (!self->GetSpellHistory()->IsReady(si))
                 continue;
             bool affordable = true;
             for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
