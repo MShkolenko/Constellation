@@ -3385,6 +3385,16 @@ public:
                         c.WalkStuckMs += slice;
                     if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                     {
+                        // ЧИСЛА, А НЕ ФРАЗА: три условия сливались в одну строку, и по журналу
+                        // нельзя было отличить «упёрлись в стену» от «идём, но слишком долго».
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation СДАЧА {}: до принимающего {} (квест {}) не дойти — осталось {:.0f} "
+                            "по плоскости, лучшее было {:.0f}, по высоте {:+.0f}; причина {}, тип пути {}, в пути {} с",
+                            self->GetName(), c.TurnInEntry, c.TurnInQuest, d, c.WalkBest,
+                            c.TurnInPos.GetPositionZ() - self->GetPositionZ(),
+                            c.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
+                            c.LastPathType ? Trinity::StringFormat("{:X}", c.LastPathType) : std::string("отказов не было"),
+                            c.ModeMs / 1000);
                         c.TurnInBackoff[c.TurnInQuest] = 300000;   // пять минут: дорога, а не рывок
                         Switch(c, self, Behavior::Idle, "до принимающего не дойти");
                     }
@@ -5535,6 +5545,7 @@ public:
             // «стою» тут же выбирало её снова (Кодекс). Уходим тем же опкодом, каким
             // это делает клиент: CMSG_ATTACK_STOP -> Player::AttackStop().
             c.EngageRange = 0.0f;           // новая цель — новая дистанция боя
+            c.LastPathType = 0;             // тип отказа построителя относится к намерению, а не к жизни спутника
 
         if (c.GiverUnreachable.size() > 40)
             c.GiverUnreachable.clear();  // список не должен расти без предела
