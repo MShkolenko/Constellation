@@ -63,6 +63,8 @@
 #include "TaxiPackets.h"
 #include "PhasingHandler.h"
 #include "Plan.h"
+#include "WaypointDefines.h"
+#include "WaypointManager.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
@@ -253,6 +255,7 @@ struct Companion
     ObjectGuid GiverGuid;               // квестодатель, к которому идём (пусто = никуда)
     uint32 GiverMs = 0;                 // сколько уже идём к нему
     float GiverDist = 0.0f;             // и с какой дистанции начали — меряем прогресс
+    float GiverRange = 0.0f;            // радиус, с которого цель передана по приходу (0 = обычный)
     std::map<ObjectGuid, uint32> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
     uint32 GiverForgetMs = 0;           // и когда забыть этот список — «навсегда» было ошибкой
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
@@ -3009,6 +3012,18 @@ public:
                     c.SeekCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
                     c.QuestMs = Cfg().QuestIntervalMs;      // спросить квестодателя на следующем же такте
                     c.IdleDiagMs = 0;                       // и прибор ПРОСТОЙ — сразу по приходу, не через 5 мин
+                    // ТОЧКА СПАВНА — НЕ МЕСТО NPC (замер: пришли в 25 ярдов к точке, а Chip Endale
+                    // стоит в 35 — за радиусом отбора). Ищем предлагающего в 60 ярдах и отдаём его
+                    // подходу; дальше обычный путь: подойти, Hello, меню, взять.
+                    if (Creature* found = NearestQuestGiver(c, self, 60.0f))
+                    {
+                        c.GiverGuid = found->GetGUID();
+                        c.GiverMs = 0;
+                        c.GiverDist = self->GetExactDist(found);
+                        c.GiverRange = 60.0f;               // порог сброса в QuestTick считает от него
+                        TC_LOG_INFO("server.worldserver", "Constellation ПОХОД {}: у точки {} ({}) стоит в {:.0f} ярдах — иду к нему",
+                            self->GetName(), found->GetName(), found->GetEntry(), c.GiverDist);
+                    }
                     Switch(c, self, Behavior::Idle, "дошёл до квестодателя по карте");
                     return;
                 }
@@ -5703,7 +5718,7 @@ public:
             Creature* going = ObjectAccessor::GetCreature(*self, c.GiverGuid);
             bool const busy = c.Mode != Behavior::Idle;     // дерётся или идёт по своим делам
             if (!going || !going->IsAlive() || busy
-                || self->GetExactDist(going) > Cfg().QuestGiverRange + 15.0f)
+                || self->GetExactDist(going) > std::max(Cfg().QuestGiverRange, c.GiverRange) + 15.0f)
             {
                 c.GiverGuid.Clear();                        // цель протухла — забыть
             }
@@ -5775,6 +5790,7 @@ public:
                 c.GiverGuid = giver->GetGUID();     // пойдём к нему со следующего такта
                 c.GiverMs = 0;
                 c.GiverDist = self->GetExactDist(giver);
+                c.GiverRange = 0.0f;
             }
             return;
         }
@@ -6205,7 +6221,8 @@ public:
             auto const rel = sObjectMgr->GetCreatureQuestRelations(data.id);
             if (rel.begin() == rel.end())
                 continue;
-            _givers[data.mapId].push_back(Giver{ data.id, tpl->faction, data.spawnPoint, spawnId });
+            CreatureAddon const* addon = sObjectMgr->GetCreatureAddon(spawnId);
+            _givers[data.mapId].push_back(Giver{ data.id, tpl->faction, data.spawnPoint, spawnId, addon ? addon->PathId : 0 });
             ++gq;
         }
         TC_LOG_INFO("server.loading", "Constellation: указатель квестодателей — {} точек на {} картах",
@@ -7818,7 +7835,16 @@ public:
         // предмет 38145 источником не оказался, а character_spell на этом ядре пуста, поэтому
         // спросить можно только у ядра в памяти. Одно слово в уже существующей строке.
         if (self->GetClass() == CLASS_DEATH_KNIGHT)
-            wardrobe += Trinity::StringFormat("51769: {}; ", self->HasSpell(51769) ? "знает" : "не знает");
+        {
+            // 51769 — зачётное заклинание, его не учит никто; зачёт 12619 даёт ЛЮБАЯ руна из
+            // spell_chapter1_runeforging_credit, наложенная у кузни. Печатаем, что из этого знаем.
+            static uint32 const runes[] = { 53428, 53343, 53344, 62158, 326805, 326855, 326911, 326977, 327082 };
+            std::string known;
+            for (uint32 sp : runes)
+                if (self->HasSpell(sp))
+                    known += std::to_string(sp) + " ";
+            wardrobe += Trinity::StringFormat("руны: {}; ", known.empty() ? std::string("ни одной") : known);
+        }
         if (!wardrobe.empty())
             TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
                 self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
@@ -8019,6 +8045,25 @@ public:
         *spawn = best->SpawnId;
         *pos = best->Where;
         *questOut = bestQuest;
+        // ХОДЯЧИЙ: точка спавна — не место NPC. Идём к ближайшему узлу его маршрута: он проходит
+        // каждый узел раз за круг, а по приходу отбор ищет его в 60 ярдах.
+        if (best->PathId)
+            if (WaypointPath const* path = sWaypointMgr->GetPath(best->PathId))
+            {
+                float bestNode = 1.0e9f;
+                for (WaypointNode const& node : path->Nodes)
+                {
+                    float const dn = self->GetExactDist2d(node.X, node.Y);
+                    if (dn < bestNode)
+                    {
+                        bestNode = dn;
+                        pos->Relocate(node.X, node.Y, node.Z);
+                    }
+                }
+                if (bestNode < 1.0e9f)
+                    TC_LOG_INFO("server.worldserver", "Constellation ПОХОД {}: {} ({}) ходит по маршруту {} — иду к ближайшему узлу в {:.0f} ярдах",
+                        self->GetName(), best->Entry, best->SpawnId, best->PathId, bestNode);
+            }
         return true;
     }
 
@@ -8588,15 +8633,18 @@ public:
     // Тот же приём, что вскрыл боевую воронку: по разу на КАЖДОГО спутника печатаем, сколько
     // существ рядом и сколько отсеяла каждая проверка. Один раз на спутника — 122 строки за
     // прогон, дальше молчок.
-    Creature* NearestQuestGiver(Companion& c, Player* self) const
+    Creature* NearestQuestGiver(Companion& c, Player* self, float rangeOverride = 0.0f) const
     {
+        // радиус шире обычного — только по приходу к точке спавна (см. SeekingGiver): NPC
+        // стоит не на точке, а рядом, и 30 ярдов от места остановки его не достают
+        float const range = rangeOverride > 0.0f ? rangeOverride : Cfg().QuestGiverRange;
         std::list<Creature*> around;
-        Trinity::AnyUnitInObjectRangeCheck check(self, Cfg().QuestGiverRange);
+        Trinity::AnyUnitInObjectRangeCheck check(self, range);
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
-        Cell::VisitGridObjects(self, searcher, Cfg().QuestGiverRange);
+        Cell::VisitGridObjects(self, searcher, range);
 
         Creature* best = nullptr;
-        float bestDist = Cfg().QuestGiverRange + 1001.0f;   // невидимые идут с надбавкой в тысячу ярдов — после всех видимых
+        float bestDist = range + 1001.0f;   // невидимые идут с надбавкой в тысячу ярдов — после всех видимых
         uint32 seen = 0, dead = 0, nothingToOffer = 0, blacklisted = 0, noLos = 0;
         for (Creature* creature : around)
         {
@@ -8661,7 +8709,7 @@ public:
                 "Constellation КВЕСТОДАТЕЛЬ {}: рядом существ {}, мертвы {}, нечего предложить {}, "
                 "в чёрном списке {}, не видно {}, ВЫБРАН {}; в журнале квестов {}, радиус {:.0f}",
                 self->GetName(), seen, dead, nothingToOffer, blacklisted, noLos,
-                best ? best->GetName() : "никто", used, Cfg().QuestGiverRange);
+                best ? best->GetName() : "никто", used, range);
         }
         return best;
     }
@@ -9398,7 +9446,7 @@ private:
     std::unordered_map<uint32, std::vector<FlightPoint>> _flightMasters;   // карта -> где стоят
     // цель -> существа, чьи KillCredit на неё указывают
     struct Mender { uint32 Entry; uint32 Faction; Position Where; bool Sells; bool Fixes; };
-    struct Giver { uint32 Entry; uint32 Faction; Position Where; ObjectGuid::LowType SpawnId; };
+    struct Giver { uint32 Entry; uint32 Faction; Position Where; ObjectGuid::LowType SpawnId; uint32 PathId; };
     std::unordered_map<uint32, std::vector<Giver>> _givers;      // карта -> квестодатели по таблице
     std::unordered_map<uint32, std::vector<Mender>> _menders;                          // карта -> торговцы
     // Поля фазы храним ВМЕСТЕ с точкой: фаза — это «версия места», и спавн, объявленный
