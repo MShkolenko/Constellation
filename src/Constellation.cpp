@@ -8683,6 +8683,11 @@ public:
                 | QuestGiverStatus::CovenantCallingQuest;
             if ((st & offers) == QuestGiverStatus::None)
                 { ++nothingToOffer; continue; }
+            // ЗНАК — НЕ МЕНЮ (Player.cpp:16086-16112): бит Quest даёт CanSeeStartQuest, а меню — CanTakeQuest.
+            // Мегс на Кезане носит знак при пустом меню. Спрашиваем право на выдачу по меню (CanTakeQuest)
+            // ПЛЮС фильтры модуля: отказные, цвет, сезонность, чужая профессия (Кодекс, задача 57).
+            if (!TakeableQuestAt(self, c, creature->GetEntry()))
+                { ++nothingToOffer; continue; }
             if (c.GiverUnreachable.count(creature->GetGUID()))
                 { ++blacklisted; continue; }   // уже пробовали дойти и не вышло
             // НЕ ВИДНО — НЕ ЗНАЧИТ НЕ ДОЙТИ. Проверка видимости стояла ПОСЛЕ проверки «предлагает
