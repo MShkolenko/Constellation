@@ -1242,10 +1242,30 @@ public:
             PathGenerator path(self);
             PathGenerator hop(self);
             PathGenerator other(self);      // ЖИВЁТ ДО КОНЦА ВЕТКИ: путь из него используется ниже
+            PathGenerator plain(self);      // и этот тоже: без сглаживания
             bool built = path.CalculatePath(tx, ty, tz, false)
                 && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT));
             Movement::PointsArray const* pts = built ? &path.GetPath() : nullptr;
             float aimX = tx, aimY = ty;
+
+            // БЕЗ СГЛАЖИВАНИЯ — ПЕРВЫЙ ЖЕ ЗАПАСНОЙ ПУТЬ, И ЭТО ИЗМЕРЕНО, А НЕ ВЫВЕДЕНО.
+            // Опыт .constellation path от Cecily к Бартлетту, 386 ярдов по Элвинну:
+            // обычным построением — тип A, две точки, то есть отказ; с SetUseStraightPath —
+            // тип 4, ДВЕНАДЦАТЬ точек, длина 466. Ядро ставит тип A ровно в BuildPointPath
+            // (PathGenerator.cpp:586), когда findStraightPath вернул меньше двух точек, а
+            // SetUseStraightPath берёт его результат напрямую, минуя сглаживание по шагам.
+            if (!built)
+            {
+                plain.SetUseStraightPath(true);
+                if (plain.CalculatePath(tx, ty, tz, false)
+                    && !(plain.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT))
+                    && plain.GetPath().size() >= 2)
+                {
+                    built = true;
+                    pts = &plain.GetPath();
+                    ++_straightSaved;
+                }
+            }
 
             // ТА ЖЕ ТОЧКА, НО С ДРУГОГО ЯРУСА — ОДНА ПОПЫТКА (замер: тип 84, «конец пути далеко
             // от полигона», и разница высот в полсотни ярдов при двадцати пяти по плоскости).
@@ -1326,12 +1346,12 @@ public:
                     TC_LOG_INFO("server.worldserver",
                         "Constellation STEP {}: маршрута нет, тип {:X}, точек {}, карта {}, "
                         "я {:.0f} {:.0f} {:.1f} -> цель {:.0f} {:.0f} {:.1f}, по плоскости {:.0f}, по высоте {:.1f}"
-                        " (ярусом выше помогло уже {} раз, промежуточными точками {})",
+                        " (ярусом выше помогло уже {} раз, без сглаживания {}, промежуточными точками {})",
                         self->GetName(), uint32(path.GetPathType()), uint32(path.GetPath().size()),
                         self->GetMapId(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
                         tx, ty, tz, self->GetExactDist2d(tx, ty), tz - self->GetPositionZ(),
-                        _otherTier, _hops);
+                        _otherTier, _straightSaved, _hops);
                 }
                 // РАЗБРОС ОБЯЗАТЕЛЕН: без него 122 спутника, вставшие одновременно,
                 // повторяют тяжёлый поиск ОДНИМ ЗАЛПОМ — реже, но всё так же кучно, и
@@ -9568,6 +9588,7 @@ private:
     uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
     uint32 _flights = 0;                // сколько раз состав улетал
     uint32 _otherTier = 0;              // сколько раз путь дался к цели на другом ярусе
+    uint32 _straightSaved = 0;          // сколько раз выручило построение без сглаживания
     uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
