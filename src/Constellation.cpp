@@ -3021,6 +3021,7 @@ public:
                         c.GiverMs = 0;
                         c.GiverDist = self->GetExactDist(found);
                         c.GiverRange = 60.0f;               // порог сброса в QuestTick считает от него
+                        c.TalkDiagDone = false;             // и прибор РАЗГОВОР — снова, у этой цели
                         TC_LOG_INFO("server.worldserver", "Constellation ПОХОД {}: у точки {} ({}) стоит в {:.0f} ярдах — иду к нему",
                             self->GetName(), found->GetName(), found->GetEntry(), c.GiverDist);
                     }
@@ -7900,7 +7901,8 @@ public:
                     continue;
                 static char const* const colourName[5] = { "серое", "зелёное", "жёлтое", "красное", "цвет?" };
                 quests += std::to_string(qid) + " " + colourName[std::min<uint8>(QuestColour(self, q), 4)]
-                        + "/" + FirstFailingGate(self, q) + (c.QuestRefused.count(qid) ? " (отказной)" : "") + "; ";
+                        + "/" + FirstFailingGate(self, q) + (self->CanSeeStartQuest(q) ? "/видит" : "")
+                        + (c.QuestRefused.count(qid) ? " (отказной)" : "") + "; ";
             }
             ++printed;
             // СВОИ ФИЛЬТРЫ — ОТДЕЛЬНО ОТ ВОРОТ ЯДРА (Кодекс): чёрный список и отказные — модуля,
@@ -9605,6 +9607,9 @@ public:
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "zones",   HandleZones,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -9634,6 +9639,80 @@ public:
     static bool HandleRepair(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->RepairAll(handler);
+    }
+
+    // .constellation spell <id> — эффекты заклинания глазами ядра (Spell.db2 в памяти сервера)
+    static bool HandleSpell(ChatHandler* handler, uint32 spellId)
+    {
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        if (!si)
+        {
+            handler->PSendSysMessage("Constellation: заклинания %u нет", spellId);
+            return true;
+        }
+        for (SpellEffectInfo const& e : si->GetEffects())
+        {
+            std::string line = Trinity::StringFormat(
+                "Constellation ЗАКЛИНАНИЕ {} «{}» эффект {}: тип {}, аура {}, триггер {}, предмет {}, значение {}, misc {} {}",
+                spellId, si->SpellName->Str[LOCALE_enUS], uint32(e.EffectIndex), uint32(e.Effect), uint32(e.ApplyAuraName),
+                e.TriggerSpell, e.ItemType, e.CalcValue(), e.MiscValue, e.MiscValueB);
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        }
+        handler->PSendSysMessage("Constellation: фокус %u, требует предмета класса %d подкласса %d", si->RequiresSpellFocus,
+            int32(si->EquippedItemClass), int32(si->EquippedItemSubClassMask));
+        return true;
+    }
+
+    // .constellation itemsrc <item> — какие заклинания создают этот предмет (CREATE_ITEM / CREATE_LOOT)
+    static bool HandleItemSrc(ChatHandler* handler, uint32 itemId)
+    {
+        // обход хранилища ядра, а не перебор номеров до потолка (Кодекс): полно и без дубликатов вариантов
+        uint32 found = 0;
+        sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+        {
+            if (si->Difficulty != DIFFICULTY_NONE || found >= 20)
+                return;
+            for (SpellEffectInfo const& e : si->GetEffects())
+                if (e.ItemType == itemId)
+                {
+                    ++found;
+                    std::string line = Trinity::StringFormat("Constellation ИСТОЧНИК предмета {}: заклинание {} «{}» эффект {} тип {}",
+                        itemId, si->Id, si->SpellName->Str[LOCALE_enUS], uint32(e.EffectIndex), uint32(e.Effect));
+                    TC_LOG_INFO("server.worldserver", "{}", line);
+                    handler->PSendSysMessage("%s", line.c_str());
+                }
+        });
+        handler->PSendSysMessage("Constellation: заклинаний, создающих %u: %u", itemId, found);
+        return true;
+    }
+
+    // .constellation trig <spell> — кто ведёт к этому заклинанию: триггер эффекта, обучение, значение скрипта
+    static bool HandleTrig(ChatHandler* handler, uint32 target)
+    {
+        // обход хранилища ядра (Кодекс); обучение идёт через TriggerSpell, совпадение по значению
+        // скрипта/пустышки — эвристика без кастера и так и помечено
+        uint32 found = 0;
+        sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+        {
+            if (si->Difficulty != DIFFICULTY_NONE || found >= 30)
+                return;
+            for (SpellEffectInfo const& e : si->GetEffects())
+            {
+                bool const byTrigger = e.TriggerSpell == target;
+                bool const byValue = (e.Effect == SPELL_EFFECT_SCRIPT_EFFECT || e.Effect == SPELL_EFFECT_DUMMY)
+                    && uint32(e.CalcValue()) == target;
+                if (!byTrigger && !byValue)
+                    continue;
+                ++found;
+                std::string line = Trinity::StringFormat("Constellation ВЕДЁТ к {}: заклинание {} «{}» эффект {} тип {} ({})",
+                    target, si->Id, si->SpellName->Str[LOCALE_enUS], uint32(e.EffectIndex), uint32(e.Effect), byTrigger ? "триггер" : "значение, эвристика");
+                TC_LOG_INFO("server.worldserver", "{}", line);
+                handler->PSendSysMessage("%s", line.c_str());
+            }
+        });
+        handler->PSendSysMessage("Constellation: ведущих к %u: %u", target, found);
+        return true;
     }
 
     static bool HandleZones(ChatHandler* handler)
