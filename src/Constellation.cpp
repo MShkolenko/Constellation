@@ -6561,6 +6561,39 @@ public:
             "Constellation: указатель объектов сбора — {} точек на {} картах, {} связей предмет->объект; "
             "отсеяно замком {}, без предметов задания {}",
             g, uint32(_goSpawns.size()), links, locked, noItems);
+
+        // ЗАЧЁТ ЧЕРЕЗ НАДЕВАНИЕ — ИНДЕКС ИЗ ДВУХ ХРАНИЛИЩ ЯДРА, ОДИН РАЗ.
+        //
+        // Шаг 1: заклинание -> существа, которым оно даёт зачёт (эффекты KILL_CREDIT и
+        // KILL_CREDIT2, номер существа в MiscValue — так же читает их и CreditsOf).
+        // Шаг 2: предмет -> эти существа, если эффект предмета ПРИ НАДЕВАНИИ произносит такое
+        // заклинание. Только при надевании: зачёт «применить предмет у фокуса» (кузня ДК)
+        // требует ещё дороги к фокусу и здесь осознанно не берётся.
+        std::unordered_map<uint32, std::set<uint32>> creditsOfSpell;
+        sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+        {
+            if (!si || si->Difficulty != DIFFICULTY_NONE)
+                return;
+            for (SpellEffectInfo const& e : si->GetEffects())
+                if ((e.Effect == SPELL_EFFECT_KILL_CREDIT || e.Effect == SPELL_EFFECT_KILL_CREDIT2) && e.MiscValue > 0)
+                    creditsOfSpell[si->Id].insert(uint32(e.MiscValue));
+        });
+        uint32 creditItems = 0;
+        for (auto const& [itemId, tpl] : sObjectMgr->GetItemTemplateStore())
+            for (ItemEffectEntry const* eff : tpl.Effects)
+            {
+                if (!eff || eff->TriggerType != ITEM_SPELLTRIGGER_ON_EQUIP || eff->SpellID <= 0)
+                    continue;
+                auto it = creditsOfSpell.find(uint32(eff->SpellID));
+                if (it == creditsOfSpell.end())
+                    continue;
+                for (uint32 entry : it->second)
+                    _itemsForCredit[entry].insert(itemId);
+                ++creditItems;
+            }
+        TC_LOG_INFO("server.loading",
+            "Constellation: указатель зачётов через надевание — заклинаний с зачётом {}, эффектов предметов при надевании {}, существ {}",
+            uint32(creditsOfSpell.size()), creditItems, uint32(_itemsForCredit.size()));
     }
 
     // Сдача: поздороваться, сдать, выбрать награду — теми же опкодами, что клиент.
@@ -6687,6 +6720,17 @@ public:
                     // «без зачёта прокси» (Кодекс). Такие цели закрываются только прямо.
                     if (proxyOk && !quest->HasFlagEx(QUEST_FLAGS_EX_NO_CREDIT_FOR_PROXY))
                         proxyOk->insert(uint32(obj.ObjectID));
+                    // ЗАЧЁТ ЧЕРЕЗ НАДЕВАНИЕ: существо, которое выдаётся эффектом предмета при
+                    // надевании, превращается в предмет, который надо ДОБЫТЬ, — и дальше это
+                    // обычный сбор с объекта плюс гардероб, который пустой слот заполняет
+                    // чем угодно пригодным. Берём только то, что этот класс может носить:
+                    // вопрос ядру (Player::CanUseItem), а не таблице стоек по классам.
+                    if (wantedItems)
+                        if (auto ci = _itemsForCredit.find(uint32(obj.ObjectID)); ci != _itemsForCredit.end())
+                            for (uint32 item : ci->second)
+                                if (ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(item))
+                                    if (self->CanUseItem(tpl) == EQUIP_ERR_OK)
+                                        wantedItems->insert(item);
                 }
                 else if (wantedItems)
                     wantedItems->insert(uint32(obj.ObjectID));
@@ -10289,6 +10333,12 @@ private:
     // и перебираются только нужные.
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _goSpawns;
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
+    // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
+    // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
+    // появляется никогда: зачёт выдаёт заклинание 100707 «Main Hand Weapon Equipped Credit»,
+    // а его произносит эффект «при надевании» девяти учебных оружий, лежащих в стойках рядом.
+    // Прибор .constellation chain доказал это на боевом из данных ядра, без единого имени.
+    std::unordered_map<uint32, std::set<uint32>> _itemsForCredit;        // существо -> предметы
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
