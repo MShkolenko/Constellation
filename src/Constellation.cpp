@@ -8944,6 +8944,61 @@ public:
         return true;
     }
 
+    // ОПЫТ ПО ПУТИ: четыре построения к одной цели, с числами. Только читает и печатает.
+    void PathProbe(ChatHandler* handler, std::string const& who, float x, float y, float z)
+    {
+        Player* self = nullptr;
+        for (Companion const& c : _companions)
+            if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer()
+                && c.Session->GetPlayer()->GetName() == who)
+                { self = c.Session->GetPlayer(); break; }
+        if (!self)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
+            return;
+        }
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)
+            || !MapManager::IsValidMapCoord(self->GetMapId(), x, y, z))
+        {
+            handler->PSendSysMessage("Constellation: цель %f %f %f не годится", x, y, z);
+            return;
+        }
+        float const whole = self->GetExactDist2d(x, y);
+        auto run = [&](char const* label, float tx, float ty, float tz, bool straight, bool raycast)
+        {
+            PathGenerator gen(self);
+            gen.SetUseStraightPath(straight);
+            gen.SetUseRaycast(raycast);
+            bool const ok = gen.CalculatePath(tx, ty, tz, false);
+            std::string line = Trinity::StringFormat(
+                "Constellation ПУТЬ {} [{}]: построен {}, тип {:X}, точек {}, длина {:.0f}, до цели {:.0f}",
+                self->GetName(), label, ok ? 1 : 0, uint32(gen.GetPathType()),
+                uint32(gen.GetPath().size()), gen.GetPathLength(), self->GetExactDist2d(tx, ty));
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        };
+        run("обычный", x, y, z, false, false);
+        run("прямой", x, y, z, true, false);
+        run("лучевой", x, y, z, false, true);
+        // четверть пути по прямой к цели, высоту берём у карты от своего яруса
+        float const ang = self->GetAbsoluteAngle(x, y);
+        float const qx = self->GetPositionX() + std::cos(ang) * whole * 0.25f;
+        float const qy = self->GetPositionY() + std::sin(ang) * whole * 0.25f;
+        float const qz = self->GetMap()->GetHeight(self->GetPhaseShift(), qx, qy, self->GetPositionZ() + 5.0f);
+        // четверть от нуля ничего не измеряет; о пропуске сообщаем и в журнал (Кодекс)
+        if (whole >= 20.0f && std::isfinite(qx) && std::isfinite(qy) && qz > INVALID_HEIGHT
+            && MapManager::IsValidMapCoord(self->GetMapId(), qx, qy, qz))
+            run("четверть", qx, qy, qz, false, false);
+        else
+        {
+            std::string const line = Trinity::StringFormat(
+                "Constellation ПУТЬ {} [четверть]: пропущена — расстояние {:.0f}, высота {:.1f}",
+                self->GetName(), whole, qz);
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        }
+    }
+
     void Status(ChatHandler* handler)
     {
         uint32 inWorld = 0, failed = 0;
@@ -9686,6 +9741,7 @@ public:
             { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -9694,6 +9750,12 @@ public:
             { "constellation", constellationTable },
         };
         return commandTable;
+    }
+
+    static bool HandlePath(ChatHandler* handler, std::string const& who, float x, float y, float z)
+    {
+        Constellation::Manager::Instance()->PathProbe(handler, who, x, y, z);
+        return true;
     }
 
     static bool HandleStatus(ChatHandler* handler)
