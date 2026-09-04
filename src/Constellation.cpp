@@ -4630,6 +4630,12 @@ public:
             if (self->GetSpellHistory()->HasCooldown(si))
                 continue;
 
+            // УСЛОВИЕ СОСТОЯНИЯ — ВОПРОС ЯДРА, А НЕ СПИСОК ЗАКЛИНАНИЙ (замер: воин раз за разом
+            // просил Victory Rush в двух ярдах от цели, без цены и без чтения — умение даётся
+            // после добивания, и ядро отвергает его в CheckCast через HasAuraState).
+            if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
+                continue;
+
             // ХВАТАЕТ ЛИ СИЛ — СЧИТАЕТ ЯДРО. Своя арифметика здесь стоила бы ровно того же,
             // что стоила арифметика по здоровью моба: правдоподобного и неверного числа.
             bool free = true, affordable = true;
@@ -5351,6 +5357,8 @@ public:
                 continue;
             if (si->CheckTarget(self, self, false) != SPELL_CAST_OK)
                 continue;               // на себя не ложится — не наш случай
+            if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
+                continue;               // условие состояния не выполнено — ядро откажет
             if (self->GetSpellHistory()->HasCooldown(si))
                 continue;
             bool affordable = true;
@@ -5423,6 +5431,15 @@ public:
         // ровно того же, что стоила своя арифметика по здоровью и по прочности.
         if (self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
             { ++c.CastsBusy; return false; }
+
+        // ЧИТАЕМОЕ ПРОИЗНОСИМ СТОЯ — одно правило на атаку и на лечение, для всех классов
+        // (замер: жрец слал Mind Blast с чтением 1500 мс в движении, и ядро отказывало).
+        // ВЫБОР заклинания не меняется: сила измеряется суррогатом, и предпочесть мгновенное
+        // значило бы менять ротацию без замера (Кодекс, задача 71). Стоим ЗДЕСЬ, а не выше:
+        // после ворот «умения выключены» и «общий откат», иначе вставали бы там, где каст
+        // всё равно не полетит (Кодекс, задача 72).
+        if (si->CalcCastTime() > 0 && self->isMoving())
+            StopMoving(c, self);
 
         ++c.CastsTried;
         WorldPacket raw(CMSG_CAST_SPELL);
@@ -9050,6 +9067,109 @@ public:
         }
     }
 
+    // ПЕРЕПИСЬ УМЕНИЙ ОДНОГО СПУТНИКА — только чтение, признаки берутся у ядра.
+    void SpellCensus(ChatHandler* handler, std::string const& who)
+    {
+        Player* self = nullptr;
+        for (Companion const& c : _companions)
+            if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer()
+                && c.Session->GetPlayer()->GetName() == who)
+                { self = c.Session->GetPlayer(); break; }
+        if (!self)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
+            return;
+        }
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        // СНАЧАЛА СОБРАТЬ И УПОРЯДОЧИТЬ (Кодекс): предел, взятый от порядка контейнера, молча
+        // скрывал бы произвольные заклинания. Сортируем по номеру и говорим, сколько скрыто.
+        std::vector<uint32> known;
+        for (auto const& [id, ps] : self->GetSpellMap())
+            if (self->HasActiveSpell(id))
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff))
+                    if (!si->IsPassive())
+                        known.push_back(id);
+        std::sort(known.begin(), known.end());
+        uint32 printed = 0;
+        for (uint32 id : known)
+        {
+            if (printed >= 60)
+                break;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            // признаки — у ядра, ни одного своего списка
+            bool dmg = false, heal = false, absorb = false, mitigate = false, control = false, buff = false;
+            for (SpellEffectInfo const& e : si->GetEffects())
+            {
+                switch (e.Effect)
+                {
+                    case SPELL_EFFECT_SCHOOL_DAMAGE: case SPELL_EFFECT_WEAPON_DAMAGE:
+                    case SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL: case SPELL_EFFECT_NORMALIZED_WEAPON_DMG:
+                    case SPELL_EFFECT_HEALTH_LEECH: case SPELL_EFFECT_INSTAKILL:
+                    case SPELL_EFFECT_ENVIRONMENTAL_DAMAGE:
+                    case SPELL_EFFECT_DAMAGE_FROM_MAX_HEALTH_PCT:
+                        dmg = true; break;
+                    case SPELL_EFFECT_HEAL: case SPELL_EFFECT_HEAL_PCT:
+                        heal = true; break;
+                    default: break;
+                }
+                switch (e.ApplyAuraName)
+                {
+                    case SPELL_AURA_PERIODIC_DAMAGE: case SPELL_AURA_PERIODIC_DAMAGE_PERCENT:
+                    case SPELL_AURA_PERIODIC_LEECH: case SPELL_AURA_DAMAGE_SHIELD:
+                    case SPELL_AURA_PROC_TRIGGER_DAMAGE:
+                        dmg = true; break;
+                    case SPELL_AURA_PERIODIC_HEAL:
+                        heal = true; break;
+                    case SPELL_AURA_SCHOOL_ABSORB: case SPELL_AURA_DEFLECT_SPELLS:
+                        absorb = true; break;
+                    // СМЯГЧЕНИЕ — НЕ ПОГЛОЩЕНИЕ (Кодекс): разные механики, и в правилах ротации
+                    // они встанут по-разному.
+                    case SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN: case SPELL_AURA_MOD_RESISTANCE:
+                    case SPELL_AURA_MOD_RESISTANCE_PCT: case SPELL_AURA_MOD_DODGE_PERCENT:
+                    case SPELL_AURA_MOD_PARRY_PERCENT: case SPELL_AURA_MOD_BLOCK_PERCENT:
+                    case SPELL_AURA_SCHOOL_IMMUNITY: case SPELL_AURA_DAMAGE_IMMUNITY:
+                    case SPELL_AURA_MECHANIC_IMMUNITY: case SPELL_AURA_MOD_INCREASE_HEALTH:
+                        mitigate = true; break;
+                    case SPELL_AURA_MOD_ROOT: case SPELL_AURA_MOD_ROOT_2: case SPELL_AURA_MOD_STUN:
+                    case SPELL_AURA_MOD_FEAR: case SPELL_AURA_MOD_DECREASE_SPEED:
+                    case SPELL_AURA_MOD_CONFUSE: case SPELL_AURA_MOD_PACIFY:
+                        control = true; break;
+                    case SPELL_AURA_MOD_DAMAGE_DONE: case SPELL_AURA_MOD_ATTACK_POWER:
+                    case SPELL_AURA_MOD_STAT: case SPELL_AURA_MOD_INCREASE_SPEED:
+                    case SPELL_AURA_MOD_HEALING_PCT:
+                        buff = true; break;
+                    default: break;
+                }
+            }
+            std::string kind;
+            if (dmg)      kind += "урон ";
+            if (absorb)   kind += "поглощение ";
+            if (mitigate) kind += "смягчение ";
+            if (heal)     kind += "лечение ";
+            if (control)  kind += "контроль ";
+            if (buff)     kind += "усиление ";
+            if (kind.empty()) kind = "прочее";
+            std::string cost;
+            for (SpellPowerCost const& pc : si->CalcPowerCost(self, si->GetSchoolMask()))
+                if (pc.Amount)
+                    cost += Trinity::StringFormat("{}:{} ", uint32(pc.Power), pc.Amount);
+            ++printed;
+            std::string const line = Trinity::StringFormat(
+                "Constellation УМЕНИЕ {} (класс {}, ур {}): {} ({}) — {}, ур.закл {}, чтение {} мс, "
+                "откат {} мс, дальность {:.0f}, цена {}, площадь {}, по цели {}",
+                self->GetName(), uint32(self->GetClass()), uint32(self->GetLevel()),
+                si->SpellName->Str[LOCALE_enUS], id, kind, si->SpellLevel, si->CalcCastTime(),
+                si->RecoveryTime, si->GetMaxRange(false), cost.empty() ? std::string("бесплатно") : cost,
+                (si->IsAffectingArea() || si->IsTargetingArea()) ? 1 : 0,
+                si->NeedsExplicitUnitTarget() ? 1 : 0);
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        }
+        handler->PSendSysMessage("Constellation: у %s активных непассивных умений %u, выписано %u, скрыто %u",
+            who.c_str(), uint32(known.size()), printed,
+            uint32(known.size() > printed ? known.size() - printed : 0));
+    }
+
     void Status(ChatHandler* handler)
     {
         uint32 inWorld = 0, failed = 0;
@@ -9794,6 +9914,7 @@ public:
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spells",  HandleSpells,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -9807,6 +9928,12 @@ public:
     static bool HandlePath(ChatHandler* handler, std::string const& who, float x, float y, float z)
     {
         Constellation::Manager::Instance()->PathProbe(handler, who, x, y, z);
+        return true;
+    }
+
+    static bool HandleSpells(ChatHandler* handler, std::string const& who)
+    {
+        Constellation::Manager::Instance()->SpellCensus(handler, who);
         return true;
     }
 
