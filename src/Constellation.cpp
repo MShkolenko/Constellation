@@ -3008,6 +3008,7 @@ public:
                     // цепочка походов вместо дела.
                     c.SeekCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
                     c.QuestMs = Cfg().QuestIntervalMs;      // спросить квестодателя на следующем же такте
+                    c.IdleDiagMs = 0;                       // и прибор ПРОСТОЙ — сразу по приходу, не через 5 мин
                     Switch(c, self, Behavior::Idle, "дошёл до квестодателя по карте");
                     return;
                 }
@@ -7878,10 +7879,16 @@ public:
             ++printed;
             // СВОИ ФИЛЬТРЫ — ОТДЕЛЬНО ОТ ВОРОТ ЯДРА (Кодекс): чёрный список и отказные — модуля,
             // и без них строка обвинила бы ядро.
+            // 3D-расстояние и фаза по спавну (Кодекс/оператор: «боты знают, на какой они стадии»):
+            // грид ищет по 3D, а печаталось только 2D; фазу до сих пор не печатал никто.
+            CreatureData const* crData = cr->GetCreatureData();
+            bool const inPhase = crData
+                ? PhasingHandler::InDbPhaseShift(self, crData->phaseUseFlags, uint16(crData->phaseId), crData->phaseGroup)
+                : self->GetPhaseShift().CanSee(cr->GetPhaseShift());
             TC_LOG_INFO("server.worldserver",
-                "Constellation ПРОСТОЙ {} (ур. {}, зона {}): {} ({}) в {:.0f} ярдах, видно {}, в чёрном списке {}, статус {:X}: {}",
+                "Constellation ПРОСТОЙ {} (ур. {}, зона {}): {} ({}) в {:.0f} ярдах ({:.0f} по 3D), видно {}, фаза {}, в чёрном списке {}, статус {:X}: {}",
                 self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), cr->GetName(), cr->GetEntry(),
-                self->GetExactDist2d(cr), self->IsWithinLOSInMap(cr) ? 1 : 0,
+                self->GetExactDist2d(cr), self->GetExactDist(cr), self->IsWithinLOSInMap(cr) ? 1 : 0, inPhase ? 1 : 0,
                 c.GiverUnreachable.count(cr->GetGUID()) ? 1 : 0,
                 uint64(self->GetQuestDialogStatus(cr)), quests);
             // МЕНЮ ЗДЕСЬ НЕ СПРАШИВАЕМ, И ЭТО РЕШЕНИЕ, А НЕ УПУЩЕНИЕ (Кодекс, вторая проверка).
