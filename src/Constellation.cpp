@@ -394,6 +394,15 @@ struct Companion
     std::unordered_map<uint32, uint8> GooberIdle;   // сколько раз применили без сдвига целей
     bool GooberDiagDone = false;
     bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
+    uint32 GatherUseItem = 0;                       // идём к фокусу, чтобы применить эту заготовку
+    std::unordered_map<uint32, uint8> CraftTried;   // заготовка -> сколько раз применили без сдвига
+    // ОТЛОЖЕННЫЙ ПРИГОВОР: применение ставится в очередь, а цепочка создаёт предмет позже, так
+    // что сверять снимок сразу после отправки — значит записывать исправный запуск в неудачу
+    // (Кодекс, задача 99). Ждём окно, потом судим.
+    uint32 CraftWaitMs = 0;
+    uint32 CraftItem = 0;
+    uint32 CraftHadBefore = 0;      // сколько заготовок было в сумках до отправки
+    std::vector<std::pair<uint32, int32>> CraftSnap;
     std::set<uint32> KilledOnQuestNoted;
     uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
     bool FleeNoted = false;             // и сказали ли об этом
@@ -2008,6 +2017,37 @@ public:
             c.LiveEnderMs = (c.LiveEnderMs <= diff) ? 0 : c.LiveEnderMs - diff;
         if (c.IdleScanMs)
             c.IdleScanMs = (c.IdleScanMs <= diff) ? 0 : c.IdleScanMs - diff;
+        // ПРИГОВОР ПРИМЕНЕНИЮ У ФОКУСА — ПО ИСТЕЧЕНИИ ОКНА, а не сразу после отправки.
+        // Сдвинулись цели — заготовка своё сделала. Не сдвинулись, но заготовки в сумках уже
+        // нет — ядро каст ПРИНЯЛО, и это тоже не неудача: результат придёт своим чередом, а
+        // кандидатом она больше не будет, потому что её нет. Ни того ни другого — считаем.
+        // СЧЁТЧИК ИДЁТ ТОЛЬКО ПРИ ЖИВОМ ИГРОКЕ: иначе окно истекло бы без него, приговор
+        // никогда не был бы вынесен, а CraftItem остался бы висеть навсегда (Кодекс).
+        if (c.CraftWaitMs)
+        {
+            Player* self = c.Session ? c.Session->GetPlayer() : nullptr;
+            if (self)
+                c.CraftWaitMs = (c.CraftWaitMs <= diff) ? 0 : c.CraftWaitMs - diff;
+            if (self && !c.CraftWaitMs && c.CraftItem)
+                {
+                    uint32 const item = c.CraftItem;
+                    bool const moved = QuestSnapshot(self) != c.CraftSnap;
+                    // «ИСТРАЧЕНА» — ПО РАЗНИЦЕ, А НЕ ПО НУЛЮ: заготовок могло быть несколько.
+                    bool const consumed = self->GetItemCount(item, false) < c.CraftHadBefore;
+                    if (moved || consumed)
+                        c.CraftTried.erase(item);
+                    else
+                        ++c.CraftTried[item];
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КУЗНЯ {}: заготовка {} — {}",
+                        self->GetName(), item,
+                        moved ? "цели сдвинулись" : consumed ? "истрачена, жду результата"
+                              : Trinity::StringFormat("без сдвига, попытка {} из 3", uint32(c.CraftTried[item])));
+                    c.CraftItem = 0;
+                    c.CraftHadBefore = 0;
+                    c.CraftSnap.clear();
+                }
+        }
         for (auto it = c.GatherBackoff.begin(); it != c.GatherBackoff.end(); )
         {
             if (it->second <= diff)
@@ -3566,6 +3606,83 @@ public:
                 // У самой точки берём живой объект ПО ИДЕНТИФИКАТОРУ СПАВНА — прямое
                 // обращение к карте вместо обхода сетки (Кодекс: Map::GetGameObjectBySpawnId).
                 float const near = self->GetExactDist(c.GatherPos);
+                // ФОКУС — ЭТО МЕСТО, А НЕ ПРЕДМЕТ ВЗАИМОДЕЙСТВИЯ. Кузню нельзя «открыть»:
+                // GetGameObjectIfCanInteractWith про неё скажет «нет», и обычная ветка ушла бы
+                // в отсрочку. Дойдя, применяем заготовку — её заклинание требует этого фокуса,
+                // и ядро само проверит, что мы достаточно близко.
+                if (c.GatherUseItem)
+                {
+                    if (near > 3.0f)
+                    {
+                        StepToward(c, self, c.GatherPos.GetPositionX(), c.GatherPos.GetPositionY(),
+                                   c.GatherPos.GetPositionZ(), 0.25f, dt, &c.GatherPos);
+                        c.GatherMs += slice;
+                        if (c.Stalled || c.NoPathMs > 0 || c.GatherMs >= 45000)
+                        {
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation КУЗНЯ {}: до фокуса {} не дойти за {} с, осталось {:.0f}",
+                                self->GetName(), c.GatherSpawnId, c.GatherMs / 1000, near);
+                            c.GatherBackoff[c.GatherSpawnId] = 300000;
+                            c.GatherSpawnId = 0; c.GatherUseItem = 0;
+                            Switch(c, self, Behavior::Idle, "до фокуса не дойти");
+                        }
+                        return;
+                    }
+                    uint32 const useEntry = c.GatherUseItem;
+                    Item* blank = nullptr;
+                    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !blank; ++i)
+                        if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                            if (it->GetEntry() == useEntry)
+                                blank = it;
+                    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !blank; ++b)
+                        if (Bag* bag = self->GetBagByPos(b))
+                            for (uint32 j = 0; j < bag->GetBagSize() && !blank; ++j)
+                                if (Item* it = bag->GetItemByPos(j))
+                                    if (it->GetEntry() == useEntry)
+                                        blank = it;
+                    uint32 const spellId = _craftSpellOfItem.count(useEntry) ? _craftSpellOfItem.at(useEntry) : 0;
+                    SpellInfo const* si = spellId ? sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE) : nullptr;
+                    if (!blank || !si)
+                    {
+                        c.GatherSpawnId = 0; c.GatherUseItem = 0;
+                        Switch(c, self, Behavior::Idle, "заготовки или заклинания нет");
+                        return;
+                    }
+                    // ОЧЕРЕДЬ И ОТКАТ СПРАШИВАЕМ ДО ОТПРАВКИ — тем же вопросом, что и бой.
+                    if (!self->CanRequestSpellCast(si, self)
+                        || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
+                        return;                 // ещё не время, вернёмся тем же тактом
+                    std::vector<std::pair<uint32, int32>> const snapBefore = QuestSnapshot(self);
+                    // СЧИТАЕМ ДО ОТПРАВКИ: обработчик может истратить предмет синхронно, и
+                    // тогда счёт «после» уже уменьшен, а признак «истрачена» стал бы ложным
+                    // (Кодекс, задача 101).
+                    uint32 const hadBefore = self->GetItemCount(useEntry, false);
+                    WorldPacket raw(CMSG_USE_ITEM);
+                    WorldPackets::Spells::UseItem use(std::move(raw));
+                    use.PackSlot = blank->GetBagSlot();
+                    use.Slot = blank->GetSlot();
+                    use.CastItem = blank->GetGUID();
+                    use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
+                        SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), spellId,
+                        self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+                    use.Cast.SpellID = int32(spellId);
+                    use.Cast.Target.Flags = TARGET_FLAG_NONE;   // заклинание на себя, у фокуса
+                    blank = nullptr;                            // обработчик мог его уничтожить
+                    c.Session->HandleUseItemOpcode(use);
+                    // СУДИМ НЕ ЗДЕСЬ. Ставим окно ожидания и вернёмся к приговору, когда
+                    // очередь ядра и вся цепочка успеют отработать.
+                    c.CraftItem = useEntry;
+                    c.CraftSnap = snapBefore;
+                    c.CraftHadBefore = hadBefore;
+                    c.CraftWaitMs = 15000;      // ВЫБРАННОЕ число: каст, аура и её триггер
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КУЗНЯ {}: применил {} (закл. {}, фокус {}) у точки {} — жду 15 с и сверю цели",
+                        self->GetName(), useEntry, spellId, si->RequiresSpellFocus, c.GatherSpawnId);
+                    c.GatherBackoff[c.GatherSpawnId] = 60000;
+                    c.GatherSpawnId = 0; c.GatherUseItem = 0;
+                    Switch(c, self, Behavior::Idle, "применил у фокуса");
+                    return;
+                }
                 GameObject* go = near <= 12.0f
                     ? self->GetMap()->GetGameObjectBySpawnId(c.GatherSpawnId) : nullptr;
 
@@ -6642,6 +6759,11 @@ public:
             // Замок здесь не смотрим: у объекта-задачи он свой (у Эдикта 1634), и правду о
             // нём скажет ядро при применении; неудача уйдёт в обычную отсрочку сбора.
             if (GameObjectTemplate const* gt = sObjectMgr->GetGameObjectTemplate(data.id))
+                if (gt->type == GAMEOBJECT_TYPE_SPELL_FOCUS && gt->spellFocus.spellFocusType)
+                    _focusSpawns[data.mapId][gt->spellFocus.spellFocusType].push_back(GatherSpawn{
+                        spawnId, data.id, data.spawnPoint, data.phaseUseFlags,
+                        uint16(data.phaseId), data.phaseGroup });
+            if (GameObjectTemplate const* gt = sObjectMgr->GetGameObjectTemplate(data.id))
                 if (gt->type == GAMEOBJECT_TYPE_GOOBER && gt->goober.questID)
                 {
                     _gooberByQuest[data.mapId][gt->goober.questID].push_back(GatherSpawn{ spawnId, data.id,
@@ -6783,7 +6905,25 @@ public:
                     if (auto io = itemsOnUse.find(sid); io != itemsOnUse.end())
                         for (uint32 src : io->second)
                             if (src != itemId)          // сам себя предмет не создаёт
+                            {
                                 _itemFromCraft[itemId].insert(src);
+                                // ЧЕМ ИМЕННО ПРИМЕНЯЕТСЯ. У одной заготовки теоретически бывает
+                                // несколько цепочек; берём ту, что требует фокуса, — иначе
+                                // победил бы порядок обхода (Кодекс, задача 99).
+                                {
+                                    auto ex = _craftSpellOfItem.find(src);
+                                    SpellInfo const* cand = sSpellMgr->GetSpellInfo(sid, DIFFICULTY_NONE);
+                                    bool const candFocus = cand && cand->RequiresSpellFocus;
+                                    if (ex == _craftSpellOfItem.end())
+                                        _craftSpellOfItem[src] = sid;
+                                    else if (candFocus)
+                                    {
+                                        SpellInfo const* cur = sSpellMgr->GetSpellInfo(ex->second, DIFFICULTY_NONE);
+                                        if (!cur || !cur->RequiresSpellFocus)
+                                            ex->second = sid;
+                                    }
+                                }
+                            }
                     auto add = [&](std::unordered_map<uint32, std::set<uint32>> const& m)
                     {
                         if (auto lt = m.find(sid); lt != m.end())
@@ -8964,6 +9104,52 @@ public:
                                 gooberIds.insert(sp.SpawnId);
                                 ++goobers;
                             }
+        // ЗАГОТОВКА НА РУКАХ — ИДЁМ К ЕЁ ФОКУСУ, А НЕ ЗА ВТОРОЙ.
+        //
+        // Это вторая половина дороги A: добыть заготовку модуль научился прошлым кругом, но
+        // цель закрывает не добыча, а ПРИМЕНЕНИЕ у фокуса — у 51769 это 1552, рунная кузня.
+        // Кандидат тот же по форме, что и всякая точка сбора, поэтому его судят те же
+        // проверки: отсрочка, фаза, дальность. Отличается он только тем, что по приходу мы
+        // применяем предмет, а не открываем объект.
+        // ПОКА ЖДЁМ ПРИГОВОРА ПРЕДЫДУЩЕМУ ПРИМЕНЕНИЮ — ВТОРОГО НЕ ЗАТЕВАЕМ. Иначе второе
+        // применение перезаписало бы CraftItem и CraftSnap, и приговор первому пропал бы,
+        // а заготовка могла быть истрачена как раз им (Кодекс, задача 100).
+        uint32 focusFor = 0, focusSpell = 0;
+        for (uint32 want : c.CraftWaitMs ? std::set<uint32>() : wantedItems)
+        {
+            if (self->GetItemCount(want, false))
+                continue;                       // изделие уже есть — фокус не нужен
+            auto cr = _itemFromCraft.find(want);
+            if (cr == _itemFromCraft.end())
+                continue;
+            for (uint32 src : cr->second)
+            {
+                if (!self->GetItemCount(src, false))
+                    continue;                   // заготовки нет — сперва добыть
+                auto cs = _craftSpellOfItem.find(src);
+                if (cs == _craftSpellOfItem.end())
+                    continue;
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(cs->second, DIFFICULTY_NONE);
+                if (!si || !si->RequiresSpellFocus)
+                    continue;                   // фокус не нужен — это не наш случай
+                if (auto tried = c.CraftTried.find(src);
+                    tried != c.CraftTried.end() && tried->second >= 3)
+                    continue;                   // трижды применили без сдвига целей
+                auto fm = _focusSpawns.find(self->GetMapId());
+                if (fm == _focusSpawns.end())
+                    continue;
+                auto fs = fm->second.find(si->RequiresSpellFocus);
+                if (fs == fm->second.end())
+                    continue;
+                for (GatherSpawn const& sp : fs->second)
+                    pool.push_back(&sp);
+                focusFor = src;
+                focusSpell = cs->second;
+                break;
+            }
+            if (focusFor)
+                break;
+        }
         // ЧИСЛО ОБЪЕКТОВ-ЗАДАЧ — В ТУ ЖЕ ДИАГНОСТИКУ, и печатаем её даже когда предметов не
         // нужно вовсе: иначе про goober-кандидатов журнал молчит (Кодекс, задача 90).
         if (!c.GooberDiagDone && goobers)
@@ -9011,6 +9197,14 @@ public:
                 c.GatherEntry = sp.Entry;
                 c.GatherPos = sp.Where;
                 c.GatherIsGoober = gooberIds.count(sp.SpawnId) > 0;   // признак, а не догадка
+                c.GatherUseItem = 0;
+                if (focusFor)
+                    if (auto fm = _focusSpawns.find(self->GetMapId()); fm != _focusSpawns.end())
+                        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(focusSpell, DIFFICULTY_NONE))
+                            if (auto fs = fm->second.find(si->RequiresSpellFocus); fs != fm->second.end())
+                                for (GatherSpawn const& f : fs->second)
+                                    if (f.SpawnId == sp.SpawnId)
+                                        { c.GatherUseItem = focusFor; c.GatherIsGoober = false; break; }
             }
             }
         }
@@ -10776,6 +10970,10 @@ private:
     // которому ведёт цепочка от применения заготовки 38607 из сундука. Без этого отбор искал
     // 38631 среди добычи объектов и честно не находил ничего.
     std::unordered_map<uint32, std::set<uint32>> _itemFromCraft;
+    std::unordered_map<uint32, uint32> _craftSpellOfItem;   // заготовка -> её заклинание при применении
+    // ТОЧКИ ОБЪЕКТОВ-ФОКУСОВ: карта -> номер фокуса -> где стоят. Заклинание заготовки требует
+    // фокуса (у 51769 это 1552, рунная кузня), и без него ядро откажет.
+    std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _focusSpawns;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
