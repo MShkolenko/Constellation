@@ -2902,8 +2902,13 @@ public:
                         if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                         {
                             TC_LOG_INFO("server.worldserver",
-                                "Constellation ПОЛЁТ {}: до полётного мастера не дойти — осталось {:.0f} ярдов",
-                                self->GetName(), d);
+                                "Constellation ПОЛЁТ {}: до полётного мастера {} не дойти — осталось {:.0f} "
+                                "по плоскости, лучшее было {:.0f}, по высоте {:+.0f}; причина {}, тип пути {}, в пути {} с",
+                                self->GetName(), c.FlightMasterEntry, d, c.WalkBest,
+                                c.FlightMasterPos.GetPositionZ() - self->GetPositionZ(),
+                                c.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
+                                c.LastPathType ? Trinity::StringFormat("{:X}", c.LastPathType) : std::string("отказов не было"),
+                                c.ModeMs / 1000);
                             c.FlightCooldownMs = 600000;
                             Switch(c, self, Behavior::Idle, "до полётного мастера не дойти");
                         }
