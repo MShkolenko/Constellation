@@ -381,6 +381,11 @@ struct Companion
     // правила: блок по виду закрывает прямую цель, а источник ПРЕДМЕТА и прокси-зачёт
     // планировщик по виду не знает — зато знает, ради какого квеста шёл (Кодекс, задача 86).
     std::unordered_map<uint32, std::pair<uint8, uint8>> KilledOnQuest;
+    // ЧТО ВЫТЕСНИЛО ОБЯЗАТЕЛЬНОЕ НАДЕВАНИЕ — ПО GUID ВЕЩИ, а не по её номеру (Кодекс, задача
+    // 91: вторая копия того же номера считалась бы вытесненной, а проданная оставляла бы запись
+    // навсегда). Без этой памяти учебное оружие остаётся насовсем: обычное сравнение запрещает
+    // обратную замену другим видом («меч остаётся мечом»), а зачёт уже получен.
+    std::unordered_map<ObjectGuid, uint8> DisplacedByMust;
     std::set<uint32> KilledOnQuestNoted;
     uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
     bool FleeNoted = false;             // и сказали ли об этом
@@ -7149,6 +7154,43 @@ public:
             c.EquipRefused.clear();
         }
 
+        // ОБЯЗАТЕЛЬНЫЕ К НАДЕВАНИЮ — предметы, чьё надевание даёт зачёт по незакрытой цели
+        // (оператор: «взять посох со стойки и надеть его, именно надеть, неважно нужен он тебе
+        // или нет»). Замер: Yunmei открыла стойку, спеллблейд и веер лежали в сумке, а гардероб
+        // отказал — «не лучше надетого» и «двуручное в руках». Набор — из того же указателя,
+        // что и сбор: незакрытые цели-существа -> предметы, чьё надевание их засчитывает.
+        std::set<uint32> mustWear;
+        {
+            std::set<uint32> wanted;
+            WantedEntries(self, wanted, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            for (uint32 entry : wanted)
+                if (auto ci = _itemsForCredit.find(entry); ci != _itemsForCredit.end())
+                    for (uint32 id : ci->second)
+                        if (ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(id))
+                            if (self->CanUseItem(tpl) == EQUIP_ERR_OK)   // как и путь сбора
+                                mustWear.insert(id);
+        }
+        // ЕСТЬ ЛИ У МЕНЯ НА РУКАХ ОБЯЗАТЕЛЬНЫЙ ПРЕДМЕТ, ЖДУЩИЙ ЗАЧЁТА.
+        //
+        // Именно это, а не «есть незакрытая цель», должно держать вытесненное снаряжение
+        // (Кодекс, задача 92): цель, которую спутнику никогда не закрыть — предмет продан,
+        // недостижим, не по классу, — иначе запирала бы возврат навсегда. Смотрим и сумки, и
+        // надетое: пока обязательное надето, но зачёт ещё не засчитан, возвращать вытесненное
+        // тоже нельзя — двуручное сняло бы его обратно.
+        bool mustPending = false;
+        if (!mustWear.empty())
+        {
+            for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END && !mustPending; ++i)
+                if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    if (mustWear.count(it->GetEntry()))
+                        mustPending = true;
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !mustPending; ++b)
+                if (Bag* bag = self->GetBagByPos(b))
+                    for (uint32 j = 0; j < bag->GetBagSize() && !mustPending; ++j)
+                        if (Item* it = bag->GetItemByPos(j))
+                            if (mustWear.count(it->GetEntry()))
+                                mustPending = true;
+        }
         auto consider = [&](Item* item) -> bool
         {
             if (!item || item->IsBroken())
@@ -7160,21 +7202,45 @@ public:
             uint8 dst = self->FindEquipSlot(item, NULL_SLOT, true);
             if (dst == NULL_SLOT)
                 return false;
+            bool const mandatory = mustWear.count(item->GetEntry()) > 0;
+
+            // ОБЯЗАТЕЛЬНОЕ В ЛЕВУЮ РУКУ ПРИ ДВУРУЧНОМ В ПРАВОЙ — ждём смены правой. Своего
+            // слота здесь не назначаем вовсе: модуль шлёт CMSG_AUTO_EQUIP_ITEM, слот выбирает
+            // ядро, и переданный ему NULL_SLOT — единственная правда (Кодекс, задача 91).
+            // Обязательный одноручник ядро само ставит в правую: по замеру спеллблейд Yunmei
+            // получил слот 15, а отказ был по уровню предмета, не по слоту.
+            if (mandatory && dst == EQUIPMENT_SLOT_OFFHAND)
+                if (Item* mh = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+                    if (mh->GetTemplate()->GetInventoryType() == INVTYPE_2HWEAPON)
+                        return false;
 
             Item* worn = self->GetItemByPos(INVENTORY_SLOT_BAG_0, dst);
-            if (worn)
+            // ВЫТЕСНЕННОЕ ВОЗВРАЩАЕТСЯ, КОГДА НА РУКАХ НЕТ ОБЯЗАТЕЛЬНОГО ПРЕДМЕТА.
+            //
+            // Держит возврат mustPending — предмет, ждущий зачёта, в сумке или уже надетый, — а
+            // НЕ сама незакрытая цель: цель, которую спутнику никогда не закрыть, запирала бы
+            // возврат навсегда (Кодекс, задача 92). И не «этот предмет уже не обязателен»:
+            // после зачёта за правую руку веер в левой ещё ждёт своего, а посох уже вернулся
+            // бы и снова запер бы левую (Кодекс, задача 91). Возврат обходит ТОЛЬКО правило
+            // вида; сравнение по уровню предмета остаётся, поэтому вернётся лишь то, что
+            // действительно лучше.
+            bool const restoring = !mandatory && worn && !mustPending
+                && [&] { auto d = c.DisplacedByMust.find(item->GetGUID());
+                         return d != c.DisplacedByMust.end() && d->second == dst; }();
+            if (worn && !mandatory)
             {
                 if (item->GetItemLevel(self) <= worn->GetItemLevel(self))
                     return false;
                 bool const weaponSlot = dst == EQUIPMENT_SLOT_MAINHAND
                     || dst == EQUIPMENT_SLOT_OFFHAND || dst == EQUIPMENT_SLOT_RANGED;
-                if (weaponSlot
+                if (weaponSlot && !restoring
                     && (item->GetTemplate()->GetInventoryType() != worn->GetTemplate()->GetInventoryType()
                         || item->GetTemplate()->GetSubClass() != worn->GetTemplate()->GetSubClass()))
                     return false;           // меч остаётся мечом (урок Легиона)
             }
 
             uint32 const wasLevel = worn ? worn->GetItemLevel(self) : 0;
+            ObjectGuid const wasGuid = worn ? worn->GetGUID() : ObjectGuid::Empty;
             uint32 const entry = item->GetEntry();
             uint8 const bagSlot = item->GetBagSlot(), slot = item->GetSlot();
 
@@ -7234,6 +7300,17 @@ public:
             if (now && now->GetEntry() == entry)
             {
                 ++c.Equipped;
+                // ПОМНИМ ВЫТЕСНЕННОЕ ПО GUID, И НЕ БОЛЬШЕ ВОСЬМИ ЗАПИСЕЙ: проданная или
+                // уничтоженная вещь свою запись уже не заберёт, а расти без предела памяти
+                // спутника незачем (Кодекс, задача 91).
+                if (mandatory && !wasGuid.IsEmpty())
+                {
+                    if (c.DisplacedByMust.size() >= 8)
+                        c.DisplacedByMust.clear();
+                    c.DisplacedByMust[wasGuid] = dst;
+                }
+                else if (restoring)
+                    c.DisplacedByMust.erase(item->GetGUID());   // вернулся — забыли
                 TC_LOG_INFO("server.worldserver",
                     "Constellation НАДЕЛ {}: {} (ур. {}) в слот {} вместо ур. {}; всего надето {}",
                     self->GetName(), entry, now->GetItemLevel(self), uint32(dst), wasLevel, c.Equipped);
