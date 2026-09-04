@@ -372,6 +372,16 @@ struct Companion
     // ОТМЕТКИ ГИБЕЛЕЙ, А НЕ СЧЁТЧИК С ТАЙМЕРОМ (Кодекс): таймер, который каждая смерть
     // ставит заново, считает тремя за десять минут даже смерти на 0-й, 9-й и 18-й.
     std::deque<uint32> DeathAt;         // время гибелей, мс игрового времени
+    // КТО УБИВАЛ И СКОЛЬКО РАЗ: вид существа -> (гибелей от него, мой уровень при последней).
+    // Не окно в десять минут, как DeathAt: между смертями от одного лейтенанта лежал забег
+    // к телу в 500 ярдов, и окно каждый раз пустело — «гибелей в окне 1» шесть раз подряд.
+    std::unordered_map<uint32, std::pair<uint8, uint8>> KilledBy;
+    std::set<uint32> KilledByNoted;     // о ком уже сказали в журнале
+    // ЗА КАКОЙ КВЕСТ ГИБ: квест -> (гибелей, мой уровень при последней). Второй конец того же
+    // правила: блок по виду закрывает прямую цель, а источник ПРЕДМЕТА и прокси-зачёт
+    // планировщик по виду не знает — зато знает, ради какого квеста шёл (Кодекс, задача 86).
+    std::unordered_map<uint32, std::pair<uint8, uint8>> KilledOnQuest;
+    std::set<uint32> KilledOnQuestNoted;
     uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
     bool FleeNoted = false;             // и сказали ли об этом
     bool CorpseRunNoted = false;        // сказали ли, что бежим к своему телу
@@ -2101,6 +2111,70 @@ public:
                 c.DeathCounted = true;
                 uint32 const nowMs = GameTime::GetGameTimeMS();
                 c.DeathAt.push_back(nowMs);
+                // УБИЙЦА — ИЗ СВОЕЙ ПАМЯТИ О БОЕ, а не из осмотра после смерти (тот же урок,
+                // что у строки ГИБЕЛЬ). Живая цель по TargetGuid, иначе вид из начала боя.
+                // Это НАМЕРЕНИЕ, не доказанный убийца: добить мог второй моб, а гибель на подходе
+                // от падения или воды тоже припишется цели (Кодекс). Порог два снижает шум, но
+                // не исключает его — две одинаковые ошибки на одном маршруте возможны. Цена
+                // такой ошибки — цель на пару уровней отложена, а не потеряна.
+                uint32 killer = 0;
+                if (Creature* t = ObjectAccessor::GetCreature(*self, c.TargetGuid))
+                    killer = t->GetEntry();
+                else if (c.FightVictimEntry)
+                    killer = c.FightVictimEntry;
+                if (killer)
+                {
+                    auto& k = c.KilledBy[killer];
+                    if (k.first < 250)
+                        ++k.first;
+                    k.second = uint8(self->GetLevel());
+                }
+                // РАДИ КАКОГО КВЕСТА ШЁЛ — из своей же памяти о походе. TravelQuest ставится при
+                // выборе точки и не сбрасывается по приходу, так что на месте боя он всё ещё
+                // называет квест, за который спутник здесь. Та же оговорка: намерение, не
+                // доказательство, потому порог два.
+                // ...НО ТОЛЬКО ЕСЛИ УБИЙЦА ИМЕЕТ К ЭТОМУ КВЕСТУ ОТНОШЕНИЕ (Кодекс, задача 87):
+                // спутник мог прийти ради квеста A, по пути взять цель квеста B и погибнуть от
+                // неё — TravelQuest всё ещё говорил бы A. Проверяем, что A ещё не закрыт и что
+                // убийца продвигает именно A: прямой целью, прокси-зачётом (KillCredit шаблона
+                // существа — им же ядро зачитывает убийство в KilledMonsterCredit) или как
+                // источник нужного предмета (список предметов задания у существа даёт ядро).
+                // Не связан — смерть на квест не пишется; блок по виду при этом остаётся.
+                if (c.TravelQuest && killer && self->GetQuestStatus(c.TravelQuest) == QUEST_STATUS_INCOMPLETE)
+                {
+                    bool related = false;
+                    Quest const* tq = sObjectMgr->GetQuestTemplate(c.TravelQuest);
+                    CreatureTemplate const* kt = sObjectMgr->GetCreatureTemplate(killer);
+                    std::vector<uint32> const* drops = sObjectMgr->GetCreatureQuestItemList(killer, self->GetMap()->GetDifficultyID());
+                    if (tq)
+                        for (QuestObjective const& obj : tq->GetObjectives())
+                        {
+                            if (obj.ObjectID <= 0 || self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
+                                continue;
+                            uint32 const want = uint32(obj.ObjectID);
+                            if (obj.Type == QUEST_OBJECTIVE_MONSTER)
+                            {
+                                if (want == killer)
+                                    { related = true; break; }
+                                if (kt && !tq->HasFlagEx(QUEST_FLAGS_EX_NO_CREDIT_FOR_PROXY))
+                                    for (uint32 kc : kt->KillCredit)
+                                        if (kc && kc == want)
+                                            { related = true; break; }
+                            }
+                            else if (obj.Type == QUEST_OBJECTIVE_ITEM && drops
+                                && std::find(drops->begin(), drops->end(), want) != drops->end())
+                                related = true;
+                            if (related)
+                                break;
+                        }
+                    if (related)
+                    {
+                        auto& q = c.KilledOnQuest[c.TravelQuest];
+                        if (q.first < 250)
+                            ++q.first;
+                        q.second = uint8(self->GetLevel());
+                    }
+                }
                 // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать
                 // в момент самого перехода, а не по косвенным признакам в ветке воскрешения.
                 c.RingHeld = false;
@@ -6882,6 +6956,27 @@ public:
         return true;
     }
 
+    // ЗАПРЕЩЁН ЛИ ЭТОТ ВИД КАК ЦЕЛЬ: убивал дважды, и я его ещё не перерос. Один предикат на
+    // два места — отбор цели в бою и планировщик походов. Без второго места запрет в первом
+    // превращал цикл смертей в цикл бесплодных походов: дойти до точки квеста, отказаться
+    // атаковать, десять минут отката, снова дойти (Кодекс, задача 85).
+    // «На два уровня выше, чем был» — число ВЫБРАНО, а не найдено, как QuestMaxAbove.
+    bool KilledByBlocked(Companion const& c, Player const* self, uint32 entry) const
+    {
+        auto k = c.KilledBy.find(entry);
+        return k != c.KilledBy.end() && k->second.first >= 2
+            && self->GetLevel() <= uint32(k->second.second) + 2;
+    }
+    // КВЕСТ, ЗА КОТОРЫЙ Я ГИБ ДВАЖДЫ, НЕ СТРОИТ МАРШРУТ, пока я не перерос уровень последней
+    // гибели на два. Закрывает то, чего блок по виду не видит: источник предмета, прокси-зачёт,
+    // второго моба у той же точки.
+    bool QuestBlockedByDeaths(Companion const& c, Player const* self, uint32 questId) const
+    {
+        auto q = c.KilledOnQuest.find(questId);
+        return q != c.KilledOnQuest.end() && q->second.first >= 2
+            && self->GetLevel() <= uint32(q->second.second) + 2;
+    }
+
     bool FindObjectiveSpot(Companion& c, Player* self) const
     {
         Position best;
@@ -6908,6 +7003,23 @@ public:
                 bool const isTrigger = obj.Type == QUEST_OBJECTIVE_AREATRIGGER;
                 if (!isMonster && !isItem && !isTrigger)
                     continue;
+                // К ТОМУ, КТО УБИВАЛ ДВАЖДЫ, НЕ ИДЁМ, ПОКА НЕ ПЕРЕРОСЛИ: иначе поход к точке
+                // квеста, отказ бить, откат и снова поход. Цель откроется сама с уровнем.
+                if (isMonster && KilledByBlocked(c, self, uint32(obj.ObjectID)))
+                    continue;
+                // И ЗА КВЕСТ, ЗА КОТОРЫЙ ГИБ ДВАЖДЫ, НЕ ИДЁМ ВОВСЕ — какой бы ни была цель:
+                // предмет, прокси-зачёт, второй моб у точки. Планировщик источник предмета по
+                // виду не знает, зато знает квест (Кодекс, задача 86).
+                if (QuestBlockedByDeaths(c, self, questId))
+                {
+                    if (c.KilledOnQuestNoted.insert(questId).second)
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ПОХОД {}: квест {} «{}» стоил мне {} гибел. — маршрут не строю, пока не перерасту (был ур {}, нужен {})",
+                            self->GetName(), questId, quest->GetLogTitle(),
+                            uint32(c.KilledOnQuest.at(questId).first), uint32(c.KilledOnQuest.at(questId).second),
+                            uint32(c.KilledOnQuest.at(questId).second) + 3);
+                    continue;
+                }
                 if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
                     continue;
 
@@ -8740,6 +8852,27 @@ public:
             // спутник целится в тех, кого на его месте не увидел бы вовсе.
             if (!self->GetPhaseShift().CanSee(creature->GetPhaseShift()))
                 { ++rejPhase; ++rejected; continue; }
+            // КТО УБИЛ МЕНЯ ДВАЖДЫ — НЕ ЦЕЛЬ, ПОКА Я ЕГО НЕ ПЕРЕРОС.
+            //
+            // Замер: монах 7 уровня шесть раз подряд погиб от лейтенанта 30 уровня, за 2-6 с
+            // каждый раз, ни разу не сбив его ниже 64 %. Ядро при этом честно отвечало «для нас
+            // ур 7, урон x0.04» — и это правда только для автоатаки: GetDamageMultiplierForTarget
+            // применяется в одном месте, Unit.cpp:804, в расчёте удара; заклинания существа
+            // под игрока не масштабируются вовсе. Никакой множитель этого не скажет — сказали
+            // смерти. Поэтому мера — не уровень, а уже случившееся: два раза от одного вида.
+            // Предикат общий с планировщиком походов (KilledByBlocked).
+            if (KilledByBlocked(c, self, creature->GetEntry()))
+            {
+                if (c.KilledByNoted.insert(creature->GetEntry()).second)
+                {
+                    auto const& k = c.KilledBy.at(creature->GetEntry());
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation БОЙ {}: {} ({}) убивал меня {} раз(а) — не цель, пока не перерасту (был ур {}, нужен {})",
+                        self->GetName(), creature->GetName(), creature->GetEntry(),
+                        uint32(k.first), uint32(k.second), uint32(k.second) + 3);
+                }
+                ++rejected; continue;
+            }
             // НЕ ПО ЗУБАМ — ЭТО ВЕЛИЧИНА ЯДРА, А НЕ ДОГАДКА (замер: 0 побед, 21 гибель).
             //
             // CreatureTemplate::Classification различает Normal, Elite, RareElite, Rare, Trivial,
