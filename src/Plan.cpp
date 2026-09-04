@@ -280,18 +280,36 @@ namespace Constellation::Plan
         _buildId = uint64(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 
-        if (!RoadOfCamps(why) || !CollectSites(why) || !LoadConditionDeps(why) || !Partition(why) || !CheckFixtures(why))
+        // per-phase timings: the first live start cost 16.1 s on the world thread, and the
+        // number alone does not say whether the terrain tiles or the commit paid for it
+        auto lap = [](std::chrono::steady_clock::time_point& from)
+        {
+            auto const now = std::chrono::steady_clock::now();
+            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - from).count();
+            from = now;
+            return ms;
+        };
+        auto mark = t0;
+        long long msCamps = 0, msSites = 0, msConds = 0, msPart = 0, msSkel = 0, msPersist = 0;
+        bool ok = RoadOfCamps(why); msCamps = lap(mark);
+        ok = ok && CollectSites(why); msSites = lap(mark);
+        ok = ok && LoadConditionDeps(why); msConds = lap(mark);
+        ok = ok && Partition(why) && CheckFixtures(why); msPart = lap(mark);
+        if (!ok)
         {
             TC_LOG_ERROR("server.loading", "Constellation ПЛАН: сборка отклонена — {}; план выключен на этот запуск", why);
             return false;
         }
         BuildDeps();
-        BuildSkeletons();
-        if (!PersistObligations(why))
+        BuildSkeletons(); msSkel = lap(mark);
+        ok = PersistObligations(why); msPersist = lap(mark);
+        if (!ok)
         {
             TC_LOG_ERROR("server.loading", "Constellation ПЛАН: запись обязательств отклонена — {}; план выключен на этот запуск", why);
             return false;
         }
+        TC_LOG_INFO("server.loading", "Constellation ПЛАН: фазы сборки — лагеря {} мс, точки и рельеф {} мс, условия {} мс, разбиение {} мс, скелеты {} мс, запись {} мс",
+            msCamps, msSites, msConds, msPart, msSkel, msPersist);
         _built = true;
         uint32 roadStops = 0, unsupported = 0;
         for (Hub const& h : _hubs)
@@ -880,6 +898,11 @@ namespace Constellation::Plan
             cp.LastStatus[q] = now;
             if (!changed)
                 continue;
+            // the transition itself is annotated here, not only when the hub is exhausted
+            if (self->GetQuestRewardStatus(q))
+                Annotate(self, cp, q, Annotation::Done, "", 0);
+            else if (InLog(self, q))
+                Annotate(self, cp, q, Annotation::Taken, "", 0);
             std::set<SiteKey> erase;
             for (SiteKey const& k : Givers(q, *hub)) erase.insert(k);
             for (SiteKey const& k : EndersInside(q, *hub)) erase.insert(k);
