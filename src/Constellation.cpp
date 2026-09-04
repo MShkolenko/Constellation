@@ -62,6 +62,7 @@
 #include "TaxiPathGraph.h"
 #include "TaxiPackets.h"
 #include "PhasingHandler.h"
+#include "Plan.h"
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "MotionMaster.h"
@@ -623,6 +624,13 @@ public:
         {
             _warmupMs += diff;
             return;
+        }
+
+        // ПЛАН СТРОИТСЯ ЗДЕСЬ: мировой поток, рельеф уже загружен, игрока не нужно.
+        if (!_planTried)
+        {
+            _planTried = true;
+            Constellation::Plan::Planner::Instance()->Build();
         }
 
         if (!_bootstrapped)
@@ -5771,6 +5779,9 @@ public:
         }
         c.GiverGuid.Clear();                        // дошли и говорим — цель больше не нужна
 
+        // ПЛАН: консультация точки ДО запроса меню — запись снимка с совместимостью по фазе
+        Constellation::Plan::Planner::Instance()->OnConsult(self, giver);
+
         // «подойти и заговорить» — тот же опкод, что шлёт клиент по клику
         WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
         WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
@@ -5806,6 +5817,10 @@ public:
 
         // читаем то, что ядро только что собрало для клиента, в его же порядке
         QuestMenu const& menu = self->PlayerTalkClass->GetQuestMenu();
+
+        // ПЛАН: снимок точки и сверка настоящего меню с зеркалом ворот (только наблюдение)
+        Constellation::Plan::Planner::Instance()->OnMenuRead(self, giver, menu,
+            [this](Player* p, Quest const* q) { return FirstFailingGate(p, q); });
 
         // ЧТО ИМЕННО ПРЕДЛОЖИЛИ И ЧТО ИЗ ЭТОГО ОТВЕРГНУТО — ПО РАЗУ НА КАЖДОГО.
         //
@@ -5902,6 +5917,7 @@ public:
                     self->GetName(), questId, quest->GetLogTitle(), giver->GetName(),
                     colourName[bestColour < 4 ? bestColour : 3], self->GetQuestLevel(quest), uint32(self->GetLevel()));
                 ++_questsTaken;
+                Constellation::Plan::Planner::Instance()->OnTakeOrTurnIn(self);
             }
             else
             {
@@ -6305,6 +6321,7 @@ public:
                 self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()),
                 reward ? Trinity::StringFormat(", выбрал награду {} из {}", reward, quest->GetRewChoiceItemsCount()) : "");
             ++_questsTurnedIn;
+            Constellation::Plan::Planner::Instance()->OnTakeOrTurnIn(self);
             return true;
         }
         TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла ({})",
@@ -9069,6 +9086,7 @@ private:
                 if (c.Session->GetPlayer())
                 {
                     c.State = Stage::InWorld;
+                    Constellation::Plan::Planner::Instance()->OnLogin(c.Session->GetPlayer());
                     RepairIfBroken(c.Session->GetPlayer(), "вход в мир");
                     c.TicksInState = 0;
                     TC_LOG_INFO("server.worldserver", "Constellation: {} is in the world", c.Entry->Name);
@@ -9230,6 +9248,7 @@ private:
     {
         if (!c.Session)
             return;
+        Constellation::Plan::Planner::Instance()->OnLogout(c.Guid);
         if (c.Session->GetPlayer())
             c.Session->LogoutPlayer(true);
         delete c.Session;
@@ -9397,6 +9416,7 @@ private:
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
     bool _bootstrapped = false;
+    bool _planTried = false;        // план строится один раз за запуск, даже если отклонён
 };
 }
 
@@ -9461,10 +9481,12 @@ public:
     void OnUpdate(uint32 diff) override
     {
         Constellation::Manager::Instance()->OnWorldUpdate(diff);
+        Constellation::Plan::Planner::Instance()->Tick(diff);
     }
 
     void OnShutdown() override
     {
+        Constellation::Plan::Planner::Instance()->OnShutdown();
         Constellation::Manager::Instance()->Shutdown();
     }
 };
