@@ -6722,6 +6722,92 @@ public:
         TC_LOG_INFO("server.loading",
             "Constellation: указатель зачётов через надевание — заклинаний с зачётом {}, эффектов предметов при надевании {}, существ {}",
             uint32(creditsOfSpell.size()), creditItems, uint32(_itemsForCredit.size()));
+
+        // ЦЕЛЬ-ПРЕДМЕТ БЫВАЕТ ИЗДЕЛИЕМ, А НЕ ДОБЫЧЕЙ — ИНДЕКС ИЗ ТЕХ ЖЕ ХРАНИЛИЩ ЯДРА.
+        //
+        // Два обратных указателя строятся по одному проходу каждый: заклинание -> предметы, чьё
+        // ПРИМЕНЕНИЕ его произносит, и заклинание -> заклинания, которые к нему ведут (триггер
+        // эффекта, в том числе периодический триггер ауры). Затем от каждого создающего
+        // заклинания идём ВВЕРХ на три уровня — тем же способом, каким это делает прибор
+        // .constellation chain, доказавший цепочку ДК на боевом.
+        std::unordered_map<uint32, std::set<uint32>> itemsOnUse;    // заклинание -> предметы
+        for (auto const& [itemId, tpl] : sObjectMgr->GetItemTemplateStore())
+            for (ItemEffectEntry const* eff : tpl.Effects)
+                if (eff && eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE && eff->SpellID > 0)
+                    itemsOnUse[uint32(eff->SpellID)].insert(itemId);
+        // ДВА РАЗНЫХ РЕБРА, А НЕ ОДНО. Триггер — связь из данных; совпадение по значению
+        // скрипта — эвристика, и прибор .constellation chain так её и подписывает. Пускаем
+        // эвристику только на ПЕРВОМ уровне подъёма: измеренная цепочка ДК именно такова
+        // (51771 <- 51770 по значению, 51770 <- 51769 по триггеру), а дальше по значению
+        // можно уйти в чужое заклинание с чужим предметом (Кодекс, задача 96).
+        std::unordered_map<uint32, std::set<uint32>> leadsByTrigger, leadsByValue;
+        std::unordered_map<uint32, std::set<uint32>> createdBy;     // предмет -> ВСЕ заклинания
+        uint32 createSpells = 0;
+        sSpellMgr->ForEachSpellInfo([&](SpellInfo const* si)
+        {
+            if (!si || si->Difficulty != DIFFICULTY_NONE)
+                return;
+            bool creates = false;
+            for (SpellEffectInfo const& e : si->GetEffects())
+            {
+                if (e.Effect == SPELL_EFFECT_CREATE_ITEM && e.ItemType > 0)
+                    { createdBy[uint32(e.ItemType)].insert(si->Id); creates = true; }
+                if (e.TriggerSpell)
+                    leadsByTrigger[e.TriggerSpell].insert(si->Id);
+                if ((e.Effect == SPELL_EFFECT_SCRIPT_EFFECT || e.Effect == SPELL_EFFECT_DUMMY)
+                    && e.CalcValue() > 0)
+                    leadsByValue[uint32(e.CalcValue())].insert(si->Id);
+            }
+            if (creates)
+                ++createSpells;
+        });
+        uint32 crafted = 0;
+        static size_t const CRAFT_NODE_CAP = 64;
+        for (auto const& [itemId, spells] : createdBy)
+        {
+            // ПРЕДЕЛ СЧИТАЕТ И НАЧАЛЬНЫЕ УЗЛЫ (Кодекс, задача 97): у предмета может быть много
+            // создающих заклинаний, и без этого обход начинался бы уже за границей.
+            std::set<uint32> seen, frontier;
+            for (uint32 sid : spells)
+            {
+                if (seen.size() >= CRAFT_NODE_CAP)
+                    break;
+                seen.insert(sid);
+                frontier.insert(sid);
+            }
+            for (int depth = 0; depth < 3 && !frontier.empty(); ++depth)
+            {
+                std::set<uint32> next;
+                for (uint32 sid : frontier)
+                {
+                    if (auto io = itemsOnUse.find(sid); io != itemsOnUse.end())
+                        for (uint32 src : io->second)
+                            if (src != itemId)          // сам себя предмет не создаёт
+                                _itemFromCraft[itemId].insert(src);
+                    auto add = [&](std::unordered_map<uint32, std::set<uint32>> const& m)
+                    {
+                        if (auto lt = m.find(sid); lt != m.end())
+                            for (uint32 parent : lt->second)
+                            {
+                                if (seen.size() >= CRAFT_NODE_CAP)   // предел ДО вставки
+                                    return;
+                                if (seen.insert(parent).second)
+                                    next.insert(parent);
+                            }
+                    };
+                    add(leadsByTrigger);
+                    if (depth == 0)
+                        add(leadsByValue);              // эвристика — только первый уровень
+                }
+                frontier.swap(next);
+            }
+            if (_itemFromCraft.count(itemId))
+                ++crafted;
+        }
+        TC_LOG_INFO("server.loading",
+            "Constellation: указатель изделий — заклинаний с созданием {}, создаваемых предметов {}, "
+            "из них с источником-предметом {}, заклинаний с применением у предметов {}",
+            createSpells, uint32(createdBy.size()), crafted, uint32(itemsOnUse.size()));
     }
 
     // Сдача: поздороваться, сдать, выбрать награду — теми же опкодами, что клиент.
@@ -6861,7 +6947,33 @@ public:
                                         wantedItems->insert(item);
                 }
                 else if (wantedItems)
-                    wantedItems->insert(uint32(obj.ObjectID));
+                {
+                    uint32 const want = uint32(obj.ObjectID);
+                    wantedItems->insert(want);
+                    // ИЗДЕЛИЕ — ХОТИМ ЗАГОТОВКУ, И ТОЛЬКО ПОКА ЕЁ НЕТ В СУМКАХ. Иначе спутник
+                    // ходил бы к сундукам за второй и третьей: сама цель от этого не двинется,
+                    // её закрывает применение, а не добыча (следующий шаг дороги A).
+                    // К УКАЗАТЕЛЮ ИЗДЕЛИЙ — ТОЛЬКО ЕСЛИ САМУ ЦЕЛЬ НИОТКУДА НЕ ДОБЫТЬ.
+                    //
+                    // Связь «создаётся из» опирается в том числе на эвристическое ребро по
+                    // значению скрипта, и ложная запись увела бы спутника за добываемым, но
+                    // ненужным предметом — фильтр по указателю сбора этого не предотвращает
+                    // (Кодекс, задача 97). Поэтому спрашиваем указатель изделий лишь тогда,
+                    // когда обычной добычи у цели нет вовсе: у 38631 её нет и быть не может,
+                    // а у обычной цели-предмета эвристика теперь не работает вовсе.
+                    // Остаточная цена названа: для НЕдобываемой цели ложная связь может стоить
+                    // одного похода за одним предметом — один раз, дальше держит GetItemCount.
+                    // ТОЛЬКО ТО, ЧТО ДЕЙСТВИТЕЛЬНО МОЖНО ВЗЯТЬ: источник должен добываться с
+                    // объекта (иначе поход в никуда), и считаем СУМКИ, а не банк — до банка
+                    // спутник не дотянется, и учёт банка навсегда подавил бы добычу (Кодекс).
+                    if (auto cr = _itemFromCraft.find(want);
+                        cr != _itemFromCraft.end() && !_itemFromGo.count(want))
+                        for (uint32 src : cr->second)
+                            if (!self->GetItemCount(src, false) && _itemFromGo.count(src))
+                                if (ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(src))
+                                    if (self->CanUseItem(tpl) == EQUIP_ERR_OK)
+                                        wantedItems->insert(src);
+                }
             }
         }
     }
@@ -10659,6 +10771,11 @@ private:
     // а его произносит эффект «при надевании» девяти учебных оружий, лежащих в стойках рядом.
     // Прибор .constellation chain доказал это на боевом из данных ядра, без единого имени.
     std::unordered_map<uint32, std::set<uint32>> _itemsForCredit;        // существо -> предметы
+    // СОЗДАВАЕМЫЙ ПРЕДМЕТ -> ПРЕДМЕТЫ, ПРИМЕНЕНИЕ КОТОРЫХ ЕГО СОЗДАЁТ (задача 0023, запись 56).
+    // Цель-предмет бывает не добычей, а изделием: у ДК 38631 создаётся заклинанием 51771, к
+    // которому ведёт цепочка от применения заготовки 38607 из сундука. Без этого отбор искал
+    // 38631 среди добычи объектов и честно не находил ничего.
+    std::unordered_map<uint32, std::set<uint32>> _itemFromCraft;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
     uint32 _throttleMs = 0;
