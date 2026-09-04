@@ -4412,6 +4412,39 @@ public:
     // overTimeCounts — считать ли уроном чистый периодический урон. По умолчанию да; ложь
     // нужна ровно одному месту, разведке дальности боя, чтобы состав её кандидатов остался
     // ровно прежним (Кодекс, задача 75).
+    // ЧЬИМ НОМЕРОМ ЛЯЖЕТ ПЕРИОДИЧЕСКАЯ АУРА — сам номер заклинания или номер его триггера.
+    //
+    // Замер на боевом: чернокнижник за 13 боёв отправил 73 умения, и все — Corruption; Shadow
+    // Bolt не прозвучал ни разу. Палитра объясняет: у Corruption 172 форма «64>146739,3,2» —
+    // свой прямой урон есть, а периодическая аура вешается ТРИГГЕРОМ 146739. Значит вопрос
+    // «периодическое ли это» к самому 172 отвечал «нет», вопрос «висит ли МОЁ» к номеру 172
+    // не мог ответить «да» никогда, и Corruption шёл в заполнитель, где выигрывал у Shadow
+    // Bolt по уровню каждый такт. Кодекс предупреждал об этой обёртке в задаче 74; теперь она
+    // измерена. Обходим триггеры на один уровень — ровно так же, как SpellDoes ищет урон.
+    static uint32 OverTimeAuraId(SpellInfo const* si, Difficulty diff)
+    {
+        if (!si)
+            return 0;
+        if (IsOverTime(si))
+            return si->Id;
+        static SpellEffectName const triggers[] = {
+            SPELL_EFFECT_TRIGGER_SPELL, SPELL_EFFECT_TRIGGER_MISSILE,
+            SPELL_EFFECT_TRIGGER_SPELL_WITH_VALUE,
+            SPELL_EFFECT_TRIGGER_MISSILE_SPELL_WITH_VALUE };
+        for (SpellEffectInfo const& eff : si->GetEffects())
+        {
+            bool trigger = false;
+            for (SpellEffectName t : triggers)
+                if (eff.IsEffect(t)) { trigger = true; break; }
+            if (!trigger || !eff.TriggerSpell)
+                continue;
+            if (SpellInfo const* child = sSpellMgr->GetSpellInfo(eff.TriggerSpell, diff))
+                if (IsOverTime(child))
+                    return child->Id;
+        }
+        return 0;
+    }
+
     static bool SpellDoes(SpellInfo const* si, bool wantHeal, Difficulty diff, int depth = 1,
                           bool overTimeCounts = true)
     {
@@ -4465,6 +4498,9 @@ public:
             for (SpellEffectName e : hurting)
                 if (si->HasEffect(e))
                     return true;
+            // ОДИН УРОВЕНЬ ТРИГГЕРА, И РОВНО ОДИН: глубину даёт рекурсия ниже, а не этот
+            // вызов. С OverTimeAuraId здесь предикат смотрел бы на два уровня, а ступень
+            // поддержания — на один, и они бы расходились (Кодекс, задача 79).
             if (overTimeCounts && IsOverTime(si))
                 return true;
         }
@@ -4675,8 +4711,8 @@ public:
         // этапе выбора у нас нет. Сочинять её значило бы выдумать контракт.
         bool keepAllowed = true;
         if (lastSpell)
-            if (SpellInfo const* prev = sSpellMgr->GetSpellInfo(lastSpell, diff))
-                if (IsOverTime(prev) && !victim->HasAura(lastSpell, self->GetGUID()))
+            if (uint32 prevAura = OverTimeAuraId(sSpellMgr->GetSpellInfo(lastSpell, diff), diff))
+                if (!victim->HasAura(prevAura, self->GetGUID()))
                     keepAllowed = false;
 
         // ДВА РАЗДЕЛЬНЫХ ЛУЧШИХ НА КАЖДОЙ СТУПЕНИ: платное и бесплатное. Внутри группы
@@ -4753,7 +4789,7 @@ public:
             int rung = RUNG_FILL;
             if (si->GetRecoveryTime() > 0 || si->ChargeCategoryId)
                 rung = RUNG_READY;      // откат или заряды объявлены; что готово — проверено выше
-            if (IsOverTime(si))
+            if (uint32 aura = OverTimeAuraId(si, diff))
             {
                 // УЖЕ ВИСЯЩЕЕ НАДО ИСКЛЮЧАТЬ, А НЕ ПОНИЖАТЬ. Прежняя правка отправляла его
                 // в заполнитель, где оно снова сравнивалось по уровню заклинания и могло
@@ -4761,7 +4797,7 @@ public:
                 // ради которой всё и делается (Кодекс). Уносим в самую нижнюю ступень:
                 // применится, только если у спутника нет вообще ничего другого.
                 bool const worth = keepAllowed
-                                && !victim->HasAura(id, self->GetGUID())
+                                && !victim->HasAura(aura, self->GetGUID())
                                 && id != lastSpell;
                 rung = worth ? RUNG_KEEP : RUNG_LAST;
             }
