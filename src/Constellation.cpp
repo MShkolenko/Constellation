@@ -316,6 +316,7 @@ struct Companion
     uint32 LootTooFar = 0;              //               не дотянулись — мера нужды в ходьбе
     uint32 LootDenied = 0;              //               ядро не дало (чужой лут, розыгрыш)
     uint32 CastsBusy = 0;               // не просили: уже читаем или не истёк общий откат
+    bool CastFailNoted = false;         // величины момента без следа — по разу на бой
     uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
     bool WasCasting = false;            // читали ли на прошлом такте (для счётчика выше)
     std::set<uint32> SpellsLogged;      // о каком выборе уже написали — по разу за всё время
@@ -5451,6 +5452,28 @@ public:
             ++c.CastsWent;
             return true;
         }
+
+        // СЛЕДА НЕТ. Причину ядро шлёт в SMSG_CAST_FAILED, а сокета у спутника нет; повторять
+        // его проверки своими руками нельзя — обвинит не ту (Кодекс, трижды). Поэтому строка
+        // НИЧЕГО НЕ УТВЕРЖДАЕТ: она записывает величины момента, а виноватого назовёт сводка
+        // по классам за окно. По разу на бой, чтобы не залить журнал.
+        if (!c.CastFailNoted)
+        {
+            c.CastFailNoted = true;
+            Powers const pw = si->PowerCosts[0] ? Powers(si->PowerCosts[0]->PowerType) : POWER_MANA;
+            uint32 const maxPw = self->GetMaxPower(pw);
+            // дружественность спрашиваем у ядра: флаг positive у границ означает именно её,
+            // а не «цель — это я» (Кодекс). Ресурса нет — пишем «нет», а не ноль процентов.
+            bool const friendly = self->IsFriendlyTo(castTarget);
+            TC_LOG_INFO("server.worldserver",
+                "Constellation КАСТ {} (класс {}): {} ({}) без следа — дистанция {:.1f}, "
+                "объявленные границы {:.1f}..{:.1f}, объявленное чтение {} мс, в движении {}, сила {}",
+                self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
+                self->GetExactDist(castTarget), si->GetMinRange(friendly),
+                si->GetMaxRange(friendly), si->CalcCastTime(),
+                self->isMoving() ? 1 : 0,
+                maxPw ? Trinity::StringFormat("{}%", self->GetPower(pw) * 100 / maxPw) : std::string("нет"));
+        }
         return false;
     }
 
@@ -5716,6 +5739,7 @@ public:
             c.CastMs = 1500;            // первое решение — сразу, а не через полторы секунды
             c.CastsTried = c.CastsWent = c.LastSpell = 0;
             c.CastsBusy = c.CastsDiedUnder = 0;
+            c.CastFailNoted = false;
             c.WasCasting = false;
             c.DamageVictim = target->GetGUID();
             c.VictimHp = b.Dealt;       // отсечка сторожа: урон НА НАЧАЛО этого боя
