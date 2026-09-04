@@ -9142,14 +9142,20 @@ public:
         return true;
     }
 
-    // ОПЫТ ПО ПУТИ: четыре построения к одной цели, с числами. Только читает и печатает.
-    void PathProbe(ChatHandler* handler, std::string const& who, float x, float y, float z)
+    // СПУТНИК ПО ИМЕНИ, ТОЛЬКО ЖИВОЙ В МИРЕ — один поиск на три консольные команды.
+    Player* InWorldByName(std::string const& who) const
     {
-        Player* self = nullptr;
         for (Companion const& c : _companions)
             if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer()
                 && c.Session->GetPlayer()->GetName() == who)
-                { self = c.Session->GetPlayer(); break; }
+                return c.Session->GetPlayer();
+        return nullptr;
+    }
+
+    // ОПЫТ ПО ПУТИ: четыре построения к одной цели, с числами. Только читает и печатает.
+    void PathProbe(ChatHandler* handler, std::string const& who, float x, float y, float z)
+    {
+        Player* self = InWorldByName(who);
         if (!self)
         {
             handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
@@ -9198,13 +9204,83 @@ public:
     }
 
     // ПЕРЕПИСЬ УМЕНИЙ ОДНОГО СПУТНИКА — только чтение, признаки берутся у ядра.
+    // ТАБЛИЦА СТОИМОСТЕЙ — КРУГ 4b ПРОЕКТА РОТАЦИИ (rotation-spec-v3, §1). Только читает.
+    //
+    // Для каждого ПЛАТНОГО умения книги: вид ресурса и его максимум у спутника, базовая цена
+    // (ManaCost / PowerCostPct), необязательная добавка (OptionalCost / OptionalCostPct) и
+    // PointsPerResource каждого эффекта. По этим данным ступень «финишер» будет отличать
+    // масштабируемое от фиксированного — и печатаются они ДО правила, чтобы по двенадцати
+    // классам было видно, что правило увидит, а что нет (Кодекс, задача 77: Execute у воина
+    // масштабируется скриптом, а не полем; такие промахи должны быть названы, а не найдены).
+    void CostCensus(ChatHandler* handler, std::string const& who)
+    {
+        Player* self = InWorldByName(who);
+        if (!self)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
+            return;
+        }
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        std::vector<uint32> known;
+        for (auto const& [id, ps] : self->GetSpellMap())
+            if (self->HasActiveSpell(id))
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff))
+                    if (!si->IsPassive())
+                        known.push_back(id);
+        std::sort(known.begin(), known.end());
+        uint32 printed = 0, paid = 0;
+        for (uint32 id : known)
+        {
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            std::string costs;
+            for (SpellPowerEntry const* pc : si->PowerCosts)
+            {
+                if (!pc)
+                    continue;
+                if (pc->ManaCost <= 0 && pc->OptionalCost == 0
+                    && pc->PowerCostPct <= 0.0f && pc->OptionalCostPct <= 0.0f)
+                    continue;
+                Powers const pw = Powers(pc->PowerType);
+                costs += Trinity::StringFormat("ресурс {} (макс {}): база {}/{:.1f}%, добавка {}/{:.1f}%; ",
+                    int32(pc->PowerType), self->GetMaxPower(pw), pc->ManaCost, pc->PowerCostPct,
+                    pc->OptionalCost, pc->OptionalCostPct);
+            }
+            if (costs.empty())
+                continue;                       // бесплатное — не про эту таблицу
+            ++paid;
+            if (printed >= 60)
+                continue;                       // считаем, но не печатаем: скрытых назовём
+            std::string scaling;
+            uint32 idx = 0;
+            for (SpellEffectInfo const& e : si->GetEffects())
+            {
+                if (e.PointsPerResource != 0.0f)
+                    scaling += Trinity::StringFormat("эфф{}({}) {:.2f}/ед; ",
+                        idx, uint32(e.Effect), e.PointsPerResource);
+                ++idx;
+            }
+            ++printed;
+            std::string const line = Trinity::StringFormat(
+                "Constellation ЦЕНА {} (класс {}, ур {}): {} ({}) — {}; {}{}",
+                self->GetName(), uint32(self->GetClass()), uint32(self->GetLevel()),
+                si->SpellName->Str[LOCALE_enUS], id,
+                SpellDoes(si, false, diff) ? "бьёт" : SpellDoes(si, true, diff) ? "лечит" : "никак",
+                costs,
+                // ТОЛЬКО О ПОЛЕ, НЕ О СМЫСЛЕ: отсутствие PointsPerResource доказывает лишь,
+                // что ЭТИМ полем масштабирование не описано. Execute у воина растёт скриптом
+                // (Кодекс, задача 78) — назвать его «не растёт» значило бы соврать ровно там,
+                // где таблица должна помочь найти такие промахи.
+                scaling.empty() ? std::string("PointsPerResource нет") : "за ресурс: " + scaling);
+            TC_LOG_INFO("server.worldserver", "{}", line);
+            handler->PSendSysMessage("%s", line.c_str());
+        }
+        handler->PSendSysMessage("Constellation: у %s платных умений %u, выписано %u, скрыто %u",
+            who.c_str(), paid, printed, paid > printed ? paid - printed : 0u);
+    }
+
     void SpellCensus(ChatHandler* handler, std::string const& who)
     {
-        Player* self = nullptr;
-        for (Companion const& c : _companions)
-            if (c.State == Stage::InWorld && c.Session && c.Session->GetPlayer()
-                && c.Session->GetPlayer()->GetName() == who)
-                { self = c.Session->GetPlayer(); break; }
+        Player* self = InWorldByName(who);
         if (!self)
         {
             handler->PSendSysMessage("Constellation: спутника %s нет в мире", who.c_str());
@@ -10045,6 +10121,7 @@ public:
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "spells",  HandleSpells,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "costs",   HandleCosts,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "wipe",    HandleWipe,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "vend",    HandleVend,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
         };
@@ -10064,6 +10141,12 @@ public:
     static bool HandleSpells(ChatHandler* handler, std::string const& who)
     {
         Constellation::Manager::Instance()->SpellCensus(handler, who);
+        return true;
+    }
+
+    static bool HandleCosts(ChatHandler* handler, std::string const& who)
+    {
+        Constellation::Manager::Instance()->CostCensus(handler, who);
         return true;
     }
 
