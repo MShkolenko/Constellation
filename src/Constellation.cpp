@@ -455,6 +455,7 @@ struct Companion
     uint32 IdleDiagMs = 0;              // прибор «ПРОСТОЙ» — раз в пять минут
     uint32 LastPathType = 0;            // тип последнего отказа построителя — для строки «не подойти»
     bool RingTried = false;             // обход точек вокруг NPC в этом намерении уже был
+    bool FarDiagDone = false;           // «за потолком» — по разу на спутника
     bool RingHeld = false;              // и найденная точка держится до прихода или отказа
     float TurnInDist = 0.0f;            // с какого расстояния пошли сдавать: срок от него
     std::unordered_map<uint32, uint32> TriggerSentMs;   // зона осмотра -> не слать повторно, мс
@@ -7774,7 +7775,8 @@ public:
         // очередь не дошла, не говорит ничего. Здесь по каждой ненадетой вещи из сумок: что
         // это, куда встаёт, и чей именно ответ её остановил.
         std::string wardrobe;
-        uint32 gearSeen = 0, toolsSeen = 0;
+        uint32 gearSeen = 0, toolsSeen = 0, otherSeen = 0, gearSkipped = 0, toolsSkipped = 0;
+        std::map<uint32, uint32> otherByClass;      // класс предмета -> сколько таких
         auto look = [&](Item* it)
         {
             if (!it || it->IsEquipped() || !it->GetTemplate())
@@ -7788,8 +7790,14 @@ public:
                 // называет целью: сведения о заклинании предмета живут в клиентских данных, и
                 // спросить их можно только отсюда.
                 uint32 const useSpell = UseSpellOf(it);
-                if (!useSpell || toolsSeen >= 4)
+                if (!useSpell)
+                {
+                    ++otherSeen;                    // ни одежда, ни инструмент — но в сумке лежит
+                    ++otherByClass[tpl->GetClass()];
                     return;
+                }
+                if (toolsSeen >= 4)
+                    { ++toolsSkipped; return; }     // инструмент, которому не хватило места в строке
                 ++toolsSeen;
                 std::string names;
                 if (SpellInfo const* si = sSpellMgr->GetSpellInfo(useSpell, DIFFICULTY_NONE))
@@ -7804,7 +7812,7 @@ public:
                 return;
             }
             if (gearSeen >= 6)       // предел одежды — только для одежды: у инструментов свой
-                return;
+                { ++gearSkipped; return; }
             ++gearSeen;
             // СЛОТ БЕРЁМ ИЗ ОТВЕТА ЯДРА (Кодекс): FindEquipSlot отвечает на свой вопрос, а
             // обработчик кладёт вещь туда, куда сказал CanEquipItem, — на кольцах и оружии это
@@ -7845,6 +7853,16 @@ public:
                 if (self->HasSpell(sp))
                     known += std::to_string(sp) + " ";
             wardrobe += Trinity::StringFormat("руны: {}; ", known.empty() ? std::string("ни одной") : known);
+        }
+        // ХВОСТ: чего строка НЕ показала. Без него «в сумках одиннадцать предметов, надеваний
+        // ноль» и «в сумках одиннадцать НЕ-вещей» выглядят одинаково — пустой строкой.
+        if (otherSeen || gearSkipped || toolsSkipped)
+        {
+            std::string classes;
+            for (auto const& [cls, n] : otherByClass)
+                classes += Trinity::StringFormat("кл.{}×{} ", cls, n);
+            wardrobe += Trinity::StringFormat("прочее {} ({}); одежды за пределом {}; инструментов за пределом {}; ",
+                otherSeen, classes, gearSkipped, toolsSkipped);
         }
         if (!wardrobe.empty())
             TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
@@ -7999,7 +8017,7 @@ public:
         return 0;
     }
 
-    bool FindGiverByMap(Companion const& c, Player* self, uint32* entry, ObjectGuid::LowType* spawn,
+    bool FindGiverByMap(Companion& c, Player* self, uint32* entry, ObjectGuid::LowType* spawn,
                         Position* pos, uint32* questOut) const
     {
         auto it = _givers.find(self->GetMapId());
@@ -8009,10 +8027,19 @@ public:
         Giver const* best = nullptr;
         float bestD = Cfg().GiverSeekRange;
         uint32 bestQuest = 0;
+        uint32 tooFar = 0;                          // сколько точек отвергнуто ТОЛЬКО за дальностью
+        float nearestFar = 0.0f;                    // и на каком расстоянии ближайшая из них
+        uint32 nearestFarEntry = 0;
         std::unordered_map<uint32, uint32> byEntry;     // вид -> квест (0 = ничего): ядро спрашиваем раз на вид
         for (Giver const& g : it->second)
         {
             float const d = self->GetExactDist2d(g.Where.GetPositionX(), g.Where.GetPositionY());
+            if (d > Cfg().GiverSeekRange)
+            {
+                ++tooFar;                           // КАЖДУЮ, а не только новую ближайшую (Кодекс)
+                if (!nearestFar || d < nearestFar)
+                    { nearestFar = d; nearestFarEntry = g.Entry; }
+            }
             if (d > bestD + 0.01f || d < Cfg().QuestGiverRange)
                 continue;                       // дальше лучшего — не нужен; в обзоре — уже спрошен и молчит
             if (c.SeekBackoff.count(g.SpawnId))
@@ -8042,7 +8069,19 @@ public:
             bestQuest = qid;
         }
         if (!best)
+        {
+            // ЗА ПОТОЛКОМ. Печатаем ОДИН раз на спутника: без этого «полётов ноль» не отличить
+            // от «лететь не к кому». Квест у дальнего НЕ спрашиваем — это дорого, а строка нужна
+            // ровно для решения, стоит ли поднимать потолок.
+            if (tooFar && !c.FarDiagDone)
+            {
+                c.FarDiagDone = true;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОТОЛОК {}: в {:.0f} ярдах никого, за потолком {} точек, ближайшая — вид {} в {:.0f} ярдах",
+                    self->GetName(), Cfg().GiverSeekRange, tooFar, nearestFarEntry, nearestFar);
+            }
             return false;
+        }
         *entry = best->Entry;
         *spawn = best->SpawnId;
         *pos = best->Where;
