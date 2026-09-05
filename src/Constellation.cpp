@@ -392,6 +392,10 @@ struct Companion
     // если прогресс по квестам изменится сам, то есть если мир вокруг стал другим.
     std::set<uint32> GooberDone;
     std::unordered_map<uint32, uint8> GooberIdle;   // сколько раз применили без сдвига целей
+    // ХОЛОСТЫЕ ЗАХОДЫ НА ТОЧКУ — предел на ЛЮБОЙ исход, а не только на «применили и не помогло».
+    // Замер: 706 строк сбора за час и ноль удачных обираний; 331 из них — одна дверь, которую
+    // ядро не считало готовой ни разу, поэтому строгий счётчик не рос вовсе.
+    std::unordered_map<uint32, uint8> GatherEmpty;
     bool GooberDiagDone = false;
     bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
     uint32 GatherUseItem = 0;                       // идём к фокусу, чтобы применить эту заготовку
@@ -402,6 +406,7 @@ struct Companion
     uint32 CraftWaitMs = 0;
     uint32 CraftItem = 0;
     uint32 CraftHadBefore = 0;      // сколько заготовок было в сумках до отправки
+    uint32 CraftSpawn = 0;          // у какой точки применяли — ей снимем холостой заход при удаче
     std::vector<std::pair<uint32, int32>> CraftSnap;
     std::set<uint32> KilledOnQuestNoted;
     uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
@@ -2035,7 +2040,11 @@ public:
                     // «ИСТРАЧЕНА» — ПО РАЗНИЦЕ, А НЕ ПО НУЛЮ: заготовок могло быть несколько.
                     bool const consumed = self->GetItemCount(item, false) < c.CraftHadBefore;
                     if (moved || consumed)
+                    {
                         c.CraftTried.erase(item);
+                        if (c.CraftSpawn)
+                            c.GatherEmpty.erase(c.CraftSpawn);  // заход оказался не холостым
+                    }
                     else
                         ++c.CraftTried[item];
                     TC_LOG_INFO("server.worldserver",
@@ -2045,6 +2054,7 @@ public:
                               : Trinity::StringFormat("без сдвига, попытка {} из 3", uint32(c.CraftTried[item])));
                     c.CraftItem = 0;
                     c.CraftHadBefore = 0;
+                    c.CraftSpawn = 0;
                     c.CraftSnap.clear();
                 }
         }
@@ -3622,9 +3632,7 @@ public:
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation КУЗНЯ {}: до фокуса {} не дойти за {} с, осталось {:.0f}",
                                 self->GetName(), c.GatherSpawnId, c.GatherMs / 1000, near);
-                            c.GatherBackoff[c.GatherSpawnId] = 300000;
-                            c.GatherSpawnId = 0; c.GatherUseItem = 0;
-                            Switch(c, self, Behavior::Idle, "до фокуса не дойти");
+                            GatherLeave(c, self, 300000, true, "до фокуса не дойти");
                         }
                         return;
                     }
@@ -3644,8 +3652,7 @@ public:
                     SpellInfo const* si = spellId ? sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE) : nullptr;
                     if (!blank || !si)
                     {
-                        c.GatherSpawnId = 0; c.GatherUseItem = 0;
-                        Switch(c, self, Behavior::Idle, "заготовки или заклинания нет");
+                        GatherLeave(c, self, 0, true, "заготовки или заклинания нет");
                         return;
                     }
                     // ОЧЕРЕДЬ И ОТКАТ СПРАШИВАЕМ ДО ОТПРАВКИ — тем же вопросом, что и бой.
@@ -3678,9 +3685,10 @@ public:
                     TC_LOG_INFO("server.worldserver",
                         "Constellation КУЗНЯ {}: применил {} (закл. {}, фокус {}) у точки {} — жду 15 с и сверю цели",
                         self->GetName(), useEntry, spellId, si->RequiresSpellFocus, c.GatherSpawnId);
-                    c.GatherBackoff[c.GatherSpawnId] = 60000;
-                    c.GatherSpawnId = 0; c.GatherUseItem = 0;
-                    Switch(c, self, Behavior::Idle, "применил у фокуса");
+                    // ЗАХОД СЧИТАЕМ СРАЗУ, А ПРИ УДАЧЕ ПРИГОВОР ЕГО СНИМЕТ: иначе фокус, у
+                    // которого применение никогда не срабатывает, оставался бы вечным.
+                    c.CraftSpawn = c.GatherSpawnId;
+                    GatherLeave(c, self, 60000, true, "применил у фокуса");
                     return;
                 }
                 GameObject* go = near <= 12.0f
@@ -3710,9 +3718,7 @@ public:
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation СБОР {}: к точке {} (вид {}) маршрута нет, беру другую",
                                 self->GetName(), c.GatherSpawnId, c.GatherEntry);
-                            c.GatherBackoff[c.GatherSpawnId] = 300000;
-                            c.GatherSpawnId = 0;
-                            Switch(c, self, Behavior::Idle, "к объекту нет дороги");
+                            GatherLeave(c, self, 300000, true, "к объекту нет дороги");
                             return;
                         }
                         c.GatherMs += slice;
@@ -3723,9 +3729,7 @@ public:
                                 "Constellation СБОР {}: до точки {} (вид {}) не дойти за {} с, было {:.0f}, стало {:.0f}",
                                 self->GetName(), c.GatherSpawnId, c.GatherEntry,
                                 c.GatherMs / 1000, c.GatherDist, near);
-                            c.GatherBackoff[c.GatherSpawnId] = 300000;   // не дойти — надолго
-                            c.GatherSpawnId = 0;
-                            Switch(c, self, Behavior::Idle, "до объекта не дойти");
+                            GatherLeave(c, self, 300000, true, "до объекта не дойти");
                         }
                         return;
                     }
@@ -3734,11 +3738,9 @@ public:
                     // член из многих, событие может быть выключено, а взятый объект
                     // возрождается по своему сроку (Кодекс перечислил все эти случаи).
                     TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: пришёл к точке {} (вид {}), а объекта там нет",
-                        self->GetName(), c.GatherSpawnId, c.GatherEntry);
-                    c.GatherBackoff[c.GatherSpawnId] = 120000;
-                    c.GatherSpawnId = 0;
-                    Switch(c, self, Behavior::Idle, "объекта на месте нет");
+                        "Constellation СБОР {}: пришёл к точке {} (вид {}), а объекта там нет — холостой заход {} из 8",
+                        self->GetName(), c.GatherSpawnId, c.GatherEntry, uint32(c.GatherEmpty[c.GatherSpawnId] + 1));
+                    GatherLeave(c, self, 120000, true, "объекта на месте нет");
                     return;
                 }
 
@@ -3763,9 +3765,7 @@ public:
                     TC_LOG_INFO("server.worldserver",
                         "Constellation СБОР {}: {} ({}) для меня не активен по квесту",
                         self->GetName(), name, entry);
-                    c.GatherBackoff[c.GatherSpawnId] = 300000;
-                    c.GatherSpawnId = 0;
-                    Switch(c, self, Behavior::Idle, "объект не мой по квесту");
+                    GatherLeave(c, self, 300000, true, "объект не мой по квесту");
                     return;
                 }
                 if (!go->IsLootAllowedFor(self))
@@ -3773,9 +3773,7 @@ public:
                     TC_LOG_INFO("server.worldserver",
                         "Constellation СБОР {}: {} ({}) уже занят или обобран другим",
                         self->GetName(), name, entry);
-                    c.GatherBackoff[c.GatherSpawnId] = 120000;
-                    c.GatherSpawnId = 0;
-                    Switch(c, self, Behavior::Idle, "добыча не наша");
+                    GatherLeave(c, self, 120000, true, "добыча не наша");
                     return;
                 }
                 uint32 const spaceBefore = FreeBagSpace(self);
@@ -3804,13 +3802,17 @@ public:
                 uint32 const landed = self->GetAELootView().empty()
                     ? (spaceBefore > FreeBagSpace(self) ? spaceBefore - FreeBagSpace(self) : 0u)
                     : TakeOpenLoot(c, self, go->GetGUID(), name, entry);
+                // УСПЕХ — ЭТО ДОБЫЧА ИЛИ СДВИГ ЦЕЛЕЙ, И НИЧТО ИНОЕ. Объединённый выход раньше
+                // объявлял успехом любой заход, из-за чего предел не действовал ровно там, где
+                // он и был нужен (Кодекс, задача 104).
+                bool success = landed > 0;
                 if (landed)
                 {
                     ++c.Gathered;
+                    c.GatherEmpty.erase(c.GatherSpawnId);   // взяли — точка снова хорошая
                     TC_LOG_INFO("server.worldserver",
                         "Constellation СБОР {}: обобрал {} ({}), предметов легло {}; всего объектов {}",
                         self->GetName(), name, entry, landed, c.Gathered);
-                    c.GatherBackoff[c.GatherSpawnId] = 60000;   // взят — вернёмся не сразу
                 }
                 else
                 {
@@ -3820,31 +3822,35 @@ public:
                     // вокруг сам изменится (Кодекс, задача 90).
                     if (c.GatherIsGoober && QuestSnapshot(self) != snapBefore)
                     {
+                        success = true;                 // цели сдвинулись — заход не холостой
                         c.GooberDone.insert(c.GatherSpawnId);
                         c.GooberIdle.erase(c.GatherSpawnId);
+                        c.GatherEmpty.erase(c.GatherSpawnId);
                         TC_LOG_INFO("server.worldserver",
                             "Constellation СБОР {}: применил {} ({}) — состояние квестов изменилось, больше не хожу",
                             self->GetName(), name, entry);
                     }
                     else if (c.GatherIsGoober)
                     {
-                        // НЕУДАЧУ СЧИТАЕМ, ТОЛЬКО ЕСЛИ ОБЪЕКТ БЫЛ ГОТОВ. Иначе это чужое
-                        // применение секунду назад, а не свойство объекта.
+                        // ДВА СЧЁТА, И ВТОРОЙ БЕЗУСЛОВНЫЙ. Строгий считает только неудачи при
+                        // ГОТОВОМ объекте — чужое применение секунду назад свойством объекта не
+                        // является. Но замер показал, чего это стоило: дверь, которую ядро не
+                        // считает готовой НИКОГДА, дёргалась 331 раз за час, потому что строгий
+                        // счётчик не рос ни разу. Поэтому холостой заход считается всегда.
                         uint8 const tries = wasReady ? uint8(++c.GooberIdle[c.GatherSpawnId])
                                                      : c.GooberIdle[c.GatherSpawnId];
                         TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись, попытка {} из {}{}",
+                            "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись, попытка {} из {}, холостой заход {} из 8{}",
                             self->GetName(), name, entry, uint32(tries), uint32(GOOBER_TRIES_LOG),
-                            wasReady ? "" : " (объект был занят — не в счёт)");
+                            uint32(c.GatherEmpty[c.GatherSpawnId] + 1),
+                            wasReady ? "" : " (объект был занят — не в счёт строгого)");
                     }
                     else
                         TC_LOG_INFO("server.worldserver",
                             "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
                             self->GetName(), name, entry);
-                    c.GatherBackoff[c.GatherSpawnId] = 120000;
                 }
-                c.GatherSpawnId = 0;
-                Switch(c, self, Behavior::Idle, "собрал");
+                GatherLeave(c, self, landed ? 60000 : 120000, !success, "собрал");
                 return;
             }
             // РАЗГОВОР КАК СПОСОБ ЗАКРЫТЬ ЦЕЛЬ ЗАДАНИЯ.
@@ -5059,6 +5065,26 @@ public:
             if (uint32 pick = bestPaid[r] ? bestPaid[r] : bestFreeId[r])
                 return pick;
         return 0;
+    }
+
+    // ОДИН ВЫХОД ИЗ СБОРА — ОДНО МЕСТО, ГДЕ СЧИТАЮТСЯ ХОЛОСТЫЕ ЗАХОДЫ.
+    //
+    // Предел был обещан любому безрезультатному исходу, а стоял в двух ветках из девяти
+    // (Кодекс, задача 103): недостижимая точка, чужой по квесту объект, занятый объект, обычный
+    // объект без добычи и применение у фокуса счёт обходили. Теперь каждый уход из сбора идёт
+    // отсюда, и обещание совпадает с кодом.
+    void GatherLeave(Companion& c, Player* self, uint32 backoffMs, bool fruitless, char const* why)
+    {
+        if (c.GatherSpawnId)
+        {
+            if (backoffMs)
+                c.GatherBackoff[c.GatherSpawnId] = backoffMs;
+            if (fruitless)
+                ++c.GatherEmpty[c.GatherSpawnId];
+        }
+        c.GatherSpawnId = 0;
+        c.GatherUseItem = 0;
+        Switch(c, self, Behavior::Idle, why);
     }
 
     // СКОЛЬКО МЕСТА РЕАЛЬНО ЕСТЬ ПОД ДОБЫЧУ.
@@ -9169,6 +9195,12 @@ public:
             {
             if (auto back = c.GatherBackoff.find(sp.SpawnId); back != c.GatherBackoff.end() && back->second)
                 continue;                       // недавно не вышло — этот пока мимо
+            // ВОСЕМЬ ХОЛОСТЫХ ЗАХОДОВ — И ХВАТИТ. Число ВЫБРАНО: при отсрочке в две минуты это
+            // около четверти часа попыток на точку. Считается любой исход без добычи и без
+            // сдвига целей, поэтому вечного дёрганья не может быть ни у двери, ни у пустого
+            // места (задача 0023, запись 58).
+            if (auto empt = c.GatherEmpty.find(sp.SpawnId); empt != c.GatherEmpty.end() && empt->second >= 8)
+                continue;
 
             // ЧУЖАЯ ФАЗА ОТСЕИВАЕТСЯ ЗДЕСЬ, А НЕ ПО ПРИХОДУ.
             //
