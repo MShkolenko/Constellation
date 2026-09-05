@@ -407,6 +407,15 @@ struct Companion
     // Замер: 706 строк сбора за час и ноль удачных обираний; 331 из них — одна дверь, которую
     // ядро не считало готовой ни разу, поэтому строгий счётчик не рос вовсе.
     std::unordered_map<uint32, uint8> GatherEmpty;
+    // СКОЛЬКО ТОЧЕК ЭТОГО ВИДА ОБЪЕКТА УЖЕ ИСЧЕРПАНЫ. Отсечка по точке ограничивает точку,
+    // а не затею: у двери «Merchant Square Door» четырнадцать точек, и восемь спутников
+    // обошли их все (задача 0023, запись 64).
+    std::unordered_map<uint32, uint8> DeadEntry;
+    // И КАКИЕ ТОЧКИ УЖЕ ЗАСЧИТАНЫ ВИДУ. Без этого одна точка засчитывалась дважды: у гуубера
+    // два независимых порога — три применения без сдвига и восемь холостых заходов, — и
+    // равенство «== предел» в каждом из них не мешает второму сработать по той же точке
+    // (Кодекс, задача 121). Тогда три засечки набирались бы с полутора точек, а не с трёх.
+    std::set<uint32> DeadCounted;
     bool GooberDiagDone = false;
     bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
     uint32 GatherUseItem = 0;                       // идём к фокусу, чтобы применить эту заготовку
@@ -3944,6 +3953,9 @@ public:
                         // счётчик не рос ни разу. Поэтому холостой заход считается всегда.
                         uint8 const tries = wasReady ? uint8(++c.GooberIdle[c.GatherSpawnId])
                                                      : c.GooberIdle[c.GatherSpawnId];
+                        if (wasReady && tries >= GOOBER_TRIES_LOG && entry
+                            && c.DeadCounted.insert(c.GatherSpawnId).second)
+                            ++c.DeadEntry[entry];
                         TC_LOG_INFO("server.worldserver",
                             "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись, попытка {} из {}, холостой заход {} из 8{}",
                             self->GetName(), name, entry, uint32(tries), uint32(GOOBER_TRIES_LOG),
@@ -5194,9 +5206,21 @@ public:
             if (backoffMs)
                 c.GatherBackoff[c.GatherSpawnId] = backoffMs;
             if (fruitless)
-                ++c.GatherEmpty[c.GatherSpawnId];
+                // РОВНО НА ПЕРЕХОДЕ ЧЕРЕЗ ПРЕДЕЛ, а не при каждом заходе после него: иначе
+                // одна упрямая точка одна закрыла бы весь вид. И только если эта точка виду
+                // ещё не засчитана — пороги у гуубера два, а точка одна.
+                //
+                // И ТОЛЬКО У КВЕСТОВОГО ГУУБЕРА (Кодекс, задача 122). Засечка виду ставилась у
+                // ЛЮБОЙ точки сбора, хотя отсечка вида объявлена goober-механизмом: обычная
+                // жила или трава заранее набивала бы счёт своему виду, и если бы тот же вид
+                // потом оказался гуубером активного квеста, он был бы отложен сразу — а
+                // `DeadCounted` уже не дал бы этот вклад отменить.
+                if (++c.GatherEmpty[c.GatherSpawnId] >= 8 && c.GatherEntry && c.GatherIsGoober
+                    && c.DeadCounted.insert(c.GatherSpawnId).second)
+                    ++c.DeadEntry[c.GatherEntry];
         }
         c.GatherSpawnId = 0;
+        c.GatherEntry = 0;              // вместе с точкой, иначе отказ припишется прошлому виду
         c.GatherUseItem = 0;
         Switch(c, self, Behavior::Idle, why);
     }
@@ -9459,13 +9483,32 @@ public:
                         if (auto gq = gm->second.find(qid); gq != gm->second.end())
                             for (GatherSpawn const& sp : gq->second)
                             {
+                                // ПРИЗНАК СТАВИМ ПЕРВЫМ, ДО ЛЮБОГО ОТКАЗА (Кодекс, задача 121).
+                                // Он стоял после отказов, и запрет отключал сам себя: отложенный
+                                // вид выпадал из этого множества, а на общем месте отбора та же
+                                // точка приходила уже «обычным объектом» — мимо правила, писанного
+                                // ровно против неё. Множество отвечает на вопрос «это квестовый
+                                // гуубер», а не «мы к нему пойдём»; смешивать их и было ошибкой.
+                                gooberIds.insert(sp.SpawnId);
                                 if (c.GooberDone.count(sp.SpawnId))
                                     continue;       // своё отработал
                                 if (auto idle = c.GooberIdle.find(sp.SpawnId);
                                     idle != c.GooberIdle.end() && idle->second >= GOOBER_TRIES)
                                     continue;       // трижды применили без сдвига целей
+                                // И ВИД ЦЕЛИКОМ, КОГДА ТРИ ЕГО ТОЧКИ УЖЕ НИЧЕГО НЕ ДАЛИ.
+                                //
+                                // Замер (запись 64): квест 14098 «Evacuate the Merchant Square»
+                                // на этом ядре непроходим — гуубер выдаёт зачёт по СЕБЕ
+                                // (GameObject.cpp:2898, KillCreditGO(info->entry)), а цель квеста
+                                // требует зачёта по существу 35830, и скрипта, который его даёт,
+                                // нет ни у двери, ни у существа. Восемь спутников обошли все
+                                // четырнадцать дверей и потратили 825 переходов из примерно 1300
+                                // за двадцать четыре минуты — шестьдесят три процента такта мира.
+                                // Отсечка по точке этого не ловит: точек четырнадцать.
+                                if (auto de = c.DeadEntry.find(sp.Entry);
+                                    de != c.DeadEntry.end() && de->second >= GOOBER_TRIES)
+                                    continue;       // вид себя показал — больше не пробуем
                                 pool.push_back(&sp);
-                                gooberIds.insert(sp.SpawnId);
                                 ++goobers;
                             }
         // ЗАГОТОВКА НА РУКАХ — ИДЁМ К ЕЁ ФОКУСУ, А НЕ ЗА ВТОРОЙ.
@@ -9539,6 +9582,15 @@ public:
             // места (задача 0023, запись 58).
             if (auto empt = c.GatherEmpty.find(sp.SpawnId); empt != c.GatherEmpty.end() && empt->second >= 8)
                 continue;
+            // ВИД ЦЕЛИКОМ — ТОЛЬКО ДЛЯ ГУУБЕРОВ, и это не осторожность, а разница по существу.
+            // У жилы или травы «объекта на месте нет» значит «кто-то успел раньше», и через две
+            // минуты он там будет снова; закрывать по трём пустым точкам весь вид руды было бы
+            // прямым вредом. У квестового реквизита пустота структурная: он либо делает своё
+            // дело, либо не делает его нигде.
+            if (gooberIds.count(sp.SpawnId))
+                if (auto de = c.DeadEntry.find(sp.Entry);
+                    de != c.DeadEntry.end() && de->second >= GOOBER_TRIES)
+                    continue;
 
             // ЧУЖАЯ ФАЗА ОТСЕИВАЕТСЯ ЗДЕСЬ, А НЕ ПО ПРИХОДУ.
             //
@@ -9574,7 +9626,15 @@ public:
                             if (auto fs = fm->second.find(si->RequiresSpellFocus); fs != fm->second.end())
                                 for (GatherSpawn const& f : fs->second)
                                     if (f.SpawnId == sp.SpawnId)
-                                        { c.GatherUseItem = focusFor; c.GatherIsGoober = false; break; }
+                                    {
+                                        // ПРИЗНАК ГУУБЕРА ЗДЕСЬ НЕ СБРАСЫВАЕМ (Кодекс, задача 124).
+                                        // Он значит «эта точка — объект активного квеста», а не
+                                        // «мы идём её открывать». Сброс отнимал засечку у точки
+                                        // ДВОЙНОГО назначения: и гуубер квеста, и фокус для
+                                        // применения. Для обычного фокуса он и так false.
+                                        c.GatherUseItem = focusFor;
+                                        break;
+                                    }
             }
             }
         }
