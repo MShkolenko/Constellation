@@ -381,6 +381,11 @@ struct Companion
     // правила: блок по виду закрывает прямую цель, а источник ПРЕДМЕТА и прокси-зачёт
     // планировщик по виду не знает — зато знает, ради какого квеста шёл (Кодекс, задача 86).
     std::unordered_map<uint32, std::pair<uint8, uint8>> KilledOnQuest;
+    // ГДЕ МЕНЯ УБИВАЛИ: клетка 50x50 ярдов -> (гибелей, мой уровень при последней). Единственная
+    // мера, которая видна ВСЕГДА: убийцу можно не успеть приписать — 43 гибели из 43 у ДК прошли
+    // с «цели не было», — а место известно по определению (задача 0023, запись 59).
+    std::unordered_map<uint64, std::pair<uint8, uint8>> DeathSpots;
+    std::set<uint64> DeathSpotNoted;
     // ЧТО ВЫТЕСНИЛО ОБЯЗАТЕЛЬНОЕ НАДЕВАНИЕ — ПО GUID ВЕЩИ, а не по её номеру (Кодекс, задача
     // 91: вторая копия того же номера считалась бы вытесненной, а проданная оставляла бы запись
     // навсегда). Без этой памяти учебное оружие остаётся насовсем: обычное сравнение запрещает
@@ -2180,6 +2185,14 @@ public:
                 // от падения или воды тоже припишется цели (Кодекс). Порог два снижает шум, но
                 // не исключает его — две одинаковые ошибки на одном маршруте возможны. Цена
                 // такой ошибки — цель на пару уровней отложена, а не потеряна.
+                // МЕСТО ЗАПИСЫВАЕМ ВСЕГДА, ДО ВСЯКОЙ АТРИБУЦИИ: оно известно и тогда, когда
+                // убийцы назвать нельзя, а именно так и выглядели все 43 гибели у ДК.
+                {
+                    auto& sp = c.DeathSpots[SpotKey(self->GetMapId(), self->GetPositionX(), self->GetPositionY())];
+                    if (sp.first < 250)
+                        ++sp.first;
+                    sp.second = uint8(self->GetLevel());
+                }
                 uint32 killer = 0;
                 if (Creature* t = ObjectAccessor::GetCreature(*self, c.TargetGuid))
                     killer = t->GetEntry();
@@ -7293,6 +7306,25 @@ public:
     // превращал цикл смертей в цикл бесплодных походов: дойти до точки квеста, отказаться
     // атаковать, десять минут отката, снова дойти (Кодекс, задача 85).
     // «На два уровня выше, чем был» — число ВЫБРАНО, а не найдено, как QuestMaxAbove.
+    // КЛЕТКА МЕСТА — 50 ЯРДОВ. Число ВЫБРАНО: замер показал гибели, сгруппированные по
+    // пятидесятиярдовым квадратам (17 в одном, 10 в соседнем), и это тот масштаб, на котором
+    // «то же самое место» ещё означает ту же толпу.
+    static uint64 SpotKey(uint32 mapId, float x, float y)
+    {
+        int32 const cx = int32(std::floor(x / 50.0f));
+        int32 const cy = int32(std::floor(y / 50.0f));
+        return (uint64(mapId) << 40) ^ (uint64(uint32(cx) & 0xFFFFF) << 20) ^ uint64(uint32(cy) & 0xFFFFF);
+    }
+    // МЕСТО, ГДЕ МЕНЯ УБИВАЛИ ТРИЖДЫ, — НЕ ЦЕЛЬ ПОХОДА, ПОКА НЕ ПЕРЕРОС. Три, а не два, как у
+    // вида: клетка грубее одного существа, и случайная гибель по дороге не должна закрывать
+    // квест. Плюс два уровня — то же условие, что и в правиле убийцы.
+    bool DeathSpotBlocked(Companion const& c, Player const* self, uint32 mapId, float x, float y) const
+    {
+        auto d = c.DeathSpots.find(SpotKey(mapId, x, y));
+        return d != c.DeathSpots.end() && d->second.first >= 3
+            && self->GetLevel() <= uint32(d->second.second) + 2;
+    }
+
     bool KilledByBlocked(Companion const& c, Player const* self, uint32 entry) const
     {
         auto k = c.KilledBy.find(entry);
@@ -7443,7 +7475,22 @@ public:
                     continue;
                 float d = self->GetExactDist2d(dest.GetPositionX(), dest.GetPositionY());
                 if (d < bestDist)
-                    { bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop; }
+                    {
+                        // В КЛЕТКУ, ГДЕ МЕНЯ УЖЕ УБИВАЛИ ТРИЖДЫ, НЕ ИДЁМ. Проверяем саму ТОЧКУ
+                        // назначения, а не текущее место: смерть случалась именно там.
+                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY()))
+                        {
+                            uint64 const key = SpotKey(self->GetMapId(), dest.GetPositionX(), dest.GetPositionY());
+                            if (c.DeathSpotNoted.insert(key).second)
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ПОХОД {}: в месте {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
+                                    self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
+                                    uint32(c.DeathSpots.at(key).first), uint32(c.DeathSpots.at(key).second),
+                                    uint32(c.DeathSpots.at(key).second) + 3);
+                            continue;
+                        }
+                        bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop;
+                    }
             }
         }
         // ближе FightRange идти незачем: там цель и так увидит обычный поиск
