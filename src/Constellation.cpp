@@ -7336,28 +7336,49 @@ public:
     // СМОТРИМ ОКРЕСТНОСТЬ, А НЕ ОДНУ КЛЕТКУ. Замер опроверг допущение, с которым это писалось:
     // я записал, что гибели происходят у самих целей, а за 44 гибели запрет не сработал ни разу
     // при семнадцати гибелях в одной клетке. Значит гибнут ВОКРУГ точки — на подходе, в
-    // соседних клетках. Три на три клетки это квадрат 150 ярдов вокруг цели; порог по-прежнему
-    // на ОДНУ клетку, чтобы разрозненные смерти по площади не складывались в запрет.
-    // Возвращает КЛЮЧ сработавшей клетки, а не просто «да»: печатать надо ту клетку, которая
-    // запретила, а не ту, куда шли. Прежняя строка брала DeathSpots.at() по клетке назначения —
-    // при срабатывании по соседу это исключение на потоке мира (Кодекс, задача 107).
+    // соседних клетках. Три на три клетки это квадрат 150 ярдов вокруг цели, и порог применяется
+    // к СУММЕ по этому квадрату — почему именно так, сказано ниже: это решил замер.
+    // СУММА ПО ОКРЕСТНОСТИ, А НЕ ПОРОГ В ОДНОЙ КЛЕТКЕ — И ЭТО РЕШИЛ ЗАМЕР, А НЕ ВКУС.
+    //
+    // Кодекс отказался суммировать без данных, и был прав; данные появились. На 33 гибели порог
+    // «три в одной клетке у одного спутника» достигнут РОВНО ОДИН раз: 22 случая по одной
+    // гибели, 4 по две, 1 по три. Поэтому запрет и не срабатывал ни разу за два замера. Сумма по
+    // окрестности 3x3 даёт три и больше в одиннадцати случаях из двадцати семи — то есть ловит
+    // именно скопления, ради которых правило и писалось. Спутник гибнет не в одной точке, а
+    // вокруг неё: его вытесняют, он бежит к телу и погибает в тридцати ярдах от прошлого раза.
+    //
+    // Уровень берём НАИБОЛЬШИЙ из слагаемых: запрет снимается, когда спутник перерос последнюю
+    // из этих гибелей. whichOut — клетка с самым большим счётом, её и печатаем.
     bool DeathSpotBlocked(Companion const& c, Player const* self, uint32 mapId, float x, float y,
-                          uint64* whichOut = nullptr) const
+                          uint64* whichOut = nullptr, uint32* totalOut = nullptr,
+                          uint32* levelOut = nullptr) const
     {
+        uint32 total = 0, worstCount = 0, level = 0;
+        uint64 worst = 0;
         for (int dx = -1; dx <= 1; ++dx)
             for (int dy = -1; dy <= 1; ++dy)
             {
                 uint64 const key = SpotKey(mapId, x + dx * 50.0f, y + dy * 50.0f);
                 auto d = c.DeathSpots.find(key);
-                if (d != c.DeathSpots.end() && d->second.first >= 3
-                    && self->GetLevel() <= uint32(d->second.second) + 2)
-                {
-                    if (whichOut)
-                        *whichOut = key;
-                    return true;
-                }
+                if (d == c.DeathSpots.end())
+                    continue;
+                total += d->second.first;
+                level = std::max<uint32>(level, d->second.second);
+                if (d->second.first > worstCount)
+                    { worstCount = d->second.first; worst = key; }
             }
-        return false;
+        if (total < 3 || self->GetLevel() > level + 2)
+            return false;
+        // ОТДАЁМ ТО, ЧЕМ РЕШАЛИ: сумму и наибольший уровень, а не счёт одной клетки. Иначе
+        // строка журнала способна сказать «убивали 1 раз» при сработавшем пороге 3 и назвать
+        // неверный уровень снятия запрета (Кодекс, задача 109).
+        if (whichOut)
+            *whichOut = worst;
+        if (totalOut)
+            *totalOut = total;
+        if (levelOut)
+            *levelOut = level;
+        return true;
     }
 
     bool KilledByBlocked(Companion const& c, Player const* self, uint32 entry) const
@@ -7514,15 +7535,15 @@ public:
                         // В КЛЕТКУ, ГДЕ МЕНЯ УЖЕ УБИВАЛИ ТРИЖДЫ, НЕ ИДЁМ. Проверяем саму ТОЧКУ
                         // назначения, а не текущее место: смерть случалась именно там.
                         uint64 deadly = 0;
-                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY(), &deadly))
+                        uint32 deadlyTotal = 0, deadlyLevel = 0;
+                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY(),
+                                             &deadly, &deadlyTotal, &deadlyLevel))
                         {
                             if (c.DeathSpotNoted.insert(deadly).second)
-                                if (auto d = c.DeathSpots.find(deadly); d != c.DeathSpots.end())
-                                    TC_LOG_INFO("server.worldserver",
-                                        "Constellation ПОХОД {}: рядом с местом {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
-                                        self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
-                                        uint32(d->second.first), uint32(d->second.second),
-                                        uint32(d->second.second) + 3);
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation ПОХОД {}: вокруг места {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
+                                    self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
+                                    deadlyTotal, deadlyLevel, deadlyLevel + 3);
                             continue;
                         }
                         bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop;
