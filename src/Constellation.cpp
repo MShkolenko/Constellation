@@ -416,6 +416,30 @@ struct Companion
     // равенство «== предел» в каждом из них не мешает второму сработать по той же точке
     // (Кодекс, задача 121). Тогда три засечки набирались бы с полутора точек, а не с трёх.
     std::set<uint32> DeadCounted;
+    // СКОЛЬКО РАЗ ЭТОТ ВИД ПРИМЕНЯЛИ БЕЗ СДВИГА ЦЕЛЕЙ — по всем его точкам вместе.
+    //
+    // Отсечка по исчерпанным точкам верна, но дорога: восемь холостых заходов на точку и три
+    // точки — двадцать четыре похода на спутника, а ходоков восемь. Замер (запись 66) показал
+    // воронку: 112 заходов на первой ступени, 6 на восьмой — то есть до предела почти никто не
+    // добирается, зато 355 ПРИМЕНЕНИЙ двери дали ноль сдвигов целей. Применение и есть прямая
+    // проба вида; заход — только дорога к ней.
+    std::unordered_map<uint32, uint16> DeadEntryUses;
+    std::set<uint32> DeadEntryNoted;    // о каком виде уже сказали в журнале
+    // НАБОР КВЕСТОВ, ПРИ КОТОРОМ НАКОПЛЕНА ОТСЕЧКА.
+    //
+    // Отсечка держится всю сессию, и это опасно (Кодекс, задача 126): отказался от квеста,
+    // взял снова — прежние неудачи запирают вид навсегда, и обнаружить, что теперь он
+    // работает, модуль уже не сможет. Поэтому запоминаем, ПРИ КАКОМ наборе квестов вывод
+    // сделан: набор сменился — вывод недействителен. Берём именно НАБОР (какие квесты в
+    // журнале), а не их продвижение: снимок продвижения меняется от каждой убитой крысы и
+    // сбрасывал бы отсечку постоянно.
+    //
+    // И ХРАНИМ САМ НАБОР, А НЕ ЕГО ХЕШ (Кодекс, задача 127). Здесь стоял 32-битный
+    // полиномиальный хеш: он допускает коллизии, а при коллизии сброса НЕ БУДЕТ — то есть
+    // ошибка в опасную сторону. Вдобавок он считался по последовательности слотов, поэтому
+    // те же квесты в другом порядке давали другую подпись. Десяток чисел дешевле любой из
+    // этих бед.
+    std::set<uint32> DeadQuestSet;
     bool GooberDiagDone = false;
     bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
     uint32 GatherUseItem = 0;                       // идём к фокусу, чтобы применить эту заготовку
@@ -3924,6 +3948,17 @@ public:
                 {
                     ++c.Gathered;
                     c.GatherEmpty.erase(c.GatherSpawnId);   // взяли — точка снова хорошая
+                    // УСПЕХ ПО ДОБЫЧЕ — ТОЖЕ УСПЕХ ВИДА (Кодекс, задача 128). Очистка стояла
+                    // только в ветке «сдвинулись цели», а объект, который отдал добычу, точно
+                    // так же доказал, что работает. Для не-гуубера эти карты пусты, и erase
+                    // по отсутствующему ключу ничего не делает.
+                    if (entry)
+                    {
+                        c.DeadEntryUses.erase(entry);
+                        c.DeadEntry.erase(entry);
+                        c.DeadEntryNoted.erase(entry);
+                    }
+                    c.DeadCounted.erase(c.GatherSpawnId);
                     TC_LOG_INFO("server.worldserver",
                         "Constellation СБОР {}: обобрал {} ({}), предметов легло {}; всего объектов {}",
                         self->GetName(), name, entry, landed, c.Gathered);
@@ -3940,6 +3975,19 @@ public:
                         c.GooberDone.insert(c.GatherSpawnId);
                         c.GooberIdle.erase(c.GatherSpawnId);
                         c.GatherEmpty.erase(c.GatherSpawnId);
+                        // УСПЕХ ОТМЕНЯЕТ НАКОПЛЕННОЕ ПО ВИДУ (Кодекс, задача 127).
+                        //
+                        // Без этого арифметика перевешивала прямое доказательство: пять неудач,
+                        // затем ВИД РЕАЛЬНО СДВИНУЛ КВЕСТ, затем ещё одна неудача — шесть, и вид
+                        // отложен навсегда. Считать неудачи после доказанной работы значит
+                        // судить по сумме там, где есть факт.
+                        if (entry)
+                        {
+                            c.DeadEntryUses.erase(entry);
+                            c.DeadEntry.erase(entry);
+                            c.DeadEntryNoted.erase(entry);
+                        }
+                        c.DeadCounted.erase(c.GatherSpawnId);
                         TC_LOG_INFO("server.worldserver",
                             "Constellation СБОР {}: применил {} ({}) — состояние квестов изменилось, больше не хожу",
                             self->GetName(), name, entry);
@@ -3956,6 +4004,16 @@ public:
                         if (wasReady && tries >= GOOBER_TRIES_LOG && entry
                             && c.DeadCounted.insert(c.GatherSpawnId).second)
                             ++c.DeadEntry[entry];
+                        // СЧЁТ ПО ВИДУ — ТОЛЬКО ПРИ ГОТОВОМ ОБЪЕКТЕ (Кодекс, задача 126).
+                        //
+                        // Здесь стоял безусловный счёт, и это была ошибка ровно того же рода,
+                        // что я чинил в отборе целей: «объект занят» — свойство мгновения, а не
+                        // вида, и шесть занятых применений подряд на ОДНОЙ точке выдавались бы
+                        // за проверку трёх. Замер (запись 66) снимает и возражение о том, что
+                        // строгого счёта не хватит: из 355 применений двери 132 пришлись на
+                        // готовый объект — этого с большим запасом достаточно.
+                        if (wasReady && entry && c.DeadEntryUses[entry] < 60000)
+                            ++c.DeadEntryUses[entry];
                         TC_LOG_INFO("server.worldserver",
                             "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись, попытка {} из {}, холостой заход {} из 8{}",
                             self->GetName(), name, entry, uint32(tries), uint32(GOOBER_TRIES_LOG),
@@ -6990,7 +7048,15 @@ public:
                 return;
             for (SpellEffectInfo const& e : si->GetEffects())
                 if ((e.Effect == SPELL_EFFECT_KILL_CREDIT || e.Effect == SPELL_EFFECT_KILL_CREDIT2) && e.MiscValue > 0)
+                {
                     creditsOfSpell[si->Id].insert(uint32(e.MiscValue));
+                    // ТОТ ЖЕ ПРОХОД ОТВЕЧАЕТ И НА ВТОРОЙ ВОПРОС. Заклинание, которое требует
+                    // фокуса, закрывается не надеванием, а дорогой к фокусу и произнесением —
+                    // это отдельный указатель, но перебирать хранилище заклинаний второй раз
+                    // ради него незачем.
+                    if (si->RequiresSpellFocus)
+                        _focusCreditSpells[uint32(e.MiscValue)].insert(si->Id);
+                }
         });
         uint32 creditItems = 0;
         for (auto const& [itemId, tpl] : sObjectMgr->GetItemTemplateStore())
@@ -7008,6 +7074,8 @@ public:
         TC_LOG_INFO("server.loading",
             "Constellation: указатель зачётов через надевание — заклинаний с зачётом {}, эффектов предметов при надевании {}, существ {}",
             uint32(creditsOfSpell.size()), creditItems, uint32(_itemsForCredit.size()));
+        TC_LOG_INFO("server.loading",
+            "Constellation: указатель зачётов у фокуса — существ {}", uint32(_focusCreditSpells.size()));
 
         // ЦЕЛЬ-ПРЕДМЕТ БЫВАЕТ ИЗДЕЛИЕМ, А НЕ ДОБЫЧЕЙ — ИНДЕКС ИЗ ТЕХ ЖЕ ХРАНИЛИЩ ЯДРА.
         //
@@ -9071,6 +9139,65 @@ public:
         return true;
     }
 
+    // ЧТО ДАЁТ ЗАЧЁТ ПО ЭТОМУ СУЩЕСТВУ — СПРАШИВАЕМ У ЯДРА.
+    //
+    // Оператор попросил доказать, что зачёт квеста 12842 по существу 28357 даёт именно руна.
+    // Снаружи это не читается: данные заклинаний живут в DB2 и упакованы битово — попытка
+    // найти номер существа как int32 в SpellEffect.db2 дала два вхождения и ни одного эффекта
+    // зачёта рядом. А ядро эти файлы уже разобрало, и указатель строится при загрузке.
+    //
+    // Печатаем по существу: кто даёт зачёт надеванием, кто — произнесением у фокуса, какой
+    // это фокус, и знает ли спрашивающий это заклинание сам.
+    bool DumpCredit(ChatHandler* handler, uint32 entry) const
+    {
+        Player* me = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr;
+        uint32 shown = 0;
+
+        if (auto it = _itemsForCredit.find(entry); it != _itemsForCredit.end())
+        {
+            std::string items;
+            for (uint32 id : it->second)
+                items += std::to_string(id) + " ";
+            handler->PSendSysMessage("Constellation ЗАЧЁТ %u: надеванием — предметы [%s]", entry, items.c_str());
+            ++shown;
+        }
+
+        if (auto it = _focusCreditSpells.find(entry); it != _focusCreditSpells.end())
+            for (uint32 spellId : it->second)
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+                if (!si)
+                    continue;
+                uint32 spawns = 0;
+                if (me)
+                    if (auto fm = _focusSpawns.find(me->GetMapId()); fm != _focusSpawns.end())
+                        if (auto fs = fm->second.find(si->RequiresSpellFocus); fs != fm->second.end())
+                            spawns = uint32(fs->second.size());
+                // ИМЯ ЗАКЛИНАНИЯ — ЧЕРЕЗ ПЕРЕМЕННУЮ И .c_str() (Кодекс, задача 126).
+                // Тернарник отдавал `std::string`, а он уходил в вариадическую PSendSysMessage
+                // под %s — это прямое неопределённое поведение, а не придирка к стилю.
+                // Заодно пустой русский перевод подменяем английским, а не пустотой.
+                std::string spellName = "?";
+                if (si->SpellName)
+                {
+                    spellName = si->SpellName->Str[LOCALE_ruRU];
+                    if (spellName.empty())
+                        spellName = si->SpellName->Str[LOCALE_enUS];
+                    if (spellName.empty())
+                        spellName = "?";
+                }
+                handler->PSendSysMessage("Constellation ЗАЧЁТ %u: заклинание %u «%s», фокус %u, точек фокуса на карте %u, знаю его: %s",
+                    entry, spellId, spellName.c_str(),
+                    si->RequiresSpellFocus, spawns,
+                    (me && me->HasSpell(spellId)) ? "да" : "нет");
+                ++shown;
+            }
+
+        if (!shown)
+            handler->PSendSysMessage("Constellation ЗАЧЁТ %u: ни предметов при надевании, ни заклинаний у фокуса", entry);
+        return true;
+    }
+
     // КРАСНЫЙ, ЖЁЛТЫЙ ИЛИ ЗЕЛЁНЫЙ — СПРАШИВАЕМ У ЯДРА, А НЕ У БАЗЫ.
     //
     // Оператор задал прямой вопрос: почему горожане Тихоземья кидаются, и нельзя ли сделать их
@@ -9413,6 +9540,7 @@ public:
     // Возвращает НЕ живой объект, а кандидата: идентификатор спавна и место. Живой объект
     // берётся по приходу, по этому же идентификатору, без единого обхода.
     static uint8 const GOOBER_TRIES_LOG = 3;    // тот же предел, что и в отборе
+    static uint8 const GOOBER_USES = 6;         // применений вида без сдвига целей — и хватит
     // СНИМОК СОСТОЯНИЯ КВЕСТОВ — СТРУКТУРНЫЙ, А НЕ СУММА (Кодекс, задача 94: в сумме два
     // изменения гасят друг друга, переполнение сливает разное в одно, а переход статуса не
     // виден вовсе). Пара на каждую цель и пара на каждый квест со статусом; порядок обхода
@@ -9474,6 +9602,23 @@ public:
         // с первой неудачи запер бы шестерых навсегда (Кодекс, задача 94). Три — число
         // ВЫБРАННОЕ, при отсрочке в две минуты это шесть минут попыток.
         static uint8 const GOOBER_TRIES = GOOBER_TRIES_LOG;
+        // НАБОР КВЕСТОВ СМЕНИЛСЯ — ПРЕЖНИЕ ВЫВОДЫ О ВИДАХ НЕДЕЙСТВИТЕЛЬНЫ (Кодекс, задача 126).
+        // Складываем номера квестов журнала: дешёвая подпись, которая меняется ровно тогда,
+        // когда квест взят, сдан или брошен, и не шевелится от продвижения по целям.
+        {
+            std::set<uint32> inLog;
+            for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                if (uint32 const qid = self->GetQuestSlotQuestId(slot))
+                    inLog.insert(qid);
+            if (inLog != c.DeadQuestSet)
+            {
+                c.DeadQuestSet = std::move(inLog);
+                c.DeadEntry.clear();
+                c.DeadEntryUses.clear();
+                c.DeadCounted.clear();
+                c.DeadEntryNoted.clear();
+            }
+        }
         uint32 goobers = 0;
         std::set<uint32> gooberIds;
         if (auto gm = _gooberByQuest.find(self->GetMapId()); gm != _gooberByQuest.end())
@@ -9508,6 +9653,22 @@ public:
                                 if (auto de = c.DeadEntry.find(sp.Entry);
                                     de != c.DeadEntry.end() && de->second >= GOOBER_TRIES)
                                     continue;       // вид себя показал — больше не пробуем
+                                // ШЕСТЬ ПРИМЕНЕНИЙ БЕЗ СДВИГА — И ХВАТИТ, не дожидаясь, пока
+                                // три точки наберут по восемь заходов. Шесть ВЫБРАНО: две
+                                // попытки на каждую из трёх точек, то есть та же строгость, но
+                                // без двадцати четырёх дорог. Молчать об этом нельзя — иначе
+                                // правило нельзя ни подтвердить, ни опровергнуть (запись 66:
+                                // прошлая отсечка была нема, и по журналу нельзя было сказать,
+                                // сработала она или нет).
+                                if (auto du = c.DeadEntryUses.find(sp.Entry);
+                                    du != c.DeadEntryUses.end() && du->second >= GOOBER_USES)
+                                {
+                                    if (c.DeadEntryNoted.insert(sp.Entry).second)
+                                        TC_LOG_INFO("server.worldserver",
+                                            "Constellation СБОР {}: вид {} применён {} раз без сдвига целей — больше к нему не хожу",
+                                            self->GetName(), sp.Entry, uint32(du->second));
+                                    continue;
+                                }
                                 pool.push_back(&sp);
                                 ++goobers;
                             }
@@ -9588,9 +9749,23 @@ public:
             // прямым вредом. У квестового реквизита пустота структурная: он либо делает своё
             // дело, либо не делает его нигде.
             if (gooberIds.count(sp.SpawnId))
+            {
                 if (auto de = c.DeadEntry.find(sp.Entry);
                     de != c.DeadEntry.end() && de->second >= GOOBER_TRIES)
                     continue;
+                if (auto du = c.DeadEntryUses.find(sp.Entry);
+                    du != c.DeadEntryUses.end() && du->second >= GOOBER_USES)
+                {
+                    // ГОВОРИМ И ЗДЕСЬ. Обещание «о каждом виде скажем один раз» держалось
+                    // только в первом фильтре, а вид, впервые отсечённый общим путём, уходил
+                    // молча (Кодекс, задача 126). Множество общее, поэтому дважды не скажем.
+                    if (c.DeadEntryNoted.insert(sp.Entry).second)
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation СБОР {}: вид {} применён {} раз без сдвига целей — больше к нему не хожу",
+                            self->GetName(), sp.Entry, uint32(du->second));
+                    continue;
+                }
+            }
 
             // ЧУЖАЯ ФАЗА ОТСЕИВАЕТСЯ ЗДЕСЬ, А НЕ ПО ПРИХОДУ.
             //
@@ -11434,6 +11609,14 @@ private:
     // запись 55). Семь панд стояли на «сжечь Эдикт»: зачёт выдаёт скрипт объекта при
     // применении, а к квесту его привязывает само ядро этим полем — ни одного имени.
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _gooberByQuest;
+    // СУЩЕСТВО -> ЗАКЛИНАНИЯ, КОТОРЫЕ ДАЮТ ПО НЕМУ ЗАЧЁТ И ТРЕБУЮТ ФОКУСА.
+    //
+    // Соседний указатель `_itemsForCredit` отвечает на вопрос «что НАДЕТЬ, чтобы получить
+    // зачёт». Этот — на вопрос «что ПРОИЗНЕСТИ и где»: у рунной кузни рыцарей смерти зачёт
+    // даёт руна, а не предмет, и цель квеста 12842 записана зачётом по существу 28357.
+    // Данные заклинаний лежат в DB2 и битово упакованы — прочесть их снаружи нельзя, а ядро
+    // их уже разобрало (задача 0023, запись 65).
+    std::unordered_map<uint32, std::set<uint32>> _focusCreditSpells;
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
     // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
@@ -11589,6 +11772,7 @@ public:
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "zones",   HandleZones,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "faction", HandleFaction, rbac::RBAC_PERM_COMMAND_GM, Console::No },
+            { "credit",  HandleCredit,  rbac::RBAC_PERM_COMMAND_GM, Console::No },
             { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -11733,6 +11917,11 @@ public:
     static bool HandleFaction(ChatHandler* handler, uint32 entry)
     {
         return Constellation::Manager::Instance()->DumpFaction(handler, entry);
+    }
+
+    static bool HandleCredit(ChatHandler* handler, uint32 entry)
+    {
+        return Constellation::Manager::Instance()->DumpCredit(handler, entry);
     }
 
     static bool HandleVend(ChatHandler* handler)
