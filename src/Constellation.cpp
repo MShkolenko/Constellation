@@ -9047,6 +9047,98 @@ public:
         return true;
     }
 
+    // КРАСНЫЙ, ЖЁЛТЫЙ ИЛИ ЗЕЛЁНЫЙ — СПРАШИВАЕМ У ЯДРА, А НЕ У БАЗЫ.
+    //
+    // Оператор задал прямой вопрос: почему горожане Тихоземья кидаются, и нельзя ли сделать их
+    // жёлтыми. Я трижды ответил «таблицы фракций лежат в DB2, из MySQL не прочесть» — и это
+    // была отговорка. Ядро эти файлы УЖЕ разобрало: `sFactionTemplateStore` заполнен на старте,
+    // а `FactionTemplateEntry` (DB2Structure.h:1670) сам считает отношение — `IsHostileTo`,
+    // `IsFriendlyTo`, `IsHostileToPlayers`, `IsNeutralToAll`. Спрашивать надо было его.
+    //
+    // Команда печатает по виду существа: его фракцию, сырые группы (свои, друзья, враги) и
+    // выводы ядра — враждебен ли он игрокам вообще и нейтрален ли ко всем. Цвет рамки даётся
+    // двумя строками: приблизительно по шаблону, и ТОЧНО — если существо выделено, потому что
+    // точный ответ ядро считает только по живым объектам.
+    bool DumpFaction(ChatHandler* handler, uint32 entry) const
+    {
+        CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(entry);
+        if (!ct)
+        {
+            handler->PSendSysMessage("Constellation: вида %u нет", entry);
+            return true;
+        }
+        FactionTemplateEntry const* ft = sFactionTemplateStore.LookupEntry(ct->faction);
+        if (!ft)
+        {
+            handler->PSendSysMessage("Constellation: у вида %u фракция %u, но её нет в справочнике",
+                                     entry, ct->faction);
+            return true;
+        }
+        std::string enemies, friends;
+        for (uint16 id : ft->Enemies)
+            if (id)
+                enemies += std::to_string(id) + " ";
+        for (uint16 id : ft->Friend)
+            if (id)
+                friends += std::to_string(id) + " ";
+        handler->PSendSysMessage("Constellation ФРАКЦИЯ: вид %u «%s» -> шаблон %u (фракция %u, флаги %d)",
+                                 entry, ct->Name.c_str(), ft->ID, uint32(ft->Faction), ft->Flags);
+        handler->PSendSysMessage("  группы: своя %u, друзья %u, враги %u; враждебен игрокам: %s; нейтрален ко всем: %s",
+                                 uint32(ft->FactionGroup), uint32(ft->FriendGroup), uint32(ft->EnemyGroup),
+                                 ft->IsHostileToPlayers() ? "да" : "нет",
+                                 ft->IsNeutralToAll() ? "да" : "нет");
+        handler->PSendSysMessage("  списком: враги [%s], друзья [%s]",
+                                 enemies.empty() ? "пусто" : enemies.c_str(),
+                                 friends.empty() ? "пусто" : friends.c_str());
+        // СЕССИЮ БЕРЁМ ОДИН РАЗ (Кодекс, задача 118): проверять один вызов, а пользоваться
+        // другим — это разрыв между проверкой и применением, пусть и узкий.
+        WorldSession* session = handler->GetSession();
+        Player* me = session ? session->GetPlayer() : nullptr;
+        if (!me)
+            return true;
+
+        // ПО ШАБЛОНУ — ЭТО ПРИБЛИЖЕНИЕ, И ТАК ЕГО И НАДО НАЗЫВАТЬ.
+        //
+        // Первая редакция объявляла цветом рамки сравнение двух шаблонов. Кодекс справедливо
+        // спросил, в какую сторону считает клиент, и ядро ответило: цвет берётся из
+        // `WorldObject::GetReactionTo` СО СТОРОНЫ ИГРОКА (Object.cpp:2079), а она учитывает
+        // много больше — репутацию, состояние «война» (`IsAtWar`), спорные флаги, владельца-
+        // игрока у питомца. Сырые `IsHostileTo`/`IsFriendlyTo` из `FactionTemplateEntry` —
+        // только последняя ступень этой лестницы. Поэтому шаблонный ответ печатаем с оговоркой.
+        // СТОРОНА ВАЖНА: спрашиваем МОЙ шаблон о ЕГО, а не наоборот (Кодекс, задача 119).
+        // Помощники несимметричны — они смотрят списки и группы ЛЕВОГО шаблона, — а подпись
+        // говорит «для тебя», то есть отношение должно считаться с моей стороны.
+        if (FactionTemplateEntry const* mine = me->GetFactionTemplateEntry())
+            handler->PSendSysMessage("  по шаблону, для тебя (%s, шаблон %u): %s — репутация и «война» здесь НЕ учтены",
+                                     me->GetName().c_str(), mine->ID,
+                                     mine->IsHostileTo(ft) ? "КРАСНЫЙ"
+                                         : (mine->IsFriendlyTo(ft) ? "ЗЕЛЁНЫЙ" : "ЖЁЛТЫЙ"));
+
+        // А ТОЧНО — только по живому существу и только у ядра. Если оно выделено, спрашиваем
+        // ту самую функцию, из которой берётся цвет, и обе стороны: отношение несимметрично.
+        // Пороги те же, что у ядра (Object.cpp:2232-2240): <= REP_HOSTILE враг, >= REP_FRIENDLY друг.
+        // И ТОЧНАЯ СТРОКА — ТОЛЬКО ПРО ТО СУЩЕСТВО, О КОТОРОМ СПРАШИВАЛИ (Кодекс, задача 119).
+        // Иначе две соседние строки описывали бы разные виды и выглядели как «приблизительно»
+        // и «точно» об одном и том же.
+        if (Unit* sel = handler->getSelectedUnit())
+            if (Creature* cr = sel->ToCreature())
+            {
+                if (cr->GetEntry() != entry)
+                    handler->PSendSysMessage("  выделено существо %u, а спрашивали про %u — точное сравнение не делаю",
+                                             cr->GetEntry(), entry);
+                else
+                {
+                    ReputationRank const toMe = me->GetReactionTo(cr);
+                    ReputationRank const toIt = cr->GetReactionTo(me);
+                    handler->PSendSysMessage("  ТОЧНО, по выделенному существу %u: я к нему %d, оно ко мне %d -> %s",
+                                             cr->GetEntry(), int32(toMe), int32(toIt),
+                                             toMe <= REP_HOSTILE ? "КРАСНЫЙ"
+                                                 : (toMe >= REP_FRIENDLY ? "ЗЕЛЁНЫЙ" : "ЖЁЛТЫЙ"));
+                }
+            }
+        return true;
+    }
+
     // ---------------------------------------------------------------- квестодатель по карте
     // КАКОЙ КВЕСТ ЯДРО ДАЛО БЫ У ЭТОГО ВИДА — по воротам ядра и светофору. Связи «существо ->
     // квесты» выбирают, КУДА ИДТИ, а не что брать: у самого квестодателя спутник, как и
@@ -9167,7 +9259,27 @@ public:
             return false;
         FactionTemplateEntry const* mine = self->GetFactionTemplateEntry();
         Mender const* best = nullptr;
-        float bestD = 600.0f;               // дальше — не поход, а переезд
+        // ПОТОЛОК ЕСТЬ, НО ОН НЕ ОДИН НА ВСЕ СЛУЧАИ.
+        //
+        // Шестьсот ярдов — разумная мера для того, кто идёт ПРОДАВАТЬ: он дееспособен, у него
+        // есть занятия получше, и ради разгрузки сумок бросать их не стоит. Для СЛОМАННОГО эта
+        // же мера смертельна, потому что дел у него нет вовсе: `BrokenForFight` запрещает ему
+        // и цель, и поход к ней, поэтому он стоит в «стою» и не выходит оттуда никогда.
+        //
+        // Замер (круг 71) поймал это в самом обидном виде. Ни у одного из четверых не было НИ
+        // ОДНОГО перехода состояния за двадцать шесть минут:
+        //   Chayton (охотник 4, Мулгор), 6 сломанных вещей — ремонтник в 601 ярде;
+        //   Wachiwi (чернокнижник 4, Мулгор), 7 сломанных — в 603 ярдах;
+        //   Ayasha (друид 3, Мулгор), 4 сломанных — в 654;
+        //   Thragan (маг 6, Степи, 6915 медяков), 5 сломанных — в 786.
+        // Один ярд сверх потолка — и спутник выбывает навсегда.
+        //
+        // Поэтому потолок остаётся ровно там, где он осмыслен, и снимается там, где вреден:
+        // сломанному дойти дороже, чем стоять, при любой достижимой дистанции. Ноль вместо
+        // числа не ставим: список ремонтников этой карты конечен, и без верхней границы мы
+        // отправили бы спутника через континент — пять тысяч ярдов это край карты, а не «сколько
+        // угодно».
+        float bestD = needRepair ? 5000.0f : 600.0f;
         for (Mender const& m : it->second)
         {
             if ((needSell && !m.Sells) || (needRepair && !m.Fixes))
@@ -11416,6 +11528,7 @@ public:
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "zones",   HandleZones,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "faction", HandleFaction, rbac::RBAC_PERM_COMMAND_GM, Console::No },
             { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -11555,6 +11668,11 @@ public:
     static bool HandleZones(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->DumpZones(handler);
+    }
+
+    static bool HandleFaction(ChatHandler* handler, uint32 entry)
+    {
+        return Constellation::Manager::Instance()->DumpFaction(handler, entry);
     }
 
     static bool HandleVend(ChatHandler* handler)
