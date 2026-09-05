@@ -3261,6 +3261,21 @@ public:
                     Switch(c, self, Behavior::Idle, "пришёл — целей нет, отложил квест");
                     return;
                 }
+                // ЦЕЛЬ СТАЛА СМЕРТЕЛЬНОЙ, ПОКА МЫ ШЛИ — ПОВОРАЧИВАЕМ. Выбор точки делается один
+                // раз, а после воскрешения поход продолжается с той же целью: без этой проверки
+                // запрет включался бы только при следующем выборе, то есть никогда, пока
+                // спутник ходит туда и гибнет (замер: 44 гибели, ноль срабатываний).
+                if (DeathSpotBlocked(c, self, self->GetMapId(),
+                                     c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY()))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПОХОД {}: место назначения {:.0f} {:.0f} стало смертельным — поворачиваю",
+                        self->GetName(), c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY());
+                    if (c.TravelQuest)
+                        c.TravelBackoff[c.TravelQuest] = 600000;
+                    Switch(c, self, Behavior::Idle, "место назначения смертельно");
+                    return;
+                }
                 StepToward(c, self, c.TravelPos.GetPositionX(), c.TravelPos.GetPositionY(),
                     c.TravelPos.GetPositionZ(), c.TravelStop, dt, &c.TravelPos);
                 // СРОК щедрый: до цели бывает и двести ярдов, а бежим мы шагами по 4 Гц
@@ -7318,11 +7333,31 @@ public:
     // МЕСТО, ГДЕ МЕНЯ УБИВАЛИ ТРИЖДЫ, — НЕ ЦЕЛЬ ПОХОДА, ПОКА НЕ ПЕРЕРОС. Три, а не два, как у
     // вида: клетка грубее одного существа, и случайная гибель по дороге не должна закрывать
     // квест. Плюс два уровня — то же условие, что и в правиле убийцы.
-    bool DeathSpotBlocked(Companion const& c, Player const* self, uint32 mapId, float x, float y) const
+    // СМОТРИМ ОКРЕСТНОСТЬ, А НЕ ОДНУ КЛЕТКУ. Замер опроверг допущение, с которым это писалось:
+    // я записал, что гибели происходят у самих целей, а за 44 гибели запрет не сработал ни разу
+    // при семнадцати гибелях в одной клетке. Значит гибнут ВОКРУГ точки — на подходе, в
+    // соседних клетках. Три на три клетки это квадрат 150 ярдов вокруг цели; порог по-прежнему
+    // на ОДНУ клетку, чтобы разрозненные смерти по площади не складывались в запрет.
+    // Возвращает КЛЮЧ сработавшей клетки, а не просто «да»: печатать надо ту клетку, которая
+    // запретила, а не ту, куда шли. Прежняя строка брала DeathSpots.at() по клетке назначения —
+    // при срабатывании по соседу это исключение на потоке мира (Кодекс, задача 107).
+    bool DeathSpotBlocked(Companion const& c, Player const* self, uint32 mapId, float x, float y,
+                          uint64* whichOut = nullptr) const
     {
-        auto d = c.DeathSpots.find(SpotKey(mapId, x, y));
-        return d != c.DeathSpots.end() && d->second.first >= 3
-            && self->GetLevel() <= uint32(d->second.second) + 2;
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                uint64 const key = SpotKey(mapId, x + dx * 50.0f, y + dy * 50.0f);
+                auto d = c.DeathSpots.find(key);
+                if (d != c.DeathSpots.end() && d->second.first >= 3
+                    && self->GetLevel() <= uint32(d->second.second) + 2)
+                {
+                    if (whichOut)
+                        *whichOut = key;
+                    return true;
+                }
+            }
+        return false;
     }
 
     bool KilledByBlocked(Companion const& c, Player const* self, uint32 entry) const
@@ -7478,15 +7513,16 @@ public:
                     {
                         // В КЛЕТКУ, ГДЕ МЕНЯ УЖЕ УБИВАЛИ ТРИЖДЫ, НЕ ИДЁМ. Проверяем саму ТОЧКУ
                         // назначения, а не текущее место: смерть случалась именно там.
-                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY()))
+                        uint64 deadly = 0;
+                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY(), &deadly))
                         {
-                            uint64 const key = SpotKey(self->GetMapId(), dest.GetPositionX(), dest.GetPositionY());
-                            if (c.DeathSpotNoted.insert(key).second)
-                                TC_LOG_INFO("server.worldserver",
-                                    "Constellation ПОХОД {}: в месте {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
-                                    self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
-                                    uint32(c.DeathSpots.at(key).first), uint32(c.DeathSpots.at(key).second),
-                                    uint32(c.DeathSpots.at(key).second) + 3);
+                            if (c.DeathSpotNoted.insert(deadly).second)
+                                if (auto d = c.DeathSpots.find(deadly); d != c.DeathSpots.end())
+                                    TC_LOG_INFO("server.worldserver",
+                                        "Constellation ПОХОД {}: рядом с местом {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
+                                        self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
+                                        uint32(d->second.first), uint32(d->second.second),
+                                        uint32(d->second.second) + 3);
                             continue;
                         }
                         bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop;
