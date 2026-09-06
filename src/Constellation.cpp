@@ -438,6 +438,14 @@ struct Companion
     bool GooberDiagDone = false;
     bool GatherIsGoober = false;                    // выбранный кандидат — объект-задача
     uint32 GatherUseItem = 0;                       // идём к фокусу, чтобы применить эту заготовку
+    uint32 GatherCastSpell = 0;                     // идём к фокусу, чтобы ПРОИЗНЕСТИ это из своей книги
+    uint32 GatherCastQuest = 0;                     // ради какой цели идём: квест
+    uint32 GatherCastCreature = 0;                  // и существо этой цели
+    uint32 CraftSpell = 0;                          // произнесённое у фокуса ждёт приговора
+    uint32 CraftObjQuest = 0;                       // и цель, ПО КОТОРОЙ судим: квест
+    uint32 CraftObjCreature = 0;                    // и существо этой цели
+    int32  CraftObjBefore = 0;                      // сколько было засчитано до каста
+    std::unordered_map<uint32, uint32> CastTried;   // заклинание -> попыток без сдвига ЭТОЙ цели
     bool BookDiagDone = false;                      // перепись книги у зачёта печатаем один раз
     uint32 BookDiagMs = 0;                          // и не пересматриваем журнал чаще минуты
     uint32 SeekRecheckMs = 0;                       // когда снова оглядеться в пути к дальнему
@@ -2103,6 +2111,43 @@ public:
                     c.CraftSpawn = 0;
                     c.CraftSnap.clear();
                 }
+            // ПРИГОВОР ПРОИЗНЕСЁННОМУ — ПО ОДНОЙ ЦЕЛИ, А НЕ ПО ВСЕМУ ЖУРНАЛУ (Кодекс).
+            //
+            // Первая редакция сверяла общий снимок целей, и Кодекс отверг её по делу:
+            // за пятнадцать секунд спутник может закрыть что угодно постороннее — убить
+            // нужного зверя, подобрать предмет, — и это записалось бы в заслугу касту.
+            // Считаем ровно ту цель, ради которой кастовали, и ничего больше.
+            if (self && !c.CraftWaitMs && c.CraftSpell)
+            {
+                uint32 const spell = c.CraftSpell;
+                int32 const now = ObjectiveCount(self, c.CraftObjQuest, c.CraftObjCreature);
+                // ЦЕЛИ БОЛЬШЕ НЕТ — НЕ ЗАСЛУГА И НЕ ВИНА (Кодекс). ObjectiveCount отдаёт -1,
+                // когда шаблона или самой цели не найти: квест сдан, снят или подменён. Тогда
+                // судить нечего — ни зачёта, ни попытки, иначе переход -1 -> 0 или n -> -1
+                // молча стал бы приговором.
+                bool const judged = now >= 0 && c.CraftObjBefore >= 0;
+                bool const moved = judged && now > c.CraftObjBefore;
+                if (moved)
+                {
+                    c.CastTried.erase(spell);
+                    if (c.CraftSpawn)
+                        c.GatherEmpty.erase(c.CraftSpawn);  // заход оказался не холостым
+                }
+                else if (judged)
+                    ++c.CastTried[spell];
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation КУЗНЯ {}: заклинание {} по цели {}/{} — было {}, стало {}: {}",
+                    self->GetName(), spell, c.CraftObjQuest, c.CraftObjCreature,
+                    c.CraftObjBefore, now,
+                    moved ? std::string("ЗАЧЁТ")
+                          : !judged ? std::string("цели больше нет — не сужу")
+                          : Trinity::StringFormat("без сдвига, попытка {} из 3", uint32(c.CastTried[spell])));
+                c.CraftSpell = 0;
+                c.CraftObjQuest = 0;
+                c.CraftObjCreature = 0;
+                c.CraftObjBefore = 0;
+                c.CraftSpawn = 0;
+            }
         }
         for (auto it = c.GatherBackoff.begin(); it != c.GatherBackoff.end(); )
         {
@@ -3808,7 +3853,7 @@ public:
                 // GetGameObjectIfCanInteractWith про неё скажет «нет», и обычная ветка ушла бы
                 // в отсрочку. Дойдя, применяем заготовку — её заклинание требует этого фокуса,
                 // и ядро само проверит, что мы достаточно близко.
-                if (c.GatherUseItem)
+                if (c.GatherUseItem || c.GatherCastSpell)
                 {
                     if (near > 3.0f)
                     {
@@ -3822,6 +3867,60 @@ public:
                                 self->GetName(), c.GatherSpawnId, c.GatherMs / 1000, near);
                             GatherLeave(c, self, 300000, true, "до фокуса не дойти");
                         }
+                        return;
+                    }
+                    // ДОРОГА B: ПРОИЗНОСИМ СВОЁ ЗАКЛИНАНИЕ У ФОКУСА, НЕСЯ ОРУЖИЕ ЦЕЛЬЮ.
+                    //
+                    // Зачёт за рунную кузню даёт не предмет: spell_chapter1_runeforging_credit
+                    // (chapter1.cpp:1147-1165) висит на EFFECT_1 восьми рунических заклинаний и
+                    // при незакрытом 12842 кастует 54586. Связь «руна -> зачёт» живёт в C++, и
+                    // указатель _focusCreditSpells её не находит: он строится по эффектам
+                    // KILL_CREDIT самого заклинания (:7373-7382), а у руны такого эффекта нет.
+                    //
+                    // ЦЕЛЬ-ПРЕДМЕТ ОБЯЗАТЕЛЬНА, И ЭТО НЕ ОСТОРОЖНОСТЬ. Spell::CheckCast
+                    // (Spell.cpp:7784-7787) на SPELL_EFFECT_ENCHANT_ITEM возвращает
+                    // SPELL_FAILED_ITEM_NOT_FOUND, если m_targets.GetItemTarget() пуст. Первая
+                    // редакция слала TARGET_FLAG_NONE — ядро отвергло бы её молча, и я искал
+                    // бы причину в третий раз. Руна ложится на оружие в главной руке.
+                    if (c.GatherCastSpell)
+                    {
+                        uint32 const spellId = c.GatherCastSpell;
+                        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
+                        Item* weapon = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                        if (!si || !self->HasSpell(spellId) || !weapon)
+                        {
+                            GatherLeave(c, self, 0, true, "заклинания или оружия нет");
+                            return;
+                        }
+                        if (!self->CanRequestSpellCast(si, self)
+                            || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
+                            return;                 // ещё не время, вернёмся тем же тактом
+                        int32 const had = ObjectiveCount(self, c.GatherCastQuest, c.GatherCastCreature);
+                        WorldPacket raw(CMSG_CAST_SPELL);
+                        WorldPackets::Spells::CastSpell cast(std::move(raw));
+                        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
+                            SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), spellId,
+                            self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+                        cast.Cast.SpellID = int32(spellId);
+                        cast.Cast.Target.Flags = TARGET_FLAG_ITEM;
+                        cast.Cast.Target.Item = weapon->GetGUID();
+                        c.Session->HandleCastSpellOpcode(cast);
+                        c.CraftSpell = spellId;
+                        c.CraftObjQuest = c.GatherCastQuest;
+                        c.CraftObjCreature = c.GatherCastCreature;
+                        c.CraftObjBefore = had;
+                        c.CraftWaitMs = 15000;      // каст, скрипт ядра и его зачёт
+                        c.CraftSpawn = c.GatherSpawnId;
+                        c.GatherCastSpell = 0;      // взведено было на эту точку и отработало
+                        c.GatherCastQuest = 0;
+                        c.GatherCastCreature = 0;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation КУЗНЯ {}: произнёс {} (фокус {}) на {} у точки {}, "
+                            "цель {}/{} была {} — жду 15 с",
+                            self->GetName(), spellId, si->RequiresSpellFocus,
+                            weapon->GetEntry(), c.GatherSpawnId,
+                            c.CraftObjQuest, c.CraftObjCreature, had);
+                        GatherLeave(c, self, 60000, true, "произнёс у фокуса");
                         return;
                     }
                     uint32 const useEntry = c.GatherUseItem;
@@ -7483,6 +7582,30 @@ public:
         TC_LOG_INFO("server.loading",
             "Constellation: указатель зачётов у фокуса — существ {}", uint32(_focusCreditSpells.size()));
 
+        // ЗАЧЁТ, КОТОРЫЙ ВЫДАЁТ СКРИПТ ЯДРА, — СПИСОК ИЗ ТОЙ ЖЕ ТАБЛИЦЫ, ЧТО ЧИТАЕТ ЯДРО.
+        //
+        // Указатель выше находит заклинания, у которых зачёт лежит в СВОИХ эффектах. У
+        // рунной кузни он лежит на шаг дальше: spell_chapter1_runeforging_credit
+        // (chapter1.cpp:1147-1165) висит на EFFECT_1 рунических заклинаний и сам кастует
+        // 54586, когда 12842 не закрыт. В данных заклинания этого не видно вовсе.
+        //
+        // ПЕРЕБИРАТЬ ВСЁ, ЧТО ТРЕБУЕТ ФОКУСА, НЕЛЬЗЯ (Кодекс, и он прав): под такой отбор
+        // попадают заклинания с реагентами, с настоящим откатом и с настоящими чарами на
+        // предмет. На Акерусе это безобидно, на другой карте — нет. Поэтому не перебор, а
+        // СПИСОК, и берём его оттуда же, откуда ядро берёт привязку скрипта. Имя скрипта —
+        // документированный контракт ядра, а не магическое число; появится второй такой
+        // случай — здесь станет на одну строку больше.
+        if (QueryResult scripted = WorldDatabase.Query(
+                "SELECT spell_id FROM spell_script_names "
+                "WHERE ScriptName = 'spell_chapter1_runeforging_credit'"))
+        {
+            do { _scriptCreditSpells.insert((*scripted)[0].GetUInt32()); }
+            while (scripted->NextRow());
+        }
+        TC_LOG_INFO("server.loading",
+            "Constellation: зачёт через скрипт ядра — заклинаний {}",
+            uint32(_scriptCreditSpells.size()));
+
         // ЦЕЛЬ-ПРЕДМЕТ БЫВАЕТ ИЗДЕЛИЕМ, А НЕ ДОБЫЧЕЙ — ИНДЕКС ИЗ ТЕХ ЖЕ ХРАНИЛИЩ ЯДРА.
         //
         // Два обратных указателя строятся по одному проходу каждый: заклинание -> предметы, чьё
@@ -10278,6 +10401,17 @@ public:
             if (focusFor)
                 break;
         }
+        // ДОРОГА B ищется только когда дорога A ничего не дала: предмет закрывает цель
+        // дешевле и вернее, чем перебор книги.
+        uint32 castQuest = 0, castCreature = 0;
+        uint32 const focusCast = (!focusFor && !c.CraftWaitMs)
+                               ? FocusSpellForOpenCredit(c, self, &castQuest, &castCreature) : 0;
+        if (focusCast)
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(focusCast, self->GetMap()->GetDifficultyID()))
+                if (auto fm = _focusSpawns.find(self->GetMapId()); fm != _focusSpawns.end())
+                    if (auto fs = fm->second.find(si->RequiresSpellFocus); fs != fm->second.end())
+                        for (GatherSpawn const& fsp : fs->second)
+                            pool.push_back(&fsp);
         // ЧИСЛО ОБЪЕКТОВ-ЗАДАЧ — В ТУ ЖЕ ДИАГНОСТИКУ, и печатаем её даже когда предметов не
         // нужно вовсе: иначе про goober-кандидатов журнал молчит (Кодекс, задача 90).
         if (!c.GooberDiagDone && goobers)
@@ -10347,6 +10481,19 @@ public:
                 c.GatherPos = sp.Where;
                 c.GatherIsGoober = gooberIds.count(sp.SpawnId) > 0;   // признак, а не догадка
                 c.GatherUseItem = 0;
+                c.GatherCastSpell = 0;
+                if (focusCast)
+                    if (SpellInfo const* si = sSpellMgr->GetSpellInfo(focusCast, self->GetMap()->GetDifficultyID()))
+                        if (auto fm = _focusSpawns.find(self->GetMapId()); fm != _focusSpawns.end())
+                            if (auto fs = fm->second.find(si->RequiresSpellFocus); fs != fm->second.end())
+                                for (GatherSpawn const& f : fs->second)
+                                    if (f.SpawnId == sp.SpawnId)
+                                    {
+                                        c.GatherCastSpell = focusCast;
+                                        c.GatherCastQuest = castQuest;
+                                        c.GatherCastCreature = castCreature;
+                                        break;
+                                    }
                 if (focusFor)
                     if (auto fm = _focusSpawns.find(self->GetMapId()); fm != _focusSpawns.end())
                         if (SpellInfo const* si = sSpellMgr->GetSpellInfo(focusSpell, DIFFICULTY_NONE))
@@ -10369,6 +10516,91 @@ public:
             TC_LOG_INFO("server.worldserver",
                 "Constellation ОТБОР {}: все {} точек отсеяны фазой", self->GetName(), phased);
         return found;
+    }
+
+    // ---------------------------------------------------------------- СЧЁТ ОДНОЙ ЦЕЛИ
+    // Приговор касту у фокуса судит ровно ту цель, ради которой кастовали. -1 значит
+    // «такой цели нет», и это отличается от нуля «есть, но не закрыта ни на сколько».
+    static int32 ObjectiveCount(Player* self, uint32 questId, uint32 creature)
+    {
+        Quest const* q = questId ? sObjectMgr->GetQuestTemplate(questId) : nullptr;
+        if (!q)
+            return -1;
+        for (QuestObjective const& obj : q->GetObjectives())
+            if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == creature)
+                return self->GetQuestObjectiveData(obj);
+        return -1;
+    }
+
+    // ---------------------------------------------------------------- ЗАЧЁТ ЗАКЛИНАНИЕМ У ФОКУСА
+    // ЧТО ЭТО ЗА СЛУЧАЙ И ПОЧЕМУ ЕГО НЕ ЗАКРЫВАЕТ УКАЗАТЕЛЬ.
+    //
+    // Замер на боевом: двенадцать рыцарей смерти сдали 12593 и 12619, взяли 12842
+    // «Runeforging: Preparation For Battle» и встали. Цель квеста — `Type 0`, существо
+    // 28357, количество 1. Но 28357 это Instructor Razuvious, и модуль читает зачёт как
+    // «убей»: в журнале «БОЙ: Instructor Razuvious — элитный/редкий, в одиночку», и так
+    // по кругу. Убивать его не надо и нельзя; зачёт даёт ядро, когда игрок произносит у
+    // рунной кузни руну из своей книги.
+    //
+    // Связи «руна -> зачёт» в данных нет — только в C++ и в spell_script_names, — поэтому
+    // спрашиваем СВОЮ КНИГУ, как её спрашивает игрок. Замер говорит, что спрашивать есть о
+    // чём: «заклинаний с фокусом известно 4, из них в книге 4, с фокусом на этой карте 3,
+    // первое 62158 (фокус 1552)». 62158 это Rune of the Stoneskin Gargoyle, 1552 — фокус
+    // рунной кузни, стоящей на этой же карте тремя точками.
+    //
+    // ГРАНИЦЫ, И КАЖДАЯ ИЗ НИХ ОТ ОТВЕРГНУТОЙ РЕДАКЦИИ:
+    //   * пробуем только при НЕЗАКРЫТОЙ цели-зачёте, и судим ИМЕННО ЕЁ счёт;
+    //   * только заклинания, которым фокус требуется, и только если такой фокус есть на карте;
+    //   * изделия исключены: у них дорога A, им нужна заготовка, а не фокус;
+    //   * три попытки на заклинание без сдвига ЭТОЙ цели — и оно больше не берётся;
+    //   * каст несёт оружие целью, иначе ядро откажет молча.
+    //
+    // Кандидатов на этой карте три, попыток по три — то есть перебор кончается за девять
+    // касов и больше не повторяется. Это дознание, а не тыканье наугад: каждая попытка
+    // отвечает на вопрос «двигает ли ЭТО заклинание ЭТУ цель», и ответ записывается.
+    uint32 FocusSpellForOpenCredit(Companion& c, Player* self, uint32* quest, uint32* creature) const
+    {
+        *quest = 0;
+        *creature = 0;
+        for (auto const& [qid, st] : self->getQuestStatusMap())
+        {
+            if (st.Status != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q)
+                continue;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER && obj.ObjectID > 0
+                    && self->GetQuestObjectiveData(obj) < std::max<int32>(obj.Amount, 1))
+                    { *quest = qid; *creature = uint32(obj.ObjectID); break; }
+            if (*quest)
+                break;
+        }
+        if (!*quest)
+            return 0;
+
+        auto fm = _focusSpawns.find(self->GetMapId());
+        if (fm == _focusSpawns.end())
+            return 0;
+
+        // ТОЛЬКО ИЗ СПИСКА, И ЭТО ГЛАВНАЯ ГРАНИЦА. Прежняя редакция перебирала всё, что
+        // требует фокуса, и Кодекс отверг её по делу: так можно произнести заклинание с
+        // реагентом, с откатом или с настоящими чарами. Список построен при загрузке из
+        // spell_script_names — той же таблицы, из которой ядро вешает скрипт зачёта.
+        for (uint32 id : _scriptCreditSpells)
+        {
+            if (!self->HasSpell(id))
+                continue;                       // не изучено — не наше
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, self->GetMap()->GetDifficultyID());
+            if (!si || !si->RequiresSpellFocus || si->IsPassive())
+                continue;
+            if (auto tried = c.CastTried.find(id); tried != c.CastTried.end() && tried->second >= 3)
+                continue;                       // трижды без сдвига этой цели
+            if (!fm->second.count(si->RequiresSpellFocus))
+                continue;                       // такого фокуса на этой карте нет
+            return id;
+        }
+        return 0;
     }
 
     Creature* FindObjectiveTarget(Companion& c, Player* self) const
@@ -12283,6 +12515,7 @@ private:
     // Данные заклинаний лежат в DB2 и битово упакованы — прочесть их снаружи нельзя, а ядро
     // их уже разобрало (задача 0023, запись 65).
     std::unordered_map<uint32, std::set<uint32>> _focusCreditSpells;
+    std::set<uint32> _scriptCreditSpells;          // заклинания, зачёт за которые выдаёт скрипт ядра
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
     // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
