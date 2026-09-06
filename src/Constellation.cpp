@@ -447,6 +447,7 @@ struct Companion
     int32  CraftObjBefore = 0;                      // сколько было засчитано до каста
     std::unordered_map<uint32, uint32> CastTried;   // заклинание -> попыток без сдвига ЭТОЙ цели
     bool BookDiagDone = false;                      // перепись книги у зачёта печатаем один раз
+    bool RuneDiagDone = false;                      // и перепись рун против оружия — тоже один раз
     uint32 BookDiagMs = 0;                          // и не пересматриваем журнал чаще минуты
     uint32 SeekRecheckMs = 0;                       // когда снова оглядеться в пути к дальнему
     std::unordered_map<uint32, uint8> CraftTried;   // заготовка -> сколько раз применили без сдвига
@@ -10578,6 +10579,83 @@ public:
         }
         if (!*quest)
             return 0;
+
+        // ЧИСЛА ЯДРА ПРО КАЖДУЮ РУНУ И ПРО НАШЕ ОРУЖИЕ — ОДИН РАЗ НА СПУТНИКА.
+        //
+        // Замер круга 73: 108 кастов (три руны по три попытки на двенадцать спутников),
+        // 108 приговоров, НОЛЬ зачётов, и `item_instance.enchantments` на оружии сплошные
+        // нули — значит каст ушёл, а ядро его отвергло. Какой именно из шести отказов
+        // ветки Spell::CheckCast (Spell.cpp:7784-7850) сработал, из журнала не видно.
+        //
+        // Гипотеза есть: SPELL_FAILED_LOWLEVEL, потому что руны — заклинания пятьдесят
+        // пятого уровня, а спутники восьмого со стартовым клинком:
+        //     uint32 requiredLevel = targetItem->GetRequiredLevel();
+        //     if (!requiredLevel) requiredLevel = targetItem->GetItemLevel(...);
+        //     if (requiredLevel < m_spellInfo->BaseLevel) return SPELL_FAILED_LOWLEVEL;
+        //
+        // НО ЭТО ГИПОТЕЗА, И ЗАПИСАНА ОНА КАК ГИПОТЕЗА. За один день пришлось снять три
+        // правдоподобные истории — про флаг статуса, про настройку контента и про книгу
+        // заклинаний, — и каждая звучала не хуже. Поэтому здесь не правка поведения, а
+        // вопрос: печатаем ЧИСЛА ЯДРА и по ним решаем.
+        //
+        // МЕСТО ВЫБРАНО МЕЖДУ ДВУХ ОШИБОК, И ОБЕ НАШЁЛ КОДЕКС. Сперва блок стоял ПОСЛЕ
+        // проверки «есть ли такой фокус на карте», и спутник без фокуса не печатал ничего —
+        // то есть ровно тот, кого диагностировать нужнее всего. Я перенёс его в самое
+        // начало — и тогда строку стали печатать все сто четырнадцать, включая тех, кому
+        // руны безразличны. Правильное место здесь: незакрытый зачёт уже найден, а выход
+        // по отсутствию фокуса ещё впереди.
+        //
+        // ЧТО ИМЕННО ПЕЧАТАЕМ, И ПОЧЕМУ ИМЕННО ЭТО (Кодекс). Номеров эффектов мало: они
+        // говорят, чары ли это вообще, но не какие. Ветка отказа смотрит ещё на атрибут
+        // «можно на низкий уровень», на MiscValue эффекта (через него ядро находит запись
+        // чар и её тип), и на само оружие — есть ли у него собственный эффект «применить»
+        // и заняты ли гнёзда. Печатаем всё это, чтобы одна строка отделила пять отказов
+        // друг от друга, а не сузила выбор до трёх.
+        // Условие повторяет `*quest` намеренно: незакрытый зачёт проверен выше и без
+        // него сюда не дойти, но условие, которое надо читать вместе с соседней строкой,
+        // трижды подряд прочитали неправильно. Пусть говорит своё предусловие вслух.
+        if (!c.RuneDiagDone && *quest && !_scriptCreditSpells.empty())
+        {
+            c.RuneDiagDone = true;
+            Item* w = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            bool usable = false;
+            uint32 sockets = 0, prismatic = 0;
+            if (w)
+            {
+                for (ItemEffectEntry const* ie : w->GetEffects())
+                    if (ie && ie->SpellID && ie->TriggerType == ITEM_SPELLTRIGGER_ON_USE)
+                        { usable = true; break; }
+                for (uint32 s = 0; s < MAX_ITEM_PROTO_SOCKETS; ++s)
+                    if (w->GetSocketColor(s))
+                        ++sockets;
+                prismatic = w->GetEnchantmentId(PRISMATIC_ENCHANTMENT_SLOT);
+            }
+            std::string rows;
+            for (uint32 id : _scriptCreditSpells)
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(id, self->GetMap()->GetDifficultyID());
+                if (!si)
+                    continue;
+                std::string eff;
+                for (SpellEffectInfo const& e : si->GetEffects())
+                    eff += Trinity::StringFormat("{}{}:{}", eff.empty() ? "" : "+",
+                                                 uint32(e.Effect), int32(e.MiscValue));
+                rows += Trinity::StringFormat(
+                    "{}{}(знаю {}, фокус {}, BaseLevel {}, MaxLevel {}, низкоур.разрешён {}, эфф {})",
+                    rows.empty() ? "" : "; ", id, self->HasSpell(id) ? 1 : 0,
+                    si->RequiresSpellFocus, si->BaseLevel, si->MaxLevel,
+                    si->HasAttribute(SPELL_ATTR2_ALLOW_LOW_LEVEL_BUFF) ? 1 : 0, eff);
+            }
+            TC_LOG_INFO("server.worldserver",
+                "Constellation РУНЫ {} (ур. {}): оружие {} — треб.уровень {}, уровень предмета {}, "
+                "своё применение {}, гнёзд {}, призматика {}; {}",
+                self->GetName(), uint32(self->GetLevel()),
+                w ? w->GetEntry() : 0,
+                w ? w->GetRequiredLevel() : 0,
+                w ? w->GetItemLevel(self) : 0,
+                usable ? 1 : 0, sockets, prismatic,
+                rows.empty() ? "список пуст" : rows);
+        }
 
         auto fm = _focusSpawns.find(self->GetMapId());
         if (fm == _focusSpawns.end())
