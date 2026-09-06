@@ -5761,15 +5761,35 @@ public:
         // заменён на «навык существует для расы и класса», иначе то, что ещё выучится у
         // тренера, ушло бы к торговцу. Маски классов прочитаны из пробного мира 2026-09-02.
         bool neverUsable = self->CanUseItem(tpl, /*skipRequiredLevelCheck=*/true) != EQUIP_ERR_OK;
-        if (!neverUsable && Cfg().SellByWeaponSkill && tpl->GetClass() == ITEM_CLASS_WEAPON)
+        // НАВЫК ВЕЩИ СПРАШИВАЕМ У ЯДРА — И ДЛЯ ОРУЖИЯ, И ДЛЯ БРОНИ.
+        //
+        // `ItemTemplate::GetSkill()` отвечает на этот вопрос сам и для брони тоже: подклассы
+        // 1-4 дают SKILL_CLOTH / LEATHER / MAIL / PLATE_MAIL, подкласс 6 — SKILL_SHIELD, а
+        // подклассы без навыка (0 «прочее», 5 «внешний вид») возвращают ноль и проверку не
+        // проходят вовсе — то есть кольца, шеи и накидки остаются разрешёнными, как и были.
+        // `GetSkillRaceClassInfo` — это его же таблица «кому какой навык положен».
+        //
+        // ЧТО ЗДЕСЬ БЫЛО И ПОЧЕМУ ЭТО ОШИБКА. Для брони стояла отдельная ветка, читавшая
+        // `ChrClassesEntry::ArmorTypeMask` как ТОЧНЫЙ список разрешённого. Но класс носит всё
+        // ДО своей брони включительно: воин ходит в коже, охотник в ткани. Замер круга 65
+        // поймал ровно это — три ложных отказа из восьми. Пять верных отказов (жрец и щит,
+        // жрец и кольчуга, друид и кольчуга) новый вопрос отвергает так же: строки навыка у
+        // этих классов нет.
+        //
+        // Плащ по-прежнему мимо проверки: он числится тканью, и единая проверка отняла бы
+        // плащи у класса, которому строки навыка ткани не положено.
+        //
+        // ЗДЕСЬ ЦЕНА ОШИБКИ ВЫШЕ, ЧЕМ В ГАРДЕРОБЕ: «непригодно» тут значит ПРОДАТЬ, то есть
+        // воин относил торговцу кожу, которую носит.
+        // ОБЛАСТЬ ПРОВЕРКИ — ОРУЖИЕ И БРОНЯ, И ЭТО НЕ ЛИШНЕЕ УСЛОВИЕ. `GetSkill()` отвечает
+        // на ТРИ класса предмета, а не на два: третий — ITEM_CLASS_PROFESSION, у которого он
+        // вернёт SKILL_BLACKSMITHING и подобные. Без этой ограды профессиональная вещь без
+        // строки навыка попала бы в «никогда не пригодится», то есть к торговцу.
+        if (!neverUsable && Cfg().SellByWeaponSkill && tpl->GetInventoryType() != INVTYPE_CLOAK
+            && (tpl->GetClass() == ITEM_CLASS_WEAPON || tpl->GetClass() == ITEM_CLASS_ARMOR))
             if (uint32 const skill = tpl->GetSkill())
                 if (!sDB2Manager.GetSkillRaceClassInfo(skill, self->GetRace(), self->GetClass()))
-                    neverUsable = true;                 // жезл у воина, двуручный меч у мага
-        if (!neverUsable && tpl->GetClass() == ITEM_CLASS_ARMOR && tpl->GetInventoryType() != INVTYPE_CLOAK)
-            if (ChrClassesEntry const* cls = sChrClassesStore.LookupEntry(self->GetClass()))
-                if ((cls->ArmorTypeMask & 0x21u) == 0x21u
-                    && !(cls->ArmorTypeMask & (1u << tpl->GetSubClass())))
-                    neverUsable = true;                 // ткань и кожа у воина, латы и щит у мага
+                    neverUsable = true;                 // жезл у воина, латы и щит у мага
         bool const tooHigh = tpl->GetBaseRequiredLevel() > int32(myLevel) + 2;
         if (!grey && !neverUsable && !tooHigh)
             return SellVerdict::Fit;                    // пригодное и по уровню — оставляем
@@ -5833,14 +5853,31 @@ public:
             return false;
         if (self->CanUseItem(tpl, /*skipRequiredLevelCheck=*/true) != EQUIP_ERR_OK)
             return false;
-        if (tpl->GetClass() == ITEM_CLASS_WEAPON)
+        // НАВЫК ВЕЩИ СПРАШИВАЕМ У ЯДРА — И ДЛЯ ОРУЖИЯ, И ДЛЯ БРОНИ.
+        //
+        // `ItemTemplate::GetSkill()` отвечает на этот вопрос сам и для брони тоже: подклассы
+        // 1-4 дают SKILL_CLOTH / LEATHER / MAIL / PLATE_MAIL, подкласс 6 — SKILL_SHIELD, а
+        // подклассы без навыка (0 «прочее», 5 «внешний вид») возвращают ноль и проверку не
+        // проходят вовсе — то есть кольца, шеи и накидки остаются разрешёнными, как и были.
+        // `GetSkillRaceClassInfo` — это его же таблица «кому какой навык положен».
+        //
+        // ЧТО ЗДЕСЬ БЫЛО И ПОЧЕМУ ЭТО ОШИБКА. Для брони стояла отдельная ветка, читавшая
+        // `ChrClassesEntry::ArmorTypeMask` как ТОЧНЫЙ список разрешённого. Но класс носит всё
+        // ДО своей брони включительно: воин ходит в коже, охотник в ткани. Замер круга 65
+        // поймал ровно это — три ложных отказа из восьми. Пять верных отказов (жрец и щит,
+        // жрец и кольчуга, друид и кольчуга) новый вопрос отвергает так же: строки навыка у
+        // этих классов нет.
+        //
+        // Плащ по-прежнему мимо проверки: он числится тканью, и единая проверка отняла бы
+        // плащи у класса, которому строки навыка ткани не положено.
+        // ОБЛАСТЬ ПРОВЕРКИ — ОРУЖИЕ И БРОНЯ, И ЭТО НЕ ЛИШНЕЕ УСЛОВИЕ (та же ограда, что в продаже). `GetSkill()` отвечает
+        // на ТРИ класса предмета, а не на два: третий — ITEM_CLASS_PROFESSION, у которого он
+        // вернёт SKILL_BLACKSMITHING и подобные. Без этой ограды профессиональная вещь без
+        // строки навыка попала бы в «никогда не пригодится», то есть к торговцу.
+        if (tpl->GetInventoryType() != INVTYPE_CLOAK
+            && (tpl->GetClass() == ITEM_CLASS_WEAPON || tpl->GetClass() == ITEM_CLASS_ARMOR))
             if (uint32 const skill = tpl->GetSkill())
                 if (!sDB2Manager.GetSkillRaceClassInfo(skill, self->GetRace(), self->GetClass()))
-                    return false;
-        if (tpl->GetClass() == ITEM_CLASS_ARMOR && tpl->GetInventoryType() != INVTYPE_CLOAK)
-            if (ChrClassesEntry const* cls = sChrClassesStore.LookupEntry(self->GetClass()))
-                if ((cls->ArmorTypeMask & 0x21u) == 0x21u
-                    && !(cls->ArmorTypeMask & (1u << tpl->GetSubClass())))
                     return false;
         return true;
     }
@@ -9290,7 +9327,14 @@ public:
             InventoryResult const useItem = self->CanUseItem(it);
             InventoryResult const canEquip = self->CanEquipItem(NULL_SLOT, dest, it, true);
             uint8 slot = canEquip == EQUIP_ERR_OK ? uint8(dest & 0xFF) : self->FindEquipSlot(it, NULL_SLOT, true);
-            if (!UsableKind(self, tpl))          why = "не наш класс/навык";
+            // ПРИЧИНА ОТКАЗА РАЗДЕЛЕНА (проверь проверяющего). `UsableKind` задаёт два
+            // разных вопроса — «ядро вообще разрешает эту вещь классу и расе» и «положен ли
+            // классу навык под этот вид», — а в журнал шла одна строка на оба. Разобрать по
+            // ней, что именно отвергло вещь, было нельзя, и вывод о неверных отказах пришлось
+            // выводить из контракта ядра, а не читать. Теперь читается.
+            if (!UsableKind(self, tpl))
+                why = self->CanUseItem(tpl, /*skipRequiredLevelCheck=*/true) != EQUIP_ERR_OK
+                    ? "ядро: класс, раса или требование" : "нет навыка под этот вид";
             else if (useItem != EQUIP_ERR_OK)    why = "ядро: использовать нельзя";
             else if (slot == NULL_SLOT)          why = "слота нет";
             else if (canEquip != EQUIP_ERR_OK)   why = "ядро: надеть нельзя";
@@ -9308,13 +9352,26 @@ public:
             if (Bag* bag = self->GetBagByPos(b))
                 for (uint32 j = 0; j < GetBagSize(bag); ++j)
                     look(GetItemInBag(bag, j));
-        // РЫЦАРЬ СМЕРТИ: ЗНАЕТ ЛИ 51769. Последнее звено цепочки 12619 — заклинание по кузнице;
-        // предмет 38145 источником не оказался, а character_spell на этом ядре пуста, поэтому
-        // спросить можно только у ядра в памяти. Одно слово в уже существующей строке.
+        // РЫЦАРЬ СМЕРТИ: КАКИЕ РУНЫ ОН ЗНАЕТ. Строка нужна потому, что зачёт у кузни даёт
+        // не предмет, а произнесённая руна, и спросить об этом можно только у ядра в памяти:
+        // character_spell на этом ядре хранит почти ничего (14 строк на весь реалм).
         if (self->GetClass() == CLASS_DEATH_KNIGHT)
         {
-            // 51769 — зачётное заклинание, его не учит никто; зачёт 12619 даёт ЛЮБАЯ руна из
-            // spell_chapter1_runeforging_credit, наложенная у кузни. Печатаем, что из этого знаем.
+            // ЗДЕСЬ БЫЛА ПЕРЕПУТАНА ЦЕПОЧКА, И ПУТАНИЦА ИСПРАВЛЕНА ПО ЯДРУ (круг 69).
+            //
+            // Комментарий говорил «51769 — зачётное заклинание, зачёт 12619 даёт любая руна».
+            // Ядро говорит другое. `spell_chapter1_runeforging_credit` (chapter1.cpp:1147-1165)
+            // висит на EFFECT_1 самих рун и даёт зачёт квеста 12842 «Runeforging: Preparation
+            // For Battle» заклинанием 54586 — и только пока квест INCOMPLETE (константы там же,
+            // строки 1135-1136). Квест 12619 «The Emblazoned Runeblade» — совсем другой, а 51769
+            // «Emblazon Runeblade» не учат и не получают: это АУРА с периодическим триггером
+            // (spell_quest.cpp:1281-1293), которая заводит цепочку 51769 -> 51770 -> значение.
+            //
+            // Боевой подтверждает разделение: 12619 у тринадцати рыцарей ВЫДАН, а 12842 у девяти
+            // так и стоит незакрытым — то есть искать надо было не то, что искал комментарий.
+            // Остальной модуль знал верную историю всё это время (12842, зачёт по существу 28357,
+            // фокус 1552, рунная кузня) — расходился с ней только этот текст, по которому человек
+            // читает журнал.
             static uint32 const runes[] = { 53428, 53343, 53344, 62158, 326805, 326855, 326911, 326977, 327082 };
             std::string known;
             for (uint32 sp : runes)
@@ -11986,11 +12043,19 @@ void LogWhoWearsWhat()
             "Constellation НОСИТ класс {}: маска брони 0x{:x}, биты 0..6 = {} (0 прочее, 1 ткань, 2 кожа, 3 кольчуга, 4 латы, 5 косметика, 6 щит)",
             cls, e->ArmorTypeMask, bits);
     }
+    // БРОНЯ В ЭТОМ СПИСКЕ — НЕ УКРАШЕНИЕ. С круга 69 пригодность брони решает та же таблица
+    // SkillRaceClassInfo, что и пригодность оружия, а печатались тут только оружейные навыки:
+    // про 415/414/413/293 диагностика не говорила НИЧЕГО, и «у жреца нет строки кольчуги» было
+    // утверждением, а не замером. Цена ошибки — продажа: Constellation.SellByWeaponSkill на
+    // боевом включён, и «строки нет» значит отнести вещь торговцу.
+    //
+    // Номера взяты у ядра (SharedDefines.h:5809-5818), а не выведены из порядка подклассов.
     static std::pair<uint32, char const*> const weaponSkills[] = {
         { 43, "мечи" }, { 55, "двуручные мечи" }, { 44, "топоры" }, { 172, "двуручные топоры" },
         { 54, "дробящее" }, { 160, "двуручное дробящее" }, { 229, "древковое" }, { 136, "посохи" },
         { 173, "кинжалы" }, { 473, "кистевое" }, { 45, "луки" }, { 46, "ружья" }, { 226, "арбалеты" },
-        { 228, "жезлы" }, { 2152, "глефы" }, { 356, "рыбалка" }, { 433, "щит" } };
+        { 228, "жезлы" }, { 2152, "глефы" }, { 356, "рыбалка" }, { 433, "щит" },
+        { 415, "ткань" }, { 414, "кожа" }, { 413, "кольчуга" }, { 293, "латы" } };
     for (auto const& [skill, name] : weaponSkills)
     {
         std::string who;
@@ -11999,6 +12064,40 @@ void LogWhoWearsWhat()
         TC_LOG_INFO("server.loading", "Constellation НОСИТ навык {} ({}): маски классов [{}]",
             skill, name, who.empty() ? std::string("строк нет") : who);
     }
+
+    // РАСА — ВТОРАЯ ПОЛОВИНА ВОПРОСА, И ОНА НЕ ПЕЧАТАЛАСЬ (Кодекс, круг 69).
+    //
+    // `GetSkillRaceClassInfo` (DB2Stores.cpp:3046-3058) отсеивает строку ДВУМЯ проверками —
+    // по маске рас и по маске классов. Выше печатались только маски классов, то есть половина
+    // условия, и «класс разрешён» ничего не говорило о том, разрешена ли КАЖДАЯ его раса.
+    // Для брони это не мелочь: на пути продажи отсутствие строки означает отнести вещь
+    // торговцу, а раса у спутников самая разная.
+    //
+    // Поэтому спрашиваем ТОЙ ЖЕ функцией, которой спрашивает решение, и печатаем ответ целиком:
+    // по каждому классу — расы, получившие строку. Совпадение вопроса и замера тут не украшение:
+    // маску можно прочитать неправильно, а вызов — нет.
+    static std::pair<uint32, char const*> const armourSkills[] = {
+        { 415, "ткань" }, { 414, "кожа" }, { 413, "кольчуга" }, { 293, "латы" }, { 433, "щит" } };
+    for (auto const& [skill, name] : armourSkills)
+        for (uint32 cls = 1; cls <= 13; ++cls)
+        {
+            if (!sChrClassesStore.LookupEntry(cls))
+                continue;
+            std::string races;
+            uint32 tried = 0;
+            for (uint32 race = 1; race < 100; ++race)
+            {
+                if (!sChrRacesStore.LookupEntry(race))
+                    continue;
+                ++tried;
+                if (sDB2Manager.GetSkillRaceClassInfo(skill, uint8(race), uint8(cls)))
+                    races += std::to_string(race) + " ";
+            }
+            TC_LOG_INFO("server.loading",
+                "Constellation НОСИТ раса-класс: навык {} ({}), класс {} — рас со строкой {} из {}: {}",
+                skill, name, cls, races.empty() ? 0u : uint32(std::count(races.begin(), races.end(), ' ')),
+                tried, races.empty() ? std::string("ни одной") : races);
+        }
 }
 
 class constellation_worldscript : public WorldScript
