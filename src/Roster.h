@@ -49,7 +49,9 @@ struct RosterEntry
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
 };
 
-inline constexpr std::array<RosterEntry, 122> Roster =
+// 114 после паузы гоблинов (было 122). ЧИСЛО ЗДЕСЬ — НЕ УКРАШЕНИЕ: std::array с меньшим
+// числом записей компилируется молча и добивает остаток нулями, то есть спутниками без имени.
+inline constexpr std::array<RosterEntry, 114> Roster =
 {{
     // человек
     { "Garrick",   RACE_HUMAN,                CLASS_WARRIOR,       GENDER_MALE },
@@ -135,15 +137,22 @@ inline constexpr std::array<RosterEntry, 122> Roster =
     { "Bumbu",     RACE_TROLL,                CLASS_MONK,          GENDER_MALE },
     { "Yalanda",   RACE_TROLL,                CLASS_DRUID,         GENDER_FEMALE },
     // гоблин
-    { "Grizzik",   RACE_GOBLIN,               CLASS_WARRIOR,       GENDER_MALE },
-    { "Sprocket",  RACE_GOBLIN,               CLASS_HUNTER,        GENDER_MALE },
-    { "Razlo",     RACE_GOBLIN,               CLASS_ROGUE,         GENDER_MALE },
-    { "Nixxa",     RACE_GOBLIN,               CLASS_PRIEST,        GENDER_FEMALE },
+    // ГОБЛИНЫ НА ПАУЗЕ (оператор, 2026-09-06: «гоблинов вообще не трогай… удали персонажей,
+    // кроме ДК»). Восемь строк убраны отсюда, а не закомментированы: состав — источник правды,
+    // и модуль восстановил бы их при следующем старте, сколько бы их ни удаляли из базы.
+    //
+    // Почему пауза: при 75 часах в игре, ровно как у всех, восемь гоблинов стоят на ПЕРВОМ
+    // уровне — средний 1.0 при максимуме 1, то есть ни один не сдвинулся со старта, — и дали
+    // по 2.0 сданных квеста против 17.6 у людей. Зона держит их на месте, а не модуль.
+    // Разбираться с ней оператор сейчас не хочет, и держать восемь спутников в тупике незачем.
+    //
+    // Числа именно такие, а не мягче: первая редакция этого комментария взяла их из таблицы,
+    // где спутники были смешаны с рыцарями смерти и с живыми персонажами, и гоблины там
+    // выглядели идущими (средний 1.8) за счёт единственного ДК восьмого уровня.
+    //
+    // Рыцарь смерти остаётся: он начинает не в гоблинской зоне, и на него это не влияет.
+    // Возврат: вписать строки обратно из истории этого файла, состав пересчитается сам.
     { "Zibby",     RACE_GOBLIN,               CLASS_DEATH_KNIGHT,  GENDER_FEMALE },
-    { "Krezzo",    RACE_GOBLIN,               CLASS_SHAMAN,        GENDER_MALE },
-    { "Vexa",      RACE_GOBLIN,               CLASS_MAGE,          GENDER_FEMALE },
-    { "Fizzle",    RACE_GOBLIN,               CLASS_WARLOCK,       GENDER_MALE },
-    { "Twizzy",    RACE_GOBLIN,               CLASS_MONK,          GENDER_FEMALE },
     // эльф крови
     { "Kaelor",    RACE_BLOODELF,             CLASS_WARRIOR,       GENDER_MALE },
     { "Theronis",  RACE_BLOODELF,             CLASS_PALADIN,       GENDER_MALE },
