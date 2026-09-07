@@ -446,6 +446,8 @@ struct Companion
     uint32 CraftObjCreature = 0;                    // и существо этой цели
     int32  CraftObjBefore = 0;                      // сколько было засчитано до каста
     std::unordered_map<uint32, uint32> CastTried;   // заклинание -> попыток без сдвига ЭТОЙ цели
+    std::unordered_map<uint32, uint32> CastRefusal; // заклинание -> последний код отказа ядра
+    std::unordered_map<uint32, uint32> CastRefused; // и сколько раз он уже случился подряд
     bool BookDiagDone = false;                      // перепись книги у зачёта печатаем один раз
     bool RuneDiagDone = false;                      // и перепись рун против оружия — тоже один раз
     uint32 BookDiagMs = 0;                          // и не пересматриваем журнал чаще минуты
@@ -3896,6 +3898,73 @@ public:
                         if (!self->CanRequestSpellCast(si, self)
                             || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
                             return;                 // ещё не время, вернёмся тем же тактом
+                        // СПРАШИВАЕМ У ЯДРА ЕГО ПРИЧИНУ, А НЕ ВЫВОДИМ ЕЁ.
+                        //
+                        // Круг 73: 108 кастов, ноль зачётов, чары на оружии нули — ядро каст
+                        // отвергло. Круг 74 напечатал числа и снял единственную гипотезу:
+                        // BaseLevel у всех восьми рун ноль, значит SPELL_FAILED_LOWLEVEL
+                        // невозможен, MaxLevel ноль — проверка не выполняется, у оружия нет
+                        // ни своего применения, ни гнёзд, ни призматики, и владелец свой.
+                        // Ни один из шести отказов ветки чар не применим, а каст всё равно
+                        // не проходит. Значит отказ раньше, и угадывать его — пятая по счёту
+                        // правдоподобная история за сутки. Четыре предыдущие пришлось снять.
+                        //
+                        // ЭТОТ ПРИЁМ — ИЗ САМОГО ЯДРА, не выдумка: WorldSession::HandleAcceptTrade
+                        // (TradeHandler.cpp:386-401) строит Spell, ставит ему m_targets, зовёт
+                        // CheckCast(true) и удаляет. CheckCast и m_targets публичны (Spell.h:516
+                        // и :640). Берём TRIGGERED_NONE, а не FULL_MASK: нам нужны те же
+                        // проверки, что у настоящего каста, а не облегчённые.
+                        //
+                        // И ЭТО НЕ ТОЛЬКО ПРИБОР. Отказной каст больше не отправляется вовсе:
+                        // три попытки на руну тратились на то, что ядро отвергает сразу.
+                        SpellCastResult probe = SPELL_CAST_OK;
+                        {
+                            Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+                            ask->m_targets.SetItemTarget(weapon);
+                            probe = ask->CheckCast(true);
+                            delete ask;
+                        }
+                        if (probe != SPELL_CAST_OK)
+                        {
+                            // ОТКАЗ НЕ ТРАТИТ ПОПЫТКУ (Кодекс). Счётчик CastTried отвечает на
+                            // другой вопрос: «каст УШЁЛ, а цель не сдвинулась». Отказ до
+                            // отправки этого не говорит вовсе, и половина отказов временна —
+                            // откат, бой, вышли из радиуса фокуса. Три таких проверки
+                            // навсегда сняли бы рабочую руну, хотя пакета не было.
+                            //
+                            // Печатаем один раз на каждый НОВЫЙ код: устойчивый отказ иначе
+                            // залил бы журнал строкой в минуту на спутника, а смена кода —
+                            // это как раз то, что интересно.
+                            if (c.CastRefusal[spellId] != uint32(probe))
+                            {
+                                c.CastRefusal[spellId] = uint32(probe);
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation КУЗНЯ {}: ядро отказало заклинанию {} на {} — причина {}; "
+                                    "не отправляю, попытку не трачу",
+                                    self->GetName(), spellId, weapon->GetEntry(), uint32(probe));
+                            }
+                            // У ОТКАЗА ДОЛЖЕН БЫТЬ КОНЕЦ (Кодекс, второй проход). Минута
+                            // ограничивает частоту, а не срок: устойчиво отказная руна
+                            // водила бы спутника к кузнице раз в минуту вечно. Счётчик
+                            // отдельный от попыток — они про «каст ушёл и не сработал», —
+                            // а вот СНЯТИЕ переиспользует уже готовый предел, чтобы не
+                            // заводить второй механизм с той же судьбой.
+                            //
+                            // Десять отказов при минутном откате — это около десяти минут
+                            // попыток. Последний код остаётся в CastRefusal для разбора.
+                            if (++c.CastRefused[spellId] >= 10)
+                            {
+                                c.CastTried[spellId] = 3;   // тем же путём, что и бесплодные касты
+                                TC_LOG_INFO("server.worldserver",
+                                    "Constellation КУЗНЯ {}: заклинание {} отказано десять раз подряд "
+                                    "(последняя причина {}) — снимаю его",
+                                    self->GetName(), spellId, uint32(probe));
+                            }
+                            GatherLeave(c, self, 60000, true, "ядро отказало");
+                            return;
+                        }
+                        c.CastRefusal.erase(spellId);   // прошло — прежний отказ больше не факт
+                        c.CastRefused.erase(spellId);   // и череда отказов прервалась
                         int32 const had = ObjectiveCount(self, c.GatherCastQuest, c.GatherCastCreature);
                         WorldPacket raw(CMSG_CAST_SPELL);
                         WorldPackets::Spells::CastSpell cast(std::move(raw));
