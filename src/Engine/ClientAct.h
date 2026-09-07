@@ -80,6 +80,9 @@ namespace Constellation::Ai
         //    ordinary work, and there is NO teleport here because a client cannot send one.
         bool ActivateTaxi(ObjectGuid master, uint32 node);          // CMSG_ACTIVATE_TAXI
         bool EnableTaxiNode(ObjectGuid master);                     // CMSG_ENABLE_TAXI_NODE
+        // Found by reading BindAtInn (Constellation.cpp:9359) for the innkeeper trigger: the
+        // sixteenth method, and the hearthstone is worthless without it.
+        bool BinderActivate(ObjectGuid innkeeper);                  // CMSG_BINDER_ACTIVATE
 
         // -- movement ----------------------------------------------------------------------
         //

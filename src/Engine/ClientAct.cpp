@@ -284,6 +284,19 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::BinderActivate(ObjectGuid innkeeper)            // from BindAtInn, :9359
+    {
+        if (!Usable() || innkeeper.IsEmpty())
+            return false;
+        // Note the packet type: CMSG_BINDER_ACTIVATE travels as NPC::Hello, same as the vendor
+        // list. Copied from the call site rather than guessed, like every other body here.
+        WorldPacket raw(CMSG_BINDER_ACTIVATE);
+        WorldPackets::NPC::Hello bind(std::move(raw));
+        bind.Unit = innkeeper;
+        _session->HandleBinderActivateOpcode(bind);
+        return true;
+    }
+
     bool ClientAct::EnableTaxiNode(ObjectGuid master)               // :9478
     {
         if (!Usable() || master.IsEmpty())
