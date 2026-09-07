@@ -306,6 +306,33 @@ namespace Constellation::Ai
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
     }
 
+    void Engine::Discard(EngineState& st)
+    {
+        // No Ctx, so no Action::Cancel — there is no world left to cancel in. What CAN be done
+        // without one is releasing anything the companion holds outside its own struct.
+        //
+        // RESERVATION RELEASE BELONGS HERE AND IS NOT WRITTEN, DELIBERATELY.
+        //
+        // The review asked twice for it to be implemented now. Refused, in writing, because
+        // there is nothing to release: no registry exists, and a release function over an absent
+        // registry is an empty abstraction that would have to be rewritten the moment the real
+        // one lands (plan step 28, which the operator put inside this migration).
+        //
+        // What IS implemented is the thing that makes forgetting impossible: every context-free
+        // ending in the module now routes through this one function — config off, a companion
+        // with no session, and dismissal including shutdown — instead of assigning a fresh state
+        // over the old one. When the registry arrives it has exactly one place to plug into, and
+        // that place is already called from all three.
+        //
+        // The danger being guarded against, so it is not rediscovered: reservations will live
+        // OUTSIDE the companion struct, so dropping the struct loses the handle and leaks the
+        // point for as long as the world runs — and the health metric reads green, because a
+        // leak and a healthy registry look identical when nothing sweeps.
+        uint32 const dropped = st.BidsDropped;      // kept: it is a defect report, not live state
+        st = EngineState();
+        st.BidsDropped = dropped;
+    }
+
     bool Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch)
     {
         if (!_ready)

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2026 MShkolenko <montekristo1995@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -63,6 +63,9 @@
 #include "TaxiPackets.h"
 #include "PhasingHandler.h"
 #include "Plan.h"
+#include "Engine/Engine.h"
+#include "Engine/Context.h"
+#include "Engine/ClientAct.h"
 #include "WaypointDefines.h"
 #include "WaypointManager.h"
 #include "QuestDef.h"
@@ -130,6 +133,11 @@ struct Settings
     bool  Abilities       = false;      // произносить умения, а не только выбирать
     bool  Loot            = false;      // подбирать добычу с собственных убийств
     bool  Vending         = false;      // ходить к торговцу: продать хлам и починиться
+    // ШОВ ДВИЖКА. По умолчанию ВЫКЛЮЧЕН, и это не осторожность, а условие обратимости:
+    // пока он выключен, боевой ведёт себя ровно как до появления движка, и это свойство
+    // проверяемо (план v2, §9′). Выключение перестаёт быть спасением с того коммита,
+    // который сотрёт первое тело ветки — тогда откат это предыдущий бинарь.
+    bool  Engine          = false;
     uint32 MaxActive      = 0;
     uint32 PerTick        = 6;
     uint32 MaxQuests      = 10;
@@ -177,6 +185,7 @@ struct Settings
         Abilities       = sConfigMgr->GetBoolDefault("Constellation.Abilities", false);
         Loot            = sConfigMgr->GetBoolDefault("Constellation.Loot", false);
         Vending         = sConfigMgr->GetBoolDefault("Constellation.Vending", false);
+        Engine          = sConfigMgr->GetBoolDefault("Constellation.Engine", false);
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
         MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
@@ -243,6 +252,15 @@ struct Companion
     std::string BnetEmail;
     ObjectGuid Guid;                    // filled once the character exists
     WorldSession* Session = nullptr;    // owned by the module, not the manager
+    Constellation::Ai::EngineState Engine;   // ставки, счётчики, отметки триггеров
+    // §2″ — счётчик смен режима. Двигается ТОЛЬКО в Switch(), единственном центральном
+    // месте смены. Движок сравнивает его со своим и сбрасывается, если обнаружил себя в
+    // своём режиме, куда сам не входил: иначе он подействовал бы на состояние, которое
+    // старше смены режима.
+    uint32 ModeEpoch = 0;
+    // §10′ — отметки для точек жизненного цикла, которые не проходят через DropSession.
+    bool   EngineDead = false;      // гасили ли уже по смерти; снимается при оживании
+    uint32 EngineMapId = 0;         // на какой карте движок последний раз работал
     Stage State = Stage::Offline;
     uint32 TicksInState = 0;
     uint8 Retries = 0;
@@ -603,6 +621,21 @@ public:
         return &instance;
     }
 
+    // §10′ — гасит работу движка у ВСЕГО состава. Зовётся из OnConfigLoad при выключении
+    // настройки: без этого ставки, эпохи и будущие резервации пережили бы `.reload config` и
+    // ждали бы обратного включения — то есть выключение не было бы откатом, а именно откатом
+    // оно и объявлено в стоп-таблице плана.
+    //
+    // Флаг к моменту вызова уже false, поэтому состояние чистится напрямую: EngineReset вышел
+    // бы по первой же проверке. Отменять при этом нечего — пока ни одно действие не может
+    // начаться, — но когда появятся резервации, ИХ освобождение должно попасть именно сюда,
+    // а не остаться в EngineReset.
+    void EngineResetAll()
+    {
+        for (Companion& c : _companions)
+            Constellation::Ai::Engine::Instance().Discard(c.Engine);
+    }
+
     // УДАРЫ, СЧИТАННЫЕ САМИМ ЯДРОМ.
     //
     // ЗАМОК ЗДЕСЬ ОБЯЗАТЕЛЕН, И ЭТО НЕ ПЕРЕСТРАХОВКА. На боевом MapUpdate.Threads = 6:
@@ -728,6 +761,22 @@ public:
         {
             _warmupMs += diff;
             return;
+        }
+
+        // ДВИЖОК ЗАПЕЧАТЫВАЕТСЯ ОДИН РАЗ, И ТОЛЬКО ЕСЛИ ШОВ ВКЛЮЧЁН.
+        //
+        // Обзор заметил, что `Seal()` не звался нигде: шов был инертен по случайности, а
+        // не по устройству — движок не мог стать готовым в принципе. Теперь он
+        // запечатывается здесь, после прогрева (мир поднят, план построен), и `Seal()`
+        // сам откажется стать готовым, если хоть одно объявленное действие не
+        // зарегистрировано. Отказ громкий: он называет каждое пропущенное по имени.
+        //
+        // За флагом — чтобы обычный боевой не видел ни строчки, пока перенос не дойдёт
+        // до первого действия.
+        if (Cfg().Engine && !_engineSealed)
+        {
+            _engineSealed = true;
+            Constellation::Ai::Engine::Instance().Seal();
         }
 
         // ПЛАН СТРОИТСЯ ЗДЕСЬ: мировой поток, рельеф уже загружен, игрока не нужно.
@@ -2271,6 +2320,13 @@ public:
 
         if (!self->IsAlive())
         {
+            // §10′ — СМЕРТЬ ГАСИТ РАБОТУ ДВИЖКА. Один раз на переход, а не каждый такт
+            // лежания: `EngineDead` и есть признак того, что мы уже погасили.
+            if (!c.EngineDead)
+            {
+                c.EngineDead = true;
+                EngineReset(c, Constellation::Ai::CancelReason::Died);
+            }
             // ГИБЕЛЬ СЧИТАЕТСЯ ЗДЕСЬ, ОДИН РАЗ, И НЕЗАВИСИМО ОТ СПОСОБА ПОДЪЁМА (Кодекс).
             // Раньше отметка ставилась только при подъёме у целительницы, поэтому круг
             // «поднялся у тела -> снова погиб» никогда не доходил до трёх — и ни отход, ни
@@ -2568,6 +2624,45 @@ public:
             return;
         }
 
+        // §10′ — ЖИВОЙ СНОВА: снимаем отметку смерти, чтобы следующая погасила заново.
+        if (c.EngineDead && self->IsAlive())
+            c.EngineDead = false;
+
+        // §10′ — СМЕНА КАРТЫ ГАСИТ РАБОТУ. Всё, что движок помнил, относилось к другой
+        // карте: цели, точки, будущие резервации. Проверяется ПЕРЕД диспетчеризацией,
+        // потому что состояние старше карты бессмысленно уже на первом такте здесь.
+        //
+        // ЧЕСТНАЯ ГРАНИЦА: это ловит смену КАРТЫ, а не фазы. Отпечатка фазы дешевле
+        // сравнения множеств у ядра нет, а сравнивать их каждый такт у 122 спутников —
+        // ровно та цена, из-за которой обходы сетки уже уводили мировой поток в потолок.
+        // Смена фазы внутри одной карты здесь НЕ ловится, и это записано, а не забыто.
+        if (c.EngineMapId != self->GetMapId())
+        {
+            if (c.EngineMapId)
+                EngineReset(c, Constellation::Ai::CancelReason::MapChanged);
+            c.EngineMapId = self->GetMapId();
+        }
+
+        // ============================ ШОВ ДВИЖКА ============================
+        //
+        // Один `if`, в одном месте, за флагом. Всё, что выше него — подтверждения
+        // телепорта, счётчики, особые состояния — остаётся вне очереди ставок НАМЕРЕННО:
+        // ставку можно перебить, зарубить множителем, выронить по крышке очереди или
+        // просрочить, а без подтверждения телепорта семафор ядра не снимается и призрак
+        // стоит на месте смерти навсегда (см. :2038).
+        //
+        // `Owns` сегодня ложно для всех веток, а `Seal()` отказывается стать готовым,
+        // пока не зарегистрировано ни одного действия. Значит шов ложится ИНЕРТНЫМ, и
+        // это проверяется, а не обещается.
+        if (Cfg().Engine && Constellation::Ai::Engine::Instance().Ready()
+            && Constellation::Ai::Engine::Owns(uint8(c.Mode)))
+        {
+            Constellation::Ai::WorldView view(self);
+            Constellation::Ai::ClientAct act(self, c.Session);
+            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
+            return;
+        }
         switch (c.Mode)
         {
             case Behavior::Idle:
@@ -6915,6 +7010,7 @@ public:
     {
         if (c.Mode == to)
             return;
+        ++c.ModeEpoch;                  // §2″ — единственное место, где режим меняется
         TC_LOG_INFO("server.worldserver", "Constellation FSM {}: {} -> {} ({})",
             self->GetName(), ModeName(c.Mode), ModeName(to), why);
         if (Player* me = c.Session ? c.Session->GetPlayer() : nullptr)
@@ -12635,6 +12731,25 @@ private:
         c.LockCastSnap.clear();
     }
 
+    // §10′ — ЕДИНСТВЕННАЯ точка, через которую модуль гасит работу движка. Игрока здесь
+    // может уже не быть (выход, роспуск), поэтому Ctx собирается только если есть кому
+    // отменять; иначе состояние чистится без вызова Cancel — отменять нечего.
+    void EngineReset(Companion& c, Constellation::Ai::CancelReason why)
+    {
+        if (!Cfg().Engine)
+            return;
+        Player* self = c.Session ? c.Session->GetPlayer() : nullptr;
+        if (!self)
+        {
+            Constellation::Ai::Engine::Instance().Discard(c.Engine);   // мира нет — отменять нечего, освобождать есть
+            return;
+        }
+        Constellation::Ai::WorldView view(self);
+        Constellation::Ai::ClientAct act(self, c.Session);
+        Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+        Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
+    }
+
     void DropSession(Companion& c)
     {
         // СЕССИИ НЕТ — ЗНАЧИТ И РЕЗЕРВА НЕТ, И ЭТО ПРОВЕРЯЕТСЯ, А НЕ ПОСТУЛИРУЕТСЯ
@@ -12652,6 +12767,7 @@ private:
         if (!c.Session)
         {
             ReleaseLockHold(c);
+            EngineReset(c, Constellation::Ai::CancelReason::LoggedOut);
             return;
         }
         Constellation::Plan::Planner::Instance()->OnLogout(c.Guid);
@@ -12665,6 +12781,7 @@ private:
         // ядро при этом обрывает его незавершённые заклинания, так что после этой строки
         // отменять уже нечего.
         ReleaseLockHold(c);
+        EngineReset(c, Constellation::Ai::CancelReason::LoggedOut);
         delete c.Session;
         c.Session = nullptr;
     }
@@ -12672,6 +12789,14 @@ private:
     void Dismiss(Companion& c, bool final)
     {
         DropSession(c);
+        // §10′ — И БЕЗУСЛОВНО ГАСИМ ДВИЖОК, ДАЖЕ ЕСЛИ ШОВ ВЫКЛЮЧЕН.
+        //
+        // `DropSession` уже зовёт `EngineReset`, но тот выходит по первой строке при
+        // `!Cfg().Engine`. Значит роспуск при выключенном шве не чистил ничего — и состояние,
+        // накопленное до выключения, пережило бы и роспуск, и остановку мира. Сегодня это
+        // безвредно (накапливать нечему), а на шаге 28 это была бы утечка резервации,
+        // переживающая сам мир.
+        Constellation::Ai::Engine::Instance().Discard(c.Engine);
         // Dismissed survives AutoSummon: only .summon (or restart) re-enters the
         // pipeline. Shutdown uses it too — the world is going away anyway.
         c.State = Stage::Dismissed;
@@ -12871,6 +12996,7 @@ private:
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _focusSpawns;
     std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
     uint32 _warmupMs = 0;
+    bool   _engineSealed = false;   // Seal() зовётся ровно один раз за подъём мира
     uint32 _throttleMs = 0;
     bool _bootstrapped = false;
     bool _planTried = false;        // план строится один раз за запуск, даже если отклонён
@@ -12932,7 +13058,13 @@ public:
     // по-прежнему меняются без пересборки
     void OnConfigLoad(bool /*reload*/) override
     {
+        bool const engineWas = Constellation::Cfg().Engine;
         Constellation::Cfg().Load();
+        // §10′ — ВЫКЛЮЧЕНИЕ ШВА ГАСИТ РАБОТУ ВСЕХ, а не просто перестаёт её начинать.
+        // Без этого ставки, эпохи и будущие резервации пережили бы `.reload config` и
+        // ждали бы обратного включения — то есть выключение не было бы откатом.
+        if (engineWas && !Constellation::Cfg().Engine)
+            Constellation::Manager::Instance()->EngineResetAll();
     }
 
     void OnUpdate(uint32 diff) override

@@ -91,6 +91,16 @@ namespace Constellation::Ai
         // True when the core teleports instead of flying. Flight actions must refuse.
         bool     InstantTaxi() const { return _instantTaxi; }
 
+        // §2 — WHICH FSM BRANCHES THE ENGINE HAS TAKEN OVER, as a raw mode value, because the
+        // engine does not know the module's Behavior enum and must not guess at it.
+        //
+        // Today it owns NOTHING, and that is the point: the seam lands inert. When a branch is
+        // migrated, its entry is added here IN THE SAME COMMIT THAT DELETES ITS OLD BODY — and
+        // it becomes true for EVERY companion, never for a canary subset. The module's switch
+        // has no `default:` arm, so a companion in a mode with a deleted body and an engine that
+        // does not own it would do nothing at all, every tick, forever.
+        static bool Owns(uint8 /*mode*/) { return false; }
+
         // §4.1 — one tick. `modeEpoch` is the module's counter of mode changes for this
         // companion; if it moved since we last ticked, somebody else put us here and every bit
         // of our state is stale (§2″). Returns true if an action executed.
@@ -104,6 +114,19 @@ namespace Constellation::Ai
         // exist they are released and invalidated HERE and nowhere else; the review is right that
         // adding either without extending Reset would break v2/v3.
         void Reset(EngineState& st, Ctx& ctx, CancelReason why);
+
+        // §10′ — THE SAME ENDING, WITHOUT A WORLD TO END IT IN.
+        //
+        // `Reset` needs a `Ctx` because it calls `Action::Cancel`. Two paths have no player and
+        // therefore no Ctx: a companion whose session is already gone, and the config being
+        // switched off. Those used to assign a fresh `EngineState` over the old one — which
+        // works today only because nothing outside the struct is owned yet.
+        //
+        // This is the named place where that stops being true. When reservations arrive (plan
+        // step 28) they are held OUTSIDE the companion, in a registry, and dropping the struct
+        // would leak them silently. Releasing them belongs HERE, not in `Reset`, because these
+        // are exactly the paths `Reset` cannot serve.
+        void Discard(EngineState& st);
 
     private:
         Engine() = default;
