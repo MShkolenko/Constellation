@@ -358,6 +358,7 @@ struct Companion
     bool RedNoted = false;              // сказали ли хоть раз, что пропускаем красные
     bool ImmuneNoted = false;           // и что цель ещё невосприимчива к игрокам
     ObjectGuid::LowType FreeGoSpawn = 0;// клетка, которой можно освободить неуязвимую цель
+    ObjectGuid::LowType FreeGoSpawnUsed = 0; // и она же, пока идём и пока используем
     uint32 FreeGoEntry = 0;             // её вид
     uint32 FreeGoFor = 0;               // и ради какого существа мы к ней идём
     Position FreeGoPos;                 // где она стоит
@@ -2870,19 +2871,22 @@ public:
                 // сбора: дойти и использовать — эта дорога уже есть и проверена.
                 if (c.FreeGoSpawn)
                 {
-                    uint64 const fk = PairKey(c.FreeGoEntry, c.FreeGoFor);
-                    ++c.FreeTried[fk];
-                    if (c.FreeTried[fk] >= 3 && _freePairDead.insert(fk).second)
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation КЛЕТКА {}: {} трижды не освободила {} — пара отставлена "
-                            "для всего состава",
-                            self->GetName(), c.FreeGoEntry, c.FreeGoFor);
-                    else
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation КЛЕТКА {}: {} невосприимчив — иду открывать {} в {:.0f} ярдах "
-                            "(попытка {})",
-                            self->GetName(), c.FreeGoFor, c.FreeGoEntry,
-                            self->GetExactDist(c.FreeGoPos), uint32(c.FreeTried[fk]));
+                    // ПОПЫТКА СЧИТАЕТСЯ ПО ПРИХОДУ, А НЕ ПРИ ВЫХОДЕ (Кодекс был прав).
+                    //
+                    // Здесь стоял ++FreeTried, и замер показал цену: походы к клетке идут
+                    // на 110 и 150 ярдов, три несостоявшихся дороги исчерпывали пару, и она
+                    // умирала для ВСЕГО состава — включая тех девятерых, у кого она бы
+                    // сработала. Трое, кому идти было близко, прошли; девять встали.
+                    //
+                    // Обзор предлагал ровно это и получил от меня отказ: «счёт при выходе
+                    // ограничивает бесполезные походы». Ограничивал он не то. Несостоявшийся
+                    // поход закрывает себя сам — у похода к точке сбора свои сроки и свой
+                    // холостой счёт («холостой заход N из 8»), и второй ограничитель поверх
+                    // них только мешал.
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КЛЕТКА {}: {} невосприимчив — иду открывать {} в {:.0f} ярдах",
+                        self->GetName(), c.FreeGoFor, c.FreeGoEntry,
+                        self->GetExactDist(c.FreeGoPos));
                     c.GatherSpawnId = c.FreeGoSpawn;
                     c.GatherEntry = c.FreeGoEntry;
                     c.GatherPos = c.FreeGoPos;
@@ -2890,6 +2894,7 @@ public:
                     c.GatherUseItem = 0;
                     c.GatherCastSpell = 0;
                     c.GatherMs = 0;
+                    c.FreeGoSpawnUsed = c.FreeGoSpawn;  // по ней и сверим приход
                     c.FreeGoSpawn = 0;              // отметку сняли, дальше ведёт сбор
                     Switch(c, self, Behavior::Gathering, "открываю клетку цели");
                     return;
@@ -4455,6 +4460,22 @@ public:
                     WorldPackets::GameObject::GameObjUse use(std::move(raw));
                     use.Guid = go->GetGUID();
                     c.Session->HandleGameObjectUseOpcode(use);
+                    // ВОТ ЗДЕСЬ ПОПЫТКА И СОСТОЯЛАСЬ: объект использован, а не «мы вышли».
+                    // ПО ТОЧКЕ, А НЕ ПО ВИДУ (Кодекс): совпадение вида не доказывает, что мы
+                    // пришли именно к той клетке, которую выбрали — тот же вид стоит в
+                    // двадцати одном экземпляре. Сверяем точку.
+                    if (c.FreeGoFor && c.FreeGoSpawnUsed == c.GatherSpawnId)
+                    {
+                        uint64 const fk = PairKey(c.FreeGoEntry, c.FreeGoFor);
+                        if (++c.FreeTried[fk] >= 3 && _freePairDead.insert(fk).second)
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation КЛЕТКА {}: {} трижды применена и {} не освобождён "
+                                "— пара отставлена для всего состава",
+                                self->GetName(), c.FreeGoEntry, c.FreeGoFor);
+                        c.FreeGoFor = 0;
+                        c.FreeGoEntry = 0;
+                        c.FreeGoSpawnUsed = 0;
+                    }
                 }
 
                 // ПРИМЕНЕНИЕ ДОКАЗЫВАЕТ САМ ОБЪЕКТ, А НЕ ОТКАТ У СПУТНИКА (Кодекс, задача 134).
@@ -5829,6 +5850,17 @@ public:
                 // механику, приняв половину случайных исходов за улику.
                 ++c.GatherEmpty[c.GatherSpawnId];
         }
+        // ОТМЕТКА КЛЕТКИ УМИРАЕТ ВМЕСТЕ С ЗАХОДОМ (Кодекс).
+        //
+        // FreeGoFor/FreeGoEntry/FreeGoSpawnUsed снимались только там, где попытка
+        // засчитана, то есть при удавшемся применении. Брошенный поход — бой, гибель,
+        // смена цели, «не дойти» — оставлял их взведёнными, и следующий ОБЫЧНЫЙ заход к
+        // той же точке совпадал по ней, засчитывал попытку и мог отставить рабочую пару
+        // для всего состава. Ровно та же форма ошибки, что и с ожиданием каста двадцатью
+        // строками ниже: любой приход сюда означает, что заход кончился.
+        c.FreeGoFor = 0;
+        c.FreeGoEntry = 0;
+        c.FreeGoSpawnUsed = 0;
         // ОЖИДАНИЕ КАСТА УМИРАЕТ ВМЕСТЕ С ТОЧКОЙ. Ждём мы, СТОЯ на ней и не вызывая этот
         // выход вовсе; значит любой приход сюда означает, что ждать больше нечего. Без этого
         // снимок пережил бы бой, смерть или смену цели, и вернувшись к той же точке позже
@@ -11127,6 +11159,37 @@ public:
                                                    GAMEOBJECT_TYPE_DOOR })
                             if (GameObject* cage = creature->FindNearestGameObjectOfType(t, 10.0f))
                             {
+                                GameObjectTemplate const* ct = cage->GetGOInfo();
+                                if (!ct)
+                                    continue;
+                                // БЕЗ СКРИПТА ОБЪЕКТ НИЧЕГО НЕ ДЕЛАЕТ, И ЭТО СВОЙСТВО, А НЕ ИМЯ.
+                                //
+                                // Первая редакция отсеивала по префиксу Doodad_, и Кодекс
+                                // отверг это по делу: имена шаблонов — соглашение, а не
+                                // контракт, и годный квестовый объект вполне может так
+                                // называться. Настоящее свойство здесь другое: клетку
+                                // открывает СКРИПТ (у Acherus Soul Prison это
+                                // go_acherus_soul_prison), а у украшения скрипта нет вовсе,
+                                // и его использование не делает ничего ни для кого.
+                                if (!ct->ScriptId && ct->AIName.empty())
+                                    continue;
+                                // И ТОТ ЖЕ ПРЕДЕЛ ХОЛОСТЫХ ЗАХОДОВ, ЧТО У ОБЫЧНЫХ ТОЧЕК.
+                                //
+                                // Я утверждал обзору, что поход к точке сбора ограничивает
+                                // себя сам, и ОШИБСЯ: GatherLeave считает холостой заход
+                                // точке, а пропускает точку с восемью — ОТБОР ТОЧЕК СБОРА,
+                                // который эта дорога обходит, ставя GatherSpawnId напрямую.
+                                // Значит предела не было вовсе. Спрашиваем тот же счёт.
+                                if (auto empt = c.GatherEmpty.find(cage->GetSpawnId());
+                                    empt != c.GatherEmpty.end() && empt->second >= 8)
+                                    continue;
+                                // ЧУЖОЙ КВЕСТ — НЕ НАШЕ ДЕЛО. Замер: «применил Eye of Acherus
+                                // Control Mechanism (191609)» — гуубер с questID 12641, а мы
+                                // в это время несём 12848. Объект, привязанный к квесту,
+                                // который мы не несём, освободить нашу цель не может.
+                                if (ct->type == GAMEOBJECT_TYPE_GOOBER && ct->goober.questID
+                                    && self->GetQuestStatus(ct->goober.questID) != QUEST_STATUS_INCOMPLETE)
+                                    continue;
                                 uint64 const fk = PairKey(cage->GetEntry(), creature->GetEntry());
                                 if (_freePairDead.count(fk))
                                     continue;                   // эту пару уже выяснили
