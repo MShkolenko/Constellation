@@ -134,14 +134,38 @@ namespace Constellation::Ai
     // ---------------------------------------------------------------------------------------
     // §3.1 — Value<T>: computed once, cached with an interval.
     //
-    // This is the single most load-bearing borrowing from the reference, and the module already
-    // proved it needs one: `c.VendScanMs = 5000` exists because a 100-yard grid sweep per tick,
-    // at four ticks a second and 122 companions, took the world thread to 99 % of a core and the
-    // FSM nearly stopped. That throttle was hand-rolled at ONE site. Here it is declared.
+    // The module proved it needs one: `c.VendScanMs = 5000` exists because a 100-yard grid sweep
+    // per tick, at four ticks a second and 122 companions, took the world thread to 99 % of a
+    // core and the FSM nearly stopped. That throttle was hand-rolled at ONE site.
     //
-    // Get() takes nowMs rather than reading a clock, so the whole tick shares one timestamp and
-    // two values cannot disagree about "now".
+    // THE FIRST DRAFT OF THIS CLASS WAS WRONG IN TWO WAYS, AND BOTH WOULD HAVE BEEN MULTIPLIED
+    // BY TWELVE HAD ANY VALUE BEEN WRITTEN AGAINST IT.
+    //
+    //   1. The cache and the timestamp lived on the Value object. Values are registered once and
+    //      shared by every companion, so the FIRST companion to tick would compute, and the other
+    //      121 would read its answer and be told the interval had not expired. A value meaning
+    //      "the nearest quest giver TO ME" would have returned somebody else's.
+    //
+    //   2. `Calculate` returned T by value. Every value the port needs is a collection, so each
+    //      recompute would heap-allocate a fresh vector and free the previous one — on the order
+    //      of a thousand alloc/free pairs a second at 122 companions, on the host that has been
+    //      OOM-killed seven times. The old comment said "a reference, not a copy", which was true
+    //      of the RETURN and said nothing about the churn on the recompute path.
+    //
+    // So: the Value object is SHARED and STATELESS. The cache, the timestamp and the buffer are
+    // per companion, supplied by the caller as a `Slot<T>` living in EngineState, and Calculate
+    // FILLS that buffer instead of returning one.
     // ---------------------------------------------------------------------------------------
+    template <class T>
+    struct Slot
+    {
+        T      Buffer{};
+        uint32 LastMs   = 0;
+        bool   Computed = false;
+
+        void Invalidate() { Computed = false; }
+    };
+
     template <class T>
     class Value
     {
@@ -152,36 +176,30 @@ namespace Constellation::Ai
         Value(Value const&) = delete;
         Value& operator=(Value const&) = delete;
 
-        // Recompute if the interval has expired, then hand back a reference into OUR storage.
-        // A reference, not a copy: §11 forbids allocating per tick on the happy path.
-        T const& Get(Ctx& ctx, uint32 nowMs)
+        // The slot is the companion's; this object owns nothing that varies between them.
+        // nowMs is passed in rather than read from a clock so the whole tick shares one
+        // timestamp and two values cannot disagree about "now".
+        T const& Get(Ctx& ctx, Slot<T>& slot, uint32 nowMs) const
         {
-            if (!_computed || !_intervalMs || nowMs - _lastMs >= _intervalMs)
+            if (!slot.Computed || !_intervalMs || nowMs - slot.LastMs >= _intervalMs)
             {
-                _value    = Calculate(ctx);
-                _lastMs   = nowMs;
-                _computed = true;
+                Calculate(ctx, slot.Buffer);     // fills, never allocates a new container
+                slot.LastMs   = nowMs;
+                slot.Computed = true;
             }
-            return _value;
+            return slot.Buffer;
         }
 
-        // The last value, never recomputing. Safe to call before any Get: returns the default.
-        T const& Peek() const { return _value; }
-
-        bool Computed() const { return _computed; }
-
-        // §10′ — the world changed under us on an event (a quest accepted, a target dying) and
-        // waiting out the interval would be wrong.
-        void Invalidate() { _computed = false; }
+        uint32 IntervalMs() const { return _intervalMs; }
 
     protected:
-        virtual T Calculate(Ctx& ctx) = 0;
+        // Fills `out`, which the caller owns and which keeps its capacity between recomputes.
+        // A collection-valued implementation clears and refills; it must not assign a fresh
+        // container, and it must cap its own growth the way BidSink caps bids.
+        virtual void Calculate(Ctx& ctx, T& out) const = 0;
 
     private:
-        T      _value{};
         uint32 _intervalMs = 0;
-        uint32 _lastMs     = 0;
-        bool   _computed   = false;
     };
 
     // ---------------------------------------------------------------------------------------
@@ -230,11 +248,17 @@ namespace Constellation::Ai
 
         // A trigger is not evaluated every tick — that is what made the hand-rolled throttles
         // necessary in the first place.
-        bool NeedsCheck(uint32 nowMs) const
+        //
+        // THE TIMESTAMP IS THE COMPANION'S, NOT THE TRIGGER'S. It used to be a member here, and
+        // triggers are registered once and shared by all 122: the first companion to tick would
+        // mark the trigger checked and the other 121 would be told to skip it. A trigger that
+        // fires once a minute would have fired once a minute FOR THE WHOLE ROSTER.
+        bool NeedsCheck(uint32 nowMs, uint32 lastMs) const
         {
-            return !_intervalMs || !_lastMs || nowMs - _lastMs >= _intervalMs;
+            return !_intervalMs || !lastMs || nowMs - lastMs >= _intervalMs;
         }
-        void Checked(uint32 nowMs) { _lastMs = nowMs; }
+
+        uint32 IntervalMs() const { return _intervalMs; }
 
         virtual bool Check(Ctx& ctx) = 0;
 
@@ -245,7 +269,6 @@ namespace Constellation::Ai
     private:
         TriggerId _id;
         uint32    _intervalMs = 0;
-        uint32    _lastMs     = 0;
     };
 
     // ---------------------------------------------------------------------------------------

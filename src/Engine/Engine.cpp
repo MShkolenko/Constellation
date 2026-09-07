@@ -241,9 +241,10 @@ namespace Constellation::Ai
         // the module's hand-rolled throttles exist to avoid; here the interval is declared.
         for (auto const& t : _triggers)
         {
-            if (!t->NeedsCheck(now))
+            uint32& lastMs = st.TriggerLastMs[size_t(t->Id())];
+            if (!t->NeedsCheck(now, lastMs))
                 continue;
-            t->Checked(now);
+            lastMs = now;                    // this companion's clock, not the trigger's
             if (!t->Check(ctx))
                 continue;
             st.Scratch.clear();

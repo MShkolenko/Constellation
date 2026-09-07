@@ -46,6 +46,12 @@ namespace Constellation::Ai
         std::vector<Bid> Queue;              // reserved once in the constructor, never grown
         std::vector<Bid> Scratch;            // where handlers/alternatives are appended, same rule
 
+        // §3.2 — WHEN THIS COMPANION last checked each trigger. It used to live on the Trigger
+        // object, which is shared by all 122: the first to tick marked it checked and the rest
+        // were told to skip. A per-minute trigger fired once a minute for the whole roster.
+        // Flat, fixed-size, no allocation — one word per trigger per companion.
+        uint32 TriggerLastMs[size_t(TriggerId::Count)] = {};
+
         ActionId Running         = ActionId::None;   // what we chose last tick
         float    RunningRel      = REL_IDLE;
         uint32   ReplanAfterMs   = 0;        // §4.4′ — hysteresis, not dice
