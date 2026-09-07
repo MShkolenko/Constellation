@@ -357,6 +357,11 @@ struct Companion
     bool TalkDiagDone = false;          // и для самого разговора
     bool RedNoted = false;              // сказали ли хоть раз, что пропускаем красные
     bool ImmuneNoted = false;           // и что цель ещё невосприимчива к игрокам
+    ObjectGuid::LowType FreeGoSpawn = 0;// клетка, которой можно освободить неуязвимую цель
+    uint32 FreeGoEntry = 0;             // её вид
+    uint32 FreeGoFor = 0;               // и ради какого существа мы к ней идём
+    Position FreeGoPos;                 // где она стоит
+    std::unordered_map<uint64, uint32> FreeTried;   // (клетка,существо) -> попыток
     Position KiteTo;                    // куда пятимся, уводя цель от лагеря
     bool Kiting = false;                // и пятимся ли сейчас
     uint32 KiteMs = 0;                  // сколько уже пятимся — чтобы не вечно
@@ -2857,6 +2862,36 @@ public:
                     c.TargetGuid = target->GetGUID();
                     c.LastDist = self->GetExactDist2d(target);
                     Switch(c, self, Behavior::ApproachingTarget, "нашлась цель квеста");
+                    return;
+                }
+                // БИТЬ НЕКОГО, ПОТОМУ ЧТО ЦЕЛЬ ЕЩЁ В КЛЕТКЕ — ЗНАЧИТ ОТКРЫВАЕМ КЛЕТКУ.
+                // Отбор боевой цели её уже нашёл и запомнил; здесь, как и с собеседником
+                // ниже, действуем по его отметке. Ведём тем же путём, что и к любой точке
+                // сбора: дойти и использовать — эта дорога уже есть и проверена.
+                if (c.FreeGoSpawn)
+                {
+                    uint64 const fk = PairKey(c.FreeGoEntry, c.FreeGoFor);
+                    ++c.FreeTried[fk];
+                    if (c.FreeTried[fk] >= 3 && _freePairDead.insert(fk).second)
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation КЛЕТКА {}: {} трижды не освободила {} — пара отставлена "
+                            "для всего состава",
+                            self->GetName(), c.FreeGoEntry, c.FreeGoFor);
+                    else
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation КЛЕТКА {}: {} невосприимчив — иду открывать {} в {:.0f} ярдах "
+                            "(попытка {})",
+                            self->GetName(), c.FreeGoFor, c.FreeGoEntry,
+                            self->GetExactDist(c.FreeGoPos), uint32(c.FreeTried[fk]));
+                    c.GatherSpawnId = c.FreeGoSpawn;
+                    c.GatherEntry = c.FreeGoEntry;
+                    c.GatherPos = c.FreeGoPos;
+                    c.GatherIsGoober = true;        // точка задания, а не добыча
+                    c.GatherUseItem = 0;
+                    c.GatherCastSpell = 0;
+                    c.GatherMs = 0;
+                    c.FreeGoSpawn = 0;              // отметку сняли, дальше ведёт сбор
+                    Switch(c, self, Behavior::Gathering, "открываю клетку цели");
                     return;
                 }
                 // БИТЬ НЕКОГО, НО МОЖЕТ БЫТЬ ЕСТЬ С КЕМ ПОГОВОРИТЬ.
@@ -11076,6 +11111,34 @@ public:
                             "Constellation ПРИМЕНЕНИЕ {}: {} ({}) пока невосприимчив к игрокам — не собеседник, жду",
                             self->GetName(), creature->GetName(), creature->GetEntry());
                     }
+                    // ЖДАТЬ — НЕ ВСЕГДА ВЕРНО. В Дуротаре пленника выводит тюремщик-NPC, и
+                    // ожидание там правильно. В Акерусе освобождает ИГРОК: цель 12848 это
+                    // существо 29519 с unit_flags 256, и рядом стоит его клетка. Ядро
+                    // (chapter1.cpp:344) на использование клетки ищет якорь 29521 в
+                    // пятнадцати ярдах, берёт у него guid пленника и запускает событие;
+                    // GameObject::Use зовёт OnGossipHello ДО разбора типа и до замка, так
+                    // что довольно обычного использования.
+                    //
+                    // РАДИУС ИЗМЕРЕН: у каждого из трёх послушников клетка в ПЯТИ ярдах.
+                    // Берём десять — запас на неровность, но не приглашение хватать всё
+                    // подряд. Отбираем только то, что вообще используется руками.
+                    if (!c.FreeGoSpawn)
+                        for (GameobjectTypes t : { GAMEOBJECT_TYPE_BUTTON, GAMEOBJECT_TYPE_GOOBER,
+                                                   GAMEOBJECT_TYPE_DOOR })
+                            if (GameObject* cage = creature->FindNearestGameObjectOfType(t, 10.0f))
+                            {
+                                uint64 const fk = PairKey(cage->GetEntry(), creature->GetEntry());
+                                if (_freePairDead.count(fk))
+                                    continue;                   // эту пару уже выяснили
+                                if (auto tr = c.FreeTried.find(fk);
+                                    tr != c.FreeTried.end() && tr->second >= 3)
+                                    continue;
+                                c.FreeGoSpawn = cage->GetSpawnId();
+                                c.FreeGoEntry = cage->GetEntry();
+                                c.FreeGoFor = creature->GetEntry();
+                                c.FreeGoPos = cage->GetPosition();
+                                break;
+                            }
                 }
                 else if (byMonster && !c.ToolActionMs
                     && !c.TalkBackoff.count(creature->GetEntry())
@@ -12684,6 +12747,7 @@ private:
     // весь модуль, а не на спутника: иначе двенадцать рыцарей смерти выясняют одно и то же
     // двенадцать раз подряд, что и дал замер — 108 кастов по одной и той же чужой цели.
     mutable std::set<uint64> _focusPairDead;
+    mutable std::set<uint64> _freePairDead;        // и пары «клетка + неуязвимая цель»
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
     // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
