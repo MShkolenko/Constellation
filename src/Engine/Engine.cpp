@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Constellation — the tick.
  *
  * Contract: engine-spec-v1.md §4, amended by v2 (§4.3′ falloff by class, §4.4′ spreading with a
@@ -14,8 +14,10 @@
 #include "ClientAct.h"
 #include "Context.h"
 #include "Log.h"
+#include "World.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace Constellation::Ai
 {
@@ -90,13 +92,47 @@ namespace Constellation::Ai
         return idx < _actions.size() ? _actions[idx].get() : nullptr;
     }
 
-    void Engine::Seal()
+    bool Engine::Seal()
     {
         _actions.resize(size_t(ActionId::Count));
-        _ready = true;
+
+        // SEALING IS A VALIDATION, NOT A RESIZE. It used to only grow the vector and set a flag,
+        // so a bid naming an unregistered action met a `continue` in the tick — silent, every
+        // tick, forever. The failure would have looked exactly like "the ladder chose something
+        // else", which is the hardest kind of defect to see in a log full of choices.
+        uint32 missing = 0;
+        for (size_t i = 1; i < size_t(ActionId::Count); ++i)     // 0 is None, deliberately absent
+        {
+            if (_actions[i])
+                continue;
+            ++missing;
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: действие «{}» ({}) объявлено и не зарегистрировано",
+                NameOf(ActionId(i)), i);
+        }
+
+        // THE FLIGHT DOOR IS A TELEPORT WHEN THE CORE SAYS SO, AND A WARNING IS NOT A GATE.
+        //
+        // Player.cpp:23076 — with CONFIG_INSTANT_TAXI set, ActivateTaxiPathTo calls TeleportTo and
+        // returns false. So CMSG_ACTIVATE_TAXI, a perfectly legal client opcode, moves a companion
+        // without walking (the operator's «ходим ногами» broken while invariant 0's letter is
+        // kept), AND IsInFlight never becomes true, so a successful teleport and a companion with
+        // no money are the same observation. The realm has it at 0 today; a config edit is one
+        // line away, so this is read here and acted on, not logged.
+        _instantTaxi = sWorld->getBoolConfig(CONFIG_INSTANT_TAXI);
+        if (_instantTaxi)
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: InstantFlightPaths включён — ядро телепортирует по"
+                " CMSG_ACTIVATE_TAXI (Player.cpp:23076). Полёты движком ЗАПРЕЩЕНЫ на этом мире.");
+
+        _ready = (missing == 0);
         TC_LOG_INFO("server.worldserver",
-            "Constellation ДВИЖОК: действий {}, триггеров {}, множителей {}, стратегий {}",
-            _actions.size(), _triggers.size(), _multipliers.size(), _strategies.size());
+            "Constellation ДВИЖОК: действий {}, триггеров {}, множителей {}, стратегий {},"
+            " мгновенные полёты {} — {}",
+            _actions.size(), _triggers.size(), _multipliers.size(), _strategies.size(),
+            _instantTaxi ? "ДА" : "нет",
+            _ready ? "готов" : "НЕ ГОТОВ, не зарегистрировано действий: " + std::to_string(missing));
+        return _ready;
     }
 
     bool Engine::Push(EngineState& st, std::vector<Bid> const& bids, float forced, uint32 nowMs)
@@ -142,41 +178,95 @@ namespace Constellation::Ai
     // bid: the first draft multiplied the bid in place, so an unselected running bid grew by 1.35
     // every tick and would have outranked an emergency within seconds. Ties within TIE_EPSILON
     // are broken by the salt so equal companions do not make equal choices.
-    size_t Engine::Choose(EngineState& st, Ctx& ctx, uint32 nowMs) const
+    size_t Engine::Choose(EngineState& st, Ctx& ctx, uint32 nowMs, float& outScore) const
     {
         bool const sticky = st.Running != ActionId::None && nowMs < st.ReplanAfterMs;
 
-        float  bestScore = -1.0f;
-        for (Bid const& b : st.Queue)
+        // §4.3′ — the SCORE decides, not the raw relevance. Each action turns its base bid into a
+        // score using its own subject and its own class of work; the engine only compares.
+        //
+        // SCORED EXACTLY ONCE, AND THE WINNER'S SCORE TRAVELS OUT. The previous version scored
+        // here and then scored again before executing: with a Score() that is not pure — and the
+        // interface cannot force purity, since a value-backed score needs a mutable Ctx — the
+        // action could execute at a relevance nobody selected. Now `outScore` carries the exact
+        // number the choice was made on.
+        //
+        // ONE BUFFER FOR THE COMPARISON; THE BASE SCORE LIVES ON THE BID.
+        //
+        // `cmp` carries the stickiness bonus and decides the comparison; the bid's own `Score`
+        // does not and is what leaves the function. Carrying stickiness into the executed
+        // relevance would inflate the continuers pushed after it, and that inflation would
+        // compound tick after tick — the same compounding already caught once when stickiness was
+        // written into the queued bid.
+        //
+        // Scoring is guarded by the tick stamp, because Choose() runs up to eight times a tick
+        // and used to re-score the whole remaining queue on every pass.
+        // Pass one: score what is not yet scored this tick, and DROP a bid whose score is not
+        // finite, compacting the queue in place.
+        //
+        // A NON-FINITE SCORE IS A DEFECT, NOT A WINNER, AND ZEROING IT WAS NOT ENOUGH. NaN loses
+        // every comparison, so such a bid slips past the tie test into the fallback; infinity
+        // wins everything forever. Setting it to zero stopped it executing — the multiplier gate
+        // rejects `<= 0` — but it still occupied a place in the selection and consumed one of the
+        // eight iterations this tick is allowed. So it leaves the queue here.
+        size_t write = 0;
+        for (size_t read = 0; read < st.Queue.size(); ++read)
         {
-            float const s = b.Relevance * ((sticky && b.Action == st.Running) ? STICKINESS : 1.0f);
-            if (s > bestScore)
-                bestScore = s;
+            Bid& b = st.Queue[read];
+            if (!b.Scored || b.ScoredMs != nowMs)
+            {
+                Action* a = Find(b.Action);
+                float const s = a ? a->Score(ctx, b.Relevance) : b.Relevance;
+                if (!std::isfinite(s))
+                {
+                    ++st.BidsDropped;
+                    continue;                       // not compacted forward: it is gone
+                }
+                b.Score    = s;
+                b.ScoredMs = nowMs;
+                b.Scored   = true;
+            }
+            if (write != read)
+                st.Queue[write] = st.Queue[read];   // Bid is trivially copyable
+            ++write;
+        }
+        st.Queue.resize(write);
+
+        float cmp[QUEUE_CAP] = {};
+        size_t const n = st.Queue.size() < QUEUE_CAP ? st.Queue.size() : QUEUE_CAP;
+        float bestCmp = -1.0f;
+        for (size_t i = 0; i < n; ++i)
+        {
+            Bid const& b = st.Queue[i];
+            cmp[i] = b.Score * ((sticky && b.Action == st.Running) ? STICKINESS : 1.0f);
+            if (cmp[i] > bestCmp)
+                bestCmp = cmp[i];
         }
 
-        // Count the ties first, then pick by salt — two passes, no allocation.
         size_t ties = 0;
-        for (Bid const& b : st.Queue)
-        {
-            float const s = b.Relevance * ((sticky && b.Action == st.Running) ? STICKINESS : 1.0f);
-            if (bestScore - s <= TIE_EPSILON)
+        for (size_t i = 0; i < n; ++i)
+            if (bestCmp - cmp[i] <= TIE_EPSILON)
                 ++ties;
-        }
+
         size_t pick = ties > 1
             ? size_t(Salt(ctx.World.Guid().GetCounter(), st.AssignmentEpoch) % ties)
             : 0;
 
-        for (size_t i = 0; i < st.Queue.size(); ++i)
+        for (size_t i = 0; i < n; ++i)
         {
-            Bid const& b = st.Queue[i];
-            float const s = b.Relevance * ((sticky && b.Action == st.Running) ? STICKINESS : 1.0f);
-            if (bestScore - s <= TIE_EPSILON)
+            if (bestCmp - cmp[i] <= TIE_EPSILON)
             {
                 if (pick == 0)
+                {
+                    outScore = st.Queue[i].Score;
                     return i;
+                }
                 --pick;
             }
         }
+        // Unreachable while every score is finite — which the guard above now guarantees, since
+        // the only way past the tie test was a NaN that loses every comparison.
+        outScore = n ? st.Queue[0].Score : REL_IDLE;
         return 0;
     }
 
@@ -184,10 +274,17 @@ namespace Constellation::Ai
     {
         // §5 — every decision says why. An engine whose choice cannot be read back is worse than
         // the `if` chain it replaces, because at least a chain can be read top to bottom.
+        //
+        // ONLY ON A CHANGE, and this is not cosmetic. Written on every successful Execute it is
+        // an fmt format into a fresh std::string at 122 companions × 4 Hz — hundreds of formatted
+        // lines a second, in a module that has already produced 31 343 238 lines in ten minutes.
+        // A decision that has not changed is not news; the counters live in the periodic line.
+        if (chosen.Id() == st.Running)
+            return;
         TC_LOG_INFO("server.worldserver",
-            "Constellation РЕШЕНИЕ {}: выбрал «{}» {:.2f} (эпоха {}, в очереди {}, сброшено {})",
-            ctx.World.Name(), chosen.Name(), relevance, st.AssignmentEpoch,
-            st.Queue.size(), st.BidsDropped);
+            "Constellation РЕШЕНИЕ {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {})",
+            ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
+            st.AssignmentEpoch, st.Queue.size(), st.BidsDropped);
     }
 
     void Engine::Reset(EngineState& st, Ctx& ctx, CancelReason why)
@@ -269,7 +366,10 @@ namespace Constellation::Ai
 
         for (uint32 i = 0; i < ITERATIONS_PER_TICK && !st.Queue.empty(); ++i)
         {
-            size_t const idx = Choose(st, ctx, now);
+            float chosenScore = REL_IDLE;
+            size_t const idx = Choose(st, ctx, now, chosenScore);
+            if (st.Queue.empty())
+                break;                  // Choose may have dropped every bid as non-finite
             Bid const bid = st.Queue[idx];
             st.Queue.erase(st.Queue.begin() + idx);
 
@@ -282,8 +382,10 @@ namespace Constellation::Ai
             if (!action->Useful(ctx))
                 continue;
 
+            // THE SCORE SELECTION COMPUTED, not a second call to Score(). Calling it again could
+            // return a different number, and then what executes is not what won.
             char const* vetoedBy = nullptr;
-            float const rel = MultipliedRelevance(*action, ctx, bid.Relevance, &vetoedBy);
+            float const rel = MultipliedRelevance(*action, ctx, chosenScore, &vetoedBy);
             if (rel <= 0.0f)
             {
                 TC_LOG_DEBUG("server.worldserver",
@@ -310,10 +412,15 @@ namespace Constellation::Ai
                 {
                     // The prerequisite goes above us and we come back just under it, so the
                     // original is not lost and does not outrank what it is waiting for.
+                    //
+                    // AND IT KEEPS ITS ORIGINAL BIRTHDAY. Stamping `now` here made the TTL
+                    // unreachable: a bid whose prerequisite is never satisfied would re-queue
+                    // itself fresh every tick and live forever, which is precisely the immortal
+                    // retry the expiry exists to kill.
                     st.Scratch.clear();
                     BidSink requeue(st.Scratch, st.BidsDropped);
                     requeue.Add(bid.Action, rel + REL_REQUEUE, true);
-                    Push(st, st.Scratch, 0.0f, now);
+                    Push(st, st.Scratch, 0.0f, bid.CreatedMs);
                     continue;
                 }
             }
@@ -334,6 +441,18 @@ namespace Constellation::Ai
                 st.RunningRel    = rel;
                 st.ReplanAfterMs = now + REPLAN_COOLDOWN_MS;
                 return true;
+            }
+
+            // EXECUTE FAILED, SO WE ARE NOT RUNNING IT ANY MORE.
+            //
+            // `Running` was left pointing at the failed action, which fed the stickiness bonus:
+            // the thing that just failed kept a 1.35× advantage for the whole replan cooldown and
+            // would be chosen again ahead of a working alternative. Clearing it also lets the
+            // next successful action be reported as a change (§5) instead of being swallowed.
+            if (st.Running == bid.Action)
+            {
+                st.Running    = ActionId::None;
+                st.RunningRel = REL_IDLE;
             }
 
             st.Scratch.clear();

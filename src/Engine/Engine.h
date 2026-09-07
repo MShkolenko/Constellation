@@ -81,7 +81,15 @@ namespace Constellation::Ai
 
         Action*  Find(ActionId id) const;
         bool     Ready() const { return _ready; }
-        void     Seal();                     // no more registration; validates completeness
+
+        // Closes registration AND validates it: every declared ActionId must have an object, or
+        // the engine refuses to become ready. Returns false in that case — the caller must not
+        // enable the seam. Also reads CONFIG_INSTANT_TAXI once, because that config turns the
+        // flight door into a teleport (Player.cpp:23076).
+        bool     Seal();
+
+        // True when the core teleports instead of flying. Flight actions must refuse.
+        bool     InstantTaxi() const { return _instantTaxi; }
 
         // §4.1 — one tick. `modeEpoch` is the module's counter of mode changes for this
         // companion; if it moved since we last ticked, somebody else put us here and every bit
@@ -103,14 +111,19 @@ namespace Constellation::Ai
         bool  Push(EngineState& st, std::vector<Bid> const& bids, float forced, uint32 nowMs);
         float MultipliedRelevance(Action& action, Ctx& ctx, float relevance,
                                   char const** vetoedBy) const;
-        size_t Choose(EngineState& st, Ctx& ctx, uint32 nowMs) const;
+        // Returns the winning bid's index AND the score it won on. The score leaves the function
+        // because calling Score() a second time before executing could return a different number,
+        // and then what executes is not what was chosen. `outScore` excludes the stickiness
+        // bonus deliberately — see the comment in the body.
+        size_t Choose(EngineState& st, Ctx& ctx, uint32 nowMs, float& outScore) const;
         void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const;
 
         std::vector<std::unique_ptr<Action>>     _actions;      // indexed by ActionId
         std::vector<std::unique_ptr<Trigger>>    _triggers;
         std::vector<std::unique_ptr<Multiplier>> _multipliers;
         std::vector<std::unique_ptr<Strategy>>   _strategies;
-        bool _ready = false;
+        bool _ready       = false;
+        bool _instantTaxi = false;           // read once at Seal; see Seal()'s comment
     };
 }
 

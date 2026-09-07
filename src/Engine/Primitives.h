@@ -113,6 +113,21 @@ namespace Constellation::Ai
         uint32   CreatedMs = 0;
         bool     SkipPrerequisites = false;
 
+        // §4.3′ — THE SCORE IS COMPUTED ONCE PER BID PER TICK, and it is cached here.
+        //
+        // The first fix made selection carry the winning score to execution, which stopped
+        // "what ran" from differing from "what won". It did not stop the rescanning: Choose()
+        // runs inside the iteration loop up to eight times a tick and re-scored every remaining
+        // bid each pass, so an action's Score() could be invoked eight times — eight world scans
+        // for one decision, on the thread that is the bottleneck.
+        //
+        // The stamp is what makes it exact rather than approximate: a bid pushed mid-loop (an
+        // alternative, a continuer) has no score yet and gets one on the next pass; a bid already
+        // scored this tick is never scored again.
+        float    Score     = REL_IDLE;
+        uint32   ScoredMs  = 0;            // 0 = never scored; the tick's NowMs otherwise
+        bool     Scored    = false;        // NowMs can legitimately be 0 on a fresh world
+
         bool operator<(Bid const& o) const { return Relevance < o.Relevance; }
     };
 
@@ -299,16 +314,33 @@ namespace Constellation::Ai
         virtual void Alternatives(BidSink&)  const { }
         virtual void Continuers(BidSink&)    const { }
 
-        // §4.3′ — the class of work decides how distance enters, and an action that is NOT
-        // distance-sensitive must say so rather than inherit a falloff.
-        enum class Cost : uint8
+        // §4.3′ — THE CLASS OF WORK DECIDES HOW DISTANCE ENTERS, AND THE ACTION IS THE ONLY ONE
+        // WHO KNOWS ITS SUBJECT.
+        //
+        // This was a `DistanceCost()` enum that the engine never read — a declared policy with no
+        // implementation, the same shape as the six the review already caught. Worse, it could not
+        // have worked: the engine has no idea what an action's subject is, and putting a position
+        // on every Bid to tell it would have quadrupled a struct kept at 16 bytes on purpose.
+        //
+        // So the action scores itself. `Score` is called during SELECTION, not after it, because
+        // a falloff applied after the winner is picked changes nothing. Default: unchanged, which
+        // is the right answer for emergencies — distance is irrelevant when you are dying.
+        //
+        // CONTRACT: pure with respect to the tick. It may read values (which is why `ctx` is not
+        // const — a value may recompute), but it must not act on the world, and two calls within
+        // one tick must return the same number. The engine calls it EXACTLY ONCE per bid per tick
+        // and carries the result to execution, so a breach can no longer split "what was chosen"
+        // from "what ran" — but it would still make one tick's log disagree with the next.
+        virtual float Score(Ctx& /*ctx*/, float baseRelevance) const { return baseRelevance; }
+
+        // The shared shape, so distance-sensitive actions decay identically rather than each
+        // inventing a curve. Reach is the reference's own new-quest search radius: a giver at
+        // twenty yards beats an objective at two hundred without either being ordered by hand.
+        static float Falloff(float yards, uint8 level)
         {
-            None,       // emergency: distance irrelevant
-            Linear,     // a small cost — a hand-in already earned is still worth walking to
-            Falloff,    // 1/(1 + d/(400 + level*10)) — choosing between candidates
-            Steep,      // follow-the-owner
-        };
-        virtual Cost DistanceCost() const { return Cost::Falloff; }
+            float const reach = 400.0f + float(level) * 10.0f;
+            return 1.0f / (1.0f + (yards > 0.0f ? yards : 0.0f) / reach);
+        }
 
     private:
         ActionId _id;
