@@ -185,6 +185,39 @@ namespace Constellation::Ai
     };
 
     // ---------------------------------------------------------------------------------------
+    // §11 — hard caps, and the ONLY way a provider may append a bid.
+    //
+    // The first draft handed providers a raw std::vector<Bid>& and enforced the cap afterwards
+    // in Push. The review pointed out the obvious: a provider can push past the cap and
+    // reallocate before Push ever sees it. So providers get a BidSink, which owns the check.
+    // A bid beyond the cap is dropped and counted; the counter is the defect report.
+    // ---------------------------------------------------------------------------------------
+    inline constexpr size_t QUEUE_CAP   = 32;
+    inline constexpr size_t SCRATCH_CAP = 16;
+
+    class BidSink
+    {
+    public:
+        BidSink(std::vector<Bid>& into, uint32& dropped) : _into(into), _dropped(dropped) { }
+
+        void Add(ActionId action, float relevance, bool skipPrerequisites = false)
+        {
+            if (_into.size() >= SCRATCH_CAP)
+            {
+                ++_dropped;
+                return;
+            }
+            _into.push_back(Bid{ action, relevance, 0, skipPrerequisites });
+        }
+
+        size_t Size() const { return _into.size(); }
+
+    private:
+        std::vector<Bid>& _into;
+        uint32&           _dropped;
+    };
+
+    // ---------------------------------------------------------------------------------------
     // §3.2 — Trigger. Watches for a state; when it holds, its handlers are bid.
     // ---------------------------------------------------------------------------------------
     class Trigger
@@ -205,8 +238,9 @@ namespace Constellation::Ai
 
         virtual bool Check(Ctx& ctx) = 0;
 
-        // Appended to `out` rather than returned by value: §11, no per-tick allocation.
-        virtual void Handlers(std::vector<Bid>& out) const = 0;
+        // Appended through a capped sink rather than returned by value: §11, no per-tick
+        // allocation, and the cap is enforced at the append, not after it.
+        virtual void Handlers(BidSink& out) const = 0;
 
     private:
         TriggerId _id;
@@ -238,9 +272,9 @@ namespace Constellation::Ai
         // §10′ — idempotent, and callable on an action that never started.
         virtual void Cancel(Ctx&, CancelReason) { }
 
-        virtual void Prerequisites(std::vector<Bid>&) const { }
-        virtual void Alternatives(std::vector<Bid>&)  const { }
-        virtual void Continuers(std::vector<Bid>&)    const { }
+        virtual void Prerequisites(BidSink&) const { }
+        virtual void Alternatives(BidSink&)  const { }
+        virtual void Continuers(BidSink&)    const { }
 
         // §4.3′ — the class of work decides how distance enters, and an action that is NOT
         // distance-sensitive must say so rather than inherit a falloff.
@@ -288,7 +322,7 @@ namespace Constellation::Ai
         char const* Name() const { return _name; }
 
         virtual void Triggers(std::vector<TriggerId>&) const { }
-        virtual void DefaultBids(std::vector<Bid>&)    const { }
+        virtual void DefaultBids(BidSink&)             const { }
         virtual void Multipliers(std::vector<Multiplier const*>&) const { }
 
     private:
