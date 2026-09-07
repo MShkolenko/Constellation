@@ -445,9 +445,12 @@ struct Companion
     uint32 CraftObjQuest = 0;                       // и цель, ПО КОТОРОЙ судим: квест
     uint32 CraftObjCreature = 0;                    // и существо этой цели
     int32  CraftObjBefore = 0;                      // сколько было засчитано до каста
-    std::unordered_map<uint32, uint32> CastTried;   // заклинание -> попыток без сдвига ЭТОЙ цели
-    std::unordered_map<uint32, uint32> CastRefusal; // заклинание -> последний код отказа ядра
-    std::unordered_map<uint32, uint32> CastRefused; // и сколько раз он уже случился подряд
+    // КЛЮЧ ПАРНЫЙ: заклинание И существо цели. По одному заклинанию считать нельзя —
+    // руна, закрывшая 12842, оставалась «свежей» для 12848, и каждый из двенадцати
+    // спутников заново тратил на неё по три каста. Замер: 108 подряд впустую.
+    std::unordered_map<uint64, uint32> CastTried;   // (закл.,существо) -> попыток без сдвига
+    std::unordered_map<uint64, uint32> CastRefusal; // (закл.,существо) -> последний код отказа
+    std::unordered_map<uint64, uint32> CastRefused; // и сколько раз он случился подряд
     bool BookDiagDone = false;                      // перепись книги у зачёта печатаем один раз
     bool RuneDiagDone = false;                      // и перепись рун против оружия — тоже один раз
     uint32 BookDiagMs = 0;                          // и не пересматриваем журнал чаще минуты
@@ -2123,6 +2126,7 @@ public:
             if (self && !c.CraftWaitMs && c.CraftSpell)
             {
                 uint32 const spell = c.CraftSpell;
+                uint64 const key = PairKey(spell, c.CraftObjCreature);
                 int32 const now = ObjectiveCount(self, c.CraftObjQuest, c.CraftObjCreature);
                 // ЦЕЛИ БОЛЬШЕ НЕТ — НЕ ЗАСЛУГА И НЕ ВИНА (Кодекс). ObjectiveCount отдаёт -1,
                 // когда шаблона или самой цели не найти: квест сдан, снят или подменён. Тогда
@@ -2132,19 +2136,22 @@ public:
                 bool const moved = judged && now > c.CraftObjBefore;
                 if (moved)
                 {
-                    c.CastTried.erase(spell);
+                    c.CastTried.erase(key);
                     if (c.CraftSpawn)
                         c.GatherEmpty.erase(c.CraftSpawn);  // заход оказался не холостым
                 }
-                else if (judged)
-                    ++c.CastTried[spell];
+                else if (judged && ++c.CastTried[key] >= 3 && _focusPairDead.insert(key).second)
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КУЗНЯ {}: заклинание {} трижды не двинуло цель на существе {} "
+                        "— пара отставлена для всего состава",
+                        self->GetName(), spell, c.CraftObjCreature);
                 TC_LOG_INFO("server.worldserver",
                     "Constellation КУЗНЯ {}: заклинание {} по цели {}/{} — было {}, стало {}: {}",
                     self->GetName(), spell, c.CraftObjQuest, c.CraftObjCreature,
                     c.CraftObjBefore, now,
                     moved ? std::string("ЗАЧЁТ")
                           : !judged ? std::string("цели больше нет — не сужу")
-                          : Trinity::StringFormat("без сдвига, попытка {} из 3", uint32(c.CastTried[spell])));
+                          : Trinity::StringFormat("без сдвига, попытка {} из 3", uint32(c.CastTried[key])));
                 c.CraftSpell = 0;
                 c.CraftObjQuest = 0;
                 c.CraftObjCreature = 0;
@@ -3935,9 +3942,10 @@ public:
                             // Печатаем один раз на каждый НОВЫЙ код: устойчивый отказ иначе
                             // залил бы журнал строкой в минуту на спутника, а смена кода —
                             // это как раз то, что интересно.
-                            if (c.CastRefusal[spellId] != uint32(probe))
+                            uint64 const rk = PairKey(spellId, c.GatherCastCreature);
+                            if (c.CastRefusal[rk] != uint32(probe))
                             {
-                                c.CastRefusal[spellId] = uint32(probe);
+                                c.CastRefusal[rk] = uint32(probe);
                                 TC_LOG_INFO("server.worldserver",
                                     "Constellation КУЗНЯ {}: ядро отказало заклинанию {} на {} — причина {}; "
                                     "не отправляю, попытку не трачу",
@@ -3952,9 +3960,10 @@ public:
                             //
                             // Десять отказов при минутном откате — это около десяти минут
                             // попыток. Последний код остаётся в CastRefusal для разбора.
-                            if (++c.CastRefused[spellId] >= 10)
+                            if (++c.CastRefused[rk] >= 10)
                             {
-                                c.CastTried[spellId] = 3;   // тем же путём, что и бесплодные касты
+                                c.CastTried[rk] = 3;        // тем же путём, что и бесплодные касты
+                                _focusPairDead.insert(rk);  // и для всего состава тоже
                                 TC_LOG_INFO("server.worldserver",
                                     "Constellation КУЗНЯ {}: заклинание {} отказано десять раз подряд "
                                     "(последняя причина {}) — снимаю его",
@@ -3963,8 +3972,9 @@ public:
                             GatherLeave(c, self, 60000, true, "ядро отказало");
                             return;
                         }
-                        c.CastRefusal.erase(spellId);   // прошло — прежний отказ больше не факт
-                        c.CastRefused.erase(spellId);   // и череда отказов прервалась
+                        uint64 const okKey = PairKey(spellId, c.GatherCastCreature);
+                        c.CastRefusal.erase(okKey);     // прошло — прежний отказ больше не факт
+                        c.CastRefused.erase(okKey);     // и череда отказов прервалась
                         int32 const had = ObjectiveCount(self, c.GatherCastQuest, c.GatherCastCreature);
                         WorldPacket raw(CMSG_CAST_SPELL);
                         WorldPackets::Spells::CastSpell cast(std::move(raw));
@@ -10588,6 +10598,10 @@ public:
         return found;
     }
 
+    // Ключ пары: заклинание в старших разрядах, существо цели в младших.
+    static uint64 PairKey(uint32 spell, uint32 creature)
+    { return (uint64(spell) << 32) | uint64(creature); }
+
     // ---------------------------------------------------------------- СЧЁТ ОДНОЙ ЦЕЛИ
     // Приговор касту у фокуса судит ровно ту цель, ради которой кастовали. -1 значит
     // «такой цели нет», и это отличается от нуля «есть, но не закрыта ни на сколько».
@@ -10741,8 +10755,11 @@ public:
             SpellInfo const* si = sSpellMgr->GetSpellInfo(id, self->GetMap()->GetDifficultyID());
             if (!si || !si->RequiresSpellFocus || si->IsPassive())
                 continue;
-            if (auto tried = c.CastTried.find(id); tried != c.CastTried.end() && tried->second >= 3)
-                continue;                       // трижды без сдвига этой цели
+            uint64 const key = PairKey(id, *creature);
+            if (_focusPairDead.count(key))
+                continue;                       // эту пару уже выяснили — на весь модуль
+            if (auto tried = c.CastTried.find(key); tried != c.CastTried.end() && tried->second >= 3)
+                continue;                       // трижды без сдвига именно этой цели
             if (!fm->second.count(si->RequiresSpellFocus))
                 continue;                       // такого фокуса на этой карте нет
             return id;
@@ -12663,6 +12680,10 @@ private:
     // их уже разобрало (задача 0023, запись 65).
     std::unordered_map<uint32, std::set<uint32>> _focusCreditSpells;
     std::set<uint32> _scriptCreditSpells;          // заклинания, зачёт за которые выдаёт скрипт ядра
+    // ВЫЯСНИЛ ОДИН — ЗНАЮТ ВСЕ. Бесплодная пара «заклинание + существо» запоминается на
+    // весь модуль, а не на спутника: иначе двенадцать рыцарей смерти выясняют одно и то же
+    // двенадцать раз подряд, что и дал замер — 108 кастов по одной и той же чужой цели.
+    mutable std::set<uint64> _focusPairDead;
     std::unordered_map<uint32, std::set<uint32>> _itemFromGo;            // предмет -> виды объектов
     // ЗАЧЁТ-СУЩЕСТВО -> ПРЕДМЕТЫ, НАДЕВАНИЕ КОТОРЫХ ЕГО ВЫДАЁТ (задача 0023, запись 52).
     // Восемь панд стояли на точке появления с целью «существо 54139», которое в мире не
