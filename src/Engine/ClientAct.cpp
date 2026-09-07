@@ -1,0 +1,297 @@
+﻿/*
+ * Constellation — the door's implementation. Every body here was MOVED from the call site named
+ * in its comment, field for field, because a packet's fields written from memory cost a build
+ * cycle to discover.
+ *
+ * Contract: engine-spec-v1.md §6 as amended by v2 §6′ and v3.
+ *
+ * Copyright (C) 2026 Constellation contributors. Licensed under the GNU AGPL v3 — see COPYING.
+ */
+#include "ClientAct.h"
+
+#include "AreaTriggerPackets.h"
+#include "CombatPackets.h"
+#include "GameTime.h"
+#include "Log.h"
+#include "MovementPackets.h"
+#include "GameObjectPackets.h"
+#include "ItemPackets.h"
+#include "MiscPackets.h"
+#include "NPCPackets.h"
+#include "Opcodes.h"
+#include "Player.h"
+#include "QuestPackets.h"
+#include "TaxiPackets.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
+
+namespace Constellation::Ai
+{
+    // ---- talking ---------------------------------------------------------------------------
+
+    bool ClientAct::QuestGiverHello(ObjectGuid giver)               // from Constellation.cpp:7198
+    {
+        if (!Usable() || giver.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_QUEST_GIVER_HELLO);
+        WorldPackets::Quest::QuestGiverHello hello(std::move(raw));
+        hello.QuestGiverGUID = giver;
+        _session->HandleQuestgiverHelloOpcode(hello);
+        return true;
+    }
+
+    bool ClientAct::GossipSelect(ObjectGuid unit, uint32 menuId, uint32 optionId)  // :5113
+    {
+        if (!Usable() || unit.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
+        WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
+        sel.GossipUnit     = unit;
+        sel.GossipID       = menuId;
+        sel.GossipOptionID = optionId;
+        _session->HandleGossipSelectOptionOpcode(sel);
+        return true;
+    }
+
+    // ---- quests ----------------------------------------------------------------------------
+
+    bool ClientAct::AcceptQuest(ObjectGuid giver, uint32 questId)   // :7345
+    {
+        if (!Usable() || giver.IsEmpty() || !questId)
+            return false;
+        WorldPacket raw(CMSG_QUEST_GIVER_ACCEPT_QUEST);
+        WorldPackets::Quest::QuestGiverAcceptQuest accept(std::move(raw));
+        accept.QuestGiverGUID = giver;
+        accept.QuestID        = questId;
+        _session->HandleQuestgiverAcceptQuestOpcode(accept);
+        return true;
+    }
+
+    bool ClientAct::CompleteQuest(ObjectGuid ender, uint32 questId)  // :7926
+    {
+        if (!Usable() || !questId)
+            return false;
+        WorldPacket raw(CMSG_QUEST_GIVER_COMPLETE_QUEST);
+        WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(raw));
+        // The call site couples these two: `FromScript = (ender == nullptr)`. Taking the flag as
+        // a parameter let a caller produce a combination the original never could — a real ender
+        // AND FromScript true. Derived, so it cannot be contradicted.
+        bool const toSelf   = ender.IsEmpty();
+        done.QuestGiverGUID = toSelf ? _self->GetGUID() : ender;
+        done.QuestID        = questId;
+        done.FromScript     = toSelf;
+        _session->HandleQuestgiverCompleteQuest(done);
+        return true;
+    }
+
+    // ---- combat ----------------------------------------------------------------------------
+
+    bool ClientAct::SetSelection(ObjectGuid target)                 // :7020
+    {
+        if (!Usable())
+            return false;
+        WorldPacket raw(CMSG_SET_SELECTION);
+        WorldPackets::Misc::SetSelection sel(std::move(raw));
+        sel.Selection = target;
+        _session->HandleSetSelectionOpcode(sel);
+        return true;
+    }
+
+    bool ClientAct::AttackSwing(ObjectGuid victim)                  // :7026
+    {
+        if (!Usable() || victim.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_ATTACK_SWING);
+        WorldPackets::Combat::AttackSwing swing(std::move(raw));
+        swing.Victim = victim;
+        _session->HandleAttackSwingOpcode(swing);
+        return true;
+    }
+
+    bool ClientAct::AttackStop()                                    // :6935
+    {
+        if (!Usable())
+            return false;
+        WorldPacket raw(CMSG_ATTACK_STOP);
+        WorldPackets::Combat::AttackStop stop(std::move(raw));
+        _session->HandleAttackStopOpcode(stop);
+        return true;
+    }
+
+    // ---- the world -------------------------------------------------------------------------
+
+    bool ClientAct::UseGameObject(ObjectGuid go)                    // :4470
+    {
+        if (!Usable() || go.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_GAME_OBJ_USE);
+        WorldPackets::GameObject::GameObjUse use(std::move(raw));
+        use.Guid = go;
+        _session->HandleGameObjectUseOpcode(use);
+        return true;
+    }
+
+    bool ClientAct::EnterAreaTrigger(int32 areaTriggerId)           // :9046
+    {
+        if (!Usable())
+            return false;
+        WorldPacket raw(CMSG_AREA_TRIGGER);
+        WorldPackets::AreaTrigger::AreaTrigger pkt(std::move(raw));
+        pkt.AreaTriggerID = areaTriggerId;
+        pkt.Entered       = true;
+        pkt.FromClient    = true;
+        _session->HandleAreaTriggerOpcode(pkt);
+        return true;
+    }
+
+    // ---- trade -----------------------------------------------------------------------------
+
+    bool ClientAct::ListInventory(ObjectGuid vendor)                // :3218
+    {
+        if (!Usable() || vendor.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_LIST_INVENTORY);
+        WorldPackets::NPC::Hello list(std::move(raw));
+        list.Unit = vendor;
+        _session->HandleListInventoryOpcode(list);
+        return true;
+    }
+
+    bool ClientAct::SellItem(ObjectGuid vendor, ObjectGuid item, uint32 amount)   // :6328
+    {
+        if (!Usable() || vendor.IsEmpty() || item.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_SELL_ITEM);
+        WorldPackets::Item::SellItem sell(std::move(raw));
+        sell.VendorGUID = vendor;
+        sell.ItemGUID   = item;
+        sell.Amount     = amount;
+        _session->HandleSellItemOpcode(sell);
+        return true;
+    }
+
+    bool ClientAct::RepairAll(ObjectGuid npc)                       // :6388
+    {
+        if (!Usable() || npc.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_REPAIR_ITEM);
+        WorldPackets::Item::RepairItem fix(std::move(raw));
+        fix.NpcGUID      = npc;
+        fix.ItemGUID     = ObjectGuid::Empty;   // empty = "repair everything", as at the call site
+        fix.UseGuildBank = false;
+        _session->HandleRepairItemOpcode(fix);
+        return true;
+    }
+
+    // ---- movement --------------------------------------------------------------------------
+
+    // A generous slice. The module ticks movement at 4 Hz, so a real step is around a yard and
+    // a half; a whole second of run speed leaves room for a loaded world thread without leaving
+    // room for a teleport.
+    static constexpr float STEP_SLICE_SECONDS = 1.0f;
+    static constexpr float STEP_TOLERANCE_YARDS = 2.0f;
+
+    float ClientAct::MaxStepYards() const
+    {
+        if (!_self)
+            return 0.0f;
+        // THE MEASURE FOLLOWS THE MOVEMENT, not the other way round. Asking MOVE_RUN while the
+        // companion is swimming both over-permits (run is faster than swim) and, on a mount over
+        // water, under-permits. Ask the core which speed actually governs right now.
+        UnitMoveType const type = _self->IsFlying()   ? MOVE_FLIGHT
+                                : _self->IsInWater()  ? MOVE_SWIM
+                                                      : MOVE_RUN;
+        return _self->GetSpeed(type) * STEP_SLICE_SECONDS + STEP_TOLERANCE_YARDS;
+    }
+
+    void ClientAct::ResetTick()
+    {
+        _stepBudgetYards = MaxStepYards();
+        _tickOpen        = true;
+    }
+
+    bool ClientAct::Step(Position const& next, uint32 movementFlags)  // from SendMove, :11598
+    {
+        if (!Usable())
+            return false;
+
+        // NOTHING MOVES BEFORE THE TICK IS OPENED. Without this an action reached outside the
+        // engine's tick — or after it — would move on a budget nobody refilled or accounted for.
+        if (!_tickOpen)
+        {
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ШАГ {}: отказ — такт не открыт", _self->GetName());
+            return false;
+        }
+
+        // THE BOUND IS THE POINT. Without it this method is a teleport wearing a movement
+        // packet: the handler will accept whatever position it is given.
+        float const allowed = MaxStepYards();
+        float const moved   = _self->GetExactDist2d(next.GetPositionX(), next.GetPositionY());
+        if (moved > allowed)
+        {
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ШАГ {}: отказ — {:.1f} ярдов за такт при разрешённых {:.1f}."
+                " Это попытка переместиться, а не пройти",
+                _self->GetName(), moved, allowed);
+            return false;
+        }
+
+        // AND ONE BOUNDED STEP IS NOT A BOUND. A hundred legal steps in one tick covers the same
+        // ground as one illegal one, so the budget is per tick and this is what spends it.
+        if (moved > _stepBudgetYards)
+        {
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ШАГ {}: отказ — за такт уже пройдено, осталось {:.1f} ярдов из"
+                " {:.1f}, а просят {:.1f}",
+                _self->GetName(), _stepBudgetYards, allowed, moved);
+            return false;
+        }
+
+        // Upward is climbing and is bounded the same way. Downward is falling, which a client
+        // does for free — and two of the module's senders exist precisely to drop a companion
+        // back onto the ground after it got stuck above it (Constellation.cpp:1259, :1509).
+        float const climbed = next.GetPositionZ() - _self->GetPositionZ();
+        if (climbed > allowed)
+        {
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ШАГ {}: отказ — вверх на {:.1f} ярдов при разрешённых {:.1f}",
+                _self->GetName(), climbed, allowed);
+            return false;
+        }
+
+        MovementInfo mi;
+        mi.guid  = _self->GetGUID();
+        mi.pos.Relocate(next);
+        mi.flags = movementFlags;
+        mi.time  = GameTime::GetGameTimeMS();
+        _session->HandleMovementOpcode(CMSG_MOVE_HEARTBEAT, mi);
+        _stepBudgetYards -= moved;
+        return true;
+    }
+
+    // ---- travel ----------------------------------------------------------------------------
+
+    bool ClientAct::ActivateTaxi(ObjectGuid master, uint32 node)    // :3387
+    {
+        if (!Usable() || master.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_ACTIVATE_TAXI);
+        WorldPackets::Taxi::ActivateTaxi taxi(std::move(raw));
+        taxi.Vendor = master;
+        taxi.Node   = node;
+        _session->HandleActivateTaxiOpcode(taxi);
+        return true;
+    }
+
+    bool ClientAct::EnableTaxiNode(ObjectGuid master)               // :9478
+    {
+        if (!Usable() || master.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_ENABLE_TAXI_NODE);
+        WorldPackets::Taxi::EnableTaxiNode enable(std::move(raw));
+        enable.Unit = master;
+        _session->HandleEnableTaxiNodeOpcode(enable);
+        return true;
+    }
+}
