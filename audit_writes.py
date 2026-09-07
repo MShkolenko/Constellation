@@ -16,12 +16,21 @@ from collections import Counter, defaultdict
 
 ROOT = r"F:\core\constellation\src"
 
-OPCODE = re.compile(r"(?:GetSession\(\)|Session)\s*->\s*(Handle\w+Opcode)")
+# ЛЮБОЙ Handle* на сессии — клиентский путь. Первая редакция требовала суффикс `Opcode` и
+# недосчитывала восемь штатных обработчиков (HandleRepopRequest, HandleSpellClick,
+# HandleReclaimCorpse, HandleSpiritHealerActivate, HandleQuestgiverCompleteQuest, три Move*Ack):
+# счётчик переноса был занижен, а сами они попали в «подозрительные».
+OPCODE = re.compile(r"(?:GetSession\(\)|Session)\s*->\s*(Handle\w+)\s*\(")
 PACKET = re.compile(r"WorldPacket\s+\w+\s*\(\s*(CMSG_\w+)")
 
 # любой вызов метода на игроке/существе — без предположений о том, что он делает
 CALL = re.compile(r"\b(self|bot|player|me|target|victim|owner|who|giver|cr|creature|unit|go|obj)"
                   r"\s*->\s*([A-Z]\w*)\s*\(")
+
+# и на СЕССИИ — всё, что не Handle*Opcode. Пропуск, найденный чтением LearnTaxiNode:
+# `c.Session->SendLearnNewTaxiNode(cr)` — прямой внутренний вызов, помеченный «зонд», которого
+# перечисление по мировым объектам не видело вовсе. Сессия — второй вход в ядро.
+SESSION_CALL = re.compile(r"\bSession\s*->\s*(?!Handle)([A-Z]\w*)\s*\(")
 
 # заведомо читающие префиксы — их отсеиваем, остальное показываем
 READ_PREFIX = ("Get", "Is", "Has", "Can", "Find", "Count", "Compute", "Calculate",
@@ -51,6 +60,12 @@ for dirpath, _, files in os.walk(ROOT):
                     if meth in READ_EXACT or meth.startswith(READ_PREFIX):
                         continue
                     if meth.startswith("Handle") and meth.endswith("Opcode"):
+                        continue
+                    other[meth] += 1
+                    where[meth].append("%s:%d" % (fn, n))
+                for m in SESSION_CALL.finditer(s):
+                    meth = "Session->" + m.group(1)
+                    if m.group(1) in READ_EXACT or m.group(1).startswith(READ_PREFIX):
                         continue
                     other[meth] += 1
                     where[meth].append("%s:%d" % (fn, n))
