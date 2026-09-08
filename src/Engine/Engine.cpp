@@ -137,15 +137,43 @@ namespace Constellation::Ai
         // so a bid naming an unregistered action met a `continue` in the tick — silent, every
         // tick, forever. The failure would have looked exactly like "the ladder chose something
         // else", which is the hardest kind of defect to see in a log full of choices.
-        uint32 missing = 0;
+        // §11′ — НЕНАПИСАННОЕ ДЕЙСТВИЕ БОЛЬШЕ НЕ ЗАПРЕЩАЕТ ГОТОВНОСТЬ.
+        //
+        // Здесь стояла проверка «у каждого объявленного ActionId есть объект, иначе не
+        // готовы», и она делала план невыполнимым: объявлено тринадцать, пишутся они по
+        // одному, а тень — весь смысл пошаговости — не могла тикнуть ни разу, пока не
+        // перенесена вся ветка целиком. То есть ворота требовали конца работы для того,
+        // чтобы разрешить её начало.
+        //
+        // Защищала она настоящий дефект — ставка на незарегистрированное действие
+        // встречала молчаливый `continue`, каждый такт и вечно, — но защищала не там.
+        // Недопустимо МОЛЧАНИЕ, а не сама ставка; молчание убрано в самом такте
+        // (см. `BidsUnbacked` ниже), и гарантия цела, а ворота больше не требуют будущего.
+        //
+        // Считаем и докладываем — но одной строкой, а не тринадцатью: сегодня нет ни
+        // одного, и тринадцать ошибок при каждом подъёме мира — это шум, а не сведение.
+        uint32 missingValues = 0;
+        uint32 unwritten = 0;
         for (size_t i = 1; i < size_t(ActionId::Count); ++i)     // 0 is None, deliberately absent
+            if (!_actions[i])
+                ++unwritten;
+        if (unwritten)
         {
-            if (_actions[i])
-                continue;
-            ++missing;
-            TC_LOG_ERROR("server.worldserver",
-                "Constellation ДВИЖОК: действие «{}» ({}) объявлено и не зарегистрировано",
-                NameOf(ActionId(i)), i);
+            // И КАКИХ ИМЕННО. Агрегат «0 из 13» не говорит, что осталось сделать, а весь
+            // смысл этой строки — чтобы подъём мира сам рассказывал, на каком шаге миграция.
+            // Один раз за подъём это предложение, а не шум (Кодекс, п. 5).
+            std::string names;
+            for (size_t i = 1; i < size_t(ActionId::Count); ++i)
+                if (!_actions[i])
+                {
+                    if (!names.empty())
+                        names += ", ";
+                    names += NameOf(ActionId(i));
+                }
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ДВИЖОК: действий объявлено {}, написано {} — миграция идёт."
+                " Нет ещё: {}. Ставка на любое из них будет посчитана и названа в самом такте",
+                uint32(ActionId::Count) - 1, uint32(ActionId::Count) - 1 - unwritten, names);
         }
 
         // §12 — ТО ЖЕ ДЛЯ ЗНАЧЕНИЙ. Без этой проверки незарегистрированное значение
@@ -156,7 +184,7 @@ namespace Constellation::Ai
         {
             if (_values[i])
                 continue;
-            ++missing;
+            ++missingValues;
             TC_LOG_ERROR("server.worldserver",
                 "Constellation ДВИЖОК: значение «{}» ({}) объявлено и не зарегистрировано",
                 NameOf(ValueId(i)), i);
@@ -186,14 +214,14 @@ namespace Constellation::Ai
                 "Constellation ДВИЖОК: отвергнуто регистраций значений: {}."
                 " Дубль или неизвестный идентификатор — отвечал бы не тот", _valuesRejected);
 
-        _ready = (missing == 0 && _rejected == 0 && _valuesRejected == 0);
+        _ready = (missingValues == 0 && _rejected == 0 && _valuesRejected == 0);
         TC_LOG_INFO("server.worldserver",
             "Constellation ДВИЖОК: действий {}, триггеров {}, множителей {}, стратегий {},"
             " мгновенные полёты {} — {}",
             _actions.size(), _triggers.size(), _multipliers.size(), _strategies.size(),
             _instantTaxi ? "ДА" : "нет",
             _ready ? "готов"
-                   : "НЕ ГОТОВ: не зарегистрировано действий " + std::to_string(missing)
+                   : "НЕ ГОТОВ: не зарегистрировано ЗНАЧЕНИЙ " + std::to_string(missingValues)
                      + ", отвергнуто регистраций " + std::to_string(_rejected));
         return _ready;
     }
@@ -496,7 +524,26 @@ namespace Constellation::Ai
 
             Action* action = Find(bid.Action);
             if (!action)
+            {
+                // §11′ — ВОТ ГДЕ СТОЯЛО МОЛЧАНИЕ, и вот где оно убрано. Простой `continue`
+                // делал дефект неотличимым от обычного выбора: кто-то ставит на действие,
+                // которого нет, каждый такт и вечно, а в журнале это выглядит как «выбралось
+                // что-то другое». Кричим ОДИН раз на спутника: при 114 спутниках и 4 Гц повторный
+                // крик утопил бы журнал быстрее, чем донёс бы мысль.
+                // ОДИН КРИК НА ИДЕНТИФИКАТОР, А НЕ НА СПУТНИКА: иначе второе, другое
+                // ненаписанное действие навсегда спрячется за первым.
+                uint32 const bit = uint32(bid.Action) < 32u ? (1u << uint32(bid.Action)) : 0u;
+                if (bit && !(st.UnbackedSeen & bit))
+                {
+                    st.UnbackedSeen |= bit;
+                    TC_LOG_ERROR("server.worldserver",
+                        "Constellation ДВИЖОК {}: ставка на «{}», а такого действия не"
+                        " зарегистрировано — оно не исполнится никогда",
+                        ctx.World.Name(), NameOf(bid.Action));
+                }
+                ++st.BidsUnbacked;
                 continue;
+            }
 
             // §3.3 — two different questions with two different recoveries. USELESS drops the
             // bid; IMPOSSIBLE pushes the alternatives.
