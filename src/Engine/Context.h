@@ -31,6 +31,52 @@ namespace Constellation::Ai
 {
     class ClientAct;
 
+
+    // -----------------------------------------------------------------------------------------
+    // §12 — ЧТО МИР ОТДАЁТ ОБХОДАМИ. Ни одного указателя в мир: значение кэшируется на
+    // секунду, а `Creature*`, проживший секунду, — это висячий указатель, ждущий выгрузки
+    // клетки. Гуид разрешается заново в момент использования — точно так же, как это делает
+    // настоящий клиент, который тоже держит гуид, а не адрес.
+    // -----------------------------------------------------------------------------------------
+
+    // Квест в моём журнале, готовый к сдаче, и место, куда его нести.
+    struct TurnInCandidate
+    {
+        uint32   QuestId    = 0;
+        // 0 = сдать САМОМУ СЕБЕ. Это НЕ «принимающий не найден», а собственное правило
+        // ядра: `HandleQuestgiverCompleteQuest` пропускает самосдачу только при
+        // `QUEST_FLAGS_AUTO_COMPLETE` (Constellation.cpp:7557-7561). Догадка «нет строки
+        // в creature_questender — значит самосдача» ошибается вчетверо: 19 868 против 4 733.
+        uint32   EnderEntry = 0;
+        Position Where;
+        float    Dist       = 0.0f;
+        bool     FromTable  = false;    // позиция из указателя точек, а не от живого существа
+    };
+
+    // Квестодатель, которого ядро сейчас считает выдающим мне что-то прямо сейчас.
+    struct GiverInSight
+    {
+        ObjectGuid Guid;
+        uint32     Entry   = 0;
+        float      Dist    = 0.0f;      // по плоскости, от меня
+        bool       Visible = false;     // IsWithinLOSInMap — НЕ фильтр, а сведение
+    };
+
+    // Квестодатель из указателя карты, загружен он сейчас или нет.
+    struct GiverOnMap
+    {
+        uint32              Entry   = 0;
+        ObjectGuid::LowType SpawnId = 0;
+        Position            Where;
+        float               Dist    = 0.0f;
+    };
+
+    // Посетители — указатели на функцию с контекстом, а не `std::function`: второе аллоцирует,
+    // а весь смысл поправки 9 плана в том, чтобы путь пересчёта не выделял памяти вовсе.
+    using TurnInVisitor     = void (*)(void* user, TurnInCandidate const& t);
+    using GiverSightVisitor = void (*)(void* user, GiverInSight const& g);
+    using GiverIndexVisitor = void (*)(void* user, GiverOnMap const& g);
+
     // Everything an action may ask about the world, and nothing else.
     class WorldView
     {
@@ -77,15 +123,67 @@ namespace Constellation::Ai
         // -- the bags ----------------------------------------------------------------------
         uint32 FreeBagSlots() const;
 
+        // -- обходы мира (§12) ---------------------------------------------------------
+        //
+        // Здесь стояло «anything that scans the world … those are Values with intervals».
+        // Это остаётся верным и теперь выполнено, а не обещано: обход — здесь, частота —
+        // у `Value`. Пер-тактовый обход сетки однажды увёл мировой поток на 99 % ядра
+        // (Constellation.cpp:2786), и именно поэтому звать их напрямую из действия нельзя.
+        //
+        // ВСЁ ЛИЧНОЕ ОСТАЁТСЯ СНАРУЖИ. Чёрные списки, отсрочки и предпочтения живут на
+        // `Companion`, а `Value::Calculate` их не видит и не должно видеть: иначе кэш
+        // протухал бы от того, что у кого-то сменилась отсрочка. Фильтрует действие.
+
+        // Журнал заданий: всё готовое к сдаче, с местом, куда нести. Сетку не обходит.
+        void ForEachCompletedTurnIn(TurnInVisitor visit, void* user) const;
+
+        // ОДИН обход сетки. Отсеивает мёртвых и тех, у кого ядро не видит ЧТО ПРЕДЛОЖИТЬ
+        // прямо сейчас. Маска — та же, что у `NearestQuestGiver` (Constellation.cpp:11566-11574), и
+        // `Future` из неё сознательно исключён: спутник дорастёт и вернётся сам. Проверка
+        // «не None» вместо маски — главная ошибка всей этой ветки: 56 спутников из 122 шли к
+        // ПРИНИМАЮЩЕМУ их же текущего квеста и брали там ноль.
+        void ForEachQuestGiverInRange(float range, GiverSightVisitor visit, void* user) const;
+
+        // Указатель карты, построенный ОДИН раз при загрузке (`Manager::_givers`,
+        // Constellation.cpp:7786-7797). Сетку не трогает вовсе — это чтение таблицы, и именно
+        // поэтому ярус «на карту» не понадобился: таблица уже общая для всех.
+        void ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const;
+
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
-        //   Anything that scans the world (nearest hostile, nearest giver, gather points) —
-        //     those are Values with intervals, because a per-tick grid sweep is what once took
-        //     the world thread to 99 % of a core (Constellation.cpp:2786).
+        //   А mutable anything. Фасад читает; пишет только `ClientAct`.
 
     private:
         Player const* _self;
     };
+
+    // -----------------------------------------------------------------------------------------
+    // ЧТО ДВИЖОК ПРОСИТ У МОДУЛЯ, А НЕ ЗНАЕТ САМ.
+    //
+    // Указатели карты — `_givers`, `_spawns` — живут на `Manager` внутри `Constellation.cpp`,
+    // который движку не виден и виден быть не должен: зависимость туда превратила бы
+    // движок в часть модуля. Поэтому движок ОБЪЯВЛЯЕТ, что ему нужно, а модуль это
+    // определяет — тот же шов, только в другую сторону, и ровно две функции шириной.
+    // -----------------------------------------------------------------------------------------
+
+    // Ближайшая известная точка появления этого вида на этой карте. false = не знаем
+    // ни одной, что НЕ то же, что «его нет в мире»: призываемых в таблице точек нет.
+    bool NearestSpawnOf(uint32 mapId, uint32 entry, Position const& from,
+                        Position* outWhere, float* outDist);
+
+    // Обход указателя квестодателей этой карты в пределах `maxDist` от `from`.
+    void VisitGiverIndex(uint32 mapId, Position const& from, float maxDist,
+                         GiverIndexVisitor visit, void* user);
+
+    // Радиусы — НАСТРОЙКА МОДУЛЯ, И У НЕЁ ОДИН ВЛАДЕЛЕЦ. Движок не читает `Cfg()` —
+    // он её не видит, и правильно: собственная копия числа разошлась бы с конфигом при
+    // первом же `.reload config`, и никто бы не заметил.
+    struct EngineTuning
+    {
+        float QuestGiverRange = 0.0f;   // обзор вокруг себя
+        float GiverSeekRange  = 0.0f;   // как далеко готовы идти по указателю
+    };
+    EngineTuning Tuning();
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

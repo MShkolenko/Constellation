@@ -98,6 +98,31 @@ namespace Constellation::Ai
             _strategies.push_back(std::move(strategy));
     }
 
+    // §12 — ОДИН ПОСТАВЩИК НА ЗНАЧЕНИЕ, И ВТОРОЙ НЕ ТИХО ПОБЕЖДАЕТ.
+    //
+    // Замена молча — тот же класс дефекта, что и `lms load` поверх загруженной модели:
+    // всё работает, отвечает не тот, и ни одно число об этом не говорит. Считаем и
+    // отказываем в готовности там, где есть журнал.
+    void Engine::RegisterValueBase(ValueId id, std::unique_ptr<ValueBase> value)
+    {
+        if (_ready || !value)
+            return;
+        if (id >= ValueId::Count)
+        {
+            ++_valuesRejected;
+            return;
+        }
+        size_t const idx = size_t(id);
+        if (_values.size() <= idx)
+            _values.resize(idx + 1);
+        if (_values[idx])
+        {
+            ++_valuesRejected;      // второй поставщик на тот же идентификатор
+            return;
+        }
+        _values[idx] = std::move(value);
+    }
+
     Action* Engine::Find(ActionId id) const
     {
         size_t const idx = size_t(id);
@@ -123,6 +148,20 @@ namespace Constellation::Ai
                 NameOf(ActionId(i)), i);
         }
 
+        // §12 — ТО ЖЕ ДЛЯ ЗНАЧЕНИЙ. Без этой проверки незарегистрированное значение
+        // даёт разыменование нуля на живом рилме при первом же чтении — не «выбралось что-то
+        // другое», а падение мирового потока (Кодекс, состязательный проход по разбору).
+        _values.resize(size_t(ValueId::Count));
+        for (size_t i = 0; i < size_t(ValueId::Count); ++i)
+        {
+            if (_values[i])
+                continue;
+            ++missing;
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: значение «{}» ({}) объявлено и не зарегистрировано",
+                NameOf(ValueId(i)), i);
+        }
+
         // THE FLIGHT DOOR IS A TELEPORT WHEN THE CORE SAYS SO, AND A WARNING IS NOT A GATE.
         //
         // Player.cpp:23076 — with CONFIG_INSTANT_TAXI set, ActivateTaxiPathTo calls TeleportTo and
@@ -142,7 +181,12 @@ namespace Constellation::Ai
                 "Constellation ДВИЖОК: отвергнуто регистраций без владельца: {}."
                 " Такой триггер или множитель не сработал бы ни у кого", _rejected);
 
-        _ready = (missing == 0 && _rejected == 0);
+        if (_valuesRejected)
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: отвергнуто регистраций значений: {}."
+                " Дубль или неизвестный идентификатор — отвечал бы не тот", _valuesRejected);
+
+        _ready = (missing == 0 && _rejected == 0 && _valuesRejected == 0);
         TC_LOG_INFO("server.worldserver",
             "Constellation ДВИЖОК: действий {}, триггеров {}, множителей {}, стратегий {},"
             " мгновенные полёты {} — {}",
@@ -339,6 +383,11 @@ namespace Constellation::Ai
         st.RunningAbout  = Subject();
         st.RunningRel    = REL_IDLE;
         st.ReplanAfterMs = 0;
+        // §12 — РАБОТА БРОШЕНА, ЗНАЧИТ ОТВЕТЫ О НЕЙ УСТАРЕЛИ. Заголовок уже называл
+        // это место единственным для будущей инвалидации; без этой строки он обещал, а
+        // не делал (Кодекс, пункт 5). Стоит три присвоения `bool` — буферы не трогаются
+        // и свою ёмкость сохраняют.
+        st.Values.InvalidateAll();
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
     }
 

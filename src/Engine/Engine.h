@@ -21,6 +21,7 @@
 #define CONSTELLATION_ENGINE_ENGINE_H
 
 #include "Primitives.h"
+#include "Values.h"
 #include <memory>
 #include <vector>
 
@@ -52,6 +53,12 @@ namespace Constellation::Ai
         // Flat, fixed-size, no allocation — one word per trigger per companion.
         uint32 TriggerLastMs[size_t(TriggerId::Count)] = {};
 
+        // §12 — КЭШ ЗНАЧЕНИЙ ЛЕЖИТ ЗДЕСЬ, А НЕ РЯДОМ, и это единственная причина,
+        // по которой `Discard` покрывает его бесплатно: он обнуляет всю структуру. Склада
+        // вне её нет ни одного, и пока его нет — третьей политики жизненного цикла не
+        // существует. Буферы резервируются в конструкторах `CappedList`, один раз.
+        ValueSlots Values;
+
         ActionId Running         = ActionId::None;   // what we chose last tick
         // §10′ — И О ЧЁМ ОНО БЫЛО. Без этого Cancel не может вернуть резервацию именно той
         // точки: после исполнения движок хранил один ActionId и терял всё остальное.
@@ -73,6 +80,7 @@ namespace Constellation::Ai
         uint32 BidsExpired      = 0;
         uint32 ActionsCancelled = 0;
         uint32 ReentriesReset   = 0;         // §2″ — how often somebody else moved us
+        uint32 ValuesRecomputed = 0;         // §12 — число, по которому проверяют интервалы
     };
 
     class Engine
@@ -92,6 +100,32 @@ namespace Constellation::Ai
         void Register(std::unique_ptr<Trigger> trigger, uint32 ownerMask);
         void Register(std::unique_ptr<Multiplier> multiplier, uint32 ownerMask);
         void Register(std::unique_ptr<Strategy> strategy);
+
+        // §12 — ИДЕНТИФИКАТОР ЗАДАЁТ ТИП, А НЕ СОПРОВОЖДАЕТ ЕГО. Поставщик,
+        // зарегистрированный под чужим идентификатором, — ошибка СБОРКИ, а не неверный
+        // `static_cast` на живом рилме: тип берётся из той же строки того же списка,
+        // что и сам идентификатор.
+        template <ValueId Id>
+        void RegisterValue(std::unique_ptr<Value<typename ValueTraits<Id>::Type>> value)
+        {
+            RegisterValueBase(Id, std::move(value));
+        }
+
+        // Чтение. Слот берётся из состояния СПУТНИКА, поэтому тень и шов, у которых
+        // разные `EngineState`, имеют разные кэши — и тень меряет свой выбор, а не чужой.
+        template <ValueId Id>
+        typename ValueTraits<Id>::Type const& Val(EngineState& st, Ctx& ctx) const
+        {
+            using T = typename ValueTraits<Id>::Type;
+            auto const* v = static_cast<Value<T> const*>(_values[size_t(Id)].get());
+            auto& slot = ValueTraits<Id>::SlotOf(st.Values);
+            bool const was = slot.Computed;
+            uint32 const wasMs = slot.LastMs;
+            T const& out = v->Get(ctx, slot, ctx.NowMs);
+            if (!was || slot.LastMs != wasMs)
+                ++st.ValuesRecomputed;
+            return out;
+        }
 
         Action*  Find(ActionId id) const;
         bool     Ready() const { return _ready; }
@@ -156,6 +190,9 @@ namespace Constellation::Ai
         // are exactly the paths `Reset` cannot serve.
         void Discard(EngineState& st);
 
+        // Сколько значений отвергнуто при регистрации — читается в `Seal()`, где есть журнал.
+        uint32 ValuesRejected() const { return _valuesRejected; }
+
     private:
         Engine() = default;
 
@@ -167,6 +204,8 @@ namespace Constellation::Ai
         // and then what executes is not what was chosen. `outScore` excludes the stickiness
         // bonus deliberately — see the comment in the body.
         size_t Choose(EngineState& st, Ctx& ctx, uint32 nowMs, float& outScore) const;
+        // Нешаблонная половина регистрации: шаблон выше только связывает тип с именем.
+        void RegisterValueBase(ValueId id, std::unique_ptr<ValueBase> value);
         void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance,
                         Run run) const;
 
@@ -183,6 +222,7 @@ namespace Constellation::Ai
         std::vector<Owned<Trigger>>    _triggers;
         std::vector<Owned<Multiplier>> _multipliers;
         std::vector<std::unique_ptr<Strategy>>   _strategies;
+        std::vector<std::unique_ptr<ValueBase>>  _values;       // indexed by ValueId
         bool _ready       = false;
         bool _instantTaxi = false;           // read once at Seal; see Seal()'s comment
 
@@ -191,6 +231,7 @@ namespace Constellation::Ai
         // нельзя: отвергнутый триггер выглядит как ненаписанный, а Seal() при этом сказал бы
         // «готов». Считаем здесь, докладываем и отказываем в готовности там, где есть журнал.
         uint32 _rejected = 0;
+        uint32 _valuesRejected = 0;      // дубль или неизвестный идентификатор значения
     };
 }
 

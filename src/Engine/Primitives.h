@@ -14,6 +14,7 @@
 #ifndef CONSTELLATION_ENGINE_PRIMITIVES_H
 #define CONSTELLATION_ENGINE_PRIMITIVES_H
 
+#include "Context.h"   // §12 — Value<T>::Get читает ctx.World.MapId(); цикла нет
 #include "Define.h"
 #include <string>
 #include <vector>
@@ -76,6 +77,28 @@ namespace Constellation::Ai
     X(Housekeeping, "попутное")                                             \
     X(Follow,       "следование")
 
+    // §12 — ЗНАЧЕНИЯ: всё, что дорого считать и глупо считать каждый такт.
+    //
+    // ЯРУС ОДИН, И ЭТО РЕШЕНИЕ, А НЕ УПУЩЕНИЕ. План v2 (поправка 10) требовал
+    // второй ярус «на карту» со своим складом у `Manager`. Он не строится: факты карты
+    // УЖЕ посчитаны один раз при загрузке (`Constellation.cpp:7786-7797`, `_givers`), а то, что
+    // план назвал `GiversByMap`, фактом карты не является — `FindGiverByMap` (`:10372`) сортирует
+    // по расстоянию ОТ ИГРОКА, фильтрует по ЕГО фракции и ЕГО отсрочкам.
+    // Решение и доказательство: `homelab/.agent/memory/decisions.md`, 2026-09-08.
+#define CONSTELLATION_VALUES(X)                                              \
+    /*  имя              текст                     тип буфера  */         \
+    X(CompletedTurnIns, "готовые к сдаче",       TurnInList)                    \
+    X(GiversInSight,    "квестодатели в обзоре", GiverSightList)                \
+    X(GiversByIndex,    "квестодатели по карте", GiverIndexList)
+
+    enum class ValueId : uint8
+    {
+#define CONSTELLATION_VALUE_ENUM(name, text, type) name,
+        CONSTELLATION_VALUES(CONSTELLATION_VALUE_ENUM)
+#undef CONSTELLATION_VALUE_ENUM
+        Count
+    };
+
     enum class StrategyId : uint8
     {
 #define CONSTELLATION_STRATEGY_ENUM(name, text) name,
@@ -113,6 +136,7 @@ namespace Constellation::Ai
     char const* NameOf(ActionId id);
     char const* NameOf(TriggerId id);
     char const* NameOf(StrategyId id);
+    char const* NameOf(ValueId id);
 
     // ---------------------------------------------------------------------------------------
     // §4.2 — the relevance scale, in our own names, so a number in a log is readable.
@@ -246,6 +270,10 @@ namespace Constellation::Ai
     };
 
     // ---------------------------------------------------------------------------------------
+    // Разброс интервала значения по гуиду. Число не выбрано здесь — оно взято у ветки
+    // `Idle`, где пережило измерение на живом составе (`1000 + guid % 250`).
+    inline constexpr uint32 VALUE_JITTER_MS = 250;
+
     // §3.1 — Value<T>: computed once, cached with an interval.
     //
     // The module proved it needs one: `c.VendScanMs = 5000` exists because a 100-yard grid sweep
@@ -275,45 +303,80 @@ namespace Constellation::Ai
     {
         T      Buffer{};
         uint32 LastMs   = 0;
+        // НА КАКОЙ КАРТЕ ЭТО СЧИТАЛОСЬ. Сегодня спутник карту внутри такта не меняет:
+        // телепортные ветки выходят выше (`Constellation.cpp:2109`), а смена карты проходит
+        // через `EngineReset` ДО построения `Ctx` (`:2661`). Но это свойство сегодняшнего
+        // кода, а не гарантия интерфейса: в двери есть `ActivateTaxi` (`ClientAct.h:104`), а
+        // `Tick` после `Execute` зовёт `Continuers`, которые вполне могут читать значения
+        // (Кодекс, состязательный проход по разбору, пункт 2). Один `uint32` на слот дешевле
+        // правила, которое некому проверить.
+        uint32 MapId    = 0;
         bool   Computed = false;
 
         void Invalidate() { Computed = false; }
     };
 
-    template <class T>
-    class Value
+    // НЕШАБЛОННОЕ ОСНОВАНИЕ, И ОНО НУЖНО НЕ ДЛЯ КРАСОТЫ. `Value<T>` разных T — не
+    // родственники, так что без общего основания их негде сложить и нечем проверить, что
+    // у каждого объявленного `ValueId` есть ровно один поставщик. Именно этой проверки
+    // не хватало `Seal()` по разбору Кодекса (пункт 5): сегодня он смотрит только действия.
+    class ValueBase
     {
     public:
-        explicit Value(uint32 intervalMs = 0) : _intervalMs(intervalMs) { }
-        virtual ~Value() = default;
+        ValueBase(ValueId id, uint32 intervalMs) : _id(id), _intervalMs(intervalMs) { }
+        virtual ~ValueBase() = default;
 
-        Value(Value const&) = delete;
-        Value& operator=(Value const&) = delete;
+        ValueBase(ValueBase const&) = delete;
+        ValueBase& operator=(ValueBase const&) = delete;
+
+        ValueId     Id() const         { return _id; }
+        char const* Name() const       { return NameOf(_id); }
+        uint32      IntervalMs() const { return _intervalMs; }
+
+    private:
+        ValueId _id;
+        uint32  _intervalMs;
+    };
+
+    template <class T>
+    class Value : public ValueBase
+    {
+    public:
+        Value(ValueId id, uint32 intervalMs) : ValueBase(id, intervalMs) { }
 
         // The slot is the companion's; this object owns nothing that varies between them.
         // nowMs is passed in rather than read from a clock so the whole tick shares one
         // timestamp and two values cannot disagree about "now".
         T const& Get(Ctx& ctx, Slot<T>& slot, uint32 nowMs) const
         {
-            if (!slot.Computed || !_intervalMs || nowMs - slot.LastMs >= _intervalMs)
+            // СМЕНА КАРТЫ ГАСИТ КЭШ БЕЗУСЛОВНО, даже если интервал не истёк. Всё, что
+            // считают значения шага 12, привязано к карте: точки появления, расстояния,
+            // обзор сетки. Ответ с чужой карты — не устаревший, а бессмысленный.
+            uint32 const mapId = ctx.World.MapId();
+            // ДЖИТТЕР ПО ГУИДУ, А НЕ ОБЩИЙ ИНТЕРВАЛ. Сто четырнадцать спутников с
+            // одинаковым интервалом тикают в одном мировом обновлении и истекают тоже в
+            // одном: ровный по времени средний расход и пила в пике. Ветка `Idle` уже
+            // разводит свои сканы так же — `1000 + guid % 250` (Constellation.cpp:2591).
+            uint32 const interval = IntervalMs()
+                ? IntervalMs() + (ctx.World.Guid().GetCounter() % VALUE_JITTER_MS)
+                : 0u;
+            if (!slot.Computed || slot.MapId != mapId
+                || !interval || nowMs - slot.LastMs >= interval)
             {
                 Calculate(ctx, slot.Buffer);     // fills, never allocates a new container
                 slot.LastMs   = nowMs;
+                slot.MapId    = mapId;
                 slot.Computed = true;
             }
             return slot.Buffer;
         }
 
-        uint32 IntervalMs() const { return _intervalMs; }
-
     protected:
         // Fills `out`, which the caller owns and which keeps its capacity between recomputes.
         // A collection-valued implementation clears and refills; it must not assign a fresh
-        // container, and it must cap its own growth the way BidSink caps bids.
+        // container, and it must cap its own growth the way BidSink caps bids — `CappedList`
+        // in Values.h does exactly that, and counts what it drops.
         virtual void Calculate(Ctx& ctx, T& out) const = 0;
-
-    private:
-        uint32 _intervalMs = 0;
     };
 
     // ---------------------------------------------------------------------------------------

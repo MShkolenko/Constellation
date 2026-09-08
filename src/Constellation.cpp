@@ -658,6 +658,58 @@ public:
         }
     }
 
+    // §12 — ЧТО ДВИЖОК СПРАШИВАЕТ У МОДУЛЯ. Три ответа, и все три — чтение уже построенных
+    // указателей, а не новый обход: `_spawns` и `_givers` заполняются ОДИН раз при загрузке.
+    // Именно поэтому ярус значений «на карту» не понадобился (решение от 2026-09-08).
+
+    // Ближайшая известная точка появления вида на карте. false = точек нет вовсе, что НЕ то же
+    // самое, что «его нет в мире»: призываемых в таблице точек не бывает.
+    bool NearestSpawnOfEntry(uint32 mapId, uint32 entry, Position const& from,
+                             Position* outWhere, float* outDist) const
+    {
+        auto mapIt = _spawns.find(mapId);
+        if (mapIt == _spawns.end())
+            return false;
+        auto entryIt = mapIt->second.find(entry);
+        if (entryIt == mapIt->second.end())
+            return false;
+        Position const* best = nullptr;
+        float bestDist = 0.0f;
+        for (Position const& pos : entryIt->second)
+        {
+            float const d = from.GetExactDist2d(pos.GetPositionX(), pos.GetPositionY());
+            if (!best || d < bestDist)
+                { bestDist = d; best = &pos; }
+        }
+        if (!best)
+            return false;
+        if (outWhere)
+            *outWhere = *best;
+        if (outDist)
+            *outDist = bestDist;
+        return true;
+    }
+
+    void VisitGiverIndexOnMap(uint32 mapId, Position const& from, float maxDist,
+                              Constellation::Ai::GiverIndexVisitor visit, void* user) const
+    {
+        auto it = _givers.find(mapId);
+        if (it == _givers.end())
+            return;
+        for (Giver const& g : it->second)
+        {
+            float const d = from.GetExactDist2d(g.Where.GetPositionX(), g.Where.GetPositionY());
+            if (d > maxDist)
+                continue;
+            Constellation::Ai::GiverOnMap out;
+            out.Entry   = g.Entry;
+            out.SpawnId = g.SpawnId;
+            out.Where   = g.Where;
+            out.Dist    = d;
+            visit(user, out);
+        }
+    }
+
     // УДАРЫ, СЧИТАННЫЕ САМИМ ЯДРОМ.
     //
     // ЗАМОК ЗДЕСЬ ОБЯЗАТЕЛЕН, И ЭТО НЕ ПЕРЕСТРАХОВКА. На боевом MapUpdate.Threads = 6:
@@ -798,6 +850,9 @@ public:
         if ((Cfg().Engine || Cfg().EngineShadow) && !_engineSealed)
         {
             _engineSealed = true;
+            // §12 — ЗНАЧЕНИЯ РЕГИСТРИРУЮТСЯ ПЕРЕД ЗАПЕЧАТЫВАНИЕМ, иначе `Seal()` откажет
+            // в готовности: он теперь требует поставщика на каждый объявленный `ValueId`.
+            Constellation::Ai::RegisterQuestValues(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -13075,6 +13130,37 @@ private:
 }
 
 } // namespace Constellation
+
+// §12 — РЕАЛИЗАЦИЯ ТОГО, ЧТО ДВИЖОК ОБЪЯВИЛ. Он не видит `Manager` и видеть не должен:
+// зависимость в ту сторону сделала бы движок частью модуля, а весь смысл переноса в обратном.
+// Поэтому шов и здесь: движок объявляет три функции, модуль их определяет, и ширина этого шва —
+// ровно три подписи.
+namespace Constellation::Ai
+{
+    bool NearestSpawnOf(uint32 mapId, uint32 entry, Position const& from,
+                        Position* outWhere, float* outDist)
+    {
+        return Constellation::Manager::Instance()
+            ->NearestSpawnOfEntry(mapId, entry, from, outWhere, outDist);
+    }
+
+    void VisitGiverIndex(uint32 mapId, Position const& from, float maxDist,
+                         GiverIndexVisitor visit, void* user)
+    {
+        Constellation::Manager::Instance()->VisitGiverIndexOnMap(mapId, from, maxDist, visit, user);
+    }
+
+    // РАДИУСЫ ЧИТАЮТСЯ У КОНФИГА КАЖДЫЙ РАЗ, А НЕ КЭШИРУЮТСЯ. `.reload config` меняет их на
+    // живом мире, и копия, снятая при запуске, разошлась бы с настройкой молча — тот же класс
+    // дефекта, что и любая вторая копия числа.
+    EngineTuning Tuning()
+    {
+        EngineTuning t;
+        t.QuestGiverRange = Constellation::Cfg().QuestGiverRange;
+        t.GiverSeekRange  = Constellation::Cfg().GiverSeekRange;
+        return t;
+    }
+}
 
 // КТО ЧТО НОСИТ — ПЕЧАТАЕМ ДАННЫЕ ДО ТОГО, КАК ПО НИМ ПРОДАВАТЬ (Кодекс: DB2 в репозитории
 // нет, продажа необратима). Маска брони каждого класса и наличие каждого оружейного навыка у

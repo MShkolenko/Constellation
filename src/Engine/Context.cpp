@@ -14,6 +14,11 @@
 #include "Context.h"
 
 #include "Bag.h"
+#include "Cell.h"
+#include "CellImpl.h"
+#include "Creature.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
@@ -130,6 +135,119 @@ namespace Constellation::Ai
             && _self->CanTakeQuest(quest, false)
             && _self->SatisfyQuestLog(false)
             && _self->CanAddQuest(quest, false);
+    }
+
+
+    // -----------------------------------------------------------------------------------------
+    // §12 — ОБХОДЫ. Частота не здесь: эти три зовутся только из `Value::Calculate`, а
+    // тот — только когда истёк интервал или сменилась карта.
+    // -----------------------------------------------------------------------------------------
+
+    void WorldView::ForEachCompletedTurnIn(TurnInVisitor visit, void* user) const
+    {
+        if (!_self || !visit)
+            return;
+
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = _self->GetQuestSlotQuestId(slot);
+            if (!qid || _self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(qid);
+            if (!quest || !_self->CanRewardQuest(quest, false))
+                continue;
+
+            TurnInCandidate cand;
+            cand.QuestId = qid;
+
+            // САМОСДАЧА — ПО ФЛАГУ ЯДРА, А НЕ ПО ОТСУТСТВИЮ ПРИНИМАЮЩЕГО.
+            //
+            // Первая версия модуля объявила самосдаваемым любой квест без принимающего-NPC.
+            // Замер по базе: без принимающего и без флага — 19 868 квестов, настоящих
+            // самосдаваемых — 4 733. Ошибка вчетверо, и не в безопасную сторону
+            // (Constellation.cpp:7546-7561).
+            if (quest->HasFlag(QUEST_FLAGS_AUTO_COMPLETE))
+            {
+                cand.EnderEntry = 0;
+                cand.Where      = _self->GetPosition();
+                cand.Dist       = 0.0f;
+                cand.FromTable  = false;
+                visit(user, cand);
+                continue;
+            }
+
+            // ВСЕХ ПРИНИМАЮЩИХ, А НЕ ПЕРВОГО. Здесь главное отличие от `FindTurnIn`:
+            // тот возвращался на первом же и тем самым решал за действие. Значение
+            // отдаёт всех кандидатов; выбирать — дело того, у кого есть отсрочки и цели.
+            for (auto const& pair : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
+            {
+                uint32 const enderEntry = pair.second;
+                Position where;
+                float    dist = 0.0f;
+                if (!NearestSpawnOf(_self->GetMapId(), enderEntry, _self->GetPosition(), &where, &dist))
+                    continue;               // призываемый или на другой карте — идти некуда
+                cand.EnderEntry = enderEntry;
+                cand.Where      = where;
+                cand.Dist       = dist;
+                cand.FromTable  = true;
+                visit(user, cand);
+            }
+        }
+    }
+
+    void WorldView::ForEachQuestGiverInRange(float range, GiverSightVisitor visit, void* user) const
+    {
+        if (!_self || !visit || range <= 0.0f)
+            return;
+
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(_self, range);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(_self, around, check);
+        Cell::VisitGridObjects(_self, searcher, range);
+
+        // МАСКА, А НЕ «НЕ None». Это главная ошибка всей ветки, и она измерена:
+        // `GetQuestDialogStatus` возвращает МАСКУ всего, что NPC значит для игрока сейчас —
+        // включая `Reward` (у меня есть НЕЗАВЕРШЁННЫЙ квест, который он ПРИНИМАЕТ — серый
+        // знак) и `Future` (квест есть, но уровнем не дорос). Проверка `!= None` принимала
+        // всё это за «есть что взять»: 56 спутников из 122 шли к ПРИНИМАЮЩЕМУ их же текущего
+        // квеста, а за день взят ОДИН квест на весь состав (Constellation.cpp:11547-11576).
+        //
+        // `Future` исключён СОЗНАТЕЛЬНО: спутник дорастёт и вернётся сам.
+        QuestGiverStatus const offers =
+              QuestGiverStatus::Quest              | QuestGiverStatus::Trivial
+            | QuestGiverStatus::DailyQuest         | QuestGiverStatus::TrivialDailyQuest
+            | QuestGiverStatus::RepeatableQuest    | QuestGiverStatus::TrivialRepeatableQuest
+            | QuestGiverStatus::MetaQuest          | QuestGiverStatus::TrivialMetaQuest
+            | QuestGiverStatus::JourneyQuest       | QuestGiverStatus::TrivialJourneyQuest
+            | QuestGiverStatus::LegendaryQuest     | QuestGiverStatus::TrivialLegendaryQuest
+            | QuestGiverStatus::ImportantQuest     | QuestGiverStatus::TrivialImportantQuest
+            | QuestGiverStatus::CovenantCallingQuest;
+
+        for (Creature* creature : around)
+        {
+            if (!creature->IsAlive())
+                continue;
+            if ((_self->GetQuestDialogStatus(creature) & offers) == QuestGiverStatus::None)
+                continue;
+
+            GiverInSight g;
+            g.Guid    = creature->GetGUID();
+            g.Entry   = creature->GetEntry();
+            g.Dist    = _self->GetExactDist2d(creature);
+            // ВИДИМОСТЬ — СВЕДЕНИЕ, А НЕ ФИЛЬТР, и это оплачено: у гнома Ноббина
+            // единственный предлагающий стоял в восьми ярдах ЗА СТЕНКОЙ мастерской — «не
+            // видно 1, выбран никто», и так у семи гномов. Дорога строится по сетке, а не
+            // по лучу (Constellation.cpp:11624-11628). Предпочтение видимым оказывает действие.
+            g.Visible = _self->IsWithinLOSInMap(creature);
+            visit(user, g);
+        }
+    }
+
+    void WorldView::ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const
+    {
+        if (!_self || !visit)
+            return;
+        VisitGiverIndex(_self->GetMapId(), _self->GetPosition(), maxDist, visit, user);
     }
 
     uint32 WorldView::FreeBagSlots() const
