@@ -85,9 +85,14 @@ namespace Constellation::Ai
 
     // Caps, and where each number comes from. They are named here so they can be argued with.
     //
-    //   turn-ins   — the quest log cannot hold more, so this cap can never bind. It exists to
-    //                give the container a reservation, not as a policy. Asked of the core
-    //                (MAX_QUEST_LOG_SIZE) rather than chosen, which is the standing rule.
+    //   turn-ins   — ONE candidate per quest, so the quest log bounds it and the cap cannot
+    //                bind. That sentence was FALSE for one revision: the scan emitted every
+    //                ender, a quest can have up to sixteen (one does; 61 have twelve, 482 have
+    //                two, 20 107 have one), and the comment claimed the cap was unreachable
+    //                while candidates could silently drop. Codex found it. The fix was to emit
+    //                the NEAREST ender per quest, which restores the bound AND beats the old
+    //                behaviour, since `FindTurnIn` took whichever ender came first.
+    //                The number is still asked of the core, not chosen.
     //   in sight   — the live log's own «проверено N» lines top out at 24 within
     //                QuestGiverRange; 32 leaves headroom without doubling the buffer.
     //   by index   — only the nearest is ever walked to; sixteen is enough that per-spawn

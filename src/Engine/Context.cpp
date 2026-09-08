@@ -176,9 +176,19 @@ namespace Constellation::Ai
                 continue;
             }
 
-            // ВСЕХ ПРИНИМАЮЩИХ, А НЕ ПЕРВОГО. Здесь главное отличие от `FindTurnIn`:
-            // тот возвращался на первом же и тем самым решал за действие. Значение
-            // отдаёт всех кандидатов; выбирать — дело того, у кого есть отсрочки и цели.
+            // БЛИЖАЙШИЙ ПРИНИМАЮЩИЙ, А НЕ ПЕРВЫЙ И НЕ ВСЕ.
+            //
+            // `FindTurnIn` возвращался на ПЕРВОМ принимающем в порядке связей ядра — то есть в
+            // произвольном. Первая версия этого обхода отдавала ВСЕХ, и Кодекс был прав:
+            // тогда потолок списка переставал быть обоснован размером журнала заданий, и
+            // кандидаты могли МОЛЧА теряться. Цифры из базы: у 20 107 квестов принимающий
+            // один, у 482 их два, у 61 — двенадцать, у одного — шестнадцать.
+            //
+            // Один кандидат на квест возвращает потолку его обоснование и заодно улучшает
+            // поведение: ближайший лучше произвольного. Зернистость та же, что у остального
+            // модуля: отсрочка `TurnInBackoff` ведётся по КВЕСТУ, а не по принимающему.
+            bool  found    = false;
+            float bestDist = 0.0f;
             for (auto const& pair : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
             {
                 uint32 const enderEntry = pair.second;
@@ -186,12 +196,17 @@ namespace Constellation::Ai
                 float    dist = 0.0f;
                 if (!NearestSpawnOf(_self->GetMapId(), enderEntry, _self->GetPosition(), &where, &dist))
                     continue;               // призываемый или на другой карте — идти некуда
+                if (found && dist >= bestDist)
+                    continue;
+                found           = true;
+                bestDist        = dist;
                 cand.EnderEntry = enderEntry;
                 cand.Where      = where;
                 cand.Dist       = dist;
                 cand.FromTable  = true;
-                visit(user, cand);
             }
+            if (found)
+                visit(user, cand);
         }
     }
 
@@ -245,7 +260,7 @@ namespace Constellation::Ai
 
     void WorldView::ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const
     {
-        if (!_self || !visit)
+        if (!_self)
             return;
         VisitGiverIndex(_self->GetMapId(), _self->GetPosition(), maxDist, visit, user);
     }
