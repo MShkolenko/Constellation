@@ -303,7 +303,8 @@ namespace Constellation::Ai
         return 0;
     }
 
-    void Engine::LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const
+    void Engine::LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance,
+                           Run run) const
     {
         // §5 — every decision says why. An engine whose choice cannot be read back is worse than
         // the `if` chain it replaces, because at least a chain can be read top to bottom.
@@ -315,7 +316,8 @@ namespace Constellation::Ai
         if (chosen.Id() == st.Running)
             return;
         TC_LOG_INFO("server.worldserver",
-            "Constellation РЕШЕНИЕ {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {})",
+            "Constellation {} {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {})",
+            run == Run::Shadow ? "ТЕНЬ" : "РЕШЕНИЕ",
             ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
             st.AssignmentEpoch, st.Queue.size(), st.BidsDropped);
     }
@@ -367,7 +369,7 @@ namespace Constellation::Ai
         st.BidsDropped = dropped;
     }
 
-    bool Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch)
+    bool Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run)
     {
         if (!_ready)
             return false;
@@ -386,7 +388,10 @@ namespace Constellation::Ai
         }
 
         // §11 — the movement budget is per tick, and nothing may move before it is opened.
-        ctx.Act.ResetTick();
+        // В ТЕНИ ТАКТ НЕ ОТКРЫВАЕТСЯ ВОВСЕ: Execute не зовётся, значит ходить нечему, а
+        // открытый бюджет позволил бы двинуться чему-то, что тень запускать не должна.
+        if (run == Run::Decide)
+            ctx.Act.ResetTick();
 
         // §4.1 — a bid made three seconds ago is answering a world that has moved on.
         size_t const before = st.Queue.size();
@@ -492,14 +497,17 @@ namespace Constellation::Ai
                 }
             }
 
-            if (action->Execute(ctx, bid))
+            // §10 — В ТЕНИ ИСПОЛНЕНИЯ НЕТ. Считаем его удавшимся: иначе ветка альтернатив
+            // разошлась бы с настоящей на первом же отказе, и сравнивать было бы нечего.
+            bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
+            if (ran)
             {
                 // §4.4′ — NEW work gets a new salt; continuing the same work keeps it, so the
                 // choice is stable within an assignment and decorrelated across them.
                 if (bid.Action != st.Running)
                     ++st.AssignmentEpoch;
 
-                LogChoice(st, ctx, *action, rel);
+                LogChoice(st, ctx, *action, rel, run);
                 st.Scratch.clear();
                 BidSink sink(st.Scratch, st.BidsDropped);
                 action->Continuers(ctx, bid, sink);

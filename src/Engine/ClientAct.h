@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Constellation — the one door through which an action may touch the world.
  *
  * Contract: homelab/.agent/design/constellation-engine/engine-spec-v1.md §6, as amended by v2
@@ -38,7 +38,18 @@ namespace Constellation::Ai
     class ClientAct
     {
     public:
-        ClientAct(Player* self, WorldSession* session) : _self(self), _session(session) { }
+        // `muted` closes the door outright: every write below returns false and is counted.
+        //
+        // §10 — THE SHADOW NEEDS THIS TO BE STRUCTURAL. It was "safe" only because the engine
+        // happens not to call `Execute` in shadow — but `Ctx` hands a mutable `ClientAct` to
+        // every virtual, `Trigger::Check` included, and `Reset` calls `Action::Cancel`, which is
+        // an observable act. "Nobody calls it" is a property of today's code; a muted door is a
+        // property of the type.
+        ClientAct(Player* self, WorldSession* session, bool muted = false)
+            : _self(self), _session(session), _muted(muted) { }
+
+        bool Muted() const { return _muted; }
+        uint32 Refused() const { return _refused; }
 
         // NO ACCESSOR FOR THE PLAYER, AND THE REASON IS SHARP.
         //
@@ -49,7 +60,19 @@ namespace Constellation::Ai
         // handler in the core, and the door this class exists to be was standing open.
         //
         // Identity and state reach an action through Ctx's read-only views instead (§6′).
-        bool Usable() const { return _self && _session; }
+        //
+        // EVERY write method's first statement is `if (!Usable()) return false;`, so muting here
+        // closes all sixteen at once — and closes the seventeenth before it is written, which is
+        // the only way a rule like this survives new code.
+        bool Usable() const
+        {
+            if (_muted)
+            {
+                ++_refused;
+                return false;
+            }
+            return _self && _session;
+        }
 
         // -- talking -----------------------------------------------------------------------
         bool QuestGiverHello(ObjectGuid giver);                     // CMSG_QUEST_GIVER_HELLO
@@ -125,6 +148,8 @@ namespace Constellation::Ai
         WorldSession* _session;
         float         _stepBudgetYards = 0.0f;   // spent by Step, refilled by ResetTick
         bool          _tickOpen        = false;  // no movement before the engine opens the tick
+        bool          _muted           = false;  // §10 — тень: дверь закрыта наглухо
+        mutable uint32 _refused        = 0;      // сколько раз в неё постучали при этом
     };
 }
 

@@ -115,10 +115,24 @@ namespace Constellation::Ai
         // does not own it would do nothing at all, every tick, forever.
         static bool Owns(uint8 /*mode*/) { return false; }
 
+        // §10 — THE SHADOW: the engine chooses and does NOT execute, while the ladder still
+        // decides.
+        //
+        // Spec §9′ named an off-realm replay harness as the gate; the operator approved the live
+        // shadow in its place (decisions.md, 2026-09-07). It is cheaper than a canary and
+        // stronger: it runs on the WHOLE roster at once and can break nothing, because Execute
+        // is never called and the movement tick is never opened.
+        //
+        // HONEST LIMIT: the shadow shows what would be CHOSEN, not what would SUCCEED. Execute's
+        // return is unknowable without running it, so the shadow treats execution as successful —
+        // otherwise the alternative and prerequisite branches would diverge from the real ones at
+        // the first failure and there would be nothing left to compare.
+        enum class Run : uint8 { Decide, Shadow };
+
         // §4.1 — one tick. `modeEpoch` is the module's counter of mode changes for this
         // companion; if it moved since we last ticked, somebody else put us here and every bit
         // of our state is stale (§2″). Returns true if an action executed.
-        bool Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch);
+        bool Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run = Run::Decide);
 
         // §2″ — give up the work, keep the mode, decide again next tick. THIS IS NOT A HANDOFF,
         // and the naming matters: calling it one is what produced a contract that contradicted
@@ -153,7 +167,8 @@ namespace Constellation::Ai
         // and then what executes is not what was chosen. `outScore` excludes the stickiness
         // bonus deliberately — see the comment in the body.
         size_t Choose(EngineState& st, Ctx& ctx, uint32 nowMs, float& outScore) const;
-        void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const;
+        void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance,
+                        Run run) const;
 
         std::vector<std::unique_ptr<Action>>     _actions;      // indexed by ActionId
         // ОДИН ВЕКТОР, А НЕ ДВА ПАРАЛЛЕЛЬНЫХ. Раньше объект и маска владельца лежали в разных

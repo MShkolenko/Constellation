@@ -138,6 +138,10 @@ struct Settings
     // проверяемо (план v2, §9′). Выключение перестаёт быть спасением с того коммита,
     // который сотрёт первое тело ветки — тогда откат это предыдущий бинарь.
     bool  Engine          = false;
+    // §10 — ТЕНЬ. Отдельный флаг, а не режим шва: тень включают на ВСЁМ составе, чтобы
+    // дефект вроде общего состояния триггеров был виден в масштабе, а шов — только когда
+    // движку есть что исполнять. Обе по умолчанию выключены.
+    bool  EngineShadow    = false;
     uint32 MaxActive      = 0;
     uint32 PerTick        = 6;
     uint32 MaxQuests      = 10;
@@ -186,6 +190,7 @@ struct Settings
         Loot            = sConfigMgr->GetBoolDefault("Constellation.Loot", false);
         Vending         = sConfigMgr->GetBoolDefault("Constellation.Vending", false);
         Engine          = sConfigMgr->GetBoolDefault("Constellation.Engine", false);
+        EngineShadow    = sConfigMgr->GetBoolDefault("Constellation.EngineShadow", false);
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
         MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
@@ -253,6 +258,20 @@ struct Companion
     ObjectGuid Guid;                    // filled once the character exists
     WorldSession* Session = nullptr;    // owned by the module, not the manager
     Constellation::Ai::EngineState Engine;   // ставки, счётчики, отметки триггеров
+    // §10 — У ТЕНИ СВОЁ СОСТОЯНИЕ, И ЭТО НЕ АККУРАТНОСТЬ.
+    //
+    // Общее состояние делало тень бессмысленной И опасной сразу. Тень считает
+    // исполнение удавшимся — иначе ветки альтернатив разошлись бы с настоящими на
+    // первом же провале, — а значит она ставила `Running`, двигала `AssignmentEpoch`,
+    // добавляла продолжения и остывания в ТО ЖЕ состояние, по которому решает шов.
+    // При двух включённых флагах шов исполнил бы продолжение хода, который в жизни
+    // провалился бы, а само сравнение «что выбрал бы движок» перестало бы быть честным
+    // даже при одном: тень сравнивала бы себя с последствиями самой себя.
+    Constellation::Ai::EngineState EngineShadow;
+    // В тени отказ двери — НЕ нормальное событие, а дефект: кто-то пишет в мир из
+    // `Check` или `Cancel`. Один крик на спутника, и больше молча: 122 спутника × 4 Гц
+    // сделали бы из диагностики затопление журнала.
+    bool EngineShadowRefusedLogged = false;
     // §2″ — счётчик смен режима. Двигается ТОЛЬКО в Switch(), единственном центральном
     // месте смены. Движок сравнивает его со своим и сбрасывается, если обнаружил себя в
     // своём режиме, куда сам не входил: иначе он подействовал бы на состояние, которое
@@ -633,7 +652,10 @@ public:
     void EngineResetAll()
     {
         for (Companion& c : _companions)
+        {
             Constellation::Ai::Engine::Instance().Discard(c.Engine);
+            Constellation::Ai::Engine::Instance().Discard(c.EngineShadow);
+        }
     }
 
     // УДАРЫ, СЧИТАННЫЕ САМИМ ЯДРОМ.
@@ -773,7 +795,7 @@ public:
         //
         // За флагом — чтобы обычный боевой не видел ни строчки, пока перенос не дойдёт
         // до первого действия.
-        if (Cfg().Engine && !_engineSealed)
+        if ((Cfg().Engine || Cfg().EngineShadow) && !_engineSealed)
         {
             _engineSealed = true;
             Constellation::Ai::Engine::Instance().Seal();
@@ -2641,6 +2663,37 @@ public:
             if (c.EngineMapId)
                 EngineReset(c, Constellation::Ai::CancelReason::MapChanged);
             c.EngineMapId = self->GetMapId();
+        }
+
+        // ============================== ТЕНЬ ==============================
+        //
+        // Движок выбирает и пишет «ТЕНЬ <имя>: выбрал бы X», а решает по-прежнему лестница
+        // ниже. Никакого `return`: управление уходит в `switch`, как будто тени и нет.
+        //
+        // НЕ ОГРАНИЧЕНА `Owns`, и это намеренно. `Owns` ложно для всех веток и останется
+        // ложно до первого переноса — тень, ограниченная владением, не запустилась бы
+        // никогда, то есть ворота, которыми её объявили, не существовали бы.
+        //
+        // Исполнять она не может ПО ТИПУ, а не по тому, что её никто не зовёт. Дверь
+        // заглушена (`muted`), и это важнее, чем кажется: `Ctx` раздаёт ИЗМЕНЯЕМЫЙ
+        // `ClientAct` всем виртуальным крючкам — включая `Trigger::Check` и `Action::Cancel`,
+        // который зовётся при смене эпохи. «`Execute` не зовётся» — свойство сегодняшнего
+        // кода, а заглушённая дверь — свойство типа (Кодекс, проход по шагу 10).
+        if (Cfg().EngineShadow && Constellation::Ai::Engine::Instance().Ready())
+        {
+            Constellation::Ai::WorldView view(self);
+            Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
+            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Engine::Instance().Tick(c.EngineShadow, ctx, c.ModeEpoch,
+                Constellation::Ai::Engine::Run::Shadow);
+            if (act.Refused() && !c.EngineShadowRefusedLogged)
+            {
+                c.EngineShadowRefusedLogged = true;
+                TC_LOG_ERROR("server.worldserver",
+                    "Constellation ТЕНЬ {}: дверь отказала {} раз за такт — значит что-то пишет в "
+                    "мир из Check или Cancel, и без заглушки тень бы его исполнила",
+                    c.PersistentName, act.Refused());
+            }
         }
 
         // ============================ ШОВ ДВИЖКА ============================
@@ -12736,18 +12789,35 @@ private:
     // отменять; иначе состояние чистится без вызова Cancel — отменять нечего.
     void EngineReset(Companion& c, Constellation::Ai::CancelReason why)
     {
-        if (!Cfg().Engine)
+        // ОБА ФЛАГА, А НЕ ОДИН. Здесь стояло `if (!Cfg().Engine) return;`, и тогда
+        // состояние тени переживало и смерть, и смену карты, и выход из мира — то есть
+        // тень сравнивала свежее решение лестницы со своим прошлогодним состоянием.
+        // Дефект нашёл Кодекс; он портит НЕ мир, а измерение, ради которого тень и есть.
+        if (!Cfg().Engine && !Cfg().EngineShadow)
             return;
         Player* self = c.Session ? c.Session->GetPlayer() : nullptr;
         if (!self)
         {
-            Constellation::Ai::Engine::Instance().Discard(c.Engine);   // мира нет — отменять нечего, освобождать есть
+            // мира нет — отменять нечего, освобождать есть
+            Constellation::Ai::Engine::Instance().Discard(c.Engine);
+            Constellation::Ai::Engine::Instance().Discard(c.EngineShadow);
             return;
         }
         Constellation::Ai::WorldView view(self);
-        Constellation::Ai::ClientAct act(self, c.Session);
-        Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
-        Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
+        if (Cfg().Engine)
+        {
+            Constellation::Ai::ClientAct act(self, c.Session);
+            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
+        }
+        if (Cfg().EngineShadow)
+        {
+            // Своя дверь и тоже заглушённая: `Reset` зовёт `Action::Cancel`, а тот
+            // вполне может захотеть отправить пакет — отмена цели, остановка атаки.
+            Constellation::Ai::ClientAct shadowAct(self, c.Session, /*muted=*/true);
+            Constellation::Ai::Ctx shadowCtx{ view, shadowAct, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Engine::Instance().Reset(c.EngineShadow, shadowCtx, why);
+        }
     }
 
     void DropSession(Companion& c)
@@ -12797,6 +12867,7 @@ private:
         // безвредно (накапливать нечему), а на шаге 28 это была бы утечка резервации,
         // переживающая сам мир.
         Constellation::Ai::Engine::Instance().Discard(c.Engine);
+        Constellation::Ai::Engine::Instance().Discard(c.EngineShadow);
         // Dismissed survives AutoSummon: only .summon (or restart) re-enters the
         // pipeline. Shutdown uses it too — the world is going away anyway.
         c.State = Stage::Dismissed;
@@ -13059,11 +13130,18 @@ public:
     void OnConfigLoad(bool /*reload*/) override
     {
         bool const engineWas = Constellation::Cfg().Engine;
+        bool const shadowWas = Constellation::Cfg().EngineShadow;
         Constellation::Cfg().Load();
         // §10′ — ВЫКЛЮЧЕНИЕ ШВА ГАСИТ РАБОТУ ВСЕХ, а не просто перестаёт её начинать.
         // Без этого ставки, эпохи и будущие резервации пережили бы `.reload config` и
         // ждали бы обратного включения — то есть выключение не было бы откатом.
-        if (engineWas && !Constellation::Cfg().Engine)
+        //
+        // ТЕНЬ ТОЖЕ, и по той же причине с обратным знаком: её выключают, чтобы
+        // перестать мерять, а пережившее состояние сделало бы следующее включение
+        // продолжением старого замера, а не новым замером. Гасим оба состояния
+        // вместе: раздельный сброс был бы третьим путём жизненного цикла, а их и так два.
+        if ((engineWas && !Constellation::Cfg().Engine)
+            || (shadowWas && !Constellation::Cfg().EngineShadow))
             Constellation::Manager::Instance()->EngineResetAll();
     }
 
