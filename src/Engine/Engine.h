@@ -61,6 +61,11 @@ namespace Constellation::Ai
         uint32   AssignmentEpoch = 0;        // §4.4′ — bumped when NEW work is chosen, and on Reset
         uint32   ModeEpochSeen   = 0;        // §2″ — the module's epoch when we last ticked
 
+        // §9 — WHICH STRATEGIES THIS COMPANION RUNS. One word, not an owning container: the
+        // canary of the plan is a strategy set, and a set that costs a vector per companion
+        // would have reintroduced the per-tick allocation §11 forbids.
+        uint32   StrategyMask    = 0;
+
         // §11 — reported, because "456 ticks a second is affordable" is an argument, not a
         // measurement. A number that is never printed is a number nobody checks.
         uint32 BidsPushed       = 0;
@@ -78,8 +83,14 @@ namespace Constellation::Ai
         // Registration. Called once at load; the registries are shared by every companion
         // because an Action holds no per-companion state — that lives in EngineState and Ctx.
         void Register(std::unique_ptr<Action> action);
-        void Register(std::unique_ptr<Trigger> trigger);
-        void Register(std::unique_ptr<Multiplier> multiplier);
+        // §9 — OWNERSHIP IS DECLARED HERE, not asked for later. A trigger and a multiplier are
+        // registered together with the strategy that owns them, so the engine can build one mask
+        // each at Seal() and filter by a bitwise and instead of collecting vectors per tick.
+        // Владельцев может быть НЕСКОЛЬКО: маска, а не один идентификатор. Хранилище это
+        // допускало с самого начала, а приём — нет, и общий триггер пришлось бы дублировать.
+        // Пишется как MaskOf(StrategyId::Quests) или MaskOf(a) | MaskOf(b).
+        void Register(std::unique_ptr<Trigger> trigger, uint32 ownerMask);
+        void Register(std::unique_ptr<Multiplier> multiplier, uint32 ownerMask);
         void Register(std::unique_ptr<Strategy> strategy);
 
         Action*  Find(ActionId id) const;
@@ -135,7 +146,7 @@ namespace Constellation::Ai
         Engine() = default;
 
         bool  Push(EngineState& st, std::vector<Bid> const& bids, float forced, uint32 nowMs);
-        float MultipliedRelevance(Action& action, Ctx& ctx, float relevance,
+        float MultipliedRelevance(Action& action, Ctx& ctx, uint32 strategyMask, float relevance,
                                   char const** vetoedBy) const;
         // Returns the winning bid's index AND the score it won on. The score leaves the function
         // because calling Score() a second time before executing could return a different number,
@@ -145,11 +156,26 @@ namespace Constellation::Ai
         void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const;
 
         std::vector<std::unique_ptr<Action>>     _actions;      // indexed by ActionId
-        std::vector<std::unique_ptr<Trigger>>    _triggers;
-        std::vector<std::unique_ptr<Multiplier>> _multipliers;
+        // ОДИН ВЕКТОР, А НЕ ДВА ПАРАЛЛЕЛЬНЫХ. Раньше объект и маска владельца лежали в разных
+        // векторах и добавлялись двумя push_back подряд: они МОГЛИ разойтись, и утверждение в
+        // Seal() только заметило бы это, а не предотвратило. Пара не расходится по устройству.
+        template <class T> struct Owned
+        {
+            std::unique_ptr<T> Obj;
+            uint32             Owners = 0;
+        };
+
+        std::vector<Owned<Trigger>>    _triggers;
+        std::vector<Owned<Multiplier>> _multipliers;
         std::vector<std::unique_ptr<Strategy>>   _strategies;
         bool _ready       = false;
         bool _instantTaxi = false;           // read once at Seal; see Seal()'s comment
+
+        // §9 — ОТКАЗ В РЕГИСТРАЦИИ НЕ ИСЧЕЗАЕТ БЕССЛЕДНО. Регистрация идёт до того, как
+        // логирование заведомо настроено, поэтому кричать на месте нельзя — но и молчать
+        // нельзя: отвергнутый триггер выглядит как ненаписанный, а Seal() при этом сказал бы
+        // «готов». Считаем здесь, докладываем и отказываем в готовности там, где есть журнал.
+        uint32 _rejected = 0;
     };
 }
 

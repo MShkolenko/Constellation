@@ -68,16 +68,28 @@ namespace Constellation::Ai
         _actions[idx] = std::move(action);
     }
 
-    void Engine::Register(std::unique_ptr<Trigger> trigger)
+    void Engine::Register(std::unique_ptr<Trigger> trigger, uint32 ownerMask)
     {
-        if (!_ready && trigger)
-            _triggers.push_back(std::move(trigger));
+        if (_ready || !trigger)
+            return;
+        if (!ownerMask)
+        {
+            ++_rejected;      // владельца нет — сработать не сможет никогда
+            return;
+        }
+        _triggers.push_back(Owned<Trigger>{ std::move(trigger), ownerMask });
     }
 
-    void Engine::Register(std::unique_ptr<Multiplier> multiplier)
+    void Engine::Register(std::unique_ptr<Multiplier> multiplier, uint32 ownerMask)
     {
-        if (!_ready && multiplier)
-            _multipliers.push_back(std::move(multiplier));
+        if (_ready || !multiplier)
+            return;
+        if (!ownerMask)
+        {
+            ++_rejected;
+            return;
+        }
+        _multipliers.push_back(Owned<Multiplier>{ std::move(multiplier), ownerMask });
     }
 
     void Engine::Register(std::unique_ptr<Strategy> strategy)
@@ -125,13 +137,20 @@ namespace Constellation::Ai
                 "Constellation ДВИЖОК: InstantFlightPaths включён — ядро телепортирует по"
                 " CMSG_ACTIVATE_TAXI (Player.cpp:23076). Полёты движком ЗАПРЕЩЕНЫ на этом мире.");
 
-        _ready = (missing == 0);
+        if (_rejected)
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: отвергнуто регистраций без владельца: {}."
+                " Такой триггер или множитель не сработал бы ни у кого", _rejected);
+
+        _ready = (missing == 0 && _rejected == 0);
         TC_LOG_INFO("server.worldserver",
             "Constellation ДВИЖОК: действий {}, триггеров {}, множителей {}, стратегий {},"
             " мгновенные полёты {} — {}",
             _actions.size(), _triggers.size(), _multipliers.size(), _strategies.size(),
             _instantTaxi ? "ДА" : "нет",
-            _ready ? "готов" : "НЕ ГОТОВ, не зарегистрировано действий: " + std::to_string(missing));
+            _ready ? "готов"
+                   : "НЕ ГОТОВ: не зарегистрировано действий " + std::to_string(missing)
+                     + ", отвергнуто регистраций " + std::to_string(_rejected));
         return _ready;
     }
 
@@ -165,11 +184,17 @@ namespace Constellation::Ai
         return pushed;
     }
 
-    float Engine::MultipliedRelevance(Action& action, Ctx& ctx, float relevance,
-                                      char const** vetoedBy) const
+    float Engine::MultipliedRelevance(Action& action, Ctx& ctx, uint32 strategyMask,
+                                      float relevance, char const** vetoedBy) const
     {
-        for (auto const& m : _multipliers)
+        for (size_t i = 0; i < _multipliers.size(); ++i)
         {
+            // §9 — только множители тех стратегий, что включены у ЭТОГО спутника. Проверка
+            // битовая, потому что собирать вектор указателей на каждую оценённую ставку
+            // означало бы выделение на такте — ровно то, что §11 запрещает.
+            if (!(_multipliers[i].Owners & strategyMask))
+                continue;
+            auto const& m = _multipliers[i].Obj;
             float const k = m->Of(action, ctx);
             relevance *= k;
             if (relevance <= 0.0f)
@@ -372,8 +397,12 @@ namespace Constellation::Ai
 
         // §4.1 — triggers, each on its own interval. Checking every trigger every tick is what
         // the module's hand-rolled throttles exist to avoid; here the interval is declared.
-        for (auto const& t : _triggers)
+        for (size_t ti = 0; ti < _triggers.size(); ++ti)
         {
+            // §9 — триггер работает, только если его стратегия включена у этого спутника.
+            if (!(_triggers[ti].Owners & st.StrategyMask))
+                continue;
+            auto const& t = _triggers[ti].Obj;
             uint32& lastMs = st.TriggerLastMs[size_t(t->Id())];
             if (!t->NeedsCheck(now, lastMs))
                 continue;
@@ -391,9 +420,11 @@ namespace Constellation::Ai
         // a companion with nothing to do the moment no trigger fired.
         for (auto const& s : _strategies)
         {
+            if (!(MaskOf(s->Id()) & st.StrategyMask))
+                continue;
             st.Scratch.clear();
             BidSink sink(st.Scratch, st.BidsDropped);
-            s->DefaultBids(sink);
+            s->DefaultBids(ctx, sink);
             Push(st, st.Scratch, 0.0f, now);
         }
 
@@ -421,7 +452,7 @@ namespace Constellation::Ai
             // THE SCORE SELECTION COMPUTED, not a second call to Score(). Calling it again could
             // return a different number, and then what executes is not what won.
             char const* vetoedBy = nullptr;
-            float const rel = MultipliedRelevance(*action, ctx, chosenScore, &vetoedBy);
+            float const rel = MultipliedRelevance(*action, ctx, st.StrategyMask, chosenScore, &vetoedBy);
             if (rel <= 0.0f)
             {
                 TC_LOG_DEBUG("server.worldserver",

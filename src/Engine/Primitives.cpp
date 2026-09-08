@@ -28,12 +28,21 @@ namespace Constellation::Ai
 #undef CONSTELLATION_TRIGGER_NAME
         };
 
+        char const* const STRATEGY_NAMES[] =
+        {
+#define CONSTELLATION_STRATEGY_NAME(name, text) text,
+            CONSTELLATION_STRATEGIES(CONSTELLATION_STRATEGY_NAME)
+#undef CONSTELLATION_STRATEGY_NAME
+        };
+
         // The X-macro generates the enum and this table from ONE list, so they cannot drift.
         // These assertions are what make that guarantee real rather than a comment.
         static_assert(std::size(ACTION_NAMES)  == size_t(ActionId::Count),
                       "имена действий разошлись с перечислением");
         static_assert(std::size(TRIGGER_NAMES) == size_t(TriggerId::Count),
                       "имена триггеров разошлись с перечислением");
+        static_assert(std::size(STRATEGY_NAMES) == size_t(StrategyId::Count),
+                      "имена стратегий разошлись с перечислением");
     }
 
     char const* NameOf(ActionId id)
@@ -44,5 +53,10 @@ namespace Constellation::Ai
     char const* NameOf(TriggerId id)
     {
         return id < TriggerId::Count ? TRIGGER_NAMES[size_t(id)] : "?";
+    }
+
+    char const* NameOf(StrategyId id)
+    {
+        return id < StrategyId::Count ? STRATEGY_NAMES[size_t(id)] : "?";
     }
 }

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Constellation — the engine's primitives. First cut of the port specified in
  * homelab/.agent/design/constellation-engine/engine-spec-v1.md as amended by v2 and v3,
  * three Codex passes, the last one BUILD THE FIRST CUT AS WRITTEN.
@@ -63,6 +63,37 @@ namespace Constellation::Ai
     X(NeedsRest,             "надо перевести дух")                          \
     X(VendorWorthATrip,      "к торговцу стоит идти")
 
+    // §9 — WHAT A COMPANION IS CURRENTLY DOING WITH ITS LIFE, as a set of named strategies.
+    //
+    // A strategy owns triggers and multipliers; enabling or disabling one changes what a
+    // companion may bid on and what may veto it, without touching any action. This is also how
+    // the canary is expressed (plan §9): a cohort is a strategy set, not a hardcoded list.
+#define CONSTELLATION_STRATEGIES(X)                                         \
+    X(Survival,     "выживание")                                            \
+    X(Quests,       "квесты")                                               \
+    X(Combat,       "бой")                                                  \
+    X(Trade,        "торговля")                                             \
+    X(Housekeeping, "попутное")                                             \
+    X(Follow,       "следование")
+
+    enum class StrategyId : uint8
+    {
+#define CONSTELLATION_STRATEGY_ENUM(name, text) name,
+        CONSTELLATION_STRATEGIES(CONSTELLATION_STRATEGY_ENUM)
+#undef CONSTELLATION_STRATEGY_ENUM
+        Count
+    };
+
+    static_assert(size_t(StrategyId::Count) <= 32, "маска стратегий — одно слово");
+
+    // Сдвиг на неизвестное число — неопределённое поведение, а StrategyId приходит из cast'а.
+    // Вне диапазона возвращаем ноль: такая стратегия просто не включится ни у кого, что видно
+    // в поведении, в отличие от сдвига на 200.
+    inline constexpr uint32 MaskOf(StrategyId id)
+    {
+        return id < StrategyId::Count ? (1u << uint32(id)) : 0u;
+    }
+
     enum class ActionId : uint8
     {
 #define CONSTELLATION_ACTION_ENUM(name, text) name,
@@ -81,6 +112,7 @@ namespace Constellation::Ai
 
     char const* NameOf(ActionId id);
     char const* NameOf(TriggerId id);
+    char const* NameOf(StrategyId id);
 
     // ---------------------------------------------------------------------------------------
     // §4.2 — the relevance scale, in our own names, so a number in a log is readable.
@@ -470,20 +502,34 @@ namespace Constellation::Ai
     // ---------------------------------------------------------------------------------------
     // §3.4 — Strategy: contributes triggers, default bids and multipliers.
     // ---------------------------------------------------------------------------------------
+    // §9 — A STRATEGY DOES NOT HAND OUT LISTS ANY MORE.
+    //
+    // It used to answer `Triggers(std::vector<TriggerId>&)` and
+    // `Multipliers(std::vector<Multiplier const*>&)` — the last two provider hooks still taking a
+    // raw, uncapped vector, which is exactly the shape `BidSink` was invented to replace. Worse,
+    // the obvious way to honour a per-companion strategy set would have been to collect those
+    // vectors per evaluated bid per tick: a per-tick allocation introduced by the very step that
+    // exists to make the ladder tradeable, in the file whose §11 forbids it.
+    //
+    // Instead ownership is declared at REGISTRATION: a trigger or a multiplier is handed to the
+    // engine together with the strategy that owns it. The engine builds one mask per trigger and
+    // per multiplier at `Seal()`, and a companion's set is a single `uint32`. Filtering is then a
+    // bitwise `and` over registries that already exist — no vector, no allocation, one word of
+    // per-companion state instead of an owning container.
     class Strategy
     {
     public:
-        explicit Strategy(char const* name) : _name(name) { }
+        Strategy(StrategyId id) : _id(id) { }
         virtual ~Strategy() = default;
 
-        char const* Name() const { return _name; }
+        StrategyId  Id() const { return _id; }
+        char const* Name() const { return NameOf(_id); }
 
-        virtual void Triggers(std::vector<TriggerId>&) const { }
-        virtual void DefaultBids(BidSink&)             const { }
-        virtual void Multipliers(std::vector<Multiplier const*>&) const { }
+        // The only thing a strategy still emits, and it goes through the capped sink.
+        virtual void DefaultBids(Ctx&, BidSink&) const { }
 
     private:
-        char const* _name;
+        StrategyId _id;
     };
 }
 
