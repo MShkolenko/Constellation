@@ -150,7 +150,15 @@ namespace Constellation::Ai
                 ++st.BidsDropped;
                 continue;
             }
-            st.Queue.push_back(Bid{ b.Action, rel, nowMs, b.SkipPrerequisites });
+            Bid q = b;
+            q.Relevance = rel;
+            q.CreatedMs = nowMs;
+            // Полный сброс кэша счёта, а не только флага: так инвариант «Scored говорит,
+            // считан ли Score» читается без оговорок про остаточные поля.
+            q.Scored    = false;
+            q.Score     = REL_IDLE;
+            q.ScoredMs  = 0;
+            st.Queue.push_back(q);
             ++st.BidsPushed;
             pushed = true;
         }
@@ -216,7 +224,7 @@ namespace Constellation::Ai
             if (!b.Scored || b.ScoredMs != nowMs)
             {
                 Action* a = Find(b.Action);
-                float const s = a ? a->Score(ctx, b.Relevance) : b.Relevance;
+                float const s = a ? a->Score(ctx, b, b.Relevance) : b.Relevance;
                 if (!std::isfinite(s))
                 {
                     ++st.BidsDropped;
@@ -295,12 +303,13 @@ namespace Constellation::Ai
         if (st.Running != ActionId::None)
         {
             if (Action* a = Find(st.Running))
-                a->Cancel(ctx, why);
+                a->Cancel(ctx, st.RunningAbout, why);
             ++st.ActionsCancelled;
         }
         st.Queue.clear();
         st.Scratch.clear();
         st.Running       = ActionId::None;
+        st.RunningAbout  = Subject();
         st.RunningRel    = REL_IDLE;
         st.ReplanAfterMs = 0;
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
@@ -406,7 +415,7 @@ namespace Constellation::Ai
 
             // §3.3 — two different questions with two different recoveries. USELESS drops the
             // bid; IMPOSSIBLE pushes the alternatives.
-            if (!action->Useful(ctx))
+            if (!action->Useful(ctx, bid))
                 continue;
 
             // THE SCORE SELECTION COMPUTED, not a second call to Score(). Calling it again could
@@ -421,11 +430,11 @@ namespace Constellation::Ai
                 continue;
             }
 
-            if (!action->Possible(ctx))
+            if (!action->Possible(ctx, bid))
             {
                 st.Scratch.clear();
                 BidSink sink(st.Scratch, st.BidsDropped);
-                action->Alternatives(sink);
+                action->Alternatives(ctx, bid, sink);
                 Push(st, st.Scratch, rel + REL_ALTERNATIVE, now);
                 continue;
             }
@@ -434,7 +443,7 @@ namespace Constellation::Ai
             {
                 st.Scratch.clear();
                 BidSink sink(st.Scratch, st.BidsDropped);
-                action->Prerequisites(sink);
+                action->Prerequisites(ctx, bid, sink);
                 if (Push(st, st.Scratch, rel + REL_PREREQ_BUMP, now))
                 {
                     // The prerequisite goes above us and we come back just under it, so the
@@ -446,13 +455,13 @@ namespace Constellation::Ai
                     // retry the expiry exists to kill.
                     st.Scratch.clear();
                     BidSink requeue(st.Scratch, st.BidsDropped);
-                    requeue.Add(bid.Action, rel + REL_REQUEUE, true);
+                    requeue.Add(bid.Action, rel + REL_REQUEUE, bid.About, true);
                     Push(st, st.Scratch, 0.0f, bid.CreatedMs);
                     continue;
                 }
             }
 
-            if (action->Execute(ctx))
+            if (action->Execute(ctx, bid))
             {
                 // §4.4′ — NEW work gets a new salt; continuing the same work keeps it, so the
                 // choice is stable within an assignment and decorrelated across them.
@@ -462,9 +471,10 @@ namespace Constellation::Ai
                 LogChoice(st, ctx, *action, rel);
                 st.Scratch.clear();
                 BidSink sink(st.Scratch, st.BidsDropped);
-                action->Continuers(sink);
+                action->Continuers(ctx, bid, sink);
                 Push(st, st.Scratch, rel, now);
                 st.Running       = bid.Action;
+                st.RunningAbout  = bid.About;
                 st.RunningRel    = rel;
                 st.ReplanAfterMs = now + REPLAN_COOLDOWN_MS;
                 return true;
@@ -478,13 +488,14 @@ namespace Constellation::Ai
             // next successful action be reported as a change (§5) instead of being swallowed.
             if (st.Running == bid.Action)
             {
-                st.Running    = ActionId::None;
-                st.RunningRel = REL_IDLE;
+                st.Running      = ActionId::None;
+                st.RunningAbout = Subject();
+                st.RunningRel   = REL_IDLE;
             }
 
             st.Scratch.clear();
             BidSink sink(st.Scratch, st.BidsDropped);
-            action->Alternatives(sink);
+            action->Alternatives(ctx, bid, sink);
             Push(st, st.Scratch, rel + REL_ALTERNATIVE, now);
         }
 

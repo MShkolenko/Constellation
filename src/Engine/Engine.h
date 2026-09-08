@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Constellation — the engine: a bid queue and one tick.
  *
  * Contract: homelab/.agent/design/constellation-engine/engine-spec-v1.md §4 as amended by v2 and
@@ -53,6 +53,9 @@ namespace Constellation::Ai
         uint32 TriggerLastMs[size_t(TriggerId::Count)] = {};
 
         ActionId Running         = ActionId::None;   // what we chose last tick
+        // §10′ — И О ЧЁМ ОНО БЫЛО. Без этого Cancel не может вернуть резервацию именно той
+        // точки: после исполнения движок хранил один ActionId и терял всё остальное.
+        Subject  RunningAbout;
         float    RunningRel      = REL_IDLE;
         uint32   ReplanAfterMs   = 0;        // §4.4′ — hysteresis, not dice
         uint32   AssignmentEpoch = 0;        // §4.4′ — bumped when NEW work is chosen, and on Reset

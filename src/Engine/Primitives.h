@@ -106,12 +106,79 @@ namespace Constellation::Ai
     // 9.4 GiB of 14.6 and has been OOM-killed seven times, so the queue is a reused vector of
     // these and nothing here may allocate.
     // ---------------------------------------------------------------------------------------
+    // §8 — the four kinds of thing a bid can be about. Kept as a tagged value rather than four
+    // parallel fields so that "which of these is set" is never a question a reader has to answer
+    // by inspecting emptiness.
+    class Subject
+    {
+    public:
+        enum class Kind : uint8
+        {
+            None,       // the bid is about the companion itself: rest, flee, follow the owner
+            Unit,       // a creature — a giver, an ender, a quest target
+            Object,     // a gameobject — a cage, a gather node, a door
+            Spawn,      // a spawn id: a point that may have no object loaded right now
+            Quest,      // a quest number: a hand-in whose ender is chosen later
+        };
+
+        Subject() = default;
+
+        // THE ONLY WAYS TO BUILD ONE, AND THE PAYLOAD IS PRIVATE.
+        //
+        // The first version left the three fields public with factories beside them. Factories
+        // alone enforce nothing: `s.What = Kind::Spawn` next to a GUID compiles and produces a
+        // subject that lies about itself, and the reader that trusts the tag gets a zero while
+        // the reader that trusts the payload gets a stale guid. Neither would look like a bug.
+        static Subject OfUnit(ObjectGuid g)   { Subject s; s._what = Kind::Unit;   s._guid = g; return s; }
+        static Subject OfObject(ObjectGuid g) { Subject s; s._what = Kind::Object; s._guid = g; return s; }
+        static Subject OfSpawn(uint32 id)     { Subject s; s._what = Kind::Spawn;  s._id  = id; return s; }
+        static Subject OfQuest(uint32 id)     { Subject s; s._what = Kind::Quest;  s._id  = id; return s; }
+
+        Kind What() const { return _what; }
+        bool IsNone() const { return _what == Kind::None; }
+
+        // A payload read against the wrong kind returns nothing rather than something stale.
+        ObjectGuid Guid() const
+        {
+            return (_what == Kind::Unit || _what == Kind::Object) ? _guid : ObjectGuid::Empty;
+        }
+        uint32 Id() const
+        {
+            return (_what == Kind::Spawn || _what == Kind::Quest) ? _id : 0;
+        }
+
+        bool operator==(Subject const& o) const
+        {
+            return _what == o._what && _guid == o._guid && _id == o._id;
+        }
+
+    private:
+        Kind       _what = Kind::None;
+        ObjectGuid _guid;
+        uint32     _id   = 0;
+    };
+
     struct Bid
     {
         ActionId Action    = ActionId::None;
         float    Relevance = REL_IDLE;
         uint32   CreatedMs = 0;
         bool     SkipPrerequisites = false;
+
+        // §8 — WHAT THE BID IS ABOUT. Without it there is no path from "the scan found this
+        // giver" to "the action goes to that giver": an Action is one shared object, so it
+        // cannot hold a per-companion subject.
+        //
+        // I refused this once, arguing it would quadruple a struct kept at sixteen bytes. The
+        // arithmetic does not survive: with padding the bid lands near 64 bytes, and at a cap of
+        // thirty-two over 122 companions that is about 250 KiB against 9.3 GiB. The rule that
+        // matters is "nothing allocates per tick", which this respects; I had applied a proxy
+        // for that rule where the proxy does not hold.
+        //
+        // A GUID alone is not enough either: the matrix needs a gather point addressed by its
+        // spawn id and a quest addressed by its number, neither of which is an object in the
+        // world at the moment the bid is made.
+        Subject  About;
 
         // §4.3′ — THE SCORE IS COMPUTED ONCE PER BID PER TICK, and it is cached here.
         //
@@ -233,14 +300,22 @@ namespace Constellation::Ai
     public:
         BidSink(std::vector<Bid>& into, uint32& dropped) : _into(into), _dropped(dropped) { }
 
-        void Add(ActionId action, float relevance, bool skipPrerequisites = false)
+        // The subject is part of the bid, not an afterthought: a trigger that found a giver says
+        // WHICH giver here, and that is the only channel by which the action learns it.
+        void Add(ActionId action, float relevance, Subject about = Subject(),
+                 bool skipPrerequisites = false)
         {
             if (_into.size() >= SCRATCH_CAP)
             {
                 ++_dropped;
                 return;
             }
-            _into.push_back(Bid{ action, relevance, 0, skipPrerequisites });
+            Bid b;
+            b.Action            = action;
+            b.Relevance         = relevance;
+            b.SkipPrerequisites = skipPrerequisites;
+            b.About             = about;
+            _into.push_back(b);
         }
 
         size_t Size() const { return _into.size(); }
@@ -303,16 +378,36 @@ namespace Constellation::Ai
         ActionId Id() const { return _id; }
         char const* Name() const { return NameOf(_id); }
 
-        virtual bool Useful(Ctx&)   { return true; }
-        virtual bool Possible(Ctx&) { return true; }
-        virtual bool Execute(Ctx&) = 0;
+        // EVERY PER-BID METHOD TAKES THE BID, and that is the whole point of §8.
+        //
+        // The first version put the subject on the bid and handed it only to `Score`. So the
+        // engine could PRICE a giver and then execute an action that had no idea which giver it
+        // was — the channel was built halfway and was therefore useless. An Action is one shared
+        // object; the bid is the only thing that varies per companion, so anything that needs to
+        // know "which one" must be given it.
+        //
+        // The derived bids matter as much: a prerequisite, an alternative or a continuer of
+        // "talk to THIS giver" is almost always about the same giver, and without the bid they
+        // could not say so.
+        virtual bool Useful(Ctx&, Bid const&)   { return true; }
+        virtual bool Possible(Ctx&, Bid const&) { return true; }
+        virtual bool Execute(Ctx&, Bid const&) = 0;
 
         // §10′ — idempotent, and callable on an action that never started.
-        virtual void Cancel(Ctx&, CancelReason) { }
+        //
+        // IT GETS THE SUBJECT, because releasing a reservation means releasing THAT point. The
+        // first version passed only the reason: after execution the engine kept the ActionId and
+        // dropped everything else, so a spawn-specific hold could not be given back and would
+        // have leaked for the life of the world.
+        virtual void Cancel(Ctx&, Subject const&, CancelReason) { }
 
-        virtual void Prerequisites(BidSink&) const { }
-        virtual void Alternatives(BidSink&)  const { }
-        virtual void Continuers(BidSink&)    const { }
+        // CONTRACT for the three providers: they may inspect the world, read values and emit
+        // bids. They may NOT act on the world, and they may not acquire or release ownership of
+        // anything — no reservation is taken or given back here. `Ctx&` is mutable only because
+        // reading a value may recompute it; that is the whole of the licence.
+        virtual void Prerequisites(Ctx&, Bid const&, BidSink&) const { }
+        virtual void Alternatives(Ctx&, Bid const&, BidSink&)  const { }
+        virtual void Continuers(Ctx&, Bid const&, BidSink&)    const { }
 
         // §4.3′ — THE CLASS OF WORK DECIDES HOW DISTANCE ENTERS, AND THE ACTION IS THE ONLY ONE
         // WHO KNOWS ITS SUBJECT.
@@ -331,7 +426,14 @@ namespace Constellation::Ai
         // one tick must return the same number. The engine calls it EXACTLY ONCE per bid per tick
         // and carries the result to execution, so a breach can no longer split "what was chosen"
         // from "what ran" — but it would still make one tick's log disagree with the next.
-        virtual float Score(Ctx& /*ctx*/, float baseRelevance) const { return baseRelevance; }
+        //
+        // The bid carries the subject (§8), which is how a shared Action prices a per-companion
+        // target: `bid.Subject` is the giver, the mob or the object this particular bid is about.
+        virtual float Score(Ctx& /*ctx*/, Bid const& bid, float baseRelevance) const
+        {
+            (void)bid;
+            return baseRelevance;
+        }
 
         // The shared shape, so distance-sensitive actions decay identically rather than each
         // inventing a curve. Reach is the reference's own new-quest search radius: a giver at
