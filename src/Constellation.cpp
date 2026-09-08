@@ -101,6 +101,8 @@
 #include <deque>
 #include <memory>
 #include <random>
+#include <map>          // §stuck — табличка режимов; транзитом она была доступна, но опираться
+                       // на чужой include — значит сломаться при первой чистке заголовков
 #include <set>
 #include <mutex>
 #include <unordered_map>
@@ -693,6 +695,9 @@ public:
     void VisitGiverIndexOnMap(uint32 mapId, Position const& from, float maxDist,
                               Constellation::Ai::GiverIndexVisitor visit, void* user) const
     {
+        if (!visit)
+            return;         // сегодня её зовёт только WorldView, который проверяет — но это
+                            // свойство единственного вызывающего, а не функции (Кодекс, п. 7)
         auto it = _givers.find(mapId);
         if (it == _givers.end())
             return;
@@ -12387,6 +12392,103 @@ public:
             uint32(known.size() > printed ? known.size() - printed : 0));
     }
 
+    // .constellation stuck — НА ЧЁМ СТОИТ КАЖДЫЙ, В ПОРЯДКЕ САМОЙ ЛЕСТНИЦЫ.
+    //
+    // Отвечает на вопрос, который журнал ответить не может: ветка `Idle` пробует рунги сверху
+    // вниз и, не найдя ничего, возвращается МОЛЧА. Прибор `ПРОСТОЙ` стоит под `!unmetNow`, то
+    // есть именно у тех, кто чем-то занят по журналу заданий, он не срабатывает никогда.
+    //
+    // НИЧЕГО НЕ МЕНЯЕТ, И ЭТО ПРОВЕРЕНО, А НЕ ОБЕЩАНО: из хелперов зовутся только `BrokenCount`
+    // и `WantedEntries`, оба `const` и оба без записи в `Companion`. `BrokenForFight` НЕ зовётся
+    // именно поэтому — он ставит `c.BrokenNoted`. `FindObjectiveSpot` тем более: он пишет
+    // `c.TravelPos` и сдвинул бы состояние, которое прибор пришёл измерить.
+    //
+    // ГОНКИ С БОЕВЫМ ТАКТОМ НЕТ, И ЭТО ПРОЧИТАНО В ЯДРЕ (Кодекс спросил гарантию).
+    // `World::Update` (World.cpp:2115) зовёт `ProcessCliCommands()` на строке 2410, а через
+    // восемь строк, В ТОМ ЖЕ обновлении, — `sScriptMgr->OnWorldUpdate(diff)`, откуда тикает
+    // автомат. Один поток, и притом последовательно: команда завершается ДО такта,
+    // так что обход `_companions` и чтение `Player` нис чем не пересекаются.
+    void Stuck(ChatHandler* handler)
+    {
+        // НАСТРОЙКИ — ОДНОЙ СТРОКОЙ НА ВЕСЬ ОТЧЁТ. Выключенная гасит целые рунги у всего
+        // состава разом, и это признак мира, а не спутника.
+        handler->PSendSysMessage(
+            "Constellation ЗАСТРЯЛИ: Quests=%u TakeQuests=%u Fight=%u Vending=%u Flying=%u Follow=%u",
+            uint32(Cfg().Quests), uint32(Cfg().TakeQuests), uint32(Cfg().Fight),
+            uint32(Cfg().Vending), uint32(Cfg().Flying), uint32(Cfg().Follow));
+
+        uint32 held[6] = {};
+        static char const* const REASONS[6] =
+        {
+            "нет игрока в мире",                       // 0
+            "рунг выключен настройкой",              // 1
+            "отсрочка после неудачной дороги",         // 2
+            "сломано — дорога к цели закрыта",         // 3
+            "нет незакрытых задач: ищет квест",        // 4
+            "помех не видно — СНИМОК, А НЕ ПРИГОВОР",  // 5
+        };
+
+        for (Companion& c : _companions)
+        {
+            Player* self = c.Session ? c.Session->GetPlayer() : nullptr;
+            if (!self)
+            {
+                ++held[0];
+                continue;
+            }
+            if (c.Mode != Behavior::Idle)
+                continue;
+
+            std::set<uint32> wanted;
+            uint32 unmet = 0, incomplete = 0, monsterObjs = 0;
+            WantedEntries(self, wanted, nullptr, &incomplete, &monsterObjs, &unmet);
+            uint32 const broken = BrokenCount(self);
+
+            // ПОРЯДОК СВЕРЕН С ЛЕСТНИЦЕЙ, А НЕ ПРИДУМАН. Рунг дороги к месту задания
+            // (`case Behavior::Idle`, поиск `FindObjectiveSpot`) закрыт тремя вещами:
+            // отсрочкой после неудачной дороги, поломкой и паузой перебора точек. Последняя
+            // живёт две секунды и в срезе значит «только что перебирал», а не «стоит», —
+            // поэтому она печатается числом, но ведром не становится.
+            //
+            // `IdleScanMs` ведром не является СОЗНАТЕЛЬНО: под ним только сканирующие рунги,
+            // а при интервале 1000-1250 мс на такте 250 мс он ненулевой в трёх тактах из
+            // четырёх — ведро собрало бы почти весь состав и сказало бы неправду уверенно.
+            // НАСТРОЙКА ВПЕРЕДИ ВСЕГО: выключенный `Fight` закрывает и бой, и дорогу к цели
+            // у ВСЕГО состава, а выключенный `Quests` — сдачу и сбор. Без этого ведра весь
+            // состав уехал бы в последнее и читался как загадка, хотя ответ стоял бы строкой выше.
+            //
+            // ПОСЛЕДНЕЕ ВЕДРО НАЗВАНО ЧЕСТНО (Кодекс, п. 6): в нём лежат и те, кто
+            // действительно застрял, и те, кто просто попал в короткое окно между сканами.
+            // Различить их снимком нельзя — искатели ПИШУТ в `Companion`, а звать их из прибора
+            // значит сдвинуть то, что меришь. Значимо тут ПОВТОРЕНИЕ: если два запуска
+            // подряд дают одних и тех же имён, это уже не окно.
+            uint32 reason;
+            if (!Cfg().Fight && !Cfg().Quests) reason = 1;
+            else if (c.TravelCooldownMs)       reason = 2;
+            else if (broken)                   reason = 3;
+            else if (!unmet)                   reason = 4;
+            else                               reason = 5;
+            ++held[reason];
+
+            handler->PSendSysMessage(
+                "  %s ур.%u карта %u зона %u: незакрыто %u (убить %u, квестов %u), сломано %u, "
+                "скан %u, дорога %u/%u, квестодатель %u, торговец %u, цель %s -> %s",
+                self->GetName().c_str(), uint32(self->GetLevel()), self->GetMapId(),
+                self->GetZoneId(), unmet, monsterObjs, incomplete, broken,
+                c.IdleScanMs, c.TravelCooldownMs, c.TravelScanMs, c.SeekCooldownMs,
+                c.VendCooldownMs, c.TargetGuid.IsEmpty() ? "нет" : "есть", REASONS[reason]);
+        }
+
+        handler->PSendSysMessage("Constellation ЗАСТРЯЛИ — по первой помехе в порядке лестницы:");
+        for (uint32 i = 0; i < 6; ++i)
+            if (held[i])
+                handler->PSendSysMessage("  %-42s %u", REASONS[i], held[i]);
+        handler->PSendSysMessage(
+            "  последнее ведро — то, ради которого прибор и заведён, но это СНИМОК:"
+            " в нём и застрявшие, и те, кто просто между сканами. Отличает их повторный запуск:"
+            " те же имена дважды — значит не окно");
+    }
+
     void Status(ChatHandler* handler)
     {
         uint32 inWorld = 0, failed = 0;
@@ -12397,18 +12499,28 @@ public:
         }
         handler->PSendSysMessage("Constellation %s: взято %u, боёв %u, СДАНО %u, переходов %u",
             CONSTELLATION_VERSION, _questsTaken, _fightsStarted, _questsTurnedIn, _transitions);
-        uint32 idle = 0, following = 0, approaching = 0, attacking = 0;
+        // ВСЕ ДВЕНАДЦАТЬ РЕЖИМОВ, А НЕ ПЯТЬ. Здесь стоял switch по пяти значениям без
+        // `default:`, и спутник в `Travelling`, `Vending`, `SeekingGiver`, `Gathering`,
+        // `Talking`, `Recovering` или `TakingFlight` не увеличивал ни одного счётчика. Числа
+        // при этом выглядели правдоподобно — просто их сумма не сходилась с ростером, а сумму
+        // никто не считал. Табличка по `ModeName` не может отстать от перечисления так же
+        // молча: незнакомый режим попадёт в «?».
+        std::map<std::string, uint32> byMode;
         for (Companion const& c : _companions)
-            switch (c.Mode)
+            ++byMode[ModeName(c.Mode)];
+        {
+            std::string line;
+            uint32 total = 0;
+            for (auto const& [name, n] : byMode)
             {
-                case Behavior::Idle:              ++idle; break;
-                case Behavior::FollowingOwner:    ++following; break;
-                case Behavior::ApproachingTarget: ++approaching; break;
-                case Behavior::Attacking:         ++attacking; break;
-                case Behavior::TurningIn:         break;
+                if (!line.empty())
+                    line += ", ";
+                line += Trinity::StringFormat("{} {}", name, n);
+                total += n;
             }
-        handler->PSendSysMessage("  idle %u, following %u, approaching %u, attacking %u",
-            idle, following, approaching, attacking);
+            handler->PSendSysMessage("  %s (всего %u из %u)", line.c_str(), total,
+                uint32(_companions.size()));
+        }
         handler->PSendSysMessage("Constellation %s: %s — roster %u, in world %u, failed %u",
             CONSTELLATION_VERSION, Cfg().Enable ? "enabled" : "disabled",
             uint32(_companions.size()), inWorld, failed);
@@ -13299,6 +13411,7 @@ public:
         static ChatCommandTable constellationTable =
         {
             { "status",  HandleStatus,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "stuck",   HandleStuck,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "summon",  HandleSummon,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "dismiss", HandleDismiss, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "repair",  HandleRepair,  rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -13349,6 +13462,13 @@ public:
     static bool HandleStatus(ChatHandler* handler)
     {
         Constellation::Manager::Instance()->Status(handler);
+        return true;
+    }
+
+    // .constellation stuck — почему каждый из стоящих стоит. Только чтение.
+    static bool HandleStuck(ChatHandler* handler)
+    {
+        Constellation::Manager::Instance()->Stuck(handler);
         return true;
     }
 
