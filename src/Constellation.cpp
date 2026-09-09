@@ -11596,6 +11596,7 @@ public:
         Creature* best = nullptr;
         float bestDist = range + 1001.0f;   // невидимые идут с надбавкой в тысячу ярдов — после всех видимых
         uint32 seen = 0, dead = 0, nothingToOffer = 0, blacklisted = 0, noLos = 0;
+        uint32 noGiverFlag = 0;         // знак есть, а флага квестодателя нет — с таким не заговорить
         uint32 markedOnly = 0;          // знак ядра есть, моя проверка не одобрила
         Creature* marked = nullptr;     // ближайший такой — запасной выбор
         float markedDist = 1.0e9f;
@@ -11604,6 +11605,18 @@ public:
             ++seen;
             if (!creature->IsAlive())
                 { ++dead; continue; }
+            // ФЛАГ КВЕСТОДАТЕЛЯ — ПЕРВЫМ, КАК У УКАЗАТЕЛЯ КАРТЫ.
+            //
+            // Указатель карты строится именно так (см. `_givers`), а обзор этого не делал — и
+            // выбирал тех, с кем заговорить нельзя НИКОГДА. Живой случай: курица 620,
+            // `npcflag = 0`, скрипт `npc_chicken_cluck` — флаг ей ставит скрипт после эмоции,
+            // а `GetQuestDialogStatus` считает по СВЯЗЯМ с квестами и про флаг не спрашивает. Спутник
+            // доходил до трёх ярдов, получал от `CanInteractWithQuestGiver` честное «нет», жгал тридцать
+            // секунд, заносил в чёрный список на десять минут и возвращался. Вечно.
+            //
+            // Это КЛАСС, а не случай: существ со связью к квесту и без флага — 248 против 7962 с флагом.
+            if (!creature->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER))
+                { ++noGiverFlag; continue; }
             // «НЕ NONE» — ЭТО НЕ «ЕСТЬ ЧТО ПРЕДЛОЖИТЬ». ЭТО БЫЛА ГЛАВНАЯ ОШИБКА.
             //
             // GetQuestDialogStatus возвращает не ответ «да/нет», а МАСКУ всего, что этот
@@ -11722,10 +11735,10 @@ public:
                 if (self->GetQuestSlotQuestId(slot))
                     ++used;
             TC_LOG_INFO("server.worldserver",
-                "Constellation КВЕСТОДАТЕЛЬ {}: рядом существ {}, мертвы {}, без знака {}, "
+                "Constellation КВЕСТОДАТЕЛЬ {}: рядом существ {}, мертвы {}, без флага {}, без знака {}, "
                 "со знаком но не одобрен {}, в чёрном списке {}, не видно {}, ВЫБРАН {}; "
                 "в журнале квестов {}, радиус {:.0f}",
-                self->GetName(), seen, dead, nothingToOffer, markedOnly, blacklisted, noLos,
+                self->GetName(), seen, dead, noGiverFlag, nothingToOffer, markedOnly, blacklisted, noLos,
                 best ? best->GetName() : "никто", used, range);
         }
         return best;

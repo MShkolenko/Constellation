@@ -242,6 +242,16 @@ namespace Constellation::Ai
         {
             if (!creature->IsAlive())
                 continue;
+            // ФЛАГ КВЕСТОДАТЕЛЯ ПЕРЕД ЗНАКОМ, и это не перестраховка.
+            //
+            // `GetQuestDialogStatus` считает по СВЯЗЯМ существа с квестами и про флаг не спрашивает,
+            // а без флага `CanInteractWithQuestGiver` откажет всегда. На живом мире это
+            // держало спутника у курицы (620, `npcflag = 0`, скрипт `npc_chicken_cluck`) весь
+            // сеанс. Существ со связью и без флага — 248 против 7962 с флагом.
+            //
+            // Указатель карты модуля эту проверку делал всегда; обзор — нет. Здесь они сравнялись.
+            if (!creature->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER))
+                continue;
             if ((_self->GetQuestDialogStatus(creature) & offers) == QuestGiverStatus::None)
                 continue;
 
