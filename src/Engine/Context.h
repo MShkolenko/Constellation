@@ -76,6 +76,12 @@ namespace Constellation::Ai
     // а весь смысл поправки 9 плана в том, чтобы путь пересчёта не выделял памяти вовсе.
     using TurnInVisitor     = void (*)(void* user, TurnInCandidate const& t);
     using GiverSightVisitor = void (*)(void* user, GiverInSight const& g);
+    // ПАМЯТЬ ОБ ОТКАЗАХ ПРИХОДИТ ОТ ВЫЗЫВАЮЩЕГО, потому что принадлежит ему, а не миру.
+    // Лестница передаёт свой набор, движок — свою таблицу отсрочек. `nullptr` значит
+    // «памяти нет», и это НЕ безобидно: без неё квест, который не взялся, будет выбран
+    // снова следующим тактом, и так навсегда.
+    using QuestRefusedFn = bool (*)(void const* user, uint32 questId);
+
     using GiverIndexVisitor = void (*)(void* user, GiverOnMap const& g);
 
     // Everything an action may ask about the world, and nothing else.
@@ -150,6 +156,22 @@ namespace Constellation::Ai
         // поэтому ярус «на карту» не понадобился: таблица уже общая для всех.
         void ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const;
 
+        // МОГУ ЛИ Я ГОВОРИТЬ ИМЕННО С ЭТИМ. Тот же предикат ядра, что и у сдачи, только по
+        // гуиду: `CanInteractWithQuestGiver` знает и расстояние, и флаг квестодателя, и смерть,
+        // и полёт. Своей мерки близости здесь нет и не будет — она уже стоила 916 кругов.
+        bool CanTalkTo(ObjectGuid unit) const;
+
+        // ЧТО ВЗЯТЬ ИЗ МЕНЮ, КОТОРОЕ ЯДРО ТОЛЬКО ЧТО СОБРАЛО. Ноль значит «нечего».
+        //
+        // Зовёт ТУ ЖЕ политику, что и лестница (`PickFromQuestMenu`), поэтому выбор совпадает
+        // по построению, а не по совпадению правил, написанных дважды. Памяти об отказах у
+        // движка своей нет: она в таблице отсрочек и проверяется на уровне ставки, до вызова.
+        //
+        // ПОРЯДОК ОБЯЗАТЕЛЕН: меню действительно только сразу после приветствия и только для
+        // того существа, которому оно послано. Это состояние прошлого разговора, а не запрос,
+        // поэтому читатель не берёт гуид — брать его значило бы обещать выборку, которой нет.
+        uint32 BestQuestOffered(QuestRefusedFn refused, void const* user) const;
+
         // ПРИНИМАЮЩИЙ ЭТОГО ВИДА, ДО КОТОРОГО ЯДРО РАЗРЕШАЕТ ДОТЯНУТЬСЯ.
         //
         // Значения отдают ВИД и точку (указатель карты знает только их), а дверь требует
@@ -198,6 +220,9 @@ namespace Constellation::Ai
         float GiverSeekRange  = 0.0f;   // как далеко готовы идти по указателю
     };
     EngineTuning Tuning();
+
+    // Политика выбора квеста из меню — одна на лестницу и на движок. Переходник, а не копия.
+    uint32 BestQuestInMenu(Player const* self, QuestRefusedFn refused, void const* user);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

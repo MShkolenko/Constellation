@@ -268,6 +268,19 @@ namespace Constellation::Ai
         }
     }
 
+    bool WorldView::CanTalkTo(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Creature* creature = ObjectAccessor::GetCreature(*_self, unit);
+        return creature && creature->IsAlive() && _self->CanInteractWithQuestGiver(creature);
+    }
+
+    uint32 WorldView::BestQuestOffered(QuestRefusedFn refused, void const* user) const
+    {
+        return _self ? BestQuestInMenu(_self, refused, user) : 0u;
+    }
+
     std::optional<ObjectGuid> WorldView::NearestQuestGiverOfEntry(uint32 entry, float searchDist) const
     {
         if (!_self || !entry || searchDist <= 0.0f)

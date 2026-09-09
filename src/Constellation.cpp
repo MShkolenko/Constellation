@@ -6366,7 +6366,7 @@ public:
     // Навык называет само ядро: SkillByQuestSort по сортировке квеста (SharedDefines.h:6190), и
     // оно же сверяет по ней RequiredSkillId при загрузке (ObjectMgr.cpp:4858). Второй источник —
     // сам RequiredSkillId. Дальше вопрос к персонажу: есть ли у него этот навык.
-    static bool ProfessionWeLack(Player* self, Quest const* q)
+    static bool ProfessionWeLack(Player const* self, Quest const* q)
     {
         uint32 skill = SkillByQuestSort(-q->GetZoneOrSort());
         if (!skill)
@@ -6374,6 +6374,10 @@ public:
         return skill != 0 && !self->HasSkill(skill);
     }
 
+    // ЧИТАЮЩАЯ ЦЕПОЧКА, И ПОДПИСИ ЭТО ГОВОРЯТ. `Player const*` здесь не уступка компилятору:
+    // всё, что зовётся ниже по цепочке — `CanTakeQuest`, `HasSkill`, `GetQuestLevel` — в ядре
+    // объявлено `const`. Читающий фасад движка хранит `Player const*`, и если бы подписи
+    // требовали `Player*`, единственным способом их соединить был бы каст ради типа.
     // ---------------------------------------------------------------- мировые правила годности
     // ОДНО МЕСТО НА ДВА ВОПРОСА. Это условие применялось в двух местах побуквенно одинаково —
     // в `QuestTick` тремя проверками с объяснениями между ними и в `TakeableQuestAt` одной
@@ -6392,7 +6396,7 @@ public:
     //
     // ПРОФЕССИЯ, КОТОРОЙ У НАС НЕТ: её цели — созданные ремеслом предметы, которых в мире не
     // существует. Семеро пандаренов держали по три таких квеста (алхимия, сортировка -181).
-    static bool PassesWorldRules(Player* self, Quest const* q)
+    static bool PassesWorldRules(Player const* self, Quest const* q)
     {
         return q
             && self->CanTakeQuest(q, false)
@@ -10621,9 +10625,11 @@ public:
     // ЧИТАЮЩИЙ указатель, в отличие от соседних посетителей: те накапливают результат В него,
     // этот только спрашивает. `void*` здесь потребовал бы `const_cast` на месте вызова —
     // каст ради типа, а не ради смысла (Кодекс, пункт 3).
-    using QuestRefusedFn = bool (*)(void const* user, uint32 questId);
+    // ТОТ ЖЕ ТИП, ЧТО У ДВИЖКА, а не одноимённый двойник: переходник передаёт указатель
+    // насквозь, и два «похожих» типа тут молча разошлись бы.
+    using QuestRefusedFn = Constellation::Ai::QuestRefusedFn;
 
-    MenuPick PickFromQuestMenu(Player* self, QuestRefusedFn refused, void const* user) const
+    MenuPick PickFromQuestMenu(Player const* self, QuestRefusedFn refused, void const* user) const
     {
         MenuPick pick;
         uint8 bestRank = 255;
@@ -10673,7 +10679,7 @@ public:
         return pick;
     }
 
-    uint8 QuestColour(Player* self, Quest const* quest) const
+    uint8 QuestColour(Player const* self, Quest const* quest) const
     {
         int32 const my = int32(self->GetLevel());
         int32 const q = self->GetQuestLevel(quest);
@@ -13412,6 +13418,13 @@ namespace Constellation::Ai
     // РАДИУСЫ ЧИТАЮТСЯ У КОНФИГА КАЖДЫЙ РАЗ, А НЕ КЭШИРУЮТСЯ. `.reload config` меняет их на
     // живом мире, и копия, снятая при запуске, разошлась бы с настройкой молча — тот же класс
     // дефекта, что и любая вторая копия числа.
+    // ПОЛИТИКА ОДНА, ВЫЗЫВАЮЩИХ ДВА. `nullptr` вместо памяти об отказах — намеренно: у движка
+    // она своя и живёт в таблице отсрочек, где проверяется до того, как дело дойдёт сюда.
+    uint32 BestQuestInMenu(Player const* self, QuestRefusedFn refused, void const* user)
+    {
+        return Constellation::Manager::Instance()->PickFromQuestMenu(self, refused, user).QuestId;
+    }
+
     EngineTuning Tuning()
     {
         EngineTuning t;

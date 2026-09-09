@@ -459,11 +459,25 @@ namespace Constellation::Ai
         }
     }
 
-    bool Engine::Deferred(EngineState& st, BackoffKey const& key, uint32 nowMs)
+    bool Engine::Deferred(EngineState const& st, BackoffKey const& key, uint32 nowMs)
     {
-        bool found = false;
-        // Один проход делает обе работы: ищет ключ и попутно освобождает просроченное. Поэтому
-        // отдельного подметания нет — а подметание и есть то место, где отсрочки обычно текут.
+        // ПРОСТО ЧИТАЕТ. Раньше этот проход попутно подметал просроченное, и из-за этого его
+        // нельзя было позвать оттуда, где состояние константно, — а именно оттуда его и зовёт
+        // политика выбора квеста. Подметание переехало в `Defer`: он и так обходит таблицу ради
+        // проверки на дубль и вытесняет просроченное первым, так что течь ей неоткуда.
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+            if (st.Backoffs[i].Key == key && !Expired(st.Backoffs[i], nowMs))
+                return true;
+        return false;
+    }
+
+    bool Engine::Defer(EngineState& st, BackoffKey const& key, uint32 ttlMs, uint32 nowMs)
+    {
+        if (key.Kind == BackoffKind::None || !ttlMs)
+            return false;
+
+        // ПОДМЕТАНИЕ ЖИВЁТ ЗДЕСЬ, потому что `Deferred` теперь только читает. Один проход, и
+        // он же нужен для проверки на дубль ниже — лишней работы не появилось.
         for (uint8 i = 0; i < st.BackoffCount; )
         {
             if (Expired(st.Backoffs[i], nowMs))
@@ -472,17 +486,8 @@ namespace Constellation::Ai
                 --st.BackoffCount;
                 continue;               // на месте i теперь другая запись — её тоже проверить
             }
-            if (st.Backoffs[i].Key == key)
-                found = true;
             ++i;
         }
-        return found;
-    }
-
-    bool Engine::Defer(EngineState& st, BackoffKey const& key, uint32 ttlMs, uint32 nowMs)
-    {
-        if (key.Kind == BackoffKind::None || !ttlMs)
-            return false;
 
         // Повторный запрет по тому же ключу ПРОДЛЕВАЕТ, а не заводит вторую запись: иначе
         // таблица заполнилась бы копиями одного отказа.

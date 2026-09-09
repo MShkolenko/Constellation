@@ -40,6 +40,17 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::GossipHello(ObjectGuid unit)                    // from Constellation.cpp:7439
+    {
+        if (!Usable() || unit.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_TALK_TO_GOSSIP);
+        WorldPackets::NPC::Hello hello(std::move(raw));
+        hello.Unit = unit;
+        _session->HandleGossipHelloOpcode(hello);
+        return true;
+    }
+
     bool ClientAct::GossipSelect(ObjectGuid unit, uint32 menuId, uint32 optionId)  // :5113
     {
         if (!Usable() || unit.IsEmpty())

@@ -76,7 +76,13 @@ namespace Constellation::Ai
 
         // -- talking -----------------------------------------------------------------------
         bool QuestGiverHello(ObjectGuid giver);                     // CMSG_QUEST_GIVER_HELLO
-        bool GossipSelect(ObjectGuid unit, uint32 menuId, uint32 optionId); // CMSG_GOSSIP_SELECT_OPTION
+        // ВТОРОЕ ПРИВЕТСТВИЕ, И ОНО НЕ ДУБЛЬ ПЕРВОГО. `HandleQuestgiverHelloOpcode` выходит ДО
+    // `PrepareQuestMenu`, если у существа есть свой обработчик приветствия, — тогда меню не
+    // строится вовсе и первый опкод возвращает пустоту (замер: «предложил пунктов 0» у всех,
+    // кто дошёл до Milly Osworth). Живой клиент шлёт этот; шлём и мы.
+    // Имя опкода в ЭТОМ ядре — `CMSG_TALK_TO_GOSSIP`, проверено по таблице обработчиков.
+    bool GossipHello(ObjectGuid unit);                          // CMSG_TALK_TO_GOSSIP
+    bool GossipSelect(ObjectGuid unit, uint32 menuId, uint32 optionId); // CMSG_GOSSIP_SELECT_OPTION
 
         // -- quests ------------------------------------------------------------------------
         bool AcceptQuest(ObjectGuid giver, uint32 questId);         // CMSG_QUEST_GIVER_ACCEPT_QUEST
