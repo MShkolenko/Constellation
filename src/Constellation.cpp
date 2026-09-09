@@ -13508,6 +13508,17 @@ namespace Constellation::Ai
     // дефекта, что и любая вторая копия числа.
     // ПОЛИТИКА ОДНА, ВЫЗЫВАЮЩИХ ДВА. `nullptr` вместо памяти об отказах — намеренно: у движка
     // она своя и живёт в таблице отсрочек, где проверяется до того, как дело дойдёт сюда.
+    // ШАГ ДВИГАТЕЛЯ ДЛЯ ДВИЖКА. Одна реализация на оба механизма — та самая, у которой
+    // маршрут ядра, отступы вбок, ярусы и примерзание; писать её заново значило бы получить
+    // спутника, который ходит в стены.
+    bool StepAlong(MoveState& m, Player* self, MoveSendFn send, void* user,
+                   Position const& to, float stopAt, float dt)
+    {
+        return Constellation::Manager::Instance()->StepTowardCore(
+            m, self, send, user, to.GetPositionX(), to.GetPositionY(), to.GetPositionZ(),
+            stopAt, dt, nullptr);
+    }
+
     bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out)
     {
         if (!self || !out)

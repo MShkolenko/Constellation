@@ -137,6 +137,11 @@ namespace Constellation::Ai
         // both over- and under-permits depending on the state.
         float MaxStepYards() const;
 
+        // ДЛИНА ТАКТА, ИЗМЕРЕННАЯ ДВЕРЬЮ. Двигателю нужен `dt` в секундах, и второго измерения
+        // того же самого заводить нельзя: два счётчика одного расходятся, а разошедшись, дают
+        // спутника, который считает свою скорость иначе, чем дверь считает его предел шага.
+        float SliceSeconds() const { return _sliceSeconds; }
+
         // §11 and the review: bounding ONE step is not bounding movement. A hundred legal steps
         // in a single tick is a teleport spelled slowly. The engine calls this once per tick and
         // the budget is what a companion could actually have covered in it.

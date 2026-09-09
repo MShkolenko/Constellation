@@ -36,6 +36,13 @@ namespace
     // не сошлись в один такт мирового потока.
     inline constexpr uint32 QUEST_SCAN_MS = 1000;
 
+    // И ЭТОТ ИНТЕРВАЛ ТОЖЕ ВЗЯТ У ВЕТКИ, КОТОРУЮ ЗАМЕНЯЕТ. Перебор карты стоит дороже обзора:
+    // лестница после каждого ставит `c.SeekCooldownMs = 300000 + guid % 61 c`
+    // (Constellation.cpp:3695) и рядом пишет, зачем — «не перебирать карту каждые пять секунд»
+    // (:3295). Джиттер добавляет `Value::Get` сам, тем же способом и по тому же гуиду, так что
+    // берётся ровно число.
+    inline constexpr uint32 GIVER_SEEK_SCAN_MS = 300000;
+
     class CompletedTurnInsValue final : public Value<TurnInList>
     {
     public:
@@ -72,6 +79,42 @@ namespace
         }
     };
 
+    // КУДА ИДТИ ЗА КВЕСТОМ — ОДИН ОТВЕТ, А НЕ СПИСОК, потому что идут всегда в одно место.
+    //
+    // ЛИЧНЫЕ ФИЛЬТРЫ ЗДЕСЬ ЕСТЬ, И ЭТО НЕ НАРУШЕНИЕ ПРАВИЛА СВЕРХУ. Правило запрещает фильтры,
+    // живущие на `Companion`: `Calculate` их не видит, и кэш, протухающий от чужой отсрочки, —
+    // кэш, у которого интервал ничего не значит. Таблица отсрочек ДВИЖКА лежит в `EngineState`,
+    // то есть ровно там, куда `Calculate` дотягивается через `ctx.St`. Заголовок `Values.h` этот
+    // случай уже разобрал: «`FindGiverByMap` сортирует по расстоянию ОТ ИГРОКА, фильтрует по ЕГО
+    // фракции и ЕГО отсрочкам — значит каждое значение здесь на спутника».
+    class GiverToSeekValue final : public Value<SeekTarget>
+    {
+    public:
+        GiverToSeekValue() : Value(ValueId::GiverToSeek, GIVER_SEEK_SCAN_MS) { }
+
+    protected:
+        void Calculate(Ctx& ctx, SeekTarget& out) const override
+        {
+            out = SeekTarget();
+            // БЕЗ СОСТОЯНИЯ НЕ СЧИТАЕМ ВОВСЕ, а не считаем без памяти. `SeekMemory::BackedOff ==
+            // nullptr` — по её собственному заголовку «ЗАЩИТЫ НЕТ», а не «памяти нет»: выбор
+            // вернул бы одну и ту же точку столько раз, сколько его спросят. Пустой ответ честнее
+            // незащищённого.
+            if (!ctx.St)
+                return;
+            SeekMemory mem;
+            mem.Refused     = &QuestRefusedByEngine;
+            mem.RefusedUser = &ctx;
+            mem.BackedOff   = &SpawnBackedOffByEngine;
+            mem.BackoffUser = &ctx;
+            // `DiagOnce` НАМЕРЕННО НЕ СТАВИТСЯ. Строка «за потолком N точек» — прибор ОПЕРАТОРА,
+            // чтобы решать про потолок, и её уже печатает лестница на того же спутника. Второй
+            // такой же строкой движок сообщил бы не новость, а своё существование. Заголовок
+            // `SeekMemory` разрешает это прямым текстом: «nullptr значит „не писать“».
+            ctx.World.GiverToWalkTo(mem, &out);
+        }
+    };
+
     class GiversByIndexValue final : public Value<GiverIndexList>
     {
     public:
@@ -100,5 +143,6 @@ namespace Constellation::Ai
         engine.RegisterValue<ValueId::CompletedTurnIns>(std::make_unique<CompletedTurnInsValue>());
         engine.RegisterValue<ValueId::GiversInSight>(std::make_unique<GiversInSightValue>());
         engine.RegisterValue<ValueId::GiversByIndex>(std::make_unique<GiversByIndexValue>());
+        engine.RegisterValue<ValueId::GiverToSeek>(std::make_unique<GiverToSeekValue>());
     }
 }

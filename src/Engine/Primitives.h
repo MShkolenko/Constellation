@@ -89,7 +89,8 @@ namespace Constellation::Ai
     /*  имя              текст                     тип буфера  */         \
     X(CompletedTurnIns, "готовые к сдаче",       TurnInList)                    \
     X(GiversInSight,    "квестодатели в обзоре", GiverSightList)                \
-    X(GiversByIndex,    "квестодатели по карте", GiverIndexList)
+    X(GiversByIndex,    "квестодатели по карте", GiverIndexList)                 \
+    X(GiverToSeek,      "куда идти за квестом",  SeekTarget)
 
     enum class ValueId : uint8
     {
@@ -233,7 +234,11 @@ namespace Constellation::Ai
     X(None,             "нет")                                                        \
     X(NothingOffered,   "предложить нечего")                                          \
     X(Unreachable,      "не дойти")                                                   \
-    X(CoreRefused,      "ядро отказало")
+    X(CoreRefused,      "ядро отказало")                                              \
+    /* ДОШЛИ И БОЛЬШЕ СЮДА НЕ НАДО — это НЕ `Unreachable`. Ставится при УДАЧНОМ приходе:   */ \
+    /* причина у лестницы (Constellation.cpp:3701, нашёл Кодекс) — иначе у пришедшего      */ \
+    /* впустую тут же начинается поход к соседней точке, цепочка походов вместо дела.      */ \
+    X(Visited,          "уже сходил")
 
     enum class BackoffKind : uint8
     {

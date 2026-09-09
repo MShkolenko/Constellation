@@ -97,6 +97,16 @@ namespace Constellation::Ai
     //                QuestGiverRange; 32 leaves headroom without doubling the buffer.
     //   by index   — only the nearest is ever walked to; sixteen is enough that per-spawn
     //                backoff cannot empty the list.
+    // РОНЯТЬ УМЕЕТ НЕ ВСЯКОЕ ЗНАЧЕНИЕ. Список за потолком роняет и обязан об этом сказать;
+    // одиночный ответ — «куда идти» — ронять нечему, у него нет потолка. Без этой пары
+    // перегрузок `DroppedTotal` ниже перестал бы собираться на первом же неспископодобном
+    // значении, и выбор был бы между «дать всем значениям фальшивый `Dropped()`» и «не заводить
+    // одиночных значений вовсе». Обе цены выше двух строк.
+    template <class T>
+    inline uint32 DroppedOf(T const&) { return 0; }
+    template <class T, size_t Cap>
+    inline uint32 DroppedOf(CappedList<T, Cap> const& list) { return list.Dropped(); }
+
     using TurnInList     = CappedList<TurnInCandidate, MAX_QUEST_LOG_SIZE>;
     using GiverSightList = CappedList<GiverInSight, 32>;
     using GiverIndexList = CappedList<GiverOnMap, 16>;
@@ -123,7 +133,7 @@ namespace Constellation::Ai
         uint32 DroppedTotal() const
         {
             uint32 n = 0;
-#define CONSTELLATION_VALUE_DROPPED(name, text, type) n += name.Buffer.Dropped();
+#define CONSTELLATION_VALUE_DROPPED(name, text, type) n += DroppedOf(name.Buffer);
             CONSTELLATION_VALUES(CONSTELLATION_VALUE_DROPPED)
 #undef CONSTELLATION_VALUE_DROPPED
             return n;

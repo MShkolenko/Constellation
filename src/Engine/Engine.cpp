@@ -450,6 +450,11 @@ namespace Constellation::Ai
         // начавшись: сравнение `Subject` ловит смену цели, но не новую попытку к прежней
         // (Кодекс, пункты 1 и 3).
         st.Walk = WalkProgress();
+        // И ЯРУСОМ НИЖЕ — ТОЖЕ. `Walk` выше отвечает «стоит ли ещё идти», `Move` — «как сделать
+        // следующий шаг»: маршрут ядра, место в нём, отступы вбок. Работа брошена — значит и
+        // маршрут: без этой строки новая попытка шла бы по точкам чужой дороги. Дефект нашёл
+        // Кодекс, и нашёл ровно там, где строкой выше объяснено, зачем чистится `Walk`.
+        st.Move = MoveState();
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
     }
 
@@ -572,6 +577,35 @@ namespace Constellation::Ai
         }
     }
 
+    namespace
+    {
+        // ЕДИНСТВЕННЫЙ ОТПРАВЩИК ДВИЖКА, И ОН ЗДЕСЬ, А НЕ У ДЕЙСТВИЯ.
+        //
+        // Двигатель шлёт три опкода; у двери есть метод ровно под один. Прыжок и приземление
+        // отвергаются, и это ШТАТНЫЙ отказ, а не авария: `UnstickCore` получит ложь и уйдёт в
+        // свою ветку отступа вбок — спутник обходит препятствие вместо того, чтобы его
+        // перепрыгнуть, пока такой двери нет.
+        //
+        // Дверь при этом считает шаг в свой бюджет такта, режет его до предела шага и записывает
+        // отказ. Ради этого учёта отправка и идёт через неё, а не мимо.
+        bool SendThroughDoor(void* user, OpcodeClient opcode, MovementInfo& mi)
+        {
+            Ctx* ctx = static_cast<Ctx*>(user);
+            if (!ctx)
+                return false;
+            if (opcode != CMSG_MOVE_HEARTBEAT)
+                return false;
+            return ctx->Act.Step(mi.pos, mi.flags);
+        }
+    }
+
+    bool WalkTowards(Ctx& ctx, Position const& to, float stopAt, float dt)
+    {
+        if (!ctx.St)
+            return false;
+        return ctx.World.StepFor(ctx.St->Move, to, stopAt, dt, &SendThroughDoor, &ctx);
+    }
+
     WalkVerdict AdvanceWalk(Ctx& ctx, Subject const& toward, float dist, uint32 sliceMs, bool stalled)
     {
         if (!ctx.St)
@@ -608,9 +642,14 @@ namespace Constellation::Ai
         return EngineRemembers(user, BackoffKind::CoreRefused, Subject::OfQuest(questId));
     }
 
+    // ДВА ВИДА, А НЕ ОДИН, потому что точка не годится по двум РАЗНЫМ причинам: до неё не
+    // добраться, или мы только что оттуда и брать там нечего. Один вид на оба заставил бы журнал
+    // говорить «не дойти» о точке, до которой дошли.
     bool SpawnBackedOffByEngine(void const* user, uint32 spawnId)
     {
-        return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfSpawn(spawnId));
+        Subject const point = Subject::OfSpawn(spawnId);
+        return EngineRemembers(user, BackoffKind::Unreachable, point)
+            || EngineRemembers(user, BackoffKind::Visited, point);
     }
 
     void Defer(Ctx& ctx, BackoffKind kind, Subject const& about, uint8 detail, uint32 ttlMs)

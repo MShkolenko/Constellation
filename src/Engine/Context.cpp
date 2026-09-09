@@ -276,6 +276,14 @@ namespace Constellation::Ai
         return creature && creature->IsAlive() && _self->CanInteractWithQuestGiver(creature);
     }
 
+    bool WorldView::StepFor(MoveState& m, Position const& to, float stopAt, float dt,
+                            MoveSendFn send, void* user) const
+    {
+        if (!_self || !send)
+            return false;
+        return StepAlong(m, _self, send, user, to, stopAt, dt);
+    }
+
     bool WorldView::GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const
     {
         if (!_self || !out)

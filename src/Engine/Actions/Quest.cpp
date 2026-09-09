@@ -56,6 +56,24 @@ namespace
     // чтобы запись не вытеснила ту, что нужнее.
     inline constexpr uint32 QUEST_REFUSED_MS = 3600000;
 
+    // ПРИШЛИ. Двадцать пять ярдов по плоскости — число лестницы (`Constellation.cpp:3699`), и
+    // мерка тоже её: до ТОЧКИ СПАВНА, а не до NPC. Ходячий стоит не там, где его точка, и
+    // добирает эти метры уже обзор.
+    inline constexpr float SEEK_ARRIVED_YARDS = 25.0f;
+
+    // НА СКОЛЬКО ЗАБЫТЬ ТОЧКУ ПОСЛЕ ПРИХОДА. Десять минут, и лестница ставит их ТОЖЕ ПРИ
+    // УДАЧНОМ приходе (`:3700`) — причину нашёл Кодекс и она записана там же: иначе у
+    // пришедшего впустую тут же начинается поход к соседней точке, цепочка походов вместо дела.
+    inline constexpr uint32 SEEK_VISITED_MS = 600000;
+
+    // И СТОЛЬКО ЖЕ — ТОЧКЕ, ДО КОТОРОЙ НЕ ДОШЛИ. Столько держит `GiverUnreachable` у лестницы.
+    inline constexpr uint32 SEEK_UNREACHABLE_MS = 600000;
+
+    // ОТПРАВЩИКА ЗДЕСЬ НЕТ, И ЭТО ГЛАВНОЕ В ЭТОМ ШВЕ. Он один на весь движок и живёт в
+    // `Engine.cpp`, где его нельзя подменить: `WalkTowards` не принимает его параметром. Первая
+    // версия принимала — и Кодекс показал, что тогда любое действие вправе передать свой способ
+    // записи, а комментарий об инварианте 0 доказывает не больше, чем обещает.
+
     // ПАМЯТЬ ОБ ОТКАЗАХ ДВИЖКА — ТА ЖЕ ТАБЛИЦА ОТСРОЧЕК, только ключ здесь КВЕСТ, а не
     // квестодатель: не взялся конкретный квест, а не «у этого NPC нечего брать».
     //
@@ -298,6 +316,103 @@ namespace
                 Defer(ctx, BackoffKind::CoreRefused, Subject::OfQuest(quest), 0, QUEST_REFUSED_MS);
                 return false;
             }
+
+            // ВЗЯЛИ КВЕСТ — «КУДА ИДТИ ЗА КВЕСТОМ» МОГЛО СТАТЬ НЕПРАВДОЙ. Ответ кэшируется на
+            // пять минут, и это цена перебора карты; но взятие — ровно то событие, после
+            // которого светофор у выбранной точки меняется. Одна строка вместо пяти минут
+            // похода к тому, что уже не нужно (Кодекс, второй проход по шву).
+            //
+            // ОСТАЛЬНЫЕ СЛУЧАИ ОСТАЮТСЯ, И ЭТО НЕ РЕГРЕСС: лестница запоминает
+            // `SeekEntry/SeekSpawn/SeekPos` в момент решения и до прихода не перепроверяет их
+            // вовсе. Движок при этом строго лучше — ставка переоценивается каждый такт, так что
+            // устаревший поход проигрывает любой настоящей работе, чего режим `SeekingGiver` не
+            // умел.
+            if (ctx.St)
+                ctx.St->Values.GiverToSeek.Invalidate();
+            return true;
+        }
+    };
+
+    // §13 — ПОХОД К КВЕСТОДАТЕЛЮ ПО КАРТЕ. Первое действие движка, которое ХОДИТ.
+    //
+    // ОГЛЯДЫВАНИЕ НА ХОДУ ЗДЕСЬ НЕ НАПИСАНО, И ЭТО НЕ ПРОПУСК. У лестницы на него уходит
+    // отдельная ветка (`Constellation.cpp:3720-3760`): на ходу переспросить обзор и сменить цель
+    // на ближнюю, с оговоркой «и не оглядываемся на хвосте». В очереди ставок то же самое
+    // происходит само: `TakeQuestNearby` ставит REL_NORMAL на КАЖДОГО квестодателя в обзоре, а
+    // поход стоит REL_BACKGROUND минус ярды — значит любой увиденный по дороге перебивает поход
+    // тем же тактом, а на хвосте перебивать уже некого. Двадцать строк ветки заменяются
+    // порядком двух ставок.
+    class SeekGiverByMapAction final : public Action
+    {
+    public:
+        SeekGiverByMapAction() : Action(ActionId::SeekGiverByMap) { }
+
+        // §14 — ПО ВИДУ «УЖЕ СХОДИЛ», потому что именно его ставит это действие. Второй вид,
+        // «не дойти», ловится в `Useful` через общую память о точке: `DeferKind` возвращает
+        // один, а причин у точки две.
+        //
+        // РАЗДВОЕНИЕ ЗДЕСЬ НАМЕРЕННОЕ, И ВОТ ЧТО ДЕЛАЕТ ЕГО БЕЗОПАСНЫМ. Предварительный фильтр
+        // движка — СОКРАЩЕНИЕ: он снимает ставку до `Useful` и экономит вызов. Решает `Useful`,
+        // и он спрашивает `SpawnBackedOffByEngine`, то есть ОБА вида. Значит худшее, что даёт
+        // непойманный фильтром `Unreachable`, — лишняя ставка, дожившая до собственной проверки
+        // и там отброшенная. Кодекс назвал это латентным; латентно оно ровно до тех пор, пока
+        // не написано, кто здесь власть, а кто скорость.
+        BackoffKind DeferKind() const override { return BackoffKind::Visited; }
+
+        bool Useful(Ctx& ctx, Bid const& bid) override
+        {
+            if (bid.About.What() != Subject::Kind::Spawn)
+                return false;
+            SeekTarget const& t = Val<ValueId::GiverToSeek>(ctx);
+            if (!t.Found || uint32(t.SpawnId) != bid.About.Id())
+                return false;       // ответ пересчитался и ведёт уже в другое место
+            return !SpawnBackedOffByEngine(&ctx, uint32(t.SpawnId));
+        }
+
+        // ХОДЬБА ВОЗМОЖНА, ПОКА ЕСТЬ ГДЕ ХРАНИТЬ ЕЁ СОСТОЯНИЕ. Маршрут ядра, место в нём и
+        // отступы вбок живут в `EngineState`; без него двигатель начинал бы путь заново каждый
+        // такт и никуда бы не пришёл.
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
+
+        // Ближе — дешевле, тем же наклоном, что у сдачи и взятия. Наклон здесь важнее, чем там:
+        // поход стоит сотни ярдов, и дальний обязан проигрывать всему, что рядом.
+        float Score(Ctx& ctx, Bid const& bid, float relevance) const override
+        {
+            SeekTarget const& t = Val<ValueId::GiverToSeek>(ctx);
+            if (!t.Found || uint32(t.SpawnId) != bid.About.Id())
+                return relevance;
+            return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
+        }
+
+        bool Execute(Ctx& ctx, Bid const& bid) override
+        {
+            if (!ctx.St)
+                return false;
+            SeekTarget const& t = Val<ValueId::GiverToSeek>(ctx);
+            if (!t.Found || uint32(t.SpawnId) != bid.About.Id())
+                return false;
+
+            float const d = ctx.World.DistanceTo2d(t.Where);
+            if (d <= SEEK_ARRIVED_YARDS)
+            {
+                // ДОШЛИ — И ИМЕННО ЗДЕСЬ СТАВИТСЯ СРОК. Не в неудаче: у лестницы он стоит при
+                // удачном приходе тоже, и по её же причине.
+                Defer(ctx, BackoffKind::Visited, bid.About, 0, SEEK_VISITED_MS);
+                return true;
+            }
+
+            float const dt = ctx.Act.SliceSeconds();
+            bool const going = WalkTowards(ctx, t.Where, SEEK_ARRIVED_YARDS, dt);
+
+            // ПРИБЛИЖАЕМСЯ ЛИ — ВОПРОС ОТДЕЛЬНЫЙ ОТ «СДЕЛАН ЛИ ШАГ». Двигатель отвечает про шаг,
+            // `AdvanceWalk` — про дорогу: расстояние не падает, или идём слишком долго. Отказ
+            // двери в шаге — это и есть отсутствие прогресса, отдельной ветки под него нет.
+            uint32 const sliceMs = uint32(dt * 1000.0f);
+            if (AdvanceWalk(ctx, bid.About, d, sliceMs, !going) != WalkVerdict::Going)
+            {
+                Defer(ctx, BackoffKind::Unreachable, bid.About, 0, SEEK_UNREACHABLE_MS);
+                return false;
+            }
             return true;
         }
     };
@@ -331,6 +446,15 @@ namespace
             // перебор считается полем `сброшено` в строке решения — по нему и станет видно.
             for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
                 sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
+
+            // ПОХОД ПО КАРТЕ — САМОЕ НИЖНЕЕ, ЧТО МОЖНО ДЕЛАТЬ ПО КВЕСТАМ, и у лестницы он ровно
+            // там же: последняя ветка `Idle`, куда доходит тот, у кого нет ни готового к сдаче,
+            // ни цели, ни собеседника. REL_BACKGROUND значит «когда больше нечем заняться»; всё
+            // остальное в этой стратегии стоит выше по построению, а не по проверке условий.
+            SeekTarget const& seek = Val<ValueId::GiverToSeek>(ctx);
+            if (seek.Found)
+                sink.Add(ActionId::SeekGiverByMap, REL_BACKGROUND,
+                         Subject::OfSpawn(uint32(seek.SpawnId)));
         }
     };
 }
@@ -341,6 +465,7 @@ namespace Constellation::Ai
     {
         engine.Register(std::make_unique<TurnInQuestAction>());
         engine.Register(std::make_unique<TakeQuestNearbyAction>());
+        engine.Register(std::make_unique<SeekGiverByMapAction>());
         engine.Register(std::make_unique<QuestsStrategy>());
     }
 }

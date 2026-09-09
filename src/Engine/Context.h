@@ -31,6 +31,7 @@ namespace Constellation::Ai
 {
     class ClientAct;
     struct EngineState;      // §13 — только вперёд: знать его здесь значило бы цикл включений
+    struct Ctx;              // — и он же, чтобы объявить единственного друга `StepFor` ниже
 
 
     // -----------------------------------------------------------------------------------------
@@ -178,7 +179,7 @@ namespace Constellation::Ai
     class WorldView
     {
     public:
-        explicit WorldView(Player const* self) : _self(self) { }
+        explicit WorldView(Player* self) : _self(self) { }
 
         // -- identity ----------------------------------------------------------------------
         ObjectGuid  Guid() const;
@@ -285,7 +286,29 @@ namespace Constellation::Ai
         //   А mutable anything. Фасад читает; пишет только `ClientAct`.
 
     private:
-        Player const* _self;
+        // ХОД К ДВИГАТЕЛЮ — ПРИВАТНЫЙ, И У НЕГО РОВНО ОДИН ДРУГ.
+        //
+        // Он был публичным ровно один проход. Кодекс: «прежняя дырка не закрыта — любое действие
+        // всё ещё может вызвать публичный `StepFor` со своим `MoveSendFn`». Он прав: я перенёс
+        // отправщик из подписи одной функции в подпись другой и назвал это закрытием. Правило,
+        // которое держится на том, что никто не позовёт, — это не правило, и в этом модуле такое
+        // рассуждение уже разобрано (`Constellation.cpp:2801`).
+        //
+        // Теперь позвать нельзя ПО ТИПУ. Единственный друг — `Ai::WalkTowards`, у которой
+        // отправщик уже выбран и не является параметром.
+        friend bool WalkTowards(Ctx& ctx, Position const& to, float stopAt, float dt);
+        bool StepFor(MoveState& m, Position const& to, float stopAt, float dt,
+                     MoveSendFn send, void* user) const;
+
+        // ХРАНИТСЯ ИЗМЕНЯЕМЫМ, И ЭТО НЕ ПОСЛАБЛЕНИЕ ПРАВИЛА, А ОНО САМО. Заголовок выше
+        // требует не ОТДАВАТЬ объект наружу — и он же объясняет, почему константность его не
+        // заменяет: `GetSession() const` возвращает ИЗМЕНЯЕМУЮ сессию, так что `Player const*`
+        // ведёт ко всем обработчикам ядра. Гарантию даёт фасад, а не `const`.
+        //
+        // Изменяемым он нужен потому, что ядро объявляет `GetFirstCollisionPosition`
+        // НЕконстантным (`Object.h:296`), а двигатель зовёт её при прыжке и при отступе вбок.
+        // Наружу по-прежнему не выходит ничего.
+        Player* _self;
     };
 
     // -----------------------------------------------------------------------------------------
@@ -324,6 +347,15 @@ namespace Constellation::Ai
 
     // Тот же приём: одна реализация в модуле, переходник для движка.
     bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out);
+
+    // Шаг двигателя: одна реализация на лестницу и на движок.
+    //
+    // ОБЪЯВЛЕНА ПУБЛИЧНО, И ДЕЙСТВИЕ ВСЁ РАВНО ЕЁ НЕ ПОЗОВЁТ — не по договорённости, а потому что
+    // первым параметром стоит `Player*`, а игрок и есть то единственное, чего действию взять
+    // неоткуда: фасад его не отдаёт, `Ctx` не носит. Кодекс отметил её видимость рядом со
+    // `StepFor`; у `StepFor` замок пришлось ставить, здесь он уже стоял — в подписи.
+    bool StepAlong(MoveState& m, Player* self, MoveSendFn send, void* user,
+                   Position const& to, float stopAt, float dt);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.
