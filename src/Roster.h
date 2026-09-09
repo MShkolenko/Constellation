@@ -16,23 +16,32 @@
  */
 
 /*
- * Constellation -- the roster: humans, and the two classes a human cannot be.
+ * Constellation -- the roster: humans, and the one class we still want that they cannot be.
  *
- * CUT DOWN TO ELEVEN on 2026-09-09 (operator: keep only humans, the death knight included, plus
- * whichever ALLIANCE race fills in the classes they cannot take). It was every standard race in
- * every class it could take -- 122, then 114 once the goblins were paused.
+ * CUT DOWN TO TEN on 2026-09-09. First to eleven (operator: keep only humans, the death knight
+ * included, plus whichever ALLIANCE race fills in the classes they cannot take), then to ten the
+ * same day -- "ДХ не берём совсем". It was every standard race in every class it could take: 122,
+ * then 114 once the goblins were paused.
  *
- * NO SINGLE RACE FILLS THE GAP, and that is data rather than a preference. A human takes nine
- * classes; shaman, druid, demon hunter and evoker are missing. Read from the realm's own
- * playercreateinfo: night elf brings druid AND demon hunter, which is the most any one Alliance
- * race adds; dwarf, draenei and Alliance pandaren bring only shaman; worgen only druid; gnome
- * nothing at all. Shaman and druid never come from the same Alliance race except Kul Tiran, and
- * allied races are excluded (operator, 2026-08-29) because they have no ordinary levelling start.
- * Evoker exists only on dracthyr, also allied. So eleven classes of thirteen, the shaman needs a
- * SECOND race, and the evoker is out of reach under that exclusion.
+ * DROPPING THE DEMON HUNTER CHANGED THE ANSWER, NOT JUST A LINE. The night elf was chosen because
+ * it was the only Alliance race supplying TWO of the missing classes -- druid AND demon hunter.
+ * Without the second it supplies exactly one, the same as the worgen.
  *
- * Only the MISSING classes are taken from the night elf -- not a second warrior and a second
- * mage. Every class appears exactly once.
+ * SO NO SINGLE RACE CAN EVEN COVER TWO, and that is data rather than a preference. A human takes
+ * nine classes; shaman, druid and evoker are what remain wanted. Read from the realm's own
+ * playercreateinfo: night elf and worgen bring druid; dwarf, draenei and Alliance pandaren bring
+ * shaman; gnome brings nothing. Shaman and druid never come from the same Alliance race except
+ * the Kul Tiran, and allied races are excluded (operator, 2026-08-29) because they have no
+ * ordinary levelling start. Evoker exists only on the dracthyr, also allied. So it is druid OR
+ * shaman from one race, or a SECOND race for both.
+ *
+ * NIGHT ELF RATHER THAN WORGEN, since both give the druid: the worgen start is Gilneas, and this
+ * realm has a known and expensive problem there -- companions standing in zone 0, and the Gilneas
+ * door already cost a day of reading. Teldrassil is an ordinary start.
+ *
+ * Only the MISSING class is taken from the night elf -- not a second warrior and a second mage.
+ * Every class appears exactly once. Kaelith is not deleted: this table decides who is summoned,
+ * and restoring his line puts him back in Mardum where he stands.
  *
  * The other 103 companions are not deleted. This table decides who is SUMMONED, not who exists;
  * their characters stay in the database and simply stop coming into the world.
@@ -68,10 +77,10 @@ struct RosterEntry
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
 };
 
-// 11 после сокращения до людей (было 114, до паузы гоблинов 122). ЧИСЛО ЗДЕСЬ — НЕ
+// 10: девять человеческих классов и друид (было 11, до сокращения 114). ЧИСЛО ЗДЕСЬ — НЕ
 // УКРАШЕНИЕ: std::array с меньшим числом записей компилируется молча и добивает остаток
 // нулями, то есть спутниками без имени.
-inline constexpr std::array<RosterEntry, 11> Roster =
+inline constexpr std::array<RosterEntry, 10> Roster =
 {{
     // человек — все девять классов, которые ему доступны, рыцарь смерти в том числе
     { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE },
@@ -83,9 +92,8 @@ inline constexpr std::array<RosterEntry, 11> Roster =
     { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE },
     { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE },
     { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE },
-    // ночной эльф — ТОЛЬКО те два класса, которых человек не может
+    // ночной эльф — только друид. Охотника на демонов не берём вовсе (оператор, 2026-09-09)
     { "Sylwen",     RACE_NIGHTELF,              CLASS_DRUID,         GENDER_FEMALE },
-    { "Kaelith",    RACE_NIGHTELF,              CLASS_DEMON_HUNTER,  GENDER_MALE },
 }};
 }
 
