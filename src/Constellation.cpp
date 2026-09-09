@@ -287,7 +287,6 @@ struct Companion
     uint8 Retries = 0;
     bool PendingDismiss = false;        // dismissal requested mid-login; applied when safe
     uint32 MoveMs = 0;                  // накопитель времени между шагами следования
-    bool Moving = false;                // мы САМИ считаем, идём ли: флаги ядра могут быть нормализованы
     bool DebugWalk = false;             // только стенд: уходить в точку, а не за лидером
     Position DebugTarget;
     uint32 QuestMs = 0;                 // накопитель между попытками взять квест
@@ -303,9 +302,10 @@ struct Companion
     ObjectGuid TargetGuid;              // цель, которая не меняется по дороге
     uint32 ModeMs = 0;                  // сколько в этом состоянии — для сроков
     float LastDist = 0.0f;              // для проверки, что мы вообще приближаемся
-    std::vector<Position> Waypoints;    // маршрут, построенный ядром
-    size_t WaypointIndex = 0;
-    float PathTargetX = 0.0f, PathTargetY = 0.0f;
+    // §31 — ВСЁ СОСТОЯНИЕ ХОДЬБЫ ОДНИМ ТИПОМ. Шестнадцать полей, которые вместе образуют
+    // механизм следования: маршрут и место в нём, отступы вбок, отсрочка построителя пути,
+    // обнаружение примерзания. Движку предстоит ходить тем же механизмом, а не похожим.
+    Constellation::Ai::MoveState Move;
     uint32 TurnInQuest = 0;             // что сдаём
     uint32 TurnInEntry = 0;
     bool TurnInPosFromTable = false;    // точка сдачи из указателя (высоту править можно) или от живого             // кому
@@ -592,7 +592,6 @@ struct Companion
     uint32 SeekCooldownMs = 0;          // между походами — пять минут
     std::unordered_map<ObjectGuid::LowType, uint32> SeekBackoff;   // точка -> сколько не ходить к ней снова
     uint32 IdleDiagMs = 0;              // прибор «ПРОСТОЙ» — раз в пять минут
-    uint32 LastPathType = 0;            // тип последнего отказа построителя — для строки «не подойти»
     bool RingTried = false;             // обход точек вокруг NPC в этом намерении уже был
     bool FarDiagDone = false;           // «за потолком» — по разу на спутника
     bool RingHeld = false;              // и найденная точка держится до прихода или отказа
@@ -605,8 +604,6 @@ struct Companion
     std::set<ObjectGuid> TalkUnreachable;   // а «не дойти» — свойство КОНКРЕТНОЙ особи:
                                         // запрет по виду глушил бы и всех остальных, и все
                                         // задания, где этот вид встречается (Кодекс)
-    uint32 FrozenMs = 0;                // сколько стоим под запретом движения
-    bool FrozenNoted = false;           // и сказали ли об этом хоть раз
     Position TurnInPos;                 // и где он стоит
     // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
     // любая новая неудача переписывала таймер, а по его истечении набор очищался
@@ -617,19 +614,12 @@ struct Companion
     ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
-    float LastX = 0.0f, LastY = 0.0f;   // где мы были — чтобы заметить, что не идём
-    uint32 StuckMs = 0;                 // сколько стоим, хотя собирались идти
-    uint32 UnstickTries = 0;            // сколько раз отступали вбок подряд
     uint32 UnstickTotal = 0;            // и сколько всего за это намерение (не сбросить движением)
     bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
     uint8 JumpsLeft = 3;                // прыжков в запасе
     uint32 JumpCooldownMs = 0;          // истратил три — минуту без прыжков
     bool UnstickLeft = true;            // в какую сторону отступать следующей
-    uint32 NoPathMs = 0;                // сколько ещё не трогать построитель маршрута
-    uint8 NoPathFails = 0;              // подряд идущих отказов — отступ растёт с ними
-    bool RawTarget = false;             // боковая точка не далась — идём на самого NPC
-    bool Stalled = false;               // отступать больше некуда — решает автомат
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
 };
 
@@ -1215,8 +1205,8 @@ public:
         down.jump.fallTime = 400;
         c.Session->HandleMovementOpcode(CMSG_MOVE_FALL_LAND, down);
 
-        c.Moving = false;
-        c.Waypoints.clear();                // маршрут пересчитаем с нового места
+        c.Move.Moving = false;
+        c.Move.Waypoints.clear();                // маршрут пересчитаем с нового места
         return true;
     }
 
@@ -1258,7 +1248,7 @@ public:
         // ДВА ПРЕДЕЛА, А НЕ ОДИН (Кодекс, 2026-08-30). Первый — попытки подряд; но его
         // обнуляет сам удавшийся отступ, ведь спутник при этом ДВИГАЛСЯ. Поэтому второй,
         // общий за намерение, движением не сбрасывается — только сменой намерения.
-        if (++c.UnstickTries > 4 || ++c.UnstickTotal > 8)
+        if (++c.Move.UnstickTries > 4 || ++c.UnstickTotal > 8)
             return false;                   // хватит топтаться — пусть решает автомат
 
         float toGoal = self->GetAbsoluteAngle(tx, ty);
@@ -1269,11 +1259,11 @@ public:
         if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f)
             return true;                    // и вбок стена — на следующем такте другая сторона
 
-        c.Waypoints.clear();
-        c.Waypoints.push_back(hop);
-        c.WaypointIndex = 0;
-        c.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
-        c.PathTargetY = ty;
+        c.Move.Waypoints.clear();
+        c.Move.Waypoints.push_back(hop);
+        c.Move.WaypointIndex = 0;
+        c.Move.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
+        c.Move.PathTargetY = ty;
         return true;
     }
 
@@ -1290,10 +1280,10 @@ public:
     // отчего оно и дожило до боевого.
     void StopMoving(Companion& c, Player* self)
     {
-        if (!c.Moving)
+        if (!c.Move.Moving)
             return;
         SendMove(c, self, self->GetPosition(), 0);
-        c.Moving = false;
+        c.Move.Moving = false;
     }
 
     // ССЫЛКА НА ТОЧКУ НАЗНАЧЕНИЯ (destFix) — И РАЗРЕШЕНИЕ, И МЕСТО ДЛЯ ПОПРАВКИ.
@@ -1316,31 +1306,31 @@ public:
         float dist = self->GetExactDist(tx, ty, tz);
         if (dist < stopAt)
         {
-            if (c.Moving)
+            if (c.Move.Moving)
             {
                 SendMove(c, self, self->GetPosition(), 0);
-                c.Moving = false;
+                c.Move.Moving = false;
             }
-            c.StuckMs = 0;
-            c.UnstickTries = 0;
-            c.NoPathFails = 0;
-            c.NoPathMs = 0;
-            c.RawTarget = false;        // дошли — в следующий раз снова вежливо, сбоку
-            c.Stalled = false;          // дошли — тупика больше нет (Кодекс)
+            c.Move.StuckMs = 0;
+            c.Move.UnstickTries = 0;
+            c.Move.NoPathFails = 0;
+            c.Move.NoPathMs = 0;
+            c.Move.RawTarget = false;        // дошли — в следующий раз снова вежливо, сбоку
+            c.Move.Stalled = false;          // дошли — тупика больше нет (Кодекс)
             return false;
         }
 
         // ЗАСТРЯЛИ — СУДИМ ПО ФАКТУ, А НЕ ПО НАМЕРЕНИЮ. Маршрут может существовать, а
         // спутник всё равно тереться об угол: значит смотрим, СДВИНУЛСЯ ли он на самом деле.
-        if (self->GetExactDist2d(c.LastX, c.LastY) > 1.0f)
+        if (self->GetExactDist2d(c.Move.LastX, c.Move.LastY) > 1.0f)
         {
-            c.LastX = self->GetPositionX();
-            c.LastY = self->GetPositionY();
-            c.StuckMs = 0;
-            c.UnstickTries = 0;
+            c.Move.LastX = self->GetPositionX();
+            c.Move.LastY = self->GetPositionY();
+            c.Move.StuckMs = 0;
+            c.Move.UnstickTries = 0;
         }
         else
-            c.StuckMs += uint32(dt * 1000.0f);
+            c.Move.StuckMs += uint32(dt * 1000.0f);
 
         // ЭТОТ ОТКАЗ БЫЛ МОЛЧАЛИВЫМ, И ЭТО ЕГО ГЛАВНАЯ БЕДА.
         //
@@ -1365,10 +1355,10 @@ public:
         if (badFlags || self->GetTransport()
             || self->IsFalling() || self->IsFlying())
         {
-            c.FrozenMs += uint32(dt * 1000.0f);
-            if (!c.FrozenNoted)
+            c.Move.FrozenMs += uint32(dt * 1000.0f);
+            if (!c.Move.FrozenNoted)
             {
-                c.FrozenNoted = true;
+                c.Move.FrozenNoted = true;
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЗАМЕР {}: шаг запрещён — флаги {:X}, транспорт {}, "
                     "падение {}, полёт {} (вода {} — уже не помеха)",
@@ -1378,9 +1368,9 @@ public:
                     self->IsInWater() ? 1 : 0);
             }
 
-            if (c.FrozenMs > 3000 && (self->IsFalling() || badFlags))
+            if (c.Move.FrozenMs > 3000 && (self->IsFalling() || badFlags))
             {
-                c.FrozenMs = 0;
+                c.Move.FrozenMs = 0;
                 float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
                     self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
                 if (gz > INVALID_HEIGHT)
@@ -1391,19 +1381,19 @@ public:
                     Position down(self->GetPositionX(), self->GetPositionY(), gz,
                                   self->GetOrientation());
                     SendMove(c, self, down, 0);
-                    c.Moving = false;
+                    c.Move.Moving = false;
                 }
             }
             StopMoving(c, self);
             return false;               // не наш случай; выручит срок состояния
         }
-        c.FrozenMs = 0;
+        c.Move.FrozenMs = 0;
 
-        if (c.StuckMs > 2500)
+        if (c.Move.StuckMs > 2500)
         {
-            c.StuckMs = 0;
+            c.Move.StuckMs = 0;
             if (!Unstick(c, self, tx, ty))
-                c.Stalled = true;
+                c.Move.Stalled = true;
             StopMoving(c, self);
             return false;
         }
@@ -1417,9 +1407,9 @@ public:
 
         // маршрут пересчитывается не каждый шаг: он нужен, только пока мы далеко
         // от следующей его точки
-        if (c.Waypoints.empty() || c.WaypointIndex >= c.Waypoints.size()
-            || self->GetExactDist2d(c.PathTargetX, c.PathTargetY) > 5.0f
-                && (std::fabs(c.PathTargetX - tx) > 3.0f || std::fabs(c.PathTargetY - ty) > 3.0f))
+        if (c.Move.Waypoints.empty() || c.Move.WaypointIndex >= c.Move.Waypoints.size()
+            || self->GetExactDist2d(c.Move.PathTargetX, c.Move.PathTargetY) > 5.0f
+                && (std::fabs(c.Move.PathTargetX - tx) > 3.0f || std::fabs(c.Move.PathTargetY - ty) > 3.0f))
         {
             // ВЫСОТА ЦЕЛИ — НАСТОЯЩАЯ, А НЕ ВЫЧИСЛЕННАЯ ЗАНОВО.
             //
@@ -1445,10 +1435,10 @@ public:
             // Отступ нарастающий — 3, 6, 12, 24 секунды, дальше 24. Цель за это время
             // никуда не убежит, а такт освобождается. Тот, кто так и не дойдёт, будет
             // отмечен «не дойти» по общему правилу и займётся другим делом.
-            if (c.NoPathMs > 0)
+            if (c.Move.NoPathMs > 0)
             {
                 uint32 const backoff = uint32(dt * 1000.0f);
-                c.NoPathMs = (c.NoPathMs <= backoff) ? 0 : c.NoPathMs - backoff;
+                c.Move.NoPathMs = (c.Move.NoPathMs <= backoff) ? 0 : c.Move.NoPathMs - backoff;
                 StopMoving(c, self);
                 return false;
             }
@@ -1560,7 +1550,7 @@ public:
             if (!built)
             {
                 ++_noPath;
-                c.LastPathType = uint32(path.GetPathType());
+                c.Move.LastPathType = uint32(path.GetPathType());
                 if (_noPathLogged < 20)
                 {
                     // прежняя диагностика стояла на ОДНОМ глобальном флаге и напечаталась
@@ -1615,7 +1605,7 @@ public:
                 // место в порядке, и дело в конце пути.
                 //
                 // Один лишний вызов на ПЕРВЫЙ отказ, дальше отступание. Не на такте.
-                if (!c.NoPathFails)
+                if (!c.Move.NoPathFails)
                 {
                     PathGenerator probe(self);
                     float const px = self->GetPositionX() + std::cos(self->GetOrientation()) * 5.0f;
@@ -1629,7 +1619,7 @@ public:
                         okNear ? "сетка под ногами есть, беда в конце пути"
                                : "сетки под ногами НЕТ, беда в нашем положении");
                 }
-                if (!c.NoPathFails)
+                if (!c.Move.NoPathFails)
                 {
                     float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
@@ -1640,47 +1630,47 @@ public:
                             self->GetName(), self->GetPositionZ() - gz, self->GetPositionZ(), gz);
                         Position down(self->GetPositionX(), self->GetPositionY(), gz, self->GetOrientation());
                         SendMove(c, self, down, 0);
-                        c.Moving = false;
+                        c.Move.Moving = false;
                     }
                 }
-                c.RawTarget = true;     // боковая точка не далась — дальше идём в центр
-                if (c.NoPathFails < 4)
-                    ++c.NoPathFails;
+                c.Move.RawTarget = true;     // боковая точка не далась — дальше идём в центр
+                if (c.Move.NoPathFails < 4)
+                    ++c.Move.NoPathFails;
                 static uint32 const backoffLadder[5] = { 0, 3000, 6000, 12000, 24000 };
-                c.NoPathMs = backoffLadder[c.NoPathFails]
+                c.Move.NoPathMs = backoffLadder[c.Move.NoPathFails]
                            + uint32(self->GetGUID().GetCounter() % 1500u);
                 if (!Unstick(c, self, tx, ty))
-                    c.Stalled = true;
+                    c.Move.Stalled = true;
                 StopMoving(c, self);
                 return false;
             }
-            c.NoPathFails = 0;              // маршрут нашёлся — отступ снимаем,
-            c.NoPathMs = 0;                 // но НЕ признак «иди в центр»: снять его на
+            c.Move.NoPathFails = 0;              // маршрут нашёлся — отступ снимаем,
+            c.Move.NoPathMs = 0;                 // но НЕ признак «иди в центр»: снять его на
                                             // удачном маршруте значило бы снова подсунуть
                                             // ту же непроходимую боковую точку — качели,
                                             // которые Кодекс и разглядел прямо в коде
-            c.Waypoints.clear();
+            c.Move.Waypoints.clear();
             for (G3D::Vector3 const& v : *pts)
-                c.Waypoints.emplace_back(v.x, v.y, v.z);
-            c.WaypointIndex = 0;
+                c.Move.Waypoints.emplace_back(v.x, v.y, v.z);
+            c.Move.WaypointIndex = 0;
             // ЦЕЛЬ ПЕРЕСЧЁТА — ТА ТОЧКА, КУДА МЫ РЕАЛЬНО ИДЁМ. При прыжке это его конец,
             // а не далёкая цель: иначе условие пересчёта считало бы, что мы уже у цели.
-            c.PathTargetX = aimX;
-            c.PathTargetY = aimY;
+            c.Move.PathTargetX = aimX;
+            c.Move.PathTargetY = aimY;
         }
 
         // идём к текущей точке маршрута; дошли — берём следующую
-        while (c.WaypointIndex < c.Waypoints.size()
-            && self->GetExactDist(c.Waypoints[c.WaypointIndex]) < 1.5f)
-            ++c.WaypointIndex;
-        if (c.WaypointIndex >= c.Waypoints.size())
+        while (c.Move.WaypointIndex < c.Move.Waypoints.size()
+            && self->GetExactDist(c.Move.Waypoints[c.Move.WaypointIndex]) < 1.5f)
+            ++c.Move.WaypointIndex;
+        if (c.Move.WaypointIndex >= c.Move.Waypoints.size())
         {
-            c.Waypoints.clear();
+            c.Move.Waypoints.clear();
             StopMoving(c, self);
             return false;                   // маршрут пройден
         }
 
-        Position const& wp = c.Waypoints[c.WaypointIndex];
+        Position const& wp = c.Move.Waypoints[c.Move.WaypointIndex];
         float angle = self->GetAbsoluteAngle(wp.GetPositionX(), wp.GetPositionY());
         float legLen = self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY());
         float go = std::min(step, legLen);
@@ -1713,7 +1703,7 @@ public:
                       self->GetPositionY() + std::sin(angle) * go,
                       nz, angle);
         SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
-        c.Moving = true;
+        c.Move.Moving = true;
         return true;
     }
     // СМЕРТЬ — НЕ КОНЕЦ, А ДОРОГА ОБРАТНО.
@@ -1891,7 +1881,7 @@ public:
                 // его за пять секунд, и спутник уходил ждать пять минут. У бега свой предел
                 // по времени и свой счётчик отказов подъёма.
                 c.ReviveTries = 0;
-                if (!c.Stalled && c.CorpseRunMs < 300000)
+                if (!c.Move.Stalled && c.CorpseRunMs < 300000)
                 {
                     c.CorpseRunMs += uint32(dt * 1000.0f);
                     return;
@@ -1920,7 +1910,7 @@ public:
                     c.ReviveMs = 0;
                     c.ReviveTries = 0;
                     c.CorpseRunMs += uint32(dt * 1000.0f);
-                    if (c.CorpseRunMs < 300000 && !c.Stalled)
+                    if (c.CorpseRunMs < 300000 && !c.Move.Stalled)
                         return;
                     c.CorpseGaveUp = true;
                     return;
@@ -2021,21 +2011,21 @@ public:
             {
                 c.GraveWalkNoted = true;
                 c.GraveWalkLast = toGrave;
-                c.Stalled = false;      // новое намерение — как в 5459: прежний тупик не наш
+                c.Move.Stalled = false;      // новое намерение — как в 5459: прежний тупик не наш
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ТЕЛО {}: целительницы нет в 60 ярдах — иду на кладбище {} ({:.0f} ярдов); "
                     "труп на карте {} в {:.0f} {:.0f} {:.0f}",
                     self->GetName(), grave->ID, toGrave, from.GetMapId(),
                     from.GetPositionX(), from.GetPositionY(), from.GetPositionZ());
             }
-            // ПРОГРЕСС — ПО РАССТОЯНИЮ, НЕ ПО ФЛАГУ. c.Stalled липкий: его ставят застревание
+            // ПРОГРЕСС — ПО РАССТОЯНИЮ, НЕ ПО ФЛАГУ. c.Move.Stalled липкий: его ставят застревание
             // и неудачный поиск пути, а снимают только «дошёл» и «новое намерение» — ни того,
             // ни другого здесь не бывает. Первый затор на дороге обнулял бы всю дорогу.
             if (toGrave < c.GraveWalkLast - 1.0f)
             {
                 c.GraveWalkLast = toGrave;
                 c.ReviveTries = 0;      // стало ближе — это дорога, а не попытка
-                c.Stalled = false;
+                c.Move.Stalled = false;
             }
             StepToward(c, self, grave->Loc.GetPositionX(), grave->Loc.GetPositionY(),
                 grave->Loc.GetPositionZ(), 4.0f, dt);
@@ -2068,7 +2058,7 @@ public:
             float ax, ay, az;
             ApproachPoint(c, healer, self, ax, ay, az, ms);
             StepToward(c, self, ax, ay, az, 2.0f, dt);
-            if (c.Stalled)
+            if (c.Move.Stalled)
             {
                 // ОТКАЗ УДЕРЖАННОЙ ТОЧКИ (Кодекс): застряли по дороге к самой точке кольца —
                 // значит, и она не годится; отпускаем, чтобы второй поиск не упёрся в неё же.
@@ -2933,7 +2923,7 @@ public:
                                 c.FleeTo.GetPositionZ(), 0.0f, dt);
                             // НАСТОЯЩИЙ ПРЕДЕЛ (Кодекс): минута отхода — и пять минут покоя,
                             // а не бесконечный шаг после «истечения» срока.
-                            if (c.Stalled || c.FleeMs >= 60000)
+                            if (c.Move.Stalled || c.FleeMs >= 60000)
                             {
                                 c.FleePauseMs = 300000;
                                 c.FleeHasPoint = false;
@@ -3285,9 +3275,9 @@ public:
                     c.LastDist = od;
                     c.ModeMs = 0;
                 }
-                else if (c.Stalled || c.ModeMs > 30000)
+                else if (c.Move.Stalled || c.ModeMs > 30000)
                 {
-                    char const* why = c.Stalled ? "до хозяина не дойти" : "полминуты без движения к хозяину";
+                    char const* why = c.Move.Stalled ? "до хозяина не дойти" : "полминуты без движения к хозяину";
                     c.FollowCooldownMs = 10000; // не возвращаться сюда каждый такт
                     Switch(c, self, Behavior::Idle, why);
                 }
@@ -3376,7 +3366,7 @@ public:
                                 { c.WalkBest = d; c.WalkStuckMs = 0; }
                             else
                                 c.WalkStuckMs += slice;
-                            if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                            if (c.Move.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                             {
                                 c.VendCooldownMs = 300000;
                                 c.VendorEntry = 0;
@@ -3413,11 +3403,11 @@ public:
                     // столбом у недостижимого торговца хуже, чем ходить сломанным.
                     // ТУПИК РАСПОЗНАЁМ СРАЗУ, А НЕ ЧЕРЕЗ ДВЕ МИНУТЫ.
                     //
-                    // Автомат уже умеет говорить «отступать больше некуда» (c.Stalled), и
+                    // Автомат уже умеет говорить «отступать больше некуда» (c.Move.Stalled), и
                     // три других состояния его слушают. Торговля не слушала — значит
                     // недостижимый торговец означал две минуты бега в стену вместо трёх
                     // секунд. Разбор поймал это сравнением с Travelling.
-                    bool const vendorDone = c.Stalled || c.ModeMs > 120000;
+                    bool const vendorDone = c.Move.Stalled || c.ModeMs > 120000;
                     if (vendorDone && FindReachableApproach(c, self, vendor))
                         { c.ModeMs = 0; return; }       // нашли обход — даём дойти до него
                     if (vendorDone)
@@ -3509,15 +3499,15 @@ public:
                             { c.WalkBest = d; c.WalkStuckMs = 0; }
                         else
                             c.WalkStuckMs += slice;
-                        if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                        if (c.Move.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                         {
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation ПОЛЁТ {}: до полётного мастера {} не дойти — осталось {:.0f} "
                                 "по плоскости, лучшее было {:.0f}, по высоте {:+.0f}; причина {}, тип пути {}, в пути {} с",
                                 self->GetName(), c.FlightMasterEntry, d, c.WalkBest,
                                 c.FlightMasterPos.GetPositionZ() - self->GetPositionZ(),
-                                c.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
-                                c.LastPathType ? Trinity::StringFormat("{:X}", c.LastPathType) : std::string("отказов не было"),
+                                c.Move.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
+                                c.Move.LastPathType ? Trinity::StringFormat("{:X}", c.Move.LastPathType) : std::string("отказов не было"),
                                 c.ModeMs / 1000);
                             c.FlightCooldownMs = 600000;
                             Switch(c, self, Behavior::Idle, "до полётного мастера не дойти");
@@ -3553,7 +3543,7 @@ public:
                     float ax, ay, az;
                     ApproachPoint(c, master, self, ax, ay, az, diff);
                     StepToward(c, self, ax, ay, az, master->GetCombatReach() + 2.0f, dt);
-                    bool const done = c.Stalled || c.ModeMs > 120000;
+                    bool const done = c.Move.Stalled || c.ModeMs > 120000;
                     if (done && FindReachableApproach(c, self, master))
                         { c.ModeMs = 0; return; }
                     if (done)
@@ -3599,9 +3589,9 @@ public:
                 // НАЗЕМНОЕ ДВИЖЕНИЕ КОНЧАЕТСЯ ЗДЕСЬ (Кодекс): после взлёта любой наш пакет
                 // движения спорил бы с маршрутом, который ведёт ядро.
                 StopMoving(c, self);
-                c.Waypoints.clear();
-                c.WaypointIndex = 0;
-                c.Moving = false;
+                c.Move.Waypoints.clear();
+                c.Move.WaypointIndex = 0;
+                c.Move.Moving = false;
 
                 // ТОТ ЖЕ ПАКЕТ, ЧТО ШЛЁТ КЛИЕНТ. Свой узел ядро выведет из позиции мастера само.
                 WorldPacket raw(CMSG_ACTIVATE_TAXI);
@@ -3714,11 +3704,11 @@ public:
                     { c.WalkBest = d; c.WalkStuckMs = 0; }
                 else
                     c.WalkStuckMs += slice;
-                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                if (c.Move.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                 {
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ПОХОД {}: до квестодателя {} по карте не дойти — осталось {:.0f} ярдов, тупик {}, без прогресса {} с, всего {} с",
-                        self->GetName(), c.SeekEntry, d, c.Stalled ? 1 : 0, c.WalkStuckMs / 1000, c.ModeMs / 1000);
+                        self->GetName(), c.SeekEntry, d, c.Move.Stalled ? 1 : 0, c.WalkStuckMs / 1000, c.ModeMs / 1000);
                     c.SeekBackoff[c.SeekSpawn] = 600000;
                     c.SeekCooldownMs = 300000;
                     Switch(c, self, Behavior::Idle, "до квестодателя по карте не дойти");
@@ -3775,7 +3765,7 @@ public:
                     { c.WalkBest = dTravel; c.WalkStuckMs = 0; }
                 else
                     c.WalkStuckMs += slice;
-                if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                if (c.Move.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                 {
                     c.TravelCooldownMs = 120000;
                     // И САМ КВЕСТ ОТКЛАДЫВАЕМ, а не только походы вообще: без этого через две
@@ -3786,7 +3776,7 @@ public:
                     if (c.TravelQuest)
                         c.TravelBackoff[c.TravelQuest] = 600000;
                     Switch(c, self, Behavior::Idle,
-                        c.Stalled ? "до места задания не дойти"
+                        c.Move.Stalled ? "до места задания не дойти"
                                   : (c.WalkStuckMs > 30000 ? "полминуты без приближения к месту задания"
                                                            : "в пути слишком долго"));
                 }
@@ -3894,19 +3884,19 @@ public:
                     c.KiteMs += uint32(dt * 1000.0f);
                     // ЗАСТРЕВАНИЕ ВО ВРЕМЯ ОТВОДА СУДИМ ТЕМ ЖЕ, ЧЕМ И ОБЫЧНЫЙ ШАГ (разбор):
                     // сдвинулись ли мы на самом деле.
-                    if (self->GetExactDist2d(c.LastX, c.LastY) > 1.0f)
+                    if (self->GetExactDist2d(c.Move.LastX, c.Move.LastY) > 1.0f)
                     {
-                        c.LastX = self->GetPositionX();
-                        c.LastY = self->GetPositionY();
-                        c.StuckMs = 0;
+                        c.Move.LastX = self->GetPositionX();
+                        c.Move.LastY = self->GetPositionY();
+                        c.Move.StuckMs = 0;
                     }
                     else
-                        c.StuckMs += uint32(dt * 1000.0f);
+                        c.Move.StuckMs += uint32(dt * 1000.0f);
 
                     float const left = self->GetExactDist2d(c.KiteTo.GetPositionX(), c.KiteTo.GetPositionY());
                     // ДОШЛИ, ЗАСТРЯЛИ ИЛИ ЗАТЯНУЛОСЬ — ДЕРЁМСЯ ЗДЕСЬ. И ОБЯЗАТЕЛЬНО ОСТАНАВЛИВАЕМСЯ
                     // (разбор): иначе сервер продолжает видеть «иду назад».
-                    if (left <= 2.0f || c.KiteMs > 12000 || c.Stalled || c.StuckMs > 3000
+                    if (left <= 2.0f || c.KiteMs > 12000 || c.Move.Stalled || c.Move.StuckMs > 3000
                         || c.KiteIdx >= c.KitePath.size())
                     {
                         c.Kiting = false;
@@ -3914,7 +3904,7 @@ public:
                         TC_LOG_INFO("server.worldserver",
                             "Constellation ОТВОД {}: отошёл, осталось {:.0f} ярдов ({}), дерусь здесь",
                             self->GetName(), left,
-                            c.StuckMs > 3000 ? "застрял" : (c.KiteMs > 12000 ? "долго" : "дошёл"));
+                            c.Move.StuckMs > 3000 ? "застрял" : (c.KiteMs > 12000 ? "долго" : "дошёл"));
                     }
                     else
                     {
@@ -3952,7 +3942,7 @@ public:
                 }
                 StepToward(c, self, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(),
                     c.EngageRange > 0.0f ? c.EngageRange : 4.0f, dt);
-                if (c.Stalled)
+                if (c.Move.Stalled)
                 {
                     c.Refused.insert(c.TargetGuid);
                     Switch(c, self, Behavior::Idle, "до цели не дойти");
@@ -4056,7 +4046,7 @@ public:
                     float ax, ay, az;
                     ApproachPoint(c, ender, self, ax, ay, az, diff);
                     StepToward(c, self, ax, ay, az, ender->GetCombatReach() + 2.0f, dt);
-                    bool const enderDone = c.Stalled || c.ModeMs > 60000;
+                    bool const enderDone = c.Move.Stalled || c.ModeMs > 60000;
                     if (enderDone && FindReachableApproach(c, self, ender))
                         { c.ModeMs = 0; return; }
                     if (enderDone)
@@ -4084,7 +4074,7 @@ public:
                         { c.WalkBest = d; c.WalkStuckMs = 0; }
                     else
                         c.WalkStuckMs += slice;
-                    if (c.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
+                    if (c.Move.Stalled || c.WalkStuckMs > 30000 || c.ModeMs > Cfg().WalkCapMs)
                     {
                         // ЧИСЛА, А НЕ ФРАЗА: три условия сливались в одну строку, и по журналу
                         // нельзя было отличить «упёрлись в стену» от «идём, но слишком долго».
@@ -4093,8 +4083,8 @@ public:
                             "по плоскости, лучшее было {:.0f}, по высоте {:+.0f}; причина {}, тип пути {}, в пути {} с",
                             self->GetName(), c.TurnInEntry, c.TurnInQuest, d, c.WalkBest,
                             c.TurnInPos.GetPositionZ() - self->GetPositionZ(),
-                            c.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
-                            c.LastPathType ? Trinity::StringFormat("{:X}", c.LastPathType) : std::string("отказов не было"),
+                            c.Move.Stalled ? "упёрлись" : (c.WalkStuckMs > 30000 ? "полминуты без приближения" : "потолок по времени"),
+                            c.Move.LastPathType ? Trinity::StringFormat("{:X}", c.Move.LastPathType) : std::string("отказов не было"),
                             c.ModeMs / 1000);
                         c.TurnInBackoff[c.TurnInQuest] = 300000;   // пять минут: дорога, а не рывок
                         Switch(c, self, Behavior::Idle, "до принимающего не дойти");
@@ -4142,7 +4132,7 @@ public:
                         StepToward(c, self, c.GatherPos.GetPositionX(), c.GatherPos.GetPositionY(),
                                    c.GatherPos.GetPositionZ(), 0.25f, dt, &c.GatherPos);
                         c.GatherMs += slice;
-                        if (c.Stalled || c.NoPathMs > 0 || c.GatherMs >= 45000)
+                        if (c.Move.Stalled || c.Move.NoPathMs > 0 || c.GatherMs >= 45000)
                         {
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation КУЗНЯ {}: до фокуса {} не дойти за {} с, осталось {:.0f}",
@@ -4352,7 +4342,7 @@ public:
                         //
                         // Точек в указателе 13 281. Если к этой дороги нет — это повод взять
                         // следующую, а не стоять двадцать секунд у той же.
-                        if (c.NoPathMs > 0)
+                        if (c.Move.NoPathMs > 0)
                         {
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation СБОР {}: к точке {} (вид {}) маршрута нет, беру другую",
@@ -4362,7 +4352,7 @@ public:
                         }
                         c.GatherMs += slice;
                         bool const noProgress = c.GatherMs >= 20000 && near > c.GatherDist - 1.0f;
-                        if (c.Stalled || noProgress || c.GatherMs >= 45000)
+                        if (c.Move.Stalled || noProgress || c.GatherMs >= 45000)
                         {
                             TC_LOG_INFO("server.worldserver",
                                 "Constellation СБОР {}: до точки {} (вид {}) не дойти за {} с, было {:.0f}, стало {:.0f}",
@@ -4998,7 +4988,7 @@ public:
                     }
                     StepToward(c, self, tx, ty, tz, gossip ? reach : std::max(1.0f, reach - 1.0f), dt);
 
-                    if (c.NoPathMs > 0)
+                    if (c.Move.NoPathMs > 0)
                     {
                         TC_LOG_INFO("server.worldserver",
                             "Constellation РЕЧЬ {}: к {} ({}) маршрута нет",
@@ -5011,7 +5001,7 @@ public:
                     c.TalkMs += slice;
                     float const now = ProgressDist(c, self, who);
                     bool const noProgress = c.TalkMs >= 20000 && now > c.TalkDist - 1.0f;
-                    bool const talkDone = c.Stalled || noProgress || c.TalkMs >= 45000;
+                    bool const talkDone = c.Move.Stalled || noProgress || c.TalkMs >= 45000;
                     if (talkDone && FindReachableApproach(c, self, who))
                         { c.TalkMs = 0; c.TalkDist = ProgressDist(c, self, who); return; }
                     if (talkDone)
@@ -5598,7 +5588,7 @@ public:
                         victim->GetPositionZ(), 4.0f, dt);
                     // тупик в бою был единственным, который никто не разбирал: спутник
                     // тёрся о стену до двухминутного срока (Кодекс, 2026-08-30)
-                    if (c.Stalled)
+                    if (c.Move.Stalled)
                     {
                         LogFightOutcome(self, victim, "до цели в бою не дойти", c);
                         c.Refused.insert(victim->GetGUID());
@@ -5903,7 +5893,7 @@ public:
         // за ночь. Останавливаемся всё равно за stopAt, так что упереться в него нельзя.
         if (c.ApproachMs)
             c.ApproachMs = (c.ApproachMs <= diff) ? 0 : c.ApproachMs - diff;
-        if (c.RawTarget)
+        if (c.Move.RawTarget)
         {
             x = target->GetPositionX();
             y = target->GetPositionY();
@@ -7177,7 +7167,7 @@ public:
             // «стою» тут же выбирало её снова (Кодекс). Уходим тем же опкодом, каким
             // это делает клиент: CMSG_ATTACK_STOP -> Player::AttackStop().
             c.EngageRange = 0.0f;           // новая цель — новая дистанция боя
-            c.LastPathType = 0;             // тип отказа построителя относится к намерению, а не к жизни спутника
+            c.Move.LastPathType = 0;             // тип отказа построителя относится к намерению, а не к жизни спутника
 
         if (c.GiverUnreachable.size() > 40)
             c.GiverUnreachable.clear();  // список не должен расти без предела
@@ -7209,7 +7199,7 @@ public:
             c.TurnInGuid.Clear();       // другое намерение — найденный принимающий не наш
         if (to != Behavior::Attacking)
             { c.VictimHp = 0; c.NoDamageMs = 0; c.DamageVictim.Clear(); }
-        c.Stalled = false;              // новое намерение — новая попытка дойти
+        c.Move.Stalled = false;              // новое намерение — новая попытка дойти
         c.RingTried = false;            // и обход точек вокруг NPC снова доступен (помост)
         c.RingHeld = false;
         c.Kiting = false;               // и отвод начинается заново в следующем бою
@@ -7217,11 +7207,11 @@ public:
         c.KitePath.clear();
         c.KiteIdx = 0;
         c.PackCenterKnown = false;
-        c.StuckMs = 0;
-        c.UnstickTries = 0;
-        c.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
-        c.NoPathMs = 0;
-        c.RawTarget = false;
+        c.Move.StuckMs = 0;
+        c.Move.UnstickTries = 0;
+        c.Move.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
+        c.Move.NoPathMs = 0;
+        c.Move.RawTarget = false;
         c.UnstickTotal = 0;
         if (to != Behavior::ApproachingTarget && to != Behavior::Attacking)
             c.TargetGuid.Clear();
@@ -7380,7 +7370,7 @@ public:
                 c.GiverMs += diff;
                 float const now = ProgressDist(c, self, going);
                 bool const noProgress = c.GiverMs >= 20000 && now > c.GiverDist - 1.0f;
-                bool const giverDone = c.Stalled || noProgress || c.GiverMs >= 30000;
+                bool const giverDone = c.Move.Stalled || noProgress || c.GiverMs >= 30000;
                 if (giverDone && FindReachableApproach(c, self, going))
                     { c.GiverMs = 0; c.GiverDist = ProgressDist(c, self, going); return; }
                 if (giverDone)
@@ -9474,11 +9464,11 @@ public:
                 // уже запрещён.
                 c.ApproachMs = 0;
                 c.RingHeld = true;
-                c.RawTarget = false;
-                c.Stalled = false;
-                c.NoPathFails = 0;
-                c.NoPathMs = 0;
-                c.UnstickTries = 0;
+                c.Move.RawTarget = false;
+                c.Move.Stalled = false;
+                c.Move.NoPathFails = 0;
+                c.Move.NoPathMs = 0;
+                c.Move.UnstickTries = 0;
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ПОДХОД {}: к {} ({}) точка контакта недостижима — нашлась точка в {:.0f} ярдах от него ({:.0f} {:.0f} {:.1f}), по высоте от меня {:+.1f}, иду к ней",
                     self->GetName(), target->GetName(), target->GetEntry(), r, x, y, z, z - self->GetPositionZ());
@@ -9500,7 +9490,7 @@ public:
             "Constellation ПОДХОД {}: к {} {} ({}) не подойти — по плоскости {:.1f}, по высоте {:+.1f}, отказов маршрута {}, последний тип {:X}, тупик {}, видно {}, {} с",
             self->GetName(), whom, target->GetName(), target->GetEntry(),
             self->GetExactDist2d(target), target->GetPositionZ() - self->GetPositionZ(),
-            uint32(c.NoPathFails), c.LastPathType, c.Stalled ? 1 : 0,
+            uint32(c.Move.NoPathFails), c.Move.LastPathType, c.Move.Stalled ? 1 : 0,
             self->IsWithinLOSInMap(target) ? 1 : 0, c.ModeMs / 1000);
     }
 
@@ -9623,9 +9613,9 @@ public:
         use.Cast.Target.Flags = TARGET_FLAG_NONE;
         // ГАСИМ ДОРОГУ ДО ОТПРАВКИ: движение оборвало бы собственный перенос.
         StopMoving(c, self);
-        c.Waypoints.clear();
-        c.WaypointIndex = 0;
-        c.Moving = false;
+        c.Move.Waypoints.clear();
+        c.Move.WaypointIndex = 0;
+        c.Move.Moving = false;
         c.Session->HandleUseItemOpcode(use);
 
         // ПАУЗУ СТАВИМ, ТОЛЬКО ЕСЛИ КАСТ ДЕЙСТВИТЕЛЬНО НАЧАЛСЯ (Кодекс): иначе мы бы честно
@@ -11951,7 +11941,7 @@ public:
 
         // СОСТОЯНИЕ ДВИЖЕНИЯ СОХРАНЯЕМ ЦЕЛИКОМ.
         // Обработчик не правит ориентацию, а ЗАМЕЩАЕТ весь m_movementInfo присланным
-        // (MovementHandler.cpp:356). Мой «c.Moving ? FORWARD : 0» стирал бы флаги,
+        // (MovementHandler.cpp:356). Мой «c.Move.Moving ? FORWARD : 0» стирал бы флаги,
         // дополнительные флаги, транспорт, падение, прыжок и тангаж. Берём нынешнее
         // состояние игрока и меняем в нём только положение, поворот и время.
         MovementInfo mi = self->m_movementInfo;
@@ -11980,7 +11970,7 @@ public:
             nz = self->GetPositionZ();
         Position next(nx, ny, nz, self->GetAbsoluteAngle(face));    // ЛИЦОМ К ЦЕЛИ
         SendMove(c, self, next, MOVEMENTFLAG_BACKWARD);
-        c.Moving = true;
+        c.Move.Moving = true;
     }
 
     void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
