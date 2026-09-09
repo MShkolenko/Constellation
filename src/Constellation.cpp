@@ -3207,7 +3207,13 @@ public:
                         if (!c.SeekCooldownMs && Cfg().GiverSeekRange > 0.0f)
                         {
                             uint32 qid = 0;
-                            if (FindGiverByMap(c, self, &c.SeekEntry, &c.SeekSpawn, &c.SeekPos, &qid))
+                            Constellation::Ai::SeekMemory mem;
+        mem.Refused     = &RefusedByCompanion;
+        mem.RefusedUser = &c;
+        mem.BackedOff   = &SeekBackedOffForCompanion;
+        mem.BackoffUser = &c;
+        mem.DiagOnce    = &c.FarDiagDone;
+        if (FindGiverByMap(self, mem, &c.SeekEntry, &c.SeekSpawn, &c.SeekPos, &qid))
                             {
                                 if (Cfg().Flying && PlanFlight(c, self, c.SeekPos))
                                 {
@@ -10259,7 +10265,10 @@ public:
     // Полётный мастер оставлен как есть по указанию оператора.
     static float constexpr TIER_Z = 50.0f;
 
-    bool ReachableTier(Player* self, float x, float y, float z) const
+    // ЧИТАЮЩАЯ: строит путь и сравнивает высоты, ничего не меняя. `PathGenerator` в ядре
+    // берёт `WorldObject const*` (PathGenerator.h:58), так что константность здесь не
+    // уступка компилятору, а верное описание.
+    bool ReachableTier(Player const* self, float x, float y, float z) const
     {
         // ЧТО ЭТА ПРОВЕРКА НЕ ДЕЛАЕТ (Кодекс, второй проход): в пределах пятидесяти ярдов
         // она пропускает и цель за стеной, и цель за запертой дверью. Это не недосмотр,
@@ -10391,6 +10400,13 @@ public:
         return c && c->QuestRefused.count(questId) != 0;
     }
 
+    // Вторая половина той же памяти: к этой ТОЧКЕ лестница пока не ходит.
+    static bool SeekBackedOffForCompanion(void const* user, uint32 spawnId)
+    {
+        Companion const* c = static_cast<Companion const*>(user);
+        return c && c->SeekBackoff.count(spawnId) != 0;
+    }
+
     // ПАМЯТЬ ОБ ОТКАЗАХ — ОБРАТНЫМ ВЫЗОВОМ, как и у выбора из меню. Третий лифт этой формы, и
     // причина каждый раз одна: движку предстоит спросить то же самое, а копия правила разойдётся.
     // `nullptr` значит «своей памяти нет» — случай движка, у которого она в таблице отсрочек.
@@ -10444,7 +10460,12 @@ public:
         return 0;
     }
 
-    bool FindGiverByMap(Companion& c, Player* self, uint32* entry, ObjectGuid::LowType* spawn,
+    // ПАМЯТЬ ПРИХОДИТ ТИПОМ, А НЕ СПУТНИКОМ. Четвёртый лифт этой формы и последний на пути
+    // «куда идти»: движку нужен ровно этот ответ, а внутри собрано то, что переписывать заново
+    // дорого и опасно — потолок, ближний порог, фракция, кэш по ВИДУ, ярус и разрешение маршрута
+    // ходячего NPC, у которого точка спавна не место, где он стоит.
+    bool FindGiverByMap(Player const* self, Constellation::Ai::SeekMemory const& mem,
+                        uint32* entry, ObjectGuid::LowType* spawn,
                         Position* pos, uint32* questOut) const
     {
         auto it = _givers.find(self->GetMapId());
@@ -10469,7 +10490,7 @@ public:
             }
             if (d > bestD + 0.01f || d < Cfg().QuestGiverRange)
                 continue;                       // дальше лучшего — не нужен; в обзоре — уже спрошен и молчит
-            if (c.SeekBackoff.count(g.SpawnId))
+            if (mem.BackedOff && mem.BackedOff(mem.BackoffUser, g.SpawnId))
                 continue;
             uint32 qid = 0;
             auto known = byEntry.find(g.Entry);
@@ -10482,7 +10503,7 @@ public:
                     if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(g.Faction))
                         hostile = mine->IsHostileTo(theirs);
                 if (!hostile)
-                    qid = TakeableQuestAt(self, &RefusedByCompanion, &c, g.Entry);
+                    qid = TakeableQuestAt(self, mem.Refused, mem.RefusedUser, g.Entry);
                 byEntry[g.Entry] = qid;
             }
             if (!qid)
@@ -10503,9 +10524,9 @@ public:
             // ЗА ПОТОЛКОМ. Печатаем ОДИН раз на спутника: без этого «полётов ноль» не отличить
             // от «лететь не к кому». Квест у дальнего НЕ спрашиваем — это дорого, а строка нужна
             // ровно для решения, стоит ли поднимать потолок.
-            if (tooFar && !c.FarDiagDone)
+            if (tooFar && mem.DiagOnce && !*mem.DiagOnce)
             {
-                c.FarDiagDone = true;
+                *mem.DiagOnce = true;
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ПОТОЛОК {}: в {:.0f} ярдах никого, за потолком {} точек, ближайшая — вид {} в {:.0f} ярдах",
                     self->GetName(), Cfg().GiverSeekRange, tooFar, nearestFarEntry, nearestFar);
