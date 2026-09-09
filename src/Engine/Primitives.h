@@ -176,6 +176,19 @@ namespace Constellation::Ai
             Object,     // a gameobject — a cage, a gather node, a door
             Spawn,      // a spawn id: a point that may have no object loaded right now
             Quest,      // a quest number: a hand-in whose ender is chosen later
+
+            // ВИД СУЩЕСТВА, А НЕ ОСОБЬ. Заводится только тогда, когда сработала эскалация:
+            // лестница запрещает вид ПОСЛЕ четырёх особей подряд, и это сужение уже оплачено —
+            // запрет по виду сразу «глушил весь квест на десять минут, так и вышло на живом у
+            // четверых», при семнадцати целых рядом. Выводить его каждый такт из запретов по
+            // гуидам нельзя: такой вывод теряет историю «четыре подряд» и работает на горячем
+            // пути (разбор дизайна).
+            Species,
+
+            // ПАРА ВИДОВ: чем открывали и ради кого. Правило сознательно про ТИП клетки и ТИП
+            // пленника, а не про экземпляр; подмена на точку появления изменила бы его, и такое
+            // делается только отдельным объявленным изменением поведения.
+            EntryPair,
         };
 
         Subject() = default;
@@ -190,6 +203,9 @@ namespace Constellation::Ai
         static Subject OfObject(ObjectGuid g) { Subject s; s._what = Kind::Object; s._guid = g; return s; }
         static Subject OfSpawn(uint32 id)     { Subject s; s._what = Kind::Spawn;  s._id  = id; return s; }
         static Subject OfQuest(uint32 id)     { Subject s; s._what = Kind::Quest;  s._id  = id; return s; }
+        static Subject OfSpecies(uint32 entry) { Subject s; s._what = Kind::Species; s._id = entry; return s; }
+        static Subject OfEntryPair(uint32 a, uint32 b)
+        { Subject s; s._what = Kind::EntryPair; s._id = a; s._id2 = b; return s; }
 
         Kind What() const { return _what; }
         bool IsNone() const { return _what == Kind::None; }
@@ -201,19 +217,44 @@ namespace Constellation::Ai
         }
         uint32 Id() const
         {
-            return (_what == Kind::Spawn || _what == Kind::Quest) ? _id : 0;
+            return (_what == Kind::Spawn || _what == Kind::Quest
+                 || _what == Kind::Species || _what == Kind::EntryPair) ? _id : 0;
         }
+
+        // Вторая половина пары. У всех прочих видов её нет, и читается она нулём — по тому же
+        // правилу, что и остальные: полезная нагрузка, прочитанная не под своим видом, отдаёт
+        // пустоту, а не что-то устаревшее.
+        uint32 Id2() const { return _what == Kind::EntryPair ? _id2 : 0; }
 
         bool operator==(Subject const& o) const
         {
-            return _what == o._what && _guid == o._guid && _id == o._id;
+            return _what == o._what && _guid == o._guid && _id == o._id && _id2 == o._id2;
         }
 
     private:
         Kind       _what = Kind::None;
         ObjectGuid _guid;
         uint32     _id   = 0;
+        uint32     _id2  = 0;   // только у пары видов
     };
+
+    // РАЗМЕР ПРОВЕРЯЕТ КОМПИЛЯТОР, И СРАВНИВАЕТ С ПРЕЖНЕЙ РАСКЛАДКОЙ, А НЕ С ЧИСЛОМ.
+    //
+    // Первая редакция этой проверки стояла `<= 24` и упала — и была неправа не в том, в чём я
+    // думал: двадцати четырёх байт предмет не занимал никогда. `Kind` — байт, семь до
+    // выравнивания `ObjectGuid`, сам гуид шестнадцать, `uint32` четыре и ещё четыре хвоста до
+    // кратности восьми. Тридцать два и ДО правки; второй `uint32` ложится в этот хвост.
+    //
+    // Поэтому проверка сравнивает с копией ПРЕЖНЕЙ раскладки. Так она утверждает ровно то, что
+    // хотелось сказать — «поле бесплатно», — а не размер, который на другой платформе или после
+    // смены `ObjectGuid` в ядре окажется иным. И следующее поле, которое бесплатным не будет,
+    // она поймает.
+    //
+    // Проверять есть что: предмет лежит в КАЖДОЙ ставке и в каждой записи таблицы отсрочек, а
+    // очередь ставок — переиспользуемый вектор на хосте, который семь раз убивал OOM.
+    struct SubjectLayoutBeforeThePair { Subject::Kind K; ObjectGuid G; uint32 A; };
+    static_assert(sizeof(Subject) == sizeof(SubjectLayoutBeforeThePair),
+                  "вторая половина пары перестала быть бесплатной — проверить очередь и таблицу");
 
     // -------------------------------------------------------------------------------------------
     // §14 — ОТСРОЧКИ: ОДНА ТАБЛИЦА ВМЕСТО ВОСЬМИ НАБОРОВ.
@@ -238,7 +279,15 @@ namespace Constellation::Ai
     /* ДОШЛИ И БОЛЬШЕ СЮДА НЕ НАДО — это НЕ `Unreachable`. Ставится при УДАЧНОМ приходе:   */ \
     /* причина у лестницы (Constellation.cpp:3701, нашёл Кодекс) — иначе у пришедшего      */ \
     /* впустую тут же начинается поход к соседней точке, цепочка походов вместо дела.      */ \
-    X(Visited,          "уже сходил")
+    X(Visited,          "уже сходил")                                                     \
+    /* ИМЕНА НИЖЕ — ПО ИСХОДУ, А НЕ ПО КОНТЕЙНЕРУ ЛЕСТНИЦЫ, и это требование разбора:      */ \
+    /* таблица отсрочек — журнал подавляющих ИСХОДОВ, а не зеркало состояния `switch`.     */ \
+    /* Пороги (четыре особи, три попытки, восемь заходов) остаются у ДЕЙСТВИЙ; сюда        */ \
+    /* попадает только сработавшая эскалация.                                              */ \
+    X(TalkSpeciesDone,  "с этим видом больше не говорим")                                 \
+    X(FreeUseDone,      "этой клеткой ради этого пленника — всё")                         \
+    X(ApproachesDone,   "заходы к точке исчерпаны")                                       \
+    X(CombatUnreachable, "до цели боя не добраться")
 
     enum class BackoffKind : uint8
     {

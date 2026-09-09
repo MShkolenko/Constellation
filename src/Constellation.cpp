@@ -11960,6 +11960,10 @@ public:
                     out->PackCenter.Relocate(packX / float(assists), packY / float(assists), packZ / float(assists));
             }
         }
+        // ГУИД — ВСЕГДА, И ПУСТОЙ ТОЖЕ ОТВЕТ. `Assists` ниже пишется только при цели и потому
+        // переживает пустой проход (так было и так остаётся); гуид переживать не должен, иначе
+        // значение движка называло бы цель, которой этот проход не нашёл.
+        out->Fight = best ? best->GetGUID() : ObjectGuid::Empty;
         if (best)
             out->Assists = bestAssists;         // с чем шли в бой — по этому решим, отводить ли
         if (!best && matched && !_rejDiagDone)
