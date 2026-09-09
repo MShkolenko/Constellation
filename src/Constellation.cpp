@@ -614,12 +614,8 @@ struct Companion
     ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
-    uint32 UnstickTotal = 0;            // и сколько всего за это намерение (не сбросить движением)
     bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
-    uint8 JumpsLeft = 3;                // прыжков в запасе
-    uint32 JumpCooldownMs = 0;          // истратил три — минуту без прыжков
-    bool UnstickLeft = true;            // в какую сторону отступать следующей
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
 };
 
@@ -1232,28 +1228,28 @@ public:
         // пополнялся в Switch(), а спутник может колебаться «иду за хозяином -> стою ->
         // иду за хозяином» бесконечно и прыгать вечно (Кодекс). Поэтому истраченный
         // запас закрывает прыжки на минуту, и смена намерения этого не обходит.
-        if (c.JumpsLeft && Jump(c, self, tx, ty))
+        if (c.Move.JumpsLeft && Jump(c, self, tx, ty))
         {
             // ОКНО ОТКРЫВАЕТ ПЕРВЫЙ ПРЫЖОК, а не третий. Прежде запас пополнялся в
             // Switch() при каждой смене намерения, и спутник, тративший по одному-два
             // прыжка и меняющий намерение, получал их снова без конца — потолок,
             // обещанный в комментарии, не был написан в коде (Кодекс, проход 4).
             // Теперь это честное «три прыжка в минуту», и смена намерения тут ни при чём.
-            if (!c.JumpCooldownMs)
-                c.JumpCooldownMs = 60000;
-            --c.JumpsLeft;
+            if (!c.Move.JumpCooldownMs)
+                c.Move.JumpCooldownMs = 60000;
+            --c.Move.JumpsLeft;
             return true;                    // прыжок НЕ тратит запас отступов
         }
 
         // ДВА ПРЕДЕЛА, А НЕ ОДИН (Кодекс, 2026-08-30). Первый — попытки подряд; но его
         // обнуляет сам удавшийся отступ, ведь спутник при этом ДВИГАЛСЯ. Поэтому второй,
         // общий за намерение, движением не сбрасывается — только сменой намерения.
-        if (++c.Move.UnstickTries > 4 || ++c.UnstickTotal > 8)
+        if (++c.Move.UnstickTries > 4 || ++c.Move.UnstickTotal > 8)
             return false;                   // хватит топтаться — пусть решает автомат
 
         float toGoal = self->GetAbsoluteAngle(tx, ty);
-        float side = toGoal + (c.UnstickLeft ? float(M_PI) / 2.0f : -float(M_PI) / 2.0f);
-        c.UnstickLeft = !c.UnstickLeft;     // попеременно, чтобы не тереться об угол
+        float side = toGoal + (c.Move.UnstickLeft ? float(M_PI) / 2.0f : -float(M_PI) / 2.0f);
+        c.Move.UnstickLeft = !c.Move.UnstickLeft;     // попеременно, чтобы не тереться об угол
 
         Position hop = self->GetFirstCollisionPosition(6.0f, side - self->GetOrientation());
         if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f)
@@ -2364,14 +2360,14 @@ public:
             else
                 { it->second -= diff; ++it; }
         }
-        if (c.JumpCooldownMs)
+        if (c.Move.JumpCooldownMs)
         {
-            c.JumpCooldownMs = (c.JumpCooldownMs <= diff) ? 0 : c.JumpCooldownMs - diff;
+            c.Move.JumpCooldownMs = (c.Move.JumpCooldownMs <= diff) ? 0 : c.Move.JumpCooldownMs - diff;
             // минута прошла — запас возвращается ЗДЕСЬ, а не при следующей смене
             // намерения: спутник, застрявший в одном намерении, иначе терял прыжки
             // навсегда, хотя отсрочка обещала обратное (Кодекс, проход 3)
-            if (!c.JumpCooldownMs)
-                c.JumpsLeft = 3;
+            if (!c.Move.JumpCooldownMs)
+                c.Move.JumpsLeft = 3;
         }
         if (c.MoveMs < 250)                 // 4 Гц, как поток живого клиента
             return;
@@ -7212,7 +7208,7 @@ public:
         c.Move.NoPathFails = 0;              // и новая цель — отступ по маршруту снимается
         c.Move.NoPathMs = 0;
         c.Move.RawTarget = false;
-        c.UnstickTotal = 0;
+        c.Move.UnstickTotal = 0;
         if (to != Behavior::ApproachingTarget && to != Behavior::Attacking)
             c.TargetGuid.Clear();
         ++_transitions;
