@@ -268,15 +268,15 @@ namespace Constellation::Ai
         }
     }
 
-    std::optional<ObjectGuid> WorldView::NearestCreature(uint32 entry, float maxDist) const
+    std::optional<ObjectGuid> WorldView::NearestQuestGiverOfEntry(uint32 entry, float searchDist) const
     {
-        if (!_self || !entry || maxDist <= 0.0f)
+        if (!_self || !entry || searchDist <= 0.0f)
             return std::nullopt;
 
         std::list<Creature*> around;
-        Trinity::AnyUnitInObjectRangeCheck check(_self, maxDist);
+        Trinity::AnyUnitInObjectRangeCheck check(_self, searchDist);
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(_self, around, check);
-        Cell::VisitGridObjects(_self, searcher, maxDist);
+        Cell::VisitGridObjects(_self, searcher, searchDist);
 
         Creature* best = nullptr;
         float bestDist = 0.0f;
@@ -284,7 +284,17 @@ namespace Constellation::Ai
         {
             if (creature->GetEntry() != entry || !creature->IsAlive())
                 continue;
-            float const d = _self->GetExactDist2d(creature);
+
+            // ЯДРО РЕШАЕТ, ДОСТАТОЧНО ЛИ БЛИЗКО, И ЭТО НЕ ВЕЖЛИВОСТЬ. Оно меряет в
+            // пространстве и знает свой INTERACTION_DISTANCE; своя мерка вместо его уже
+            // дала 916 кругов и ноль сдач (Constellation.cpp:3984-3998). Заодно снимаются
+            // условия, которых мы бы и не вспомнили: смерть, полёт, бой, дружественность.
+            if (!_self->CanInteractWithQuestGiver(creature))
+                continue;
+
+            // В ПРОСТРАНСТВЕ, НЕ ПО ПЛОСКОСТИ. Тот же случай: помост девятью ярдами выше
+            // ближе всех по плоскости и дальше всех на самом деле.
+            float const d = _self->GetExactDist(creature);
             if (!best || d < bestDist)
                 { bestDist = d; best = creature; }
         }

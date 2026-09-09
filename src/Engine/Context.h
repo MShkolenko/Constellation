@@ -150,13 +150,18 @@ namespace Constellation::Ai
         // поэтому ярус «на карту» не понадобился: таблица уже общая для всех.
         void ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const;
 
-        // БЛИЖАЙШЕЕ ЖИВОЕ СУЩЕСТВО ЭТОГО ВИДА, если оно вообще загружено рядом.
+        // ПРИНИМАЮЩИЙ ЭТОГО ВИДА, ДО КОТОРОГО ЯДРО РАЗРЕШАЕТ ДОТЯНУТЬСЯ.
         //
         // Значения отдают ВИД и точку (указатель карты знает только их), а дверь требует
         // гуид — как и клиент, который шлёт гуид того, по кому щёлкнул. Перевод одного в
         // другое делается в момент действия, а не кэшируется: `Creature*`, проживший секунду,
         // — это висячий указатель, ждущий выгрузки клетки.
-        std::optional<ObjectGuid> NearestCreature(uint32 entry, float maxDist) const;
+        //
+        // `searchDist` — ГРАНИЦА ОБХОДА, А НЕ РЕШЕНИЕ О БЛИЗОСТИ. Своя мерка здесь уже стоила
+        // 916 кругов и ноль сдач (Constellation.cpp:3984-3998): по плоскости 5.8 ярда, в
+        // пространстве 10.7, ядру нужно 5. Поэтому «достаточно ли близко» отвечает
+        // `CanInteractWithQuestGiver`, а этот радиус лишь ограничивает обход сетки.
+        std::optional<ObjectGuid> NearestQuestGiverOfEntry(uint32 entry, float searchDist) const;
 
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
