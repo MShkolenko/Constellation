@@ -16,35 +16,25 @@
  */
 
 /*
- * Constellation -- the roster: humans, and the one class we still want that they cannot be.
+ * Constellation -- the roster: eight humans, one starting zone.
  *
- * CUT DOWN TO TEN on 2026-09-09. First to eleven (operator: keep only humans, the death knight
- * included, plus whichever ALLIANCE race fills in the classes they cannot take), then to ten the
- * same day -- "ДХ не берём совсем". It was every standard race in every class it could take: 122,
- * then 114 once the goblins were paused.
+ * CUT TO EIGHT on 2026-09-09, and the reason is not arithmetic. The operator: "только люди на
+ * стартовой локации, без ДК / налаживаешь модуль по ним. остальное это частности / основные
+ * классы у них есть / не будем распылять твое внимание". It was every standard race in every
+ * class it could take -- 122, then 114 once the goblins were paused, then 11, then 10.
  *
- * DROPPING THE DEMON HUNTER CHANGED THE ANSWER, NOT JUST A LINE. The night elf was chosen because
- * it was the only Alliance race supplying TWO of the missing classes -- druid AND demon hunter.
- * Without the second it supplies exactly one, the same as the worgen.
+ * THE DEATH KNIGHT GOES FOR HIS START, NOT HIS CLASS. He begins in Acherus on map 609, a tiered
+ * citadel whose navmesh does not even load in full on this realm, while everyone else begins in
+ * Northshire. One companion in nine living in a different world makes every measurement a blend
+ * of two different problems.
  *
- * SO NO SINGLE RACE CAN EVEN COVER TWO, and that is data rather than a preference. A human takes
- * nine classes; shaman, druid and evoker are what remain wanted. Read from the realm's own
- * playercreateinfo: night elf and worgen bring druid; dwarf, draenei and Alliance pandaren bring
- * shaman; gnome brings nothing. Shaman and druid never come from the same Alliance race except
- * the Kul Tiran, and allied races are excluded (operator, 2026-08-29) because they have no
- * ordinary levelling start. Evoker exists only on the dracthyr, also allied. So it is druid OR
- * shaman from one race, or a SECOND race for both.
+ * WHAT THE CUT BUYS: one race, one starting zone, one levelling path. Eight companions walk the
+ * same quests to the same givers, so any difference between them is a difference of CLASS -- not
+ * of map, phase or starting chain. Until now every number mixed thirteen different beginnings.
  *
- * NIGHT ELF RATHER THAN WORGEN, since both give the druid: the worgen start is Gilneas, and this
- * realm has a known and expensive problem there -- companions standing in zone 0, and the Gilneas
- * door already cost a day of reading. Teldrassil is an ordinary start.
- *
- * Only the MISSING class is taken from the night elf -- not a second warrior and a second mage.
- * Every class appears exactly once. Kaelith is not deleted: this table decides who is summoned,
- * and restoring his line puts him back in Mardum where he stands.
- *
- * The other 103 companions are not deleted. This table decides who is SUMMONED, not who exists;
- * their characters stay in the database and simply stop coming into the world.
+ * Nobody is deleted. This table decides who is summoned; Corvin, Sylwen and the other 106 of the
+ * 114 that were provisioned stay in the characters database and simply stop coming into the
+ * world. Restoring a line brings that companion back where it stands.
  *
  * The race/class pairs are not invented here:
  * they were read from the realm's own world.playercreateinfo, which is what the
@@ -77,23 +67,20 @@ struct RosterEntry
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
 };
 
-// 10: девять человеческих классов и друид (было 11, до сокращения 114). ЧИСЛО ЗДЕСЬ — НЕ
+// 8: люди без рыцаря смерти (было 10, до сокращения 114). ЧИСЛО ЗДЕСЬ — НЕ
 // УКРАШЕНИЕ: std::array с меньшим числом записей компилируется молча и добивает остаток
 // нулями, то есть спутниками без имени.
-inline constexpr std::array<RosterEntry, 10> Roster =
+inline constexpr std::array<RosterEntry, 8> Roster =
 {{
-    // человек — все девять классов, которые ему доступны, рыцарь смерти в том числе
+    // восемь классов человека, которые начинают в Северной Долине
     { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE },
     { "Aldric",     RACE_HUMAN,                 CLASS_PALADIN,       GENDER_MALE },
     { "Rowena",     RACE_HUMAN,                 CLASS_HUNTER,        GENDER_FEMALE },
     { "Cecily",     RACE_HUMAN,                 CLASS_ROGUE,         GENDER_FEMALE },
     { "Adeline",    RACE_HUMAN,                 CLASS_PRIEST,        GENDER_FEMALE },
-    { "Corvin",     RACE_HUMAN,                 CLASS_DEATH_KNIGHT,  GENDER_MALE },
     { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE },
     { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE },
     { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE },
-    // ночной эльф — только друид. Охотника на демонов не берём вовсе (оператор, 2026-09-09)
-    { "Sylwen",     RACE_NIGHTELF,              CLASS_DRUID,         GENDER_FEMALE },
 }};
 }
 
