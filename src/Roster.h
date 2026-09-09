@@ -16,9 +16,28 @@
  */
 
 /*
- * Constellation -- the roster: EVERY standard race in EVERY class it can take.
+ * Constellation -- the roster: humans, and the two classes a human cannot be.
  *
- * 122 companions over 13 races. The race/class pairs are not invented here:
+ * CUT DOWN TO ELEVEN on 2026-09-09 (operator: keep only humans, the death knight included, plus
+ * whichever ALLIANCE race fills in the classes they cannot take). It was every standard race in
+ * every class it could take -- 122, then 114 once the goblins were paused.
+ *
+ * NO SINGLE RACE FILLS THE GAP, and that is data rather than a preference. A human takes nine
+ * classes; shaman, druid, demon hunter and evoker are missing. Read from the realm's own
+ * playercreateinfo: night elf brings druid AND demon hunter, which is the most any one Alliance
+ * race adds; dwarf, draenei and Alliance pandaren bring only shaman; worgen only druid; gnome
+ * nothing at all. Shaman and druid never come from the same Alliance race except Kul Tiran, and
+ * allied races are excluded (operator, 2026-08-29) because they have no ordinary levelling start.
+ * Evoker exists only on dracthyr, also allied. So eleven classes of thirteen, the shaman needs a
+ * SECOND race, and the evoker is out of reach under that exclusion.
+ *
+ * Only the MISSING classes are taken from the night elf -- not a second warrior and a second
+ * mage. Every class appears exactly once.
+ *
+ * The other 103 companions are not deleted. This table decides who is SUMMONED, not who exists;
+ * their characters stay in the database and simply stop coming into the world.
+ *
+ * The race/class pairs are not invented here:
  * they were read from the realm's own world.playercreateinfo, which is what the
  * core consults when a client creates a character, so an impossible pair cannot
  * be in this table. Allied races are deliberately excluded (operator, 2026-08-29).
@@ -49,162 +68,24 @@ struct RosterEntry
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
 };
 
-// 114 после паузы гоблинов (было 122). ЧИСЛО ЗДЕСЬ — НЕ УКРАШЕНИЕ: std::array с меньшим
-// числом записей компилируется молча и добивает остаток нулями, то есть спутниками без имени.
-inline constexpr std::array<RosterEntry, 114> Roster =
+// 11 после сокращения до людей (было 114, до паузы гоблинов 122). ЧИСЛО ЗДЕСЬ — НЕ
+// УКРАШЕНИЕ: std::array с меньшим числом записей компилируется молча и добивает остаток
+// нулями, то есть спутниками без имени.
+inline constexpr std::array<RosterEntry, 11> Roster =
 {{
-    // человек
-    { "Garrick",   RACE_HUMAN,                CLASS_WARRIOR,       GENDER_MALE },
-    { "Aldric",    RACE_HUMAN,                CLASS_PALADIN,       GENDER_MALE },
-    { "Rowena",    RACE_HUMAN,                CLASS_HUNTER,        GENDER_FEMALE },
-    { "Cecily",    RACE_HUMAN,                CLASS_ROGUE,         GENDER_FEMALE },
-    { "Adeline",   RACE_HUMAN,                CLASS_PRIEST,        GENDER_FEMALE },
-    { "Corvin",    RACE_HUMAN,                CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Emrick",    RACE_HUMAN,                CLASS_MAGE,          GENDER_MALE },
-    { "Deverel",   RACE_HUMAN,                CLASS_WARLOCK,       GENDER_MALE },
-    { "Brienne",   RACE_HUMAN,                CLASS_MONK,          GENDER_FEMALE },
-    // орк
-    { "Karguk",    RACE_ORC,                  CLASS_WARRIOR,       GENDER_MALE },
-    { "Durok",     RACE_ORC,                  CLASS_HUNTER,        GENDER_MALE },
-    { "Mazzok",    RACE_ORC,                  CLASS_ROGUE,         GENDER_MALE },
-    { "Shakti",    RACE_ORC,                  CLASS_PRIEST,        GENDER_FEMALE },
-    { "Grommara",  RACE_ORC,                  CLASS_DEATH_KNIGHT,  GENDER_FEMALE },
-    { "Urzula",    RACE_ORC,                  CLASS_SHAMAN,        GENDER_FEMALE },
-    { "Thragan",   RACE_ORC,                  CLASS_MAGE,          GENDER_MALE },
-    { "Gorrum",    RACE_ORC,                  CLASS_WARLOCK,       GENDER_MALE },
-    { "Kaltha",    RACE_ORC,                  CLASS_MONK,          GENDER_FEMALE },
-    // дворф
-    { "Thoradin",  RACE_DWARF,                CLASS_WARRIOR,       GENDER_MALE },
-    { "Balrik",    RACE_DWARF,                CLASS_PALADIN,       GENDER_MALE },
-    { "Brandir",   RACE_DWARF,                CLASS_HUNTER,        GENDER_MALE },
-    { "Gerda",     RACE_DWARF,                CLASS_ROGUE,         GENDER_FEMALE },
-    { "Hilda",     RACE_DWARF,                CLASS_PRIEST,        GENDER_FEMALE },
-    { "Morgrim",   RACE_DWARF,                CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Thyra",     RACE_DWARF,                CLASS_SHAMAN,        GENDER_FEMALE },
-    { "Brenna",    RACE_DWARF,                CLASS_MAGE,          GENDER_FEMALE },
-    { "Durgan",    RACE_DWARF,                CLASS_WARLOCK,       GENDER_MALE },
-    { "Ferla",     RACE_DWARF,                CLASS_MONK,          GENDER_FEMALE },
-    // ночной эльф
-    { "Theron",    RACE_NIGHTELF,             CLASS_WARRIOR,       GENDER_MALE },
-    { "Faelan",    RACE_NIGHTELF,             CLASS_HUNTER,        GENDER_MALE },
-    { "Nyressa",   RACE_NIGHTELF,             CLASS_ROGUE,         GENDER_FEMALE },
-    { "Aelira",    RACE_NIGHTELF,             CLASS_PRIEST,        GENDER_FEMALE },
-    { "Ilyndir",   RACE_NIGHTELF,             CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Shaeryn",   RACE_NIGHTELF,             CLASS_MAGE,          GENDER_FEMALE },
-    { "Vaelthas",  RACE_NIGHTELF,             CLASS_WARLOCK,       GENDER_MALE },
-    { "Liriel",    RACE_NIGHTELF,             CLASS_MONK,          GENDER_FEMALE },
-    { "Sylwen",    RACE_NIGHTELF,             CLASS_DRUID,         GENDER_FEMALE },
-    { "Kaelith",   RACE_NIGHTELF,             CLASS_DEMON_HUNTER,  GENDER_MALE },
-    // нежить
-    { "Vorlin",    RACE_UNDEAD_PLAYER,        CLASS_WARRIOR,       GENDER_MALE },
-    { "Grimwald",  RACE_UNDEAD_PLAYER,        CLASS_HUNTER,        GENDER_MALE },
-    { "Yssara",    RACE_UNDEAD_PLAYER,        CLASS_ROGUE,         GENDER_FEMALE },
-    { "Nadira",    RACE_UNDEAD_PLAYER,        CLASS_PRIEST,        GENDER_FEMALE },
-    { "Corvath",   RACE_UNDEAD_PLAYER,        CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Elmira",    RACE_UNDEAD_PLAYER,        CLASS_MAGE,          GENDER_FEMALE },
-    { "Morwenna",  RACE_UNDEAD_PLAYER,        CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Ashkar",    RACE_UNDEAD_PLAYER,        CLASS_MONK,          GENDER_MALE },
-    // таурен
-    { "Mato",      RACE_TAUREN,               CLASS_WARRIOR,       GENDER_MALE },
-    { "Takoda",    RACE_TAUREN,               CLASS_PALADIN,       GENDER_MALE },
-    { "Chayton",   RACE_TAUREN,               CLASS_HUNTER,        GENDER_MALE },
-    { "Winona",    RACE_TAUREN,               CLASS_ROGUE,         GENDER_FEMALE },
-    { "Anpaytoo",  RACE_TAUREN,               CLASS_PRIEST,        GENDER_FEMALE },
-    { "Nashoba",   RACE_TAUREN,               CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Ohanzee",   RACE_TAUREN,               CLASS_SHAMAN,        GENDER_MALE },
-    { "Kimimela",  RACE_TAUREN,               CLASS_MAGE,          GENDER_FEMALE },
-    { "Wachiwi",   RACE_TAUREN,               CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Hototo",    RACE_TAUREN,               CLASS_MONK,          GENDER_MALE },
-    { "Ayasha",    RACE_TAUREN,               CLASS_DRUID,         GENDER_FEMALE },
-    // гном
-    { "Nobbin",    RACE_GNOME,                CLASS_WARRIOR,       GENDER_MALE },
-    { "Fizwick",   RACE_GNOME,                CLASS_HUNTER,        GENDER_MALE },
-    { "Pimpi",     RACE_GNOME,                CLASS_ROGUE,         GENDER_FEMALE },
-    { "Wenna",     RACE_GNOME,                CLASS_PRIEST,        GENDER_FEMALE },
-    { "Snargle",   RACE_GNOME,                CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Tizzine",   RACE_GNOME,                CLASS_MAGE,          GENDER_FEMALE },
-    { "Bimble",    RACE_GNOME,                CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Klanko",    RACE_GNOME,                CLASS_MONK,          GENDER_MALE },
-    // тролль
-    { "Zalko",     RACE_TROLL,                CLASS_WARRIOR,       GENDER_MALE },
-    { "Jubaka",    RACE_TROLL,                CLASS_HUNTER,        GENDER_MALE },
-    { "Tayana",    RACE_TROLL,                CLASS_ROGUE,         GENDER_FEMALE },
-    { "Zulwara",   RACE_TROLL,                CLASS_PRIEST,        GENDER_FEMALE },
-    { "Mahiki",    RACE_TROLL,                CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Nakuru",    RACE_TROLL,                CLASS_SHAMAN,        GENDER_MALE },
-    { "Sennja",    RACE_TROLL,                CLASS_MAGE,          GENDER_FEMALE },
-    { "Voljara",   RACE_TROLL,                CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Bumbu",     RACE_TROLL,                CLASS_MONK,          GENDER_MALE },
-    { "Yalanda",   RACE_TROLL,                CLASS_DRUID,         GENDER_FEMALE },
-    // гоблин
-    // ГОБЛИНЫ НА ПАУЗЕ (оператор, 2026-09-06: «гоблинов вообще не трогай… удали персонажей,
-    // кроме ДК»). Восемь строк убраны отсюда, а не закомментированы: состав — источник правды,
-    // и модуль восстановил бы их при следующем старте, сколько бы их ни удаляли из базы.
-    //
-    // Почему пауза: при 75 часах в игре, ровно как у всех, восемь гоблинов стоят на ПЕРВОМ
-    // уровне — средний 1.0 при максимуме 1, то есть ни один не сдвинулся со старта, — и дали
-    // по 2.0 сданных квеста против 17.6 у людей. Зона держит их на месте, а не модуль.
-    // Разбираться с ней оператор сейчас не хочет, и держать восемь спутников в тупике незачем.
-    //
-    // Числа именно такие, а не мягче: первая редакция этого комментария взяла их из таблицы,
-    // где спутники были смешаны с рыцарями смерти и с живыми персонажами, и гоблины там
-    // выглядели идущими (средний 1.8) за счёт единственного ДК восьмого уровня.
-    //
-    // Рыцарь смерти остаётся: он начинает не в гоблинской зоне, и на него это не влияет.
-    // Возврат: вписать строки обратно из истории этого файла, состав пересчитается сам.
-    { "Zibby",     RACE_GOBLIN,               CLASS_DEATH_KNIGHT,  GENDER_FEMALE },
-    // эльф крови
-    { "Kaelor",    RACE_BLOODELF,             CLASS_WARRIOR,       GENDER_MALE },
-    { "Theronis",  RACE_BLOODELF,             CLASS_PALADIN,       GENDER_MALE },
-    { "Aravel",    RACE_BLOODELF,             CLASS_HUNTER,        GENDER_FEMALE },
-    { "Sylvara",   RACE_BLOODELF,             CLASS_ROGUE,         GENDER_FEMALE },
-    { "Elenwe",    RACE_BLOODELF,             CLASS_PRIEST,        GENDER_FEMALE },
-    { "Valethar",  RACE_BLOODELF,             CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Lyresa",    RACE_BLOODELF,             CLASS_MAGE,          GENDER_FEMALE },
-    { "Naeryn",    RACE_BLOODELF,             CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Belorin",   RACE_BLOODELF,             CLASS_MONK,          GENDER_MALE },
-    { "Ithaeril",  RACE_BLOODELF,             CLASS_DEMON_HUNTER,  GENDER_MALE },
-    // дреней
-    { "Nuroth",    RACE_DRAENEI,              CLASS_WARRIOR,       GENDER_MALE },
-    { "Vaandor",   RACE_DRAENEI,              CLASS_PALADIN,       GENDER_MALE },
-    { "Ishala",    RACE_DRAENEI,              CLASS_HUNTER,        GENDER_FEMALE },
-    { "Ohana",     RACE_DRAENEI,              CLASS_ROGUE,         GENDER_FEMALE },
-    { "Yrel",      RACE_DRAENEI,              CLASS_PRIEST,        GENDER_FEMALE },
-    { "Maraad",    RACE_DRAENEI,              CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Naariel",   RACE_DRAENEI,              CLASS_SHAMAN,        GENDER_FEMALE },
-    { "Zurael",    RACE_DRAENEI,              CLASS_MAGE,          GENDER_MALE },
-    { "Talandra",  RACE_DRAENEI,              CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Ekkorn",    RACE_DRAENEI,              CLASS_MONK,          GENDER_MALE },
-    // ворген
-    { "Hallow",    RACE_WORGEN,               CLASS_WARRIOR,       GENDER_MALE },
-    { "Ashgrove",  RACE_WORGEN,               CLASS_HUNTER,        GENDER_MALE },
-    { "Greyric",   RACE_WORGEN,               CLASS_ROGUE,         GENDER_MALE },
-    { "Elswyth",   RACE_WORGEN,               CLASS_PRIEST,        GENDER_FEMALE },
-    { "Marrow",    RACE_WORGEN,               CLASS_DEATH_KNIGHT,  GENDER_MALE },
-    { "Bramwyn",   RACE_WORGEN,               CLASS_MAGE,          GENDER_FEMALE },
-    { "Thornwick", RACE_WORGEN,               CLASS_WARLOCK,       GENDER_MALE },
-    { "Ivelle",    RACE_WORGEN,               CLASS_MONK,          GENDER_FEMALE },
-    { "Ravenna",   RACE_WORGEN,               CLASS_DRUID,         GENDER_FEMALE },
-    // ПАНДАРЕН — НЕЙТРАЛЬНЫЙ, И ЭТО РЕШАЕТ, ГДЕ ОН РОДИТСЯ (оператор, 2026-09-03: «панды где
-    // появились? если в шторме, надо править»).
-    //
-    // Появлялись в Штормграде, и ядро тут ни при чём: у расы 25 (пандарен Альянса) точка создания
-    // в playercreateinfo и есть Штормград — потому что это персонаж УЖЕ ВЫБРАВШИЙ фракцию, то есть
-    // прошедший Скитающийся остров. Настоящее начало у расы 24: карта 860, (1466, 3466, 182).
-    // Ошибка была в этой росписи, а не в данных.
-    //
-    // Рыцарь смерти остаётся расой 25: у нейтральной расы такого класса нет вовсе
-    // (playercreateinfo: у 24 классы 1,3,4,5,7,8,9,10, у 25 — те же плюс 6).
-    // пандарен
-    { "Baoshen",   RACE_PANDAREN_NEUTRAL,     CLASS_WARRIOR,       GENDER_MALE },
-    { "Wenjun",    RACE_PANDAREN_NEUTRAL,     CLASS_HUNTER,        GENDER_MALE },
-    { "Meilin",    RACE_PANDAREN_NEUTRAL,     CLASS_ROGUE,         GENDER_FEMALE },
-    { "Liuwei",    RACE_PANDAREN_NEUTRAL,     CLASS_PRIEST,        GENDER_MALE },
-    { "Xinyi",     RACE_PANDAREN_ALLIANCE,    CLASS_DEATH_KNIGHT,  GENDER_FEMALE },
-    { "Jinhua",    RACE_PANDAREN_NEUTRAL,     CLASS_SHAMAN,        GENDER_FEMALE },
-    { "Shenlong",  RACE_PANDAREN_NEUTRAL,     CLASS_MAGE,          GENDER_MALE },
-    { "Yunmei",    RACE_PANDAREN_NEUTRAL,     CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Taozi",     RACE_PANDAREN_NEUTRAL,     CLASS_MONK,          GENDER_FEMALE },
+    // человек — все девять классов, которые ему доступны, рыцарь смерти в том числе
+    { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE },
+    { "Aldric",     RACE_HUMAN,                 CLASS_PALADIN,       GENDER_MALE },
+    { "Rowena",     RACE_HUMAN,                 CLASS_HUNTER,        GENDER_FEMALE },
+    { "Cecily",     RACE_HUMAN,                 CLASS_ROGUE,         GENDER_FEMALE },
+    { "Adeline",    RACE_HUMAN,                 CLASS_PRIEST,        GENDER_FEMALE },
+    { "Corvin",     RACE_HUMAN,                 CLASS_DEATH_KNIGHT,  GENDER_MALE },
+    { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE },
+    { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE },
+    { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE },
+    // ночной эльф — ТОЛЬКО те два класса, которых человек не может
+    { "Sylwen",     RACE_NIGHTELF,              CLASS_DRUID,         GENDER_FEMALE },
+    { "Kaelith",    RACE_NIGHTELF,              CLASS_DEMON_HUNTER,  GENDER_MALE },
 }};
 }
 
