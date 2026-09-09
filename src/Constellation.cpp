@@ -10496,6 +10496,66 @@ public:
             && kills <= total && nearest <= 75.0f;
     }
 
+    // ПАМЯТЬ ЛЕСТНИЦЫ О СОБСТВЕННЫХ ПОПЫТКАХ — одним переключателем на все её контейнеры.
+    //
+    // ПОРОГИ ЖИВУТ ЗДЕСЬ, И ЭТО ИХ МЕСТО. «Сколько раз пробовать, прежде чем бросить» —
+    // бухгалтерия механизма, а не свойство мира: у движка на это таблица отсрочек, и его
+    // ответ придёт оттуда, а не из этих чисел.
+    static bool FightBannedById(void const* user, Constellation::Ai::FightBan why, uint64 key)
+    {
+        Companion const* c = static_cast<Companion const*>(user);
+        if (!c)
+            return false;
+        switch (why)
+        {
+            case Constellation::Ai::FightBan::TalkKind:
+                return c->TalkBackoff.count(uint32(key)) != 0;
+            case Constellation::Ai::FightBan::FreeUse:
+            {
+                // Трижды применял эту клетку ради этой цели.
+                auto it = c->FreeTried.find(key);
+                return it != c->FreeTried.end() && it->second >= 3;
+            }
+            case Constellation::Ai::FightBan::GatherPoint:
+            {
+                // ТОТ ЖЕ ПРЕДЕЛ ХОЛОСТЫХ ЗАХОДОВ, ЧТО У ОБЫЧНЫХ ТОЧЕК СБОРА. Я утверждал
+                // обзору, что поход к точке ограничивает себя сам, и ошибся: `GatherLeave`
+                // считает холостой заход точке, а пропускает точку с восемью — ОТБОР точек,
+                // который дорога к клетке обходит, ставя `GatherSpawnId` напрямую. Значит
+                // предела не было вовсе, и спрашивается тот же счёт.
+                auto it = c->GatherEmpty.find(ObjectGuid::LowType(key));
+                return it != c->GatherEmpty.end() && it->second >= 8;
+            }
+            default:
+                return false;
+        }
+    }
+
+    static bool FightBannedByGuid(void const* user, Constellation::Ai::FightBan why, ObjectGuid guid)
+    {
+        Companion const* c = static_cast<Companion const*>(user);
+        if (!c)
+            return false;
+        switch (why)
+        {
+            case Constellation::Ai::FightBan::TalkRetry:     return c->TalkRetry.count(guid) != 0;
+            case Constellation::Ai::FightBan::Unreachable:   return c->TalkUnreachable.count(guid) != 0;
+            case Constellation::Ai::FightBan::TargetRefused: return c->Refused.count(guid) != 0;
+            default: return false;
+        }
+    }
+
+    // ЕДИНСТВЕННАЯ ЗАПИСЬ, КОТОРУЮ ОБХОД ДЕЛАЕТ ПО ХОДУ ДЕЛА, и она названа отдельно от чтений
+    // именно поэтому. Движок свяжет её со своей отсрочкой; тень — ни с чем, и тогда `Note`
+    // остаётся нулём, а обход ничего не запоминает.
+    static bool FightNote(void* user, Constellation::Ai::FightBan why, ObjectGuid guid)
+    {
+        Companion* c = static_cast<Companion*>(user);
+        if (!c || why != Constellation::Ai::FightBan::Unreachable)
+            return false;
+        return c->TalkUnreachable.insert(guid).second;
+    }
+
     static bool RefusedByCompanion(void const* user, uint32 questId)
     {
         Companion const* c = static_cast<Companion const*>(user);
@@ -11324,7 +11384,14 @@ public:
         scan.PackCenter = c.PackCenter;
         scan.PackKnown  = c.PackCenterKnown;
 
-        Creature* best = ScanObjectives(c, self, &scan);
+        Constellation::Ai::FightMemory const mem(&FightBannedById, &FightBannedByGuid,
+                                                 &FightNote, &c,
+                                                 c.ToolActionMs != 0, c.NoTargetMs);
+
+        DangerBinding bind{ &c, self };
+        Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
+
+        Creature* best = ScanObjectives(self, mem, danger, &scan, &c);
 
         c.TalkCandidate    = scan.Talk;
         c.FreeGoSpawn      = scan.CageSpawn;
@@ -11337,8 +11404,31 @@ public:
         return best;
     }
 
-    Creature* ScanObjectives(Companion& c, Player* self, Constellation::Ai::ObjectiveScan* out) const
+    // СПУТНИК БОЛЬШЕ НЕ ВИДЕН ОТСЮДА НАПРЯМУЮ — И ЭТО НЕ «НЕЗАВИСИМОСТЬ ОТ НЕГО».
+    //
+    // В теле не осталось ни одного `c.<поле>` (проверено скриптом, вырезающим тело по балансу
+    // скобок). Но связь никуда не делась: она идёт через вызовы `mem`, за которыми у лестницы
+    // стоят её же контейнеры. Куплено не отсутствие связи, а её ПРОХОЖДЕНИЕ ЧЕРЕЗ ЗАКРЫТЫЙ НАБОР
+    // ВОПРОСОВ — движок подставит свои ответы, не имея ни одного из этих контейнеров.
+    // Формулировку поправил разбор; прежняя обещала больше, чем даёт код.
+    //
+    // `diag` — необязательный, и ноль означает «не печатать», как у `SeekMemory::DiagOnce`.
+    // Требование разбора выполняется именно им: значение флагов не ставит, а тень не съедает
+    // строку, которую собиралась напечатать работающая ветка лестницы.
+    //
+    // ЧТО ЭТОТ НОЛЬ ГАРАНТИРУЕТ, А ЧТО НЕТ. Указатель неконстантный, и через него можно
+    // записать в спутника что угодно. Барьер не в типе параметра, а в том, что взять
+    // `Companion*` действию неоткуда: `Ctx` его не носит, фасад не отдаёт. Это то же самое
+    // основание, на котором публично объявлена `StepAlong`, — и оно свойство `Ctx`, а не
+    // обещание этой подписи.
+    Creature* ScanObjectives(Player* self, Constellation::Ai::FightMemory const& mem,
+                             Constellation::Ai::DangerView const& danger,
+                             Constellation::Ai::ObjectiveScan* out, Companion* diag) const
     {
+        // Причина отставки живёт в `Constellation::Ai`, обход — в `Constellation`. Псевдоним
+        // здесь, а не полное имя в двадцати местах: длинное имя в условии прячет само условие.
+        using FightBan = Constellation::Ai::FightBan;
+
         // СО СЛОМАННЫМ СНАРЯЖЕНИЕМ ЦЕЛЬ НЕ ИЩЕМ ВОВСЕ.
         //
         // Это и есть тот круг, который держал боевой сервер: тканевый не может выиграть
@@ -11350,7 +11440,9 @@ public:
         //
         // Пока похода к починке нет (задача 0010), спутник просто не ищет боя: сдавать
         // готовые квесты, отдыхать и ходить за хозяином он по-прежнему может.
-        if (BrokenForFight(c, self))
+        // ПРИБОР СБРАСЫВАЕТ СВОЙ ФЛАГ И КОГДА ВСЁ ЦЕЛО, поэтому у лестницы зовётся ВСЕГДА,
+        // а не только при поломке: иначе «сломано» напечаталось бы дважды подряд.
+        if (diag ? BrokenForFight(*diag, self) : (BrokenCount(self) != 0))
             return nullptr;
 
         // какие виды существ нам вообще нужны
@@ -11363,9 +11455,9 @@ public:
         // Гаррика. По ней нельзя сказать ничего о составе: у него нашлось ноль целей-убить,
         // а у скольких ещё — неизвестно. Пять гипотез подряд разбились об это, поэтому
         // флаг переезжает в спутника: 122 строки один раз, и картина видна целиком.
-        if (!c.FightDiagDone && slotsUsed)
+        if (diag && !diag->FightDiagDone && slotsUsed)
         {
-            c.FightDiagDone = true;
+            diag->FightDiagDone = true;
             LogWardrobe(self);
             TC_LOG_INFO("server.worldserver",
                 "Constellation DIAG {}: слотов занято {}, незакрытых {}, целей-убить {}, ненабранных {}, видов {}, радиус зова {:.0f}",
@@ -11440,12 +11532,12 @@ public:
             // зачёта, которого в мире нет, — но заклинание предмета от квеста называет это
             // существо целью и даёт зачёт маркеру (QuestToolFor, второй проход). Только не
             // боевая цель, в нашей фазе, восприимчивая к игрокам и не отставленная.
-            if (!suitable && anyTool && !c.ToolActionMs
+            if (!suitable && anyTool && !mem.ToolBusy
                 && self->GetPhaseShift().CanSee(creature->GetPhaseShift())
                 && !self->IsValidAttackTarget(creature) && !creature->IsImmuneToPC()
-                && !c.TalkBackoff.count(creature->GetEntry())
-                && !c.TalkRetry.count(creature->GetGUID())
-                && !c.TalkUnreachable.count(creature->GetGUID()))
+                && !mem.Banned(FightBan::TalkKind, creature->GetEntry())
+                && !mem.Banned(FightBan::TalkRetry, creature->GetGUID())
+                && !mem.Banned(FightBan::Unreachable, creature->GetGUID()))
             {
                 uint32 sp = 0, qh = 0;
                 if (QuestToolFor(self, creature->GetEntry(), &sp, creature, &qh) && qh)
@@ -11473,11 +11565,11 @@ public:
             // под игрока не масштабируются вовсе. Никакой множитель этого не скажет — сказали
             // смерти. Поэтому мера — не уровень, а уже случившееся: два раза от одного вида.
             // Предикат общий с планировщиком походов (KilledByBlocked).
-            if (KilledByBlocked(c, self, creature->GetEntry()))
+            if (danger.KilledMeTwice(creature->GetEntry()))
             {
-                if (c.KilledByNoted.insert(creature->GetEntry()).second)
+                if (diag && diag->KilledByNoted.insert(creature->GetEntry()).second)
                 {
-                    auto const& k = c.KilledBy.at(creature->GetEntry());
+                    auto const& k = diag->KilledBy.at(creature->GetEntry());
                     TC_LOG_INFO("server.worldserver",
                         "Constellation БОЙ {}: {} ({}) убивал меня {} раз(а) — не цель, пока не перерасту (был ур {}, нужен {})",
                         self->GetName(), creature->GetName(), creature->GetEntry(),
@@ -11517,12 +11609,20 @@ public:
                 // запрет, хотя три гибели — это уже порог опасности, а три победы преимущества
                 // ещё не доказывают. Условие теперь читается ровно так, как написано выше:
                 // место проходимо, только если побед БОЛЬШЕ, чем гибелей.
-                if (DeathSpotBlocked(c, self, self->GetMapId(),
-                                     creature->GetPositionX(), creature->GetPositionY(),
-                                     &deadly, &deadlyTotal, &deadlyLevel, &deadlyKills, &deadlyNear)
-                    && deadlyKills <= deadlyTotal && deadlyNear <= 75.0f)
+                // РЕШАЕТ ВИД ОПАСНОСТИ, ОДНИМ «ДА/НЕТ». Оба сужения — отношение побед и
+                // семьдесят пять ярдов — уехали внутрь него вместе с правилом, чтобы движок
+                // получил тот же ответ, а не похожий.
+                //
+                // ЦЕНА НАЗВАНА: строке прибора нужны ЧИСЛА, а вид их не отдаёт — таким его
+                // сделал разбор. Поэтому лестница переспрашивает предикат, и только на пути
+                // ОТКАЗА, где существо и так уже пропущено.
+                if (danger.DeadlyToFightAt(creature->GetPositionX(), creature->GetPositionY()))
                 {
-                    if (c.DeathSpotNoted.insert(deadly).second)
+                    if (diag && DeathSpotBlocked(*diag, self, self->GetMapId(),
+                                                 creature->GetPositionX(), creature->GetPositionY(),
+                                                 &deadly, &deadlyTotal, &deadlyLevel,
+                                                 &deadlyKills, &deadlyNear)
+                        && diag->DeathSpotNoted.insert(deadly).second)
                         TC_LOG_INFO("server.worldserver",
                             "Constellation БОЙ {}: вокруг {} ({}) меня убивали {} раз(а) при {} победах "
                             "(до смертельной клетки {:.0f} ярдов) — не цель, пока не перерасту (был ур {}, нужен {})",
@@ -11544,9 +11644,9 @@ public:
                 if (cls != CreatureClassifications::Normal && cls != CreatureClassifications::Trivial
                     && cls != CreatureClassifications::MinusMob)
                 {
-                    if (!c.EliteNoted)
+                    if (diag && !diag->EliteNoted)
                     {
-                        c.EliteNoted = true;
+                        diag->EliteNoted = true;
                         TC_LOG_INFO("server.worldserver",
                             "Constellation БОЙ {}: {} ({}) — вид {} (элитный/редкий), в одиночку не беру",
                             self->GetName(), creature->GetName(), creature->GetEntry(), uint32(cls));
@@ -11595,11 +11695,11 @@ public:
             // ГОЛОДАНИЕ ОТМЕНЯЕТ ПОРОГ (разбор): цели, которые водятся только стаями, иначе стали
             // бы невыполнимы навсегда. Долго нет боя — берём наименее людную, но элитных всё
             // равно не берём: это отдельное правило.
-            if (Cfg().MaxAssist && assists > Cfg().MaxAssist && c.NoTargetMs < Cfg().StarveMs)
+            if (Cfg().MaxAssist && assists > Cfg().MaxAssist && mem.StarvedMs < Cfg().StarveMs)
             {
-                if (!c.ToughNoted)
+                if (diag && !diag->ToughNoted)
                 {
-                    c.ToughNoted = true;
+                    diag->ToughNoted = true;
                     TC_LOG_INFO("server.worldserver",
                         "Constellation БОЙ {}: за {} ({}) вступятся {} — беру того, кто с краю",
                         self->GetName(), creature->GetName(), creature->GetEntry(), assists);
@@ -11686,13 +11786,16 @@ public:
                 uint32 toolSp = 0, toolQh = 0;
                 if (byMonster && creature->IsImmuneToPC()
                     && !creature->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK)
-                    && !(anyTool && !c.ToolActionMs
+                    && !(anyTool && !mem.ToolBusy
                          && QuestToolFor(self, creature->GetEntry(), &toolSp, creature, &toolQh)
                          && toolQh))
                 {
-                    if (c.TalkUnreachable.insert(creature->GetGUID()).second && !c.ImmuneNoted)
+                    // ЗАПИСЬ ИДЁТ ВСЕГДА, А ПЕЧАТЬ — ПО ЕЁ ОТВЕТУ. Порядок тот же, что был:
+                    // сначала запомнить, потом решать, говорить ли об этом.
+                    if (mem.NoteFirst(FightBan::Unreachable, creature->GetGUID())
+                        && diag && !diag->ImmuneNoted)
                     {
-                        c.ImmuneNoted = true;
+                        diag->ImmuneNoted = true;
                         TC_LOG_INFO("server.worldserver",
                             "Constellation ПРИМЕНЕНИЕ {}: {} ({}) пока невосприимчив к игрокам — не собеседник, жду",
                             self->GetName(), creature->GetName(), creature->GetEntry());
@@ -11734,8 +11837,7 @@ public:
                                 // точке, а пропускает точку с восемью — ОТБОР ТОЧЕК СБОРА,
                                 // который эта дорога обходит, ставя GatherSpawnId напрямую.
                                 // Значит предела не было вовсе. Спрашиваем тот же счёт.
-                                if (auto empt = c.GatherEmpty.find(cage->GetSpawnId());
-                                    empt != c.GatherEmpty.end() && empt->second >= 8)
+                                if (mem.Banned(FightBan::GatherPoint, cage->GetSpawnId()))
                                     continue;
                                 // ЧУЖОЙ КВЕСТ — НЕ НАШЕ ДЕЛО. Замер: «применил Eye of Acherus
                                 // Control Mechanism (191609)» — гуубер с questID 12641, а мы
@@ -11745,8 +11847,7 @@ public:
                                     && self->GetQuestStatus(ct->goober.questID) != QUEST_STATUS_INCOMPLETE)
                                     continue;
                                 uint64 const fk = PairKey(cage->GetEntry(), creature->GetEntry());
-                                if (auto tr = c.FreeTried.find(fk);
-                                    tr != c.FreeTried.end() && tr->second >= 3)
+                                if (mem.Banned(FightBan::FreeUse, fk))
                                     continue;   // трижды применял эту клетку ради этой цели
                                 out->CageSpawn = cage->GetSpawnId();
                                 out->CageEntry = cage->GetEntry();
@@ -11755,10 +11856,10 @@ public:
                                 break;
                             }
                 }
-                else if (byMonster && !c.ToolActionMs
-                    && !c.TalkBackoff.count(creature->GetEntry())
-                    && !c.TalkRetry.count(creature->GetGUID())
-                    && !c.TalkUnreachable.count(creature->GetGUID()))
+                else if (byMonster && !mem.ToolBusy
+                    && !mem.Banned(FightBan::TalkKind, creature->GetEntry())
+                    && !mem.Banned(FightBan::TalkRetry, creature->GetGUID())
+                    && !mem.Banned(FightBan::Unreachable, creature->GetGUID()))
                 {
                     float const d = self->GetExactDist(creature);
                     if (talkDist < 0.0f || d < talkDist)
@@ -11842,7 +11943,7 @@ public:
             // Прямую видимость на ВЫБОРЕ не требуем: за 120 ярдов почти всё за
             // чем-нибудь, а игрок обходит препятствие. Её проверяет шаг и само ядро
             // при ударе. Здесь отсеиваем лишь то, что уже признано недостижимым.
-            if (c.Refused.count(creature->GetGUID()))
+            if (mem.Banned(FightBan::TargetRefused, creature->GetGUID()))
                 { ++rejLos; ++rejected; continue; }
             // ЦЕЛЬ ВЫБИРАЕТСЯ ПО ОДИНОЧЕСТВУ, А ПОТОМ УЖЕ ПО БЛИЗОСТИ: так лагерь разбирается
             // с края по одному, а не начинается с середины (оператор: «цеплять по 1-2»).
