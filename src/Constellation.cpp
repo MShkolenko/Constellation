@@ -2805,8 +2805,10 @@ public:
         if (Cfg().EngineShadow && Constellation::Ai::Engine::Instance().Ready())
         {
             Constellation::Ai::WorldView view(self);
+            DangerBinding danger{ &c, self };
+            Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
             Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS(), &c.EngineShadow };
+            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(), &c.EngineShadow };
             // §9 — БЕЗ МАСКИ СТРАТЕГИЯ НЕ РАБОТАЕТ НИ У КОГО: `StrategyMask` начинается
             // нулём, а фильтр — побитовое И. Ставим её ТОЛЬКО тени: шов и так закрыт
             // `Owns`, но разница между «движок думает» и «движок делает» не должна держаться
@@ -2840,8 +2842,10 @@ public:
             && Constellation::Ai::Engine::Owns(uint8(c.Mode)))
         {
             Constellation::Ai::WorldView view(self);
+            DangerBinding danger{ &c, self };
+            Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
             Constellation::Ai::ClientAct act(self, c.Session);
-            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS(), &c.Engine };
+            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(), &c.Engine };
             Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
             return;
         }
@@ -10456,6 +10460,42 @@ public:
 
     // Память об отказах ЭТОГО механизма — лестницы. Движок передаст `nullptr`: его память живёт
     // в таблице отсрочек и проверяется на уровне ставки, до всякого вызова сюда.
+    // ПЯТЫЙ ЛИФТ, И ОН ОТДАЁТ НЕ ПРАВИЛО, А ДВА ВОПРОСА. Внутри — предикаты, которые лестница
+    // копила по гибелям; движку предстоит спросить ровно то же самое, а копия правила разойдётся.
+    //
+    // Связка нужна потому, что оба предиката спрашивают И спутника, И игрока: уровень снимает
+    // запрет, а он у игрока. Один указатель на два объекта — иначе вид пришлось бы делать на три
+    // поля, из которых два всегда ходят парой.
+    struct DangerBinding
+    {
+        Companion const* C    = nullptr;
+        Player const*    Self = nullptr;
+    };
+
+    static bool KilledMeTwiceFor(void const* user, uint32 entry)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        if (!b || !b->C || !b->Self)
+            return false;
+        return Manager::Instance()->KilledByBlocked(*b->C, b->Self, entry);
+    }
+
+    // БОЕВОЕ правило целиком, вместе с двумя сужениями, которые у лестницы стоят НА МЕСТЕ ВЫЗОВА
+    // (`:11448-11451`), а не внутри предиката. Собраны здесь именно потому, что там они и есть
+    // правило: без них движок получил бы другой ответ на тот же вопрос.
+    static bool DeadlyToFightAtFor(void const* user, float x, float y)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        if (!b || !b->C || !b->Self)
+            return false;
+        uint64 which = 0;
+        uint32 total = 0, level = 0, kills = 0;
+        float nearest = 0.0f;
+        return Manager::Instance()->DeathSpotBlocked(*b->C, b->Self, b->Self->GetMapId(), x, y,
+                                                     &which, &total, &level, &kills, &nearest)
+            && kills <= total && nearest <= 75.0f;
+    }
+
     static bool RefusedByCompanion(void const* user, uint32 questId)
     {
         Companion const* c = static_cast<Companion const*>(user);
@@ -13212,10 +13252,12 @@ private:
             return;
         }
         Constellation::Ai::WorldView view(self);
+        DangerBinding danger{ &c, self };
+        Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
         if (Cfg().Engine)
         {
             Constellation::Ai::ClientAct act(self, c.Session);
-            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS() };
             Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
         }
         if (Cfg().EngineShadow)
@@ -13223,7 +13265,7 @@ private:
             // Своя дверь и тоже заглушённая: `Reset` зовёт `Action::Cancel`, а тот
             // вполне может захотеть отправить пакет — отмена цели, остановка атаки.
             Constellation::Ai::ClientAct shadowAct(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx shadowCtx{ view, shadowAct, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Ctx shadowCtx{ view, dangerView, shadowAct, GameTime::GetGameTimeMS() };
             Constellation::Ai::Engine::Instance().Reset(c.EngineShadow, shadowCtx, why);
         }
     }
