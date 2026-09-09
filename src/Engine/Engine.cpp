@@ -389,10 +389,11 @@ namespace Constellation::Ai
             return;
         TC_LOG_INFO("server.worldserver",
             "Constellation {} {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {},"
-            " подавлено {})",
+            " подавлено {}, шаг отвергнут {})",
             run == Run::Shadow ? "ТЕНЬ" : "РЕШЕНИЕ",
             ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
-            st.AssignmentEpoch, st.Queue.size(), st.BidsDropped, st.BidsSuppressed);
+            st.AssignmentEpoch, st.Queue.size(), st.BidsDropped, st.BidsSuppressed,
+            st.StepsRefused);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -683,7 +684,14 @@ namespace Constellation::Ai
         // В ТЕНИ ТАКТ НЕ ОТКРЫВАЕТСЯ ВОВСЕ: Execute не зовётся, значит ходить нечему, а
         // открытый бюджет позволил бы двинуться чему-то, что тень запускать не должна.
         if (run == Run::Decide)
-            ctx.Act.ResetTick();
+        {
+            // §6 — БЮДЖЕТ ОТ ИЗМЕРЕННОГО ТАКТА. Ноль на первом такте значит «мерить не с чем»,
+            // и дверь возьмёт заявленную частоту; дальше только разность.
+            uint32 const slice = st.HasDecided ? (ctx.NowMs - st.LastTickMs) : 0u;
+            st.HasDecided = true;
+            st.LastTickMs = ctx.NowMs;
+            ctx.Act.ResetTick(slice, &st.StepsRefused);
+        }
 
         // §4.1 — a bid made three seconds ago is answering a world that has moved on.
         size_t const before = st.Queue.size();

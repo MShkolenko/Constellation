@@ -140,7 +140,13 @@ namespace Constellation::Ai
         // §11 and the review: bounding ONE step is not bounding movement. A hundred legal steps
         // in a single tick is a teleport spelled slowly. The engine calls this once per tick and
         // the budget is what a companion could actually have covered in it.
-        void ResetTick();
+        // `sliceMs` — СКОЛЬКО ВРЕМЕНИ ПРОШЛО с прошлого такта ЭТОГО спутника. Ноль значит
+        // «первый такт, мерить не с чем», и дверь возьмёт заявленную частоту модуля.
+        // `refusedSink` — КУДА СКЛАДЫВАТЬ ОТКАЗЫ ШАГА. Своего счётчика у двери нет намеренно:
+        // два счётчика одного и того же расходятся, и один из них оказывается тем, который
+        // никто не заполняет (Кодекс, пункт 4). Здесь он ровно один, и живёт он там, где его
+        // читают, — в состоянии спутника.
+        void ResetTick(uint32 sliceMs, uint32* refusedSink);
 
         // NOT YET HERE, and deliberately listed so the gap is visible rather than discovered:
         //   UseItem     — CMSG_USE_ITEM needs the cast id built at the call site; moved when
@@ -154,6 +160,8 @@ namespace Constellation::Ai
         WorldSession* _session;
         float         _stepBudgetYards = 0.0f;   // spent by Step, refilled by ResetTick
         bool          _tickOpen        = false;  // no movement before the engine opens the tick
+        float         _sliceSeconds    = 0.0f;   // ИЗМЕРЕННАЯ длина такта, в секундах
+        uint32*       _refusedSink     = nullptr; // счётчик отказов шага — в состоянии спутника
         bool          _muted           = false;  // §10 — тень: дверь закрыта наглухо
         mutable uint32 _refused        = 0;      // сколько раз в неё постучали при этом
     };

@@ -199,7 +199,16 @@ namespace Constellation::Ai
     // A generous slice. The module ticks movement at 4 Hz, so a real step is around a yard and
     // a half; a whole second of run speed leaves room for a loaded world thread without leaving
     // room for a teleport.
-    static constexpr float STEP_SLICE_SECONDS = 1.0f;
+    // ПРЕЖНЯЯ КОНСТАНТА СТАЛА ПОТОЛКОМ, А НЕ НОРМОЙ. Здесь стояла целая секунда бега при
+    // такте в 250 мс, с обоснованием «запас на загруженный поток мира». От телепорта это
+    // защищало, от учетверённой скорости — нет: семь ярдов бюджета против полутора ярдов
+    // настоящего шага разрешают четыре шага за такт. Теперь бюджет от ИЗМЕРЕННОГО такта, а
+    // секунда — верхняя граница: загруженный поток по-прежнему не отвергнет законный шаг.
+    static constexpr float  STEP_SLICE_CAP_SECONDS = 1.0f;
+
+    // Первый такт спутника мерить не с чем. Берём заявленную частоту модуля (4 Гц) — ровно
+    // один раз за жизнь состояния, дальше только измерение.
+    static constexpr uint32 STEP_NOMINAL_SLICE_MS  = 250;
     static constexpr float STEP_TOLERANCE_YARDS = 2.0f;
 
     float ClientAct::MaxStepYards() const
@@ -212,11 +221,18 @@ namespace Constellation::Ai
         UnitMoveType const type = _self->IsFlying()   ? MOVE_FLIGHT
                                 : _self->IsInWater()  ? MOVE_SWIM
                                                       : MOVE_RUN;
-        return _self->GetSpeed(type) * STEP_SLICE_SECONDS + STEP_TOLERANCE_YARDS;
+        return _self->GetSpeed(type) * _sliceSeconds + STEP_TOLERANCE_YARDS;
     }
 
-    void ClientAct::ResetTick()
+    void ClientAct::ResetTick(uint32 sliceMs, uint32* refusedSink)
     {
+        _refusedSink = refusedSink;
+        // ИЗМЕРЕНИЕ, А НЕ КОНСТАНТА — И С ПОТОЛКОМ, ПОТОМУ ЧТО ИЗМЕРЕНИЕ ТОЖЕ ВРЁТ. Если поток
+        // мира встал на десять секунд, честная разность выдала бы бюджет на семьдесят ярдов —
+        // ровно тот телепорт, ради запрета которого дверь и существует.
+        uint32 const slice   = sliceMs ? sliceMs : STEP_NOMINAL_SLICE_MS;
+        float const  seconds = float(slice) / 1000.0f;
+        _sliceSeconds    = seconds < STEP_SLICE_CAP_SECONDS ? seconds : STEP_SLICE_CAP_SECONDS;
         _stepBudgetYards = MaxStepYards();
         _tickOpen        = true;
     }
@@ -232,6 +248,7 @@ namespace Constellation::Ai
         {
             TC_LOG_ERROR("server.worldserver",
                 "Constellation ШАГ {}: отказ — такт не открыт", _self->GetName());
+            if (_refusedSink) ++*_refusedSink;
             return false;
         }
 
@@ -245,6 +262,7 @@ namespace Constellation::Ai
                 "Constellation ШАГ {}: отказ — {:.1f} ярдов за такт при разрешённых {:.1f}."
                 " Это попытка переместиться, а не пройти",
                 _self->GetName(), moved, allowed);
+            if (_refusedSink) ++*_refusedSink;
             return false;
         }
 
@@ -256,6 +274,7 @@ namespace Constellation::Ai
                 "Constellation ШАГ {}: отказ — за такт уже пройдено, осталось {:.1f} ярдов из"
                 " {:.1f}, а просят {:.1f}",
                 _self->GetName(), _stepBudgetYards, allowed, moved);
+            if (_refusedSink) ++*_refusedSink;
             return false;
         }
 
@@ -268,6 +287,7 @@ namespace Constellation::Ai
             TC_LOG_ERROR("server.worldserver",
                 "Constellation ШАГ {}: отказ — вверх на {:.1f} ярдов при разрешённых {:.1f}",
                 _self->GetName(), climbed, allowed);
+            if (_refusedSink) ++*_refusedSink;
             return false;
         }
 
