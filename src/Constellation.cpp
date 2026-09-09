@@ -13446,6 +13446,16 @@ namespace Constellation::Ai
     // дефекта, что и любая вторая копия числа.
     // ПОЛИТИКА ОДНА, ВЫЗЫВАЮЩИХ ДВА. `nullptr` вместо памяти об отказах — намеренно: у движка
     // она своя и живёт в таблице отсрочек, где проверяется до того, как дело дойдёт сюда.
+    bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out)
+    {
+        if (!self || !out)
+            return false;
+        *out = SeekTarget();
+        out->Found = Constellation::Manager::Instance()->FindGiverByMap(
+            self, mem, &out->Entry, &out->SpawnId, &out->Where, &out->QuestId);
+        return out->Found;
+    }
+
     uint32 BestQuestInMenu(Player const* self, QuestRefusedFn refused, void const* user)
     {
         return Constellation::Manager::Instance()->PickFromQuestMenu(self, refused, user).QuestId;
@@ -13456,6 +13466,7 @@ namespace Constellation::Ai
         EngineTuning t;
         t.QuestGiverRange = Constellation::Cfg().QuestGiverRange;
         t.GiverSeekRange  = Constellation::Cfg().GiverSeekRange;
+        t.WalkCapMs       = Constellation::Cfg().WalkCapMs;
         return t;
     }
 }

@@ -63,6 +63,19 @@ namespace Constellation::Ai
         bool       Visible = false;     // IsWithinLOSInMap — НЕ фильтр, а сведение
     };
 
+    // КУДА ИДТИ И ЗА ЧЕМ. Ответ выбора по указателю карты — один, а не список: маршрут
+    // ходячего NPC разрешается уже для ВЫБРАННОГО, и лестница тоже выбирает одного.
+    // `Where` — не точка спавна, а место, к которому идти: у патрулирующего это ближайший
+    // узел его маршрута на нашем ярусе.
+    struct SeekTarget
+    {
+        uint32              Entry   = 0;
+        ObjectGuid::LowType SpawnId = 0;
+        Position            Where;
+        uint32              QuestId = 0;
+        bool                Found   = false;
+    };
+
     // Квестодатель из указателя карты, загружен он сейчас или нет.
     struct GiverOnMap
     {
@@ -199,6 +212,11 @@ namespace Constellation::Ai
         // поэтому читатель не берёт гуид — брать его значило бы обещать выборку, которой нет.
         uint32 BestQuestOffered(QuestRefusedFn refused, void const* user) const;
 
+        // КУДА ИДТИ ЗА СЛЕДУЮЩИМ КВЕСТОМ. Зовёт ту же функцию, что и лестница, со всей её
+        // начинкой: потолок дальности, ближний порог, фракция, кэш по ВИДУ существа, проверка
+        // яруса и разрешение маршрута патрулирующего. Память передаётся вызывающим.
+        bool GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const;
+
         // ПРИНИМАЮЩИЙ ЭТОГО ВИДА, ДО КОТОРОГО ЯДРО РАЗРЕШАЕТ ДОТЯНУТЬСЯ.
         //
         // Значения отдают ВИД и точку (указатель карты знает только их), а дверь требует
@@ -244,12 +262,18 @@ namespace Constellation::Ai
     struct EngineTuning
     {
         float QuestGiverRange = 0.0f;   // обзор вокруг себя
-        float GiverSeekRange  = 0.0f;   // как далеко готовы идти по указателю
+        float GiverSeekRange  = 0.0f;
+        // Потолок на одну дорогу. Читается у конфига каждый раз, как и радиусы: `.reload config`
+        // меняет его на живом мире.
+        uint32 WalkCapMs      = 900000;   // как далеко готовы идти по указателю
     };
     EngineTuning Tuning();
 
     // Политика выбора квеста из меню — одна на лестницу и на движок. Переходник, а не копия.
     uint32 BestQuestInMenu(Player const* self, QuestRefusedFn refused, void const* user);
+
+    // Тот же приём: одна реализация в модуле, переходник для движка.
+    bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

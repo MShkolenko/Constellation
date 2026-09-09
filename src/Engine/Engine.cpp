@@ -442,6 +442,13 @@ namespace Constellation::Ai
         // не делал (Кодекс, пункт 5). Стоит три присвоения `bool` — буферы не трогаются
         // и свою ёмкость сохраняют.
         st.Values.InvalidateAll();
+        // §31 — ДОРОГА ТОЖЕ БРОШЕНА. Здесь различие с таблицей отсрочек, и оно противоположное:
+        // отсрочка — память о РЕЗУЛЬТАТЕ и переживает отказ от работы, а прогресс ходьбы — снимок
+        // ИСПОЛНЯЕМОГО действия. Работа брошена — значит и дорога. Без этой строки повторная
+        // попытка к той же цели унаследовала бы чужой счётчик застревания и оборвалась бы, не
+        // начавшись: сравнение `Subject` ловит смену цели, но не новую попытку к прежней
+        // (Кодекс, пункты 1 и 3).
+        st.Walk = WalkProgress();
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
     }
 
@@ -547,6 +554,62 @@ namespace Constellation::Ai
                 --st.BackoffCount;
                 return;
             }
+    }
+
+    namespace
+    {
+        // Общая часть обоих адаптеров: собрать ключ и спросить таблицу.
+        inline bool EngineRemembers(void const* user, BackoffKind kind, Subject const& about)
+        {
+            Ctx const* ctx = static_cast<Ctx const*>(user);
+            if (!ctx || !ctx->St)
+                return false;
+            BackoffKey key;
+            key.Kind  = kind;
+            key.About = about;
+            return Engine::Deferred(*ctx->St, key, ctx->NowMs);
+        }
+    }
+
+    WalkVerdict AdvanceWalk(Ctx& ctx, Subject const& toward, float dist, uint32 sliceMs, bool stalled)
+    {
+        if (!ctx.St)
+            return WalkVerdict::Going;      // без состояния судить не о чем — и не мешать
+        WalkProgress& w = ctx.St->Walk;
+
+        // НОВАЯ ЦЕЛЬ — НОВАЯ ДОРОГА. Перезапуск здесь, а не у вызывающего: забытый перезапуск
+        // означал бы, что счётчик застревания пришёл из прошлого пути и оборвал бы новый.
+        if (!(w.Toward == toward))
+            w.Restart(toward, ctx.NowMs);
+
+        // ПРИБЛИЖЕНИЕ — С ЗАПАСОМ. Правило и число у лестницы (`Constellation.cpp:3375`).
+        // Первый замер прогрессом не считается и не наказывается: сравнивать ещё не с чем.
+        if (!w.Measured || dist < w.Best - WALK_PROGRESS_YARDS)
+        {
+            w.Measured = true;
+            w.Best     = dist;
+            w.StuckMs  = 0;
+        }
+        else
+            w.StuckMs += sliceMs;
+
+        if (stalled)
+            return WalkVerdict::Stalled;
+        if (w.StuckMs > WALK_NO_PROGRESS_MS)
+            return WalkVerdict::NoProgress;
+        if (ctx.NowMs - w.StartedMs > Tuning().WalkCapMs)
+            return WalkVerdict::TooLong;
+        return WalkVerdict::Going;
+    }
+
+    bool QuestRefusedByEngine(void const* user, uint32 questId)
+    {
+        return EngineRemembers(user, BackoffKind::CoreRefused, Subject::OfQuest(questId));
+    }
+
+    bool SpawnBackedOffByEngine(void const* user, uint32 spawnId)
+    {
+        return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfSpawn(spawnId));
     }
 
     void Defer(Ctx& ctx, BackoffKind kind, Subject const& about, uint8 detail, uint32 ttlMs)

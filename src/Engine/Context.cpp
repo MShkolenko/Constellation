@@ -276,6 +276,13 @@ namespace Constellation::Ai
         return creature && creature->IsAlive() && _self->CanInteractWithQuestGiver(creature);
     }
 
+    bool WorldView::GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const
+    {
+        if (!_self || !out)
+            return false;
+        return FindGiverToWalkTo(_self, mem, out);
+    }
+
     uint32 WorldView::BestQuestOffered(QuestRefusedFn refused, void const* user) const
     {
         return _self ? BestQuestInMenu(_self, refused, user) : 0u;
