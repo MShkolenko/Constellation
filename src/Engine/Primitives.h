@@ -214,6 +214,66 @@ namespace Constellation::Ai
         uint32     _id   = 0;
     };
 
+    // -------------------------------------------------------------------------------------------
+    // §14 — ОТСРОЧКИ: ОДНА ТАБЛИЦА ВМЕСТО ВОСЬМИ НАБОРОВ.
+    //
+    // Лестница завела восемь отдельных контейнеров, по одному на случай: `SellRefused`,
+    // `EquipRefused`, `TurnInBackoff`, `SeekBackoff`, `GiverUnreachable`, `TalkBackoff`,
+    // `TalkUnreachable`, `QuestRefused`. Каждый со своим ключом, своим сроком и своей политикой
+    // очистки — а два из них не чистятся вовсе. Здесь это одна вещь.
+    //
+    // КЛЮЧ — ТРОЙКА, И ЭТО НЕ ИЗБЫТОЧНОСТЬ. Один и тот же NPC бывает одновременно непригоден для
+    // взятия квеста, годен для сдачи другого, недоступен для разговора и пригоден как торговец.
+    // Ключ по одному `Subject` склеил бы четыре разных запрета в один; ключи лестницы это и
+    // подтверждают — `EquipRefused` ключуется парой «гуид + слот», `TalkBackoff` по виду,
+    // `TalkUnreachable` по гуиду. `Detail` и есть место для такой пары.
+    // -------------------------------------------------------------------------------------------
+#define CONSTELLATION_BACKOFFS(X)                                                     \
+    /*  имя             текст                       */                                \
+    X(None,             "нет")                                                        \
+    X(NothingOffered,   "предложить нечего")                                          \
+    X(Unreachable,      "не дойти")                                                   \
+    X(CoreRefused,      "ядро отказало")
+
+    enum class BackoffKind : uint8
+    {
+#define CONSTELLATION_BACKOFF_ENUM(name, text) name,
+        CONSTELLATION_BACKOFFS(CONSTELLATION_BACKOFF_ENUM)
+#undef CONSTELLATION_BACKOFF_ENUM
+        Count
+    };
+
+    // Определение inline, а не в .cpp: таблица короткая, а имя нужно и журналу движка, и
+    // диагностике действия — лишний узел компоновки здесь ничего не купил бы.
+    inline char const* NameOf(BackoffKind k)
+    {
+        switch (k)
+        {
+#define CONSTELLATION_BACKOFF_NAME(name, text) case BackoffKind::name: return text;
+            CONSTELLATION_BACKOFFS(CONSTELLATION_BACKOFF_NAME)
+#undef CONSTELLATION_BACKOFF_NAME
+            default: return "?";
+        }
+    }
+
+    // Ёмкость НЕ УГАДАНА и угадана быть не должна: она берётся по наблюдаемому пику живых ключей
+    // на спутника, а счётчики `BackoffFull` и `BackoffEvictedLive` в `EngineState` для того и
+    // заведены. Шестнадцать — начальное значение при составе из восьми; при возврате к 122 его
+    // надо ПЕРЕПРОВЕРИТЬ по этим счётчикам, а не по ощущению.
+    inline constexpr size_t BACKOFF_CAP = 16;
+
+    struct BackoffKey
+    {
+        BackoffKind Kind   = BackoffKind::None;
+        Subject     About;
+        uint8       Detail = 0;     // слот экипировки, номер пункта меню — то, чем ключи различаются
+
+        bool operator==(BackoffKey const& o) const
+        {
+            return Kind == o.Kind && Detail == o.Detail && About == o.About;
+        }
+    };
+
     struct Bid
     {
         ActionId Action    = ActionId::None;
@@ -486,6 +546,27 @@ namespace Constellation::Ai
         // could not say so.
         virtual bool Useful(Ctx&, Bid const&)   { return true; }
         virtual bool Possible(Ctx&, Bid const&) { return true; }
+
+        // §14 — ПОД КАКИМ ВИДОМ ЗАПРЕТА ХОДИТ ЭТО ДЕЙСТВИЕ. Движок фильтрует ставку по паре
+        // {этот вид, предмет ставки} ДО того, как спросит `Useful`, — то есть по ТОЧНОМУ ключу,
+        // а не по предмету вообще. Иначе запрет «у этого NPC нечего взять» заодно запретил бы
+        // сдать ему другой квест.
+        //
+        // `None` по умолчанию значит «это действие отсрочек не признаёт», и таких большинство:
+        // заводить вид ради одного действия незачем, пока это действие не показало, что умеет
+        // выбираться впустую.
+        virtual BackoffKind DeferKind() const { return BackoffKind::None; }
+
+        // §14 — И ДЕТАЛЬ КЛЮЧА, ИЗ ТОЙ ЖЕ СТАВКИ. Без неё ключ объявлен тройкой, а строился
+        // всегда с нулём — и запись с ненулевой деталью не подавляла бы ставку НИКОГДА, молча
+        // (Кодекс, пункт 5). Спрашивается у того же действия, что объявляет вид: тогда оно
+        // отвечает на «чем ключуемся» одним кодом и при постановке запрета, и при проверке, и
+        // разойтись им негде.
+        //
+        // Ноль по умолчанию значит «различать нечего»: у сдачи квеста ключ и есть сам квест.
+        // Деталь понадобится там, где один предмет несёт несколько независимых запретов —
+        // у лестницы это `EquipRefused`, ключ которого пара «гуид + слот».
+        virtual uint8 DeferDetail(Bid const&) const { return 0; }
         virtual bool Execute(Ctx&, Bid const&) = 0;
 
         // §10′ — idempotent, and callable on an action that never started.

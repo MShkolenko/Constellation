@@ -38,6 +38,11 @@ namespace
     // который придёт своим шагом.
     inline constexpr float TURNIN_MAX_YARDS = 600.0f;
 
+    // §14 — НА СКОЛЬКО ОТКЛАДЫВАЕТСЯ СДАЧА, У КОТОРОЙ ПРИНИМАЮЩИЙ ПРОПАЛ. Пять секунд: за них
+    // спутник успевает сделать шаг, а движок — заняться другим. Дольше держать нечего, условие
+    // здесь меняется движением, а не временем.
+    inline constexpr uint32 TURNIN_RETRY_MS = 5000;
+
     class TurnInQuestAction final : public Action
     {
     public:
@@ -61,6 +66,12 @@ namespace
         // ядро. Теперь отвечает `CanInteractWithQuestGiver`, а сорок ярдов лишь ограничивают
         // обход сетки — столько же, сколько берёт ветка `TurningIn` на той же работе.
         static constexpr float GIVER_SEARCH_YARDS = 40.0f;
+
+        // §14 — ПОД КАКИМ ВИДОМ ЗАПРЕТА ХОДИТ ЭТО ДЕЙСТВИЕ. Движок фильтрует по паре
+        // {этот вид, предмет ставки} до `Useful`, то есть по ТОЧНОМУ ключу: запрет «до этого
+        // принимающего не дотянуться» не должен мешать взять у того же NPC новый квест, когда
+        // такое действие появится.
+        BackoffKind DeferKind() const override { return BackoffKind::Unreachable; }
 
         // §3.3 — БЕСПОЛЕЗНО И НЕВОЗМОЖНО — РАЗНЫЕ ВОПРОСЫ С РАЗНЫМ ВОССТАНОВЛЕНИЕМ.
         // Здесь именно «бесполезно»: квест уже не готов к сдаче, ставку надо просто выбросить.
@@ -149,7 +160,14 @@ namespace
                 std::optional<ObjectGuid> const ender =
                     ctx.World.NearestQuestGiverOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS);
                 if (!ender)
+                {
+                    // §14 — И ВОТ ЗДЕСЬ ПЕТЛЯ, РАДИ КОТОРОЙ ЗАВЕДЕНА ТАБЛИЦА. Альтернатив у
+                    // этого действия нет, поэтому ставка вернулась бы чуть ниже и была бы
+                    // выбрана СЛЕДУЮЩИМ ЖЕ тактом — и так, пока принимающий не появится.
+                    // Пять секунд это пауза, а не наказание: спутник в это время идёт.
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_RETRY_MS);
                     return false;
+                }
                 return ctx.Act.CompleteQuest(*ender, quest);
             }
             return false;

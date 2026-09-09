@@ -388,10 +388,11 @@ namespace Constellation::Ai
         if (chosen.Id() == st.Running)
             return;
         TC_LOG_INFO("server.worldserver",
-            "Constellation {} {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {})",
+            "Constellation {} {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {},"
+            " подавлено {})",
             run == Run::Shadow ? "ТЕНЬ" : "РЕШЕНИЕ",
             ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
-            st.AssignmentEpoch, st.Queue.size(), st.BidsDropped);
+            st.AssignmentEpoch, st.Queue.size(), st.BidsDropped, st.BidsSuppressed);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -442,6 +443,127 @@ namespace Constellation::Ai
         // и свою ёмкость сохраняют.
         st.Values.InvalidateAll();
         ++st.AssignmentEpoch;       // §4.4′ — new work, new salt; spreading must not be permanent
+    }
+
+    namespace
+    {
+        // Просрочка считается ИНТЕРВАЛОМ — см. комментарий у `BackoffEntry`.
+        inline bool Expired(EngineState::BackoffEntry const& e, uint32 nowMs)
+        {
+            return (nowMs - e.SetAtMs) >= e.TtlMs;
+        }
+        inline uint32 Remaining(EngineState::BackoffEntry const& e, uint32 nowMs)
+        {
+            uint32 const gone = nowMs - e.SetAtMs;
+            return gone >= e.TtlMs ? 0u : e.TtlMs - gone;
+        }
+    }
+
+    bool Engine::Deferred(EngineState& st, BackoffKey const& key, uint32 nowMs)
+    {
+        bool found = false;
+        // Один проход делает обе работы: ищет ключ и попутно освобождает просроченное. Поэтому
+        // отдельного подметания нет — а подметание и есть то место, где отсрочки обычно текут.
+        for (uint8 i = 0; i < st.BackoffCount; )
+        {
+            if (Expired(st.Backoffs[i], nowMs))
+            {
+                st.Backoffs[i] = st.Backoffs[st.BackoffCount - 1];
+                --st.BackoffCount;
+                continue;               // на месте i теперь другая запись — её тоже проверить
+            }
+            if (st.Backoffs[i].Key == key)
+                found = true;
+            ++i;
+        }
+        return found;
+    }
+
+    bool Engine::Defer(EngineState& st, BackoffKey const& key, uint32 ttlMs, uint32 nowMs)
+    {
+        if (key.Kind == BackoffKind::None || !ttlMs)
+            return false;
+
+        // Повторный запрет по тому же ключу ПРОДЛЕВАЕТ, а не заводит вторую запись: иначе
+        // таблица заполнилась бы копиями одного отказа.
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+            if (st.Backoffs[i].Key == key)
+            {
+                st.Backoffs[i].SetAtMs = nowMs;
+                st.Backoffs[i].TtlMs   = ttlMs;
+                return false;
+            }
+
+        if (st.BackoffCount < BACKOFF_CAP)
+        {
+            st.Backoffs[st.BackoffCount].Key     = key;
+            st.Backoffs[st.BackoffCount].SetAtMs = nowMs;
+            st.Backoffs[st.BackoffCount].TtlMs   = ttlMs;
+            ++st.BackoffCount;
+            return false;
+        }
+
+        ++st.BackoffFull;
+
+        // Сперва просроченное — оно уже ничего не стоит.
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+            if (Expired(st.Backoffs[i], nowMs))
+            {
+                st.Backoffs[i].Key     = key;
+                st.Backoffs[i].SetAtMs = nowMs;
+                st.Backoffs[i].TtlMs   = ttlMs;
+                return false;
+            }
+
+        // Затем — с НАИМЕНЬШИМ ОСТАТКОМ. Не старейшая: возраст создания не равен оставшейся
+        // ценности, и «вытесняем старейшее» это способ заставить занятого спутника забыть
+        // именно то, что ему нужнее всего помнить.
+        uint8  victim = 0;
+        uint32 least  = Remaining(st.Backoffs[0], nowMs);
+        for (uint8 i = 1; i < st.BackoffCount; ++i)
+        {
+            uint32 const r = Remaining(st.Backoffs[i], nowMs);
+            if (r < least)
+                { least = r; victim = i; }
+        }
+        ++st.BackoffEvictedLive;        // ДЕФЕКТ ЁМКОСТИ, а не рабочий режим — по этому счётчику
+        st.Backoffs[victim].Key     = key;   // и выбирается BACKOFF_CAP при росте состава
+        st.Backoffs[victim].SetAtMs = nowMs;
+        st.Backoffs[victim].TtlMs   = ttlMs;
+        return true;
+    }
+
+    void Engine::Allow(EngineState& st, BackoffKey const& key)
+    {
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+            if (st.Backoffs[i].Key == key)
+            {
+                st.Backoffs[i] = st.Backoffs[st.BackoffCount - 1];
+                --st.BackoffCount;
+                return;
+            }
+    }
+
+    void Defer(Ctx& ctx, BackoffKind kind, Subject const& about, uint8 detail, uint32 ttlMs)
+    {
+        if (!ctx.St)
+            return;
+        BackoffKey key;
+        key.Kind   = kind;
+        key.About  = about;
+        key.Detail = detail;
+        if (Engine::Defer(*ctx.St, key, ttlMs, ctx.NowMs) && !ctx.St->BackoffOverflowLogged)
+        {
+            // ОДИН РАЗ НА СПУТНИКА. Переполнение — дефект ЁМКОСТИ: таблица рассчитана на пик
+            // живых ключей, и если живую запись пришлось выбросить, значит пик оценён неверно.
+            // По этой строке и правится `BACKOFF_CAP` при росте состава — по ней, а не по
+            // ощущению, потому что сегодняшние восемь спутников про 122 ничего не доказывают.
+            ctx.St->BackoffOverflowLogged = true;
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК {}: таблица отсрочек переполнена, вытеснена ЖИВАЯ запись "
+                "«{}» — ёмкости {} не хватает, поднять её",
+                ctx.World.Name(), NameOf(kind), uint32(BACKOFF_CAP));
+        }
     }
 
     void Engine::Discard(EngineState& st)
@@ -570,6 +692,26 @@ namespace Constellation::Ai
                 continue;
             }
 
+            // §14 — ОТСРОЧКА ПРОВЕРЯЕТСЯ ДО `Useful`, И ПО ТОЧНОМУ КЛЮЧУ.
+            //
+            // До — потому что смысл запрета в том, чтобы не спрашивать вовсе: `Useful` у
+            // взятия квеста вынужден был бы отвечать «да» (знак над головой на месте), и
+            // пустой квестодатель выбирался бы каждый такт вечно.
+            //
+            // По ТОЧНОМУ ключу, а не по предмету: у одного NPC «взять нечего» не должно
+            // запрещать сдать ему другой квест. Вид запрета объявляет само действие.
+            BackoffKey suppress;
+            suppress.Kind   = action->DeferKind();
+            suppress.About  = bid.About;
+            suppress.Detail = action->DeferDetail(bid);
+            if (suppress.Kind != BackoffKind::None && Deferred(st, suppress, now))
+            {
+                // СЧИТАЕТСЯ ОТДЕЛЬНО: без этого в теневом режиме подавленное действие выглядит
+                // ровно как непредложенное, а теневой отчёт — это мера всего переноса.
+                ++st.BidsSuppressed;
+                continue;
+            }
+
             // §3.3 — two different questions with two different recoveries. USELESS drops the
             // bid; IMPOSSIBLE pushes the alternatives.
             if (!action->Useful(ctx, bid))
@@ -623,6 +765,12 @@ namespace Constellation::Ai
             bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
             if (ran)
             {
+                // §14 — УСПЕХ СНИМАЕТ ЗАПРЕТ, иначе он переживёт то изменение мира, которое
+                // сделало его неверным. НО НЕ В ТЕНИ: там `ran` выставлен без исполнения, и
+                // снимать по несостоявшемуся успеху значило бы чистить то, что не заработано.
+                if (run != Run::Shadow && suppress.Kind != BackoffKind::None)
+                    Allow(st, suppress);
+
                 // §4.4′ — NEW work gets a new salt; continuing the same work keeps it, so the
                 // choice is stable within an assignment and decorrelated across them.
                 if (bid.Action != st.Running)
