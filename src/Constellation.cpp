@@ -1215,7 +1215,12 @@ public:
         up.jump.sinAngle = std::sin(ang);
         up.jump.xyspeed = self->GetSpeed(MOVE_RUN);
         up.jump.fallTime = 0;
-        send(user, CMSG_MOVE_JUMP, up);
+        // ОТКАЗ НА ПЕРВОМ ПАКЕТЕ — ПРЫЖКА НЕ БЫЛО. Второй не шлём и состояние не трогаем: у
+        // движка двери для прыжка ещё нет, и он попадёт сюда штатно, а не по ошибке. `Unstick`
+        // получит ложь и уйдёт в свою ветку с отступом вбок — то есть будет обходить, а не
+        // прыгать, пока дверь не появится.
+        if (!send(user, CMSG_MOVE_JUMP, up))
+            return false;
 
         MovementInfo down;
         down.guid = self->GetGUID();
@@ -1224,6 +1229,10 @@ public:
         down.flags = 0;
         down.time = GameTime::GetGameTimeMS();
         down.jump.fallTime = 400;
+        // А ЗДЕСЬ ОТКАЗ УЖЕ НЕ ОТМЕНЯЕТ ПРЫЖОК: он состоялся, и состояние обязано это
+        // отразить, иначе двигатель будет считать себя стоящим там, откуда сервер его уже
+        // подбросил. Возвращаем успех — прыжок был, — а неудачу приземления видно в журнале
+        // двери.
         send(user, CMSG_MOVE_FALL_LAND, down);
 
         m.Moving = false;
@@ -1297,7 +1306,7 @@ public:
         return true;
     }
 
-bool Unstick(Companion& c, Player* self, float tx, float ty)
+    bool Unstick(Companion& c, Player* self, float tx, float ty)
     {
         return UnstickCore(c.Move, self, &SendThroughSession, &c, tx, ty);
     }
@@ -1320,11 +1329,14 @@ bool Unstick(Companion& c, Player* self, float tx, float ty)
     {
         if (!m.Moving)
             return;
-        SendStep(self, send, user, self->GetPosition(), 0);
+        // ОТКАЗ ЗНАЧИТ, ЧТО МЫ ВСЁ ЕЩЁ ИДЁМ — по крайней мере для сервера. Сбросить флаг
+        // здесь означало бы разойтись с ним и больше никогда не попытаться остановиться.
+        if (!SendStep(self, send, user, self->GetPosition(), 0))
+            return;
         m.Moving = false;
     }
 
-void StopMoving(Companion& c, Player* self)
+    void StopMoving(Companion& c, Player* self)
     {
         StopMovingCore(c.Move, self, &SendThroughSession, &c);
     }
@@ -1749,7 +1761,11 @@ void StopMoving(Companion& c, Player* self)
         Position next(self->GetPositionX() + std::cos(angle) * go,
                       self->GetPositionY() + std::sin(angle) * go,
                       nz, angle);
-        SendStep(self, send, user, next, MOVEMENTFLAG_FORWARD);
+        // ШАГ ОТВЕРГНУТ — ЗНАЧИТ ШАГА НЕ БЫЛО. Не выставляем «иду»: продвижения не случилось,
+        // и пусть его отсутствие увидит тот, кто следит за прогрессом. Возвращаем «продолжаю»,
+        // потому что мы НЕ дошли — отказ двери не есть прибытие.
+        if (!SendStep(self, send, user, next, MOVEMENTFLAG_FORWARD))
+            return true;
         m.Moving = true;
         return true;
     }
