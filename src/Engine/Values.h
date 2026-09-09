@@ -147,10 +147,25 @@ namespace Constellation::Ai
     CONSTELLATION_VALUES(CONSTELLATION_VALUE_TRAIT)
 #undef CONSTELLATION_VALUE_TRAIT
 
+    // -------------------------------------------------------------------------------------
+    // §13 — ЧТЕНИЕ ЗНАЧЕНИЯ ИЗ ДЕЙСТВИЯ ИЛИ СТРАТЕГИИ.
+    //
+    // Один вызов вместо трёх шагов через синглтон и состояние: читатель называет
+    // идентификатор, тип буфера решает та же строка списка, что его объявила.
+    //
+    // ЕСЛИ СОСТОЯНИЯ НЕТ — возвращается ПУСТОЙ буфер, а не падение. Такой `Ctx`
+    // сегодня не строится нигде, но «сегодня никто не зовёт» — именно то рассуждение,
+    // которое уже однажды оставило тени изменяемую дверь в мир.
+    // -------------------------------------------------------------------------------------
+    template <ValueId Id>
+    typename ValueTraits<Id>::Type const& Val(Ctx& ctx);
+
     // Registration of the three quest values, in one place so the inventory of what exists is
     // readable without grepping. Called once at load beside the action registrations.
     class Engine;
     void RegisterQuestValues(Engine& engine);
+    // Шаг 13 — действия ветки `Idle`, по одному, и стратегия, которая за них ставит.
+    void RegisterQuestActions(Engine& engine);
 }
 
 #endif // CONSTELLATION_ENGINE_VALUES_H

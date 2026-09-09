@@ -120,6 +120,8 @@ namespace Constellation::Ai
 
         // Чтение. Слот берётся из состояния СПУТНИКА, поэтому тень и шов, у которых
         // разные `EngineState`, имеют разные кэши — и тень меряет свой выбор, а не чужой.
+        // Читать через свободную `Val(ctx)` из Values.h — она сама найдёт состояние в `Ctx`.
+        // Этот вариант остаётся для тех, у кого состояние уже на руках — для самого такта.
         template <ValueId Id>
         typename ValueTraits<Id>::Type const& Val(EngineState& st, Ctx& ctx) const
         {

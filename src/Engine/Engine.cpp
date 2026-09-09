@@ -394,6 +394,31 @@ namespace Constellation::Ai
             st.AssignmentEpoch, st.Queue.size(), st.BidsDropped);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // §13 — чтение значения по одному `Ctx`. Тело здесь, а не в заголовке, потому что
+    // только здесь оба типа — `EngineState` и `Engine` — полные.
+    //
+    // СОСТОЯНИЯ НЕТ — ПУСТОЙ БУФЕР, А НЕ ПАДЕНИЕ. Статический пустой экземпляр
+    // на каждый тип буфера: читатель получает что-то обходимое и пустое, и ни одно
+    // действие не обязано проверять указатель.
+    // -----------------------------------------------------------------------------------------
+    template <ValueId Id>
+    typename ValueTraits<Id>::Type const& Val(Ctx& ctx)
+    {
+        using T = typename ValueTraits<Id>::Type;
+        static T const empty{};
+        if (!ctx.St)
+            return empty;
+        return Engine::Instance().Val<Id>(*ctx.St, ctx);
+    }
+
+    // Явные инстанциации — по тому же списку, что объявил сами значения: тело в .cpp,
+    // значит без них любой читатель упадёт на компоновке. Список один, расхождения нет.
+#define CONSTELLATION_VALUE_INSTANTIATE(name, text, type) \
+    template type const& Val<ValueId::name>(Ctx&);
+    CONSTELLATION_VALUES(CONSTELLATION_VALUE_INSTANTIATE)
+#undef CONSTELLATION_VALUE_INSTANTIATE
+
     void Engine::Reset(EngineState& st, Ctx& ctx, CancelReason why)
     {
         // §2″ — give up the work, KEEP the mode. Not a handoff.

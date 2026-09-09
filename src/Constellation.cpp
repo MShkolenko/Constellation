@@ -858,6 +858,7 @@ public:
             // §12 — ЗНАЧЕНИЯ РЕГИСТРИРУЮТСЯ ПЕРЕД ЗАПЕЧАТЫВАНИЕМ, иначе `Seal()` откажет
             // в готовности: он теперь требует поставщика на каждый объявленный `ValueId`.
             Constellation::Ai::RegisterQuestValues(Constellation::Ai::Engine::Instance());
+            Constellation::Ai::RegisterQuestActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -2743,7 +2744,13 @@ public:
         {
             Constellation::Ai::WorldView view(self);
             Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS(), &c.EngineShadow };
+            // §9 — БЕЗ МАСКИ СТРАТЕГИЯ НЕ РАБОТАЕТ НИ У КОГО: `StrategyMask` начинается
+            // нулём, а фильтр — побитовое И. Ставим её ТОЛЬКО тени: шов и так закрыт
+            // `Owns`, но разница между «движок думает» и «движок делает» не должна держаться
+            // на одном замке.
+            c.EngineShadow.StrategyMask = Constellation::Ai::MaskOf(
+                Constellation::Ai::StrategyId::Quests);
             Constellation::Ai::Engine::Instance().Tick(c.EngineShadow, ctx, c.ModeEpoch,
                 Constellation::Ai::Engine::Run::Shadow);
             if (act.Refused() && !c.EngineShadowRefusedLogged)
@@ -2772,7 +2779,7 @@ public:
         {
             Constellation::Ai::WorldView view(self);
             Constellation::Ai::ClientAct act(self, c.Session);
-            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS() };
+            Constellation::Ai::Ctx ctx{ view, act, GameTime::GetGameTimeMS(), &c.Engine };
             Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
             return;
         }

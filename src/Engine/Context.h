@@ -30,6 +30,7 @@ class Player;
 namespace Constellation::Ai
 {
     class ClientAct;
+    struct EngineState;      // §13 — только вперёд: знать его здесь значило бы цикл включений
 
 
     // -----------------------------------------------------------------------------------------
@@ -149,6 +150,14 @@ namespace Constellation::Ai
         // поэтому ярус «на карту» не понадобился: таблица уже общая для всех.
         void ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const;
 
+        // БЛИЖАЙШЕЕ ЖИВОЕ СУЩЕСТВО ЭТОГО ВИДА, если оно вообще загружено рядом.
+        //
+        // Значения отдают ВИД и точку (указатель карты знает только их), а дверь требует
+        // гуид — как и клиент, который шлёт гуид того, по кому щёлкнул. Перевод одного в
+        // другое делается в момент действия, а не кэшируется: `Creature*`, проживший секунду,
+        // — это висячий указатель, ждущий выгрузки клетки.
+        std::optional<ObjectGuid> NearestCreature(uint32 entry, float maxDist) const;
+
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
         //   А mutable anything. Фасад читает; пишет только `ClientAct`.
@@ -192,6 +201,17 @@ namespace Constellation::Ai
         WorldView const& World;
         ClientAct&       Act;
         uint32           NowMs;
+
+        // §13 — ОТКУДА ДЕЙСТВИЕ ЧИТАЕТ ЗНАЧЕНИЕ.
+        //
+        // На шаге 12 значения написали и проверили в `Seal()`, но не провели к читателю:
+        // `Value<T>::Get` требует слот, слот лежит в `EngineState`, а `DefaultBids(Ctx&, BidSink&)`
+        // и `Score(Ctx&, ...)` видят только `Ctx`. Механизм был, провода не было; всплыло при
+        // первом же чтении, то есть ровно тогда, когда это вообще могло всплыть.
+        //
+        // УКАЗАТЕЛЬ, А НЕ ССЫЛКА: ноль значит «значения недоступны», и читающая
+        // функция обязана это проверить, а не разыменовать.
+        EngineState*     St = nullptr;
     };
 }
 

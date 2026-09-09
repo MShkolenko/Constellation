@@ -268,6 +268,29 @@ namespace Constellation::Ai
         }
     }
 
+    std::optional<ObjectGuid> WorldView::NearestCreature(uint32 entry, float maxDist) const
+    {
+        if (!_self || !entry || maxDist <= 0.0f)
+            return std::nullopt;
+
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(_self, maxDist);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(_self, around, check);
+        Cell::VisitGridObjects(_self, searcher, maxDist);
+
+        Creature* best = nullptr;
+        float bestDist = 0.0f;
+        for (Creature* creature : around)
+        {
+            if (creature->GetEntry() != entry || !creature->IsAlive())
+                continue;
+            float const d = _self->GetExactDist2d(creature);
+            if (!best || d < bestDist)
+                { bestDist = d; best = creature; }
+        }
+        return best ? std::optional<ObjectGuid>(best->GetGUID()) : std::nullopt;
+    }
+
     void WorldView::ForEachGiverOnMap(float maxDist, GiverIndexVisitor visit, void* user) const
     {
         if (!_self)
