@@ -11305,7 +11305,39 @@ public:
         return 0;
     }
 
+    // ПРЕЖНЯЯ ПОДПИСЬ — ТРЁХСТРОЧНАЯ ОБЁРТКА, как у четырёх функций двигателя. Три места
+    // вызова не меняются вовсе, и это проверяется диффом, а не обещается.
+    //
+    // Засев и обратная копия ПОЛНЫЕ и БЕЗУСЛОВНЫЕ. Это не осторожность, а точность: у трёх
+    // выходов три разных времени жизни (см. `ObjectiveScan`), и структура, начинающаяся пустой,
+    // превратила бы стоящую отметку клетки в результат прохода. Засеянная — даёт `if
+    // (!out->CageSpawn)` буква в букву прежнее `if (!c.FreeGoSpawn)`.
     Creature* FindObjectiveTarget(Companion& c, Player* self) const
+    {
+        Constellation::Ai::ObjectiveScan scan;
+        scan.Talk       = c.TalkCandidate;
+        scan.CageSpawn  = c.FreeGoSpawn;
+        scan.CageEntry  = c.FreeGoEntry;
+        scan.CageFor    = c.FreeGoFor;
+        scan.CagePos    = c.FreeGoPos;
+        scan.Assists    = c.EngageAssists;
+        scan.PackCenter = c.PackCenter;
+        scan.PackKnown  = c.PackCenterKnown;
+
+        Creature* best = ScanObjectives(c, self, &scan);
+
+        c.TalkCandidate    = scan.Talk;
+        c.FreeGoSpawn      = scan.CageSpawn;
+        c.FreeGoEntry      = scan.CageEntry;
+        c.FreeGoFor        = scan.CageFor;
+        c.FreeGoPos        = scan.CagePos;
+        c.EngageAssists    = scan.Assists;
+        c.PackCenter       = scan.PackCenter;
+        c.PackCenterKnown  = scan.PackKnown;
+        return best;
+    }
+
+    Creature* ScanObjectives(Companion& c, Player* self, Constellation::Ai::ObjectiveScan* out) const
     {
         // СО СЛОМАННЫМ СНАРЯЖЕНИЕМ ЦЕЛЬ НЕ ИЩЕМ ВОВСЕ.
         //
@@ -11367,7 +11399,7 @@ public:
                 threats.push_back(other);
         // сбрасываем перед КАЖДЫМ проходом: иначе прошлый кандидат живёт в состоянии до
         // тех пор, пока его не употребят, и спутник идёт к тому, кого рядом уже нет (Кодекс)
-        c.TalkCandidate.Clear();
+        out->Talk.Clear();
         float talkDist = -1.0f;
         uint32 lastEntry = 0, lastFaction = 0;
         bool const anyTool = AnyToolQuest(self);   // есть ли предмет от квеста, которым вообще можно работать
@@ -11420,7 +11452,7 @@ public:
                 {
                     float const d = self->GetExactDist(creature);
                     if (talkDist < 0.0f || d < talkDist)
-                        { talkDist = d; c.TalkCandidate = creature->GetGUID(); }
+                        { talkDist = d; out->Talk = creature->GetGUID(); }
                 }
                 continue;
             }
@@ -11676,7 +11708,7 @@ public:
                     // РАДИУС ИЗМЕРЕН: у каждого из трёх послушников клетка в ПЯТИ ярдах.
                     // Берём десять — запас на неровность, но не приглашение хватать всё
                     // подряд. Отбираем только то, что вообще используется руками.
-                    if (!c.FreeGoSpawn)
+                    if (!out->CageSpawn)
                         for (GameobjectTypes t : { GAMEOBJECT_TYPE_BUTTON, GAMEOBJECT_TYPE_GOOBER,
                                                    GAMEOBJECT_TYPE_DOOR })
                             if (GameObject* cage = creature->FindNearestGameObjectOfType(t, 10.0f))
@@ -11716,10 +11748,10 @@ public:
                                 if (auto tr = c.FreeTried.find(fk);
                                     tr != c.FreeTried.end() && tr->second >= 3)
                                     continue;   // трижды применял эту клетку ради этой цели
-                                c.FreeGoSpawn = cage->GetSpawnId();
-                                c.FreeGoEntry = cage->GetEntry();
-                                c.FreeGoFor = creature->GetEntry();
-                                c.FreeGoPos = cage->GetPosition();
+                                out->CageSpawn = cage->GetSpawnId();
+                                out->CageEntry = cage->GetEntry();
+                                out->CageFor   = creature->GetEntry();
+                                out->CagePos   = cage->GetPosition();
                                 break;
                             }
                 }
@@ -11730,7 +11762,7 @@ public:
                 {
                     float const d = self->GetExactDist(creature);
                     if (talkDist < 0.0f || d < talkDist)
-                        { talkDist = d; c.TalkCandidate = creature->GetGUID(); }
+                        { talkDist = d; out->Talk = creature->GetGUID(); }
                 }
                 ++rejInvalid; ++rejected;
                 lastEntry = creature->GetEntry(); lastFaction = creature->GetFaction();
@@ -11822,13 +11854,13 @@ public:
                 best = creature;
                 // ЦЕНТР ПАЧКИ — ОТ НЕГО И БУДЕМ ОТХОДИТЬ (разбор): лагерь не всегда за спиной
                 // цели, а вот центр посчитанных соседей указывает на него прямо.
-                c.PackCenterKnown = assists > 0;
-                if (c.PackCenterKnown)
-                    c.PackCenter.Relocate(packX / float(assists), packY / float(assists), packZ / float(assists));
+                out->PackKnown = assists > 0;
+                if (out->PackKnown)
+                    out->PackCenter.Relocate(packX / float(assists), packY / float(assists), packZ / float(assists));
             }
         }
         if (best)
-            c.EngageAssists = bestAssists;      // с чем шли в бой — по этому решим, отводить ли
+            out->Assists = bestAssists;         // с чем шли в бой — по этому решим, отводить ли
         if (!best && matched && !_rejDiagDone)
         {
             _rejDiagDone = true;
