@@ -1162,7 +1162,32 @@ public:
     // StepToward запрещает идти. То есть ровно тот вечный тупик, который мы и чиним.
     // Кодекс нашёл четыре таких выхода; вместо того чтобы затыкать каждый, состояния
     // просто нет.
-    bool Jump(Companion& c, Player* self, float tx, float ty)
+    // ОТПРАВЩИК ЛЕСТНИЦЫ: прямо в сессию, как и было. Отказать он не может, поэтому всегда
+    // истина — прежнее поведение слово в слово.
+    static bool SendThroughSession(void* user, OpcodeClient opcode, MovementInfo& mi)
+    {
+        Companion* c = static_cast<Companion*>(user);
+        if (!c || !c->Session)
+            return false;
+        c->Session->HandleMovementOpcode(opcode, mi);
+        return true;
+    }
+
+    // Тело прежней `SendMove`, у которой отправка стала параметром. Она сама остаётся для шести
+    // мест вызова вне двигателя.
+    static bool SendStep(Player* self, Constellation::Ai::MoveSendFn send, void* user,
+                         Position const& pos, uint32 flags)
+    {
+        MovementInfo mi;
+        mi.guid = self->GetGUID();
+        mi.pos.Relocate(pos);
+        mi.flags = flags;
+        mi.time = GameTime::GetGameTimeMS();
+        return send(user, CMSG_MOVE_HEARTBEAT, mi);
+    }
+
+    bool JumpCore(Constellation::Ai::MoveState& m, Player* self,
+                  Constellation::Ai::MoveSendFn send, void* user, float tx, float ty)
     {
         float ang = self->GetAbsoluteAngle(tx, ty);
         Position land = self->GetFirstCollisionPosition(2.0f, ang - self->GetOrientation());
@@ -1190,7 +1215,7 @@ public:
         up.jump.sinAngle = std::sin(ang);
         up.jump.xyspeed = self->GetSpeed(MOVE_RUN);
         up.jump.fallTime = 0;
-        c.Session->HandleMovementOpcode(CMSG_MOVE_JUMP, up);
+        send(user, CMSG_MOVE_JUMP, up);
 
         MovementInfo down;
         down.guid = self->GetGUID();
@@ -1199,12 +1224,20 @@ public:
         down.flags = 0;
         down.time = GameTime::GetGameTimeMS();
         down.jump.fallTime = 400;
-        c.Session->HandleMovementOpcode(CMSG_MOVE_FALL_LAND, down);
+        send(user, CMSG_MOVE_FALL_LAND, down);
 
-        c.Move.Moving = false;
-        c.Move.Waypoints.clear();                // маршрут пересчитаем с нового места
+        m.Moving = false;
+        m.Waypoints.clear();                // маршрут пересчитаем с нового места
         return true;
     }
+
+// ОБЁРТКА ДЛЯ ЛЕСТНИЦЫ: подпись прежняя, поэтому ни одно место вызова не тронуто.
+    bool Jump(Companion& c, Player* self, float tx, float ty)
+    {
+        return JumpCore(c.Move, self, &SendThroughSession, &c, tx, ty);
+    }
+
+
 
     // УПЁРЛИСЬ — ОТСТУПАЕМ ВДОЛЬ ПРЕПЯТСТВИЯ, КАК ЖИВОЙ.
     //
@@ -1219,7 +1252,8 @@ public:
     // GetFirstCollisionPosition: луч УПИРАЕТСЯ в стену, а не проходит её. Точка вбок
     // становится обычной путевой точкой, к ней идём бегом теми же пакетами. Ни одной
     // прорехи в нулевом инварианте и ни одного прохода сквозь текстуры.
-    bool Unstick(Companion& c, Player* self, float tx, float ty)
+    bool UnstickCore(Constellation::Ai::MoveState& m, Player* self,
+                     Constellation::Ai::MoveSendFn send, void* user, float tx, float ty)
     {
         // ЛЕСТНИЦА, А НЕ ОДНО СРЕДСТВО: сперва прыгнуть, и только если три прыжка не
         // сняли с места — уходить вбок. Порядок именно такой, потому что прыжок дешевле
@@ -1228,40 +1262,47 @@ public:
         // пополнялся в Switch(), а спутник может колебаться «иду за хозяином -> стою ->
         // иду за хозяином» бесконечно и прыгать вечно (Кодекс). Поэтому истраченный
         // запас закрывает прыжки на минуту, и смена намерения этого не обходит.
-        if (c.Move.JumpsLeft && Jump(c, self, tx, ty))
+        if (m.JumpsLeft && JumpCore(m, self, send, user, tx, ty))
         {
             // ОКНО ОТКРЫВАЕТ ПЕРВЫЙ ПРЫЖОК, а не третий. Прежде запас пополнялся в
             // Switch() при каждой смене намерения, и спутник, тративший по одному-два
             // прыжка и меняющий намерение, получал их снова без конца — потолок,
             // обещанный в комментарии, не был написан в коде (Кодекс, проход 4).
             // Теперь это честное «три прыжка в минуту», и смена намерения тут ни при чём.
-            if (!c.Move.JumpCooldownMs)
-                c.Move.JumpCooldownMs = 60000;
-            --c.Move.JumpsLeft;
+            if (!m.JumpCooldownMs)
+                m.JumpCooldownMs = 60000;
+            --m.JumpsLeft;
             return true;                    // прыжок НЕ тратит запас отступов
         }
 
         // ДВА ПРЕДЕЛА, А НЕ ОДИН (Кодекс, 2026-08-30). Первый — попытки подряд; но его
         // обнуляет сам удавшийся отступ, ведь спутник при этом ДВИГАЛСЯ. Поэтому второй,
         // общий за намерение, движением не сбрасывается — только сменой намерения.
-        if (++c.Move.UnstickTries > 4 || ++c.Move.UnstickTotal > 8)
+        if (++m.UnstickTries > 4 || ++m.UnstickTotal > 8)
             return false;                   // хватит топтаться — пусть решает автомат
 
         float toGoal = self->GetAbsoluteAngle(tx, ty);
-        float side = toGoal + (c.Move.UnstickLeft ? float(M_PI) / 2.0f : -float(M_PI) / 2.0f);
-        c.Move.UnstickLeft = !c.Move.UnstickLeft;     // попеременно, чтобы не тереться об угол
+        float side = toGoal + (m.UnstickLeft ? float(M_PI) / 2.0f : -float(M_PI) / 2.0f);
+        m.UnstickLeft = !m.UnstickLeft;     // попеременно, чтобы не тереться об угол
 
         Position hop = self->GetFirstCollisionPosition(6.0f, side - self->GetOrientation());
         if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f)
             return true;                    // и вбок стена — на следующем такте другая сторона
 
-        c.Move.Waypoints.clear();
-        c.Move.Waypoints.push_back(hop);
-        c.Move.WaypointIndex = 0;
-        c.Move.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
-        c.Move.PathTargetY = ty;
+        m.Waypoints.clear();
+        m.Waypoints.push_back(hop);
+        m.WaypointIndex = 0;
+        m.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
+        m.PathTargetY = ty;
         return true;
     }
+
+bool Unstick(Companion& c, Player* self, float tx, float ty)
+    {
+        return UnstickCore(c.Move, self, &SendThroughSession, &c, tx, ty);
+    }
+
+
 
     // ОСТАНОВКУ НАДО ПОСЫЛАТЬ, А НЕ ПРОСТО ПЕРЕСТАТЬ ИДТИ.
     //
@@ -1274,13 +1315,21 @@ public:
     //
     // У спутника своего клиента нет, поэтому увидеть это мог только живой игрок рядом —
     // отчего оно и дожило до боевого.
-    void StopMoving(Companion& c, Player* self)
+    void StopMovingCore(Constellation::Ai::MoveState& m, Player* self,
+                        Constellation::Ai::MoveSendFn send, void* user)
     {
-        if (!c.Move.Moving)
+        if (!m.Moving)
             return;
-        SendMove(c, self, self->GetPosition(), 0);
-        c.Move.Moving = false;
+        SendStep(self, send, user, self->GetPosition(), 0);
+        m.Moving = false;
     }
+
+void StopMoving(Companion& c, Player* self)
+    {
+        StopMovingCore(c.Move, self, &SendThroughSession, &c);
+    }
+
+
 
     // ССЫЛКА НА ТОЧКУ НАЗНАЧЕНИЯ (destFix) — И РАЗРЕШЕНИЕ, И МЕСТО ДЛЯ ПОПРАВКИ.
     //
@@ -1289,8 +1338,10 @@ public:
     // спросить высоту с другого яруса и, если оттуда путь строится, ЗАПИСАТЬ поправку обратно —
     // иначе следующий заход повторил бы тот же поиск, а «дошёл» мог не признаться никогда
     // (Кодекс). К живому существу ничего не правим: его высота — его собственная и верная.
-    bool StepToward(Companion& c, Player* self, float tx, float ty, float tz, float stopAt, float dt,
-                    Position* destFix = nullptr)
+    bool StepTowardCore(Constellation::Ai::MoveState& m, Player* self,
+                        Constellation::Ai::MoveSendFn send, void* user,
+                        float tx, float ty, float tz, float stopAt, float dt,
+                        Position* destFix)
     {
         // РАССТОЯНИЕ ЗДЕСЬ — В ПРОСТРАНСТВЕ, А НЕ ПО ПЛОСКОСТИ.
         //
@@ -1302,31 +1353,31 @@ public:
         float dist = self->GetExactDist(tx, ty, tz);
         if (dist < stopAt)
         {
-            if (c.Move.Moving)
+            if (m.Moving)
             {
-                SendMove(c, self, self->GetPosition(), 0);
-                c.Move.Moving = false;
+                SendStep(self, send, user, self->GetPosition(), 0);
+                m.Moving = false;
             }
-            c.Move.StuckMs = 0;
-            c.Move.UnstickTries = 0;
-            c.Move.NoPathFails = 0;
-            c.Move.NoPathMs = 0;
-            c.Move.RawTarget = false;        // дошли — в следующий раз снова вежливо, сбоку
-            c.Move.Stalled = false;          // дошли — тупика больше нет (Кодекс)
+            m.StuckMs = 0;
+            m.UnstickTries = 0;
+            m.NoPathFails = 0;
+            m.NoPathMs = 0;
+            m.RawTarget = false;        // дошли — в следующий раз снова вежливо, сбоку
+            m.Stalled = false;          // дошли — тупика больше нет (Кодекс)
             return false;
         }
 
         // ЗАСТРЯЛИ — СУДИМ ПО ФАКТУ, А НЕ ПО НАМЕРЕНИЮ. Маршрут может существовать, а
         // спутник всё равно тереться об угол: значит смотрим, СДВИНУЛСЯ ли он на самом деле.
-        if (self->GetExactDist2d(c.Move.LastX, c.Move.LastY) > 1.0f)
+        if (self->GetExactDist2d(m.LastX, m.LastY) > 1.0f)
         {
-            c.Move.LastX = self->GetPositionX();
-            c.Move.LastY = self->GetPositionY();
-            c.Move.StuckMs = 0;
-            c.Move.UnstickTries = 0;
+            m.LastX = self->GetPositionX();
+            m.LastY = self->GetPositionY();
+            m.StuckMs = 0;
+            m.UnstickTries = 0;
         }
         else
-            c.Move.StuckMs += uint32(dt * 1000.0f);
+            m.StuckMs += uint32(dt * 1000.0f);
 
         // ЭТОТ ОТКАЗ БЫЛ МОЛЧАЛИВЫМ, И ЭТО ЕГО ГЛАВНАЯ БЕДА.
         //
@@ -1351,10 +1402,10 @@ public:
         if (badFlags || self->GetTransport()
             || self->IsFalling() || self->IsFlying())
         {
-            c.Move.FrozenMs += uint32(dt * 1000.0f);
-            if (!c.Move.FrozenNoted)
+            m.FrozenMs += uint32(dt * 1000.0f);
+            if (!m.FrozenNoted)
             {
-                c.Move.FrozenNoted = true;
+                m.FrozenNoted = true;
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЗАМЕР {}: шаг запрещён — флаги {:X}, транспорт {}, "
                     "падение {}, полёт {} (вода {} — уже не помеха)",
@@ -1364,9 +1415,9 @@ public:
                     self->IsInWater() ? 1 : 0);
             }
 
-            if (c.Move.FrozenMs > 3000 && (self->IsFalling() || badFlags))
+            if (m.FrozenMs > 3000 && (self->IsFalling() || badFlags))
             {
-                c.Move.FrozenMs = 0;
+                m.FrozenMs = 0;
                 float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
                     self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
                 if (gz > INVALID_HEIGHT)
@@ -1376,36 +1427,36 @@ public:
                         self->GetName(), self->GetPositionZ(), gz);
                     Position down(self->GetPositionX(), self->GetPositionY(), gz,
                                   self->GetOrientation());
-                    SendMove(c, self, down, 0);
-                    c.Move.Moving = false;
+                    SendStep(self, send, user, down, 0);
+                    m.Moving = false;
                 }
             }
-            StopMoving(c, self);
+            StopMovingCore(m, self, send, user);
             return false;               // не наш случай; выручит срок состояния
         }
-        c.Move.FrozenMs = 0;
+        m.FrozenMs = 0;
 
-        if (c.Move.StuckMs > 2500)
+        if (m.StuckMs > 2500)
         {
-            c.Move.StuckMs = 0;
-            if (!Unstick(c, self, tx, ty))
-                c.Move.Stalled = true;
-            StopMoving(c, self);
+            m.StuckMs = 0;
+            if (!UnstickCore(m, self, send, user, tx, ty))
+                m.Stalled = true;
+            StopMovingCore(m, self, send, user);
             return false;
         }
 
         float step = std::min(self->GetSpeed(MOVE_RUN) * dt, dist - stopAt * 0.5f);
         if (step <= 0.0f)
         {
-            StopMoving(c, self);
+            StopMovingCore(m, self, send, user);
             return false;
         }
 
         // маршрут пересчитывается не каждый шаг: он нужен, только пока мы далеко
         // от следующей его точки
-        if (c.Move.Waypoints.empty() || c.Move.WaypointIndex >= c.Move.Waypoints.size()
-            || self->GetExactDist2d(c.Move.PathTargetX, c.Move.PathTargetY) > 5.0f
-                && (std::fabs(c.Move.PathTargetX - tx) > 3.0f || std::fabs(c.Move.PathTargetY - ty) > 3.0f))
+        if (m.Waypoints.empty() || m.WaypointIndex >= m.Waypoints.size()
+            || self->GetExactDist2d(m.PathTargetX, m.PathTargetY) > 5.0f
+                && (std::fabs(m.PathTargetX - tx) > 3.0f || std::fabs(m.PathTargetY - ty) > 3.0f))
         {
             // ВЫСОТА ЦЕЛИ — НАСТОЯЩАЯ, А НЕ ВЫЧИСЛЕННАЯ ЗАНОВО.
             //
@@ -1431,11 +1482,11 @@ public:
             // Отступ нарастающий — 3, 6, 12, 24 секунды, дальше 24. Цель за это время
             // никуда не убежит, а такт освобождается. Тот, кто так и не дойдёт, будет
             // отмечен «не дойти» по общему правилу и займётся другим делом.
-            if (c.Move.NoPathMs > 0)
+            if (m.NoPathMs > 0)
             {
                 uint32 const backoff = uint32(dt * 1000.0f);
-                c.Move.NoPathMs = (c.Move.NoPathMs <= backoff) ? 0 : c.Move.NoPathMs - backoff;
-                StopMoving(c, self);
+                m.NoPathMs = (m.NoPathMs <= backoff) ? 0 : m.NoPathMs - backoff;
+                StopMovingCore(m, self, send, user);
                 return false;
             }
             // ХОДИТЬ ДАЛЕКО НАДО ПРЫЖКАМИ, А НЕ ОДНИМ ВОПРОСОМ.
@@ -1546,7 +1597,7 @@ public:
             if (!built)
             {
                 ++_noPath;
-                c.Move.LastPathType = uint32(path.GetPathType());
+                m.LastPathType = uint32(path.GetPathType());
                 if (_noPathLogged < 20)
                 {
                     // прежняя диагностика стояла на ОДНОМ глобальном флаге и напечаталась
@@ -1601,7 +1652,7 @@ public:
                 // место в порядке, и дело в конце пути.
                 //
                 // Один лишний вызов на ПЕРВЫЙ отказ, дальше отступание. Не на такте.
-                if (!c.Move.NoPathFails)
+                if (!m.NoPathFails)
                 {
                     PathGenerator probe(self);
                     float const px = self->GetPositionX() + std::cos(self->GetOrientation()) * 5.0f;
@@ -1615,7 +1666,7 @@ public:
                         okNear ? "сетка под ногами есть, беда в конце пути"
                                : "сетки под ногами НЕТ, беда в нашем положении");
                 }
-                if (!c.Move.NoPathFails)
+                if (!m.NoPathFails)
                 {
                     float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(), true, 50.0f);
@@ -1625,48 +1676,48 @@ public:
                             "Constellation STEP {}: висел на {:.1f} над землёй ({:.1f} -> {:.1f}), спускаю",
                             self->GetName(), self->GetPositionZ() - gz, self->GetPositionZ(), gz);
                         Position down(self->GetPositionX(), self->GetPositionY(), gz, self->GetOrientation());
-                        SendMove(c, self, down, 0);
-                        c.Move.Moving = false;
+                        SendStep(self, send, user, down, 0);
+                        m.Moving = false;
                     }
                 }
-                c.Move.RawTarget = true;     // боковая точка не далась — дальше идём в центр
-                if (c.Move.NoPathFails < 4)
-                    ++c.Move.NoPathFails;
+                m.RawTarget = true;     // боковая точка не далась — дальше идём в центр
+                if (m.NoPathFails < 4)
+                    ++m.NoPathFails;
                 static uint32 const backoffLadder[5] = { 0, 3000, 6000, 12000, 24000 };
-                c.Move.NoPathMs = backoffLadder[c.Move.NoPathFails]
+                m.NoPathMs = backoffLadder[m.NoPathFails]
                            + uint32(self->GetGUID().GetCounter() % 1500u);
-                if (!Unstick(c, self, tx, ty))
-                    c.Move.Stalled = true;
-                StopMoving(c, self);
+                if (!UnstickCore(m, self, send, user, tx, ty))
+                    m.Stalled = true;
+                StopMovingCore(m, self, send, user);
                 return false;
             }
-            c.Move.NoPathFails = 0;              // маршрут нашёлся — отступ снимаем,
-            c.Move.NoPathMs = 0;                 // но НЕ признак «иди в центр»: снять его на
+            m.NoPathFails = 0;              // маршрут нашёлся — отступ снимаем,
+            m.NoPathMs = 0;                 // но НЕ признак «иди в центр»: снять его на
                                             // удачном маршруте значило бы снова подсунуть
                                             // ту же непроходимую боковую точку — качели,
                                             // которые Кодекс и разглядел прямо в коде
-            c.Move.Waypoints.clear();
+            m.Waypoints.clear();
             for (G3D::Vector3 const& v : *pts)
-                c.Move.Waypoints.emplace_back(v.x, v.y, v.z);
-            c.Move.WaypointIndex = 0;
+                m.Waypoints.emplace_back(v.x, v.y, v.z);
+            m.WaypointIndex = 0;
             // ЦЕЛЬ ПЕРЕСЧЁТА — ТА ТОЧКА, КУДА МЫ РЕАЛЬНО ИДЁМ. При прыжке это его конец,
             // а не далёкая цель: иначе условие пересчёта считало бы, что мы уже у цели.
-            c.Move.PathTargetX = aimX;
-            c.Move.PathTargetY = aimY;
+            m.PathTargetX = aimX;
+            m.PathTargetY = aimY;
         }
 
         // идём к текущей точке маршрута; дошли — берём следующую
-        while (c.Move.WaypointIndex < c.Move.Waypoints.size()
-            && self->GetExactDist(c.Move.Waypoints[c.Move.WaypointIndex]) < 1.5f)
-            ++c.Move.WaypointIndex;
-        if (c.Move.WaypointIndex >= c.Move.Waypoints.size())
+        while (m.WaypointIndex < m.Waypoints.size()
+            && self->GetExactDist(m.Waypoints[m.WaypointIndex]) < 1.5f)
+            ++m.WaypointIndex;
+        if (m.WaypointIndex >= m.Waypoints.size())
         {
-            c.Move.Waypoints.clear();
-            StopMoving(c, self);
+            m.Waypoints.clear();
+            StopMovingCore(m, self, send, user);
             return false;                   // маршрут пройден
         }
 
-        Position const& wp = c.Move.Waypoints[c.Move.WaypointIndex];
+        Position const& wp = m.Waypoints[m.WaypointIndex];
         float angle = self->GetAbsoluteAngle(wp.GetPositionX(), wp.GetPositionY());
         float legLen = self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY());
         float go = std::min(step, legLen);
@@ -1698,10 +1749,19 @@ public:
         Position next(self->GetPositionX() + std::cos(angle) * go,
                       self->GetPositionY() + std::sin(angle) * go,
                       nz, angle);
-        SendMove(c, self, next, MOVEMENTFLAG_FORWARD);
-        c.Move.Moving = true;
+        SendStep(self, send, user, next, MOVEMENTFLAG_FORWARD);
+        m.Moving = true;
         return true;
     }
+
+    // ОБЁРТКА ДЛЯ ЛЕСТНИЦЫ. Значение по умолчанию остаётся здесь: у ядра его нет намеренно —
+    // движок передаёт свои аргументы явно.
+    bool StepToward(Companion& c, Player* self, float tx, float ty, float tz, float stopAt, float dt,
+                    Position* destFix = nullptr)
+    {
+        return StepTowardCore(c.Move, self, &SendThroughSession, &c, tx, ty, tz, stopAt, dt, destFix);
+    }
+
     // СМЕРТЬ — НЕ КОНЕЦ, А ДОРОГА ОБРАТНО.
     //
     // Оператор увидел это в игре и спросил, чего они ждут: трое дворфов стоят на
