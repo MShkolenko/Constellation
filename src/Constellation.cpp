@@ -10379,11 +10379,27 @@ public:
     // КАКОЙ КВЕСТ ЯДРО ДАЛО БЫ У ЭТОГО ВИДА — по воротам ядра и светофору. Связи «существо ->
     // квесты» выбирают, КУДА ИДТИ, а не что брать: у самого квестодателя спутник, как и
     // прежде, шлёт Hello, читает меню, собранное ядром, и берёт по цвету.
-    uint32 TakeableQuestAt(Player* self, Companion const& c, uint32 entry) const
+    // ТОТ ЖЕ ТИП, ЧТО У ДВИЖКА, а не одноимённый двойник: переходник передаёт указатель
+    // насквозь, и два «похожих» типа тут молча разошлись бы.
+    using QuestRefusedFn = Constellation::Ai::QuestRefusedFn;
+
+    // Память об отказах ЭТОГО механизма — лестницы. Движок передаст `nullptr`: его память живёт
+    // в таблице отсрочек и проверяется на уровне ставки, до всякого вызова сюда.
+    static bool RefusedByCompanion(void const* user, uint32 questId)
+    {
+        Companion const* c = static_cast<Companion const*>(user);
+        return c && c->QuestRefused.count(questId) != 0;
+    }
+
+    // ПАМЯТЬ ОБ ОТКАЗАХ — ОБРАТНЫМ ВЫЗОВОМ, как и у выбора из меню. Третий лифт этой формы, и
+    // причина каждый раз одна: движку предстоит спросить то же самое, а копия правила разойдётся.
+    // `nullptr` значит «своей памяти нет» — случай движка, у которого она в таблице отсрочек.
+    uint32 TakeableQuestAt(Player const* self, QuestRefusedFn refused, void const* user,
+                           uint32 entry) const
     {
         for (uint32 qid : sObjectMgr->GetCreatureQuestRelations(entry))
         {
-            if (c.QuestRefused.count(qid))
+            if (refused && refused(user, qid))
                 continue;
             Quest const* q = sObjectMgr->GetQuestTemplate(qid);
             if (!q || self->GetQuestStatus(qid) != QUEST_STATUS_NONE)
@@ -10466,7 +10482,7 @@ public:
                     if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(g.Faction))
                         hostile = mine->IsHostileTo(theirs);
                 if (!hostile)
-                    qid = TakeableQuestAt(self, c, g.Entry);
+                    qid = TakeableQuestAt(self, &RefusedByCompanion, &c, g.Entry);
                 byEntry[g.Entry] = qid;
             }
             if (!qid)
@@ -10589,14 +10605,6 @@ public:
     //
     // 0 — серое, 1 — зелёное, 2 — жёлтое, 3 — оранжевое/красное, 4 — уровень неизвестен.
     // Берём по возрастанию: сперва безопасное; красное и неизвестное не трогаем вовсе.
-    // Память об отказах ЭТОГО механизма — лестницы. Движок передаст `nullptr`: его память живёт
-    // в таблице отсрочек и проверяется на уровне ставки, до всякого вызова сюда.
-    static bool RefusedByCompanion(void const* user, uint32 questId)
-    {
-        Companion const* c = static_cast<Companion const*>(user);
-        return c && c->QuestRefused.count(questId) != 0;
-    }
-
     // ---------------------------------------------------------------- выбор из МЕНЮ
     // ЧТО ВЫБРАТЬ ИЗ ТОГО, ЧТО ЯДРО УЖЕ СОБРАЛО ДЛЯ КЛИЕНТА. Не из связей — из меню: связи
     // выбирают, КУДА ИДТИ, а что брать видно только в окне, которое ядро построило в ответ на
@@ -10625,9 +10633,6 @@ public:
     // ЧИТАЮЩИЙ указатель, в отличие от соседних посетителей: те накапливают результат В него,
     // этот только спрашивает. `void*` здесь потребовал бы `const_cast` на месте вызова —
     // каст ради типа, а не ради смысла (Кодекс, пункт 3).
-    // ТОТ ЖЕ ТИП, ЧТО У ДВИЖКА, а не одноимённый двойник: переходник передаёт указатель
-    // насквозь, и два «похожих» типа тут молча разошлись бы.
-    using QuestRefusedFn = Constellation::Ai::QuestRefusedFn;
 
     MenuPick PickFromQuestMenu(Player const* self, QuestRefusedFn refused, void const* user) const
     {
@@ -11811,7 +11816,7 @@ public:
             // это делает игрок. Меню там собирает ядро (PrepareQuestMenu по
             // CanTakeQuest), и если оно окажется пустым, разговор занесёт особь в
             // отказ на десять минут — правка выше это и обеспечивает.
-            if (!TakeableQuestAt(self, c, creature->GetEntry()))
+            if (!TakeableQuestAt(self, &RefusedByCompanion, &c, creature->GetEntry()))
             {
                 ++markedOnly;
                 // ЗАПАСНОЙ ВЫБОР — ТОЛЬКО ПО ВИДИМОМУ, И ЭТО НЕ ПЕРЕСТРАХОВКА (Кодекс).
