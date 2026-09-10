@@ -236,7 +236,22 @@ namespace
         BackoffKind DeferKind() const override { return BackoffKind::Visited; }
         uint8 DeferDetail(Bid const&) const override { return REST_DETAIL; }
 
-        bool Useful(Ctx& ctx, Bid const&) override { return ctx.World.NeedsRest(); }
+        // ДВА ПОРОГА — ЗНАЧИТ ДВА УСЛОВИЯ, А НЕ ОДНО. Уходят отдыхать ниже одного, возвращаются
+        // выше другого; у лестницы это выражено РЕЖИМОМ, который держится до `RestedEnough`.
+        //
+        // Первая редакция спрашивала здесь только `NeedsRest`, то есть бросала отдых на первом
+        // же пороге — и в полосе между порогами движок предлагал драться, пока лестница ещё
+        // отдыхала. Прибор показал это двумя строками через четыре минуты после выкладки. Я
+        // перенёс оба числа и не перенёс то, ради чего они разные.
+        //
+        // Новое состояние не нужно: `RestingMs` больше нуля и значит «отдыхали только что» — он
+        // обнуляется и по `RestedEnough`, и по разрыву в наблюдении.
+        bool Useful(Ctx& ctx, Bid const&) override
+        {
+            if (ctx.World.NeedsRest())
+                return true;
+            return ctx.St && ctx.St->RestingMs && !ctx.World.RestedEnough();
+        }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
 
@@ -312,7 +327,14 @@ namespace
             // ОТДЫХ ВПЕРЕДИ ДРАКИ, НО ПОЗАДИ СДАЧИ — порядок лестницы, слово в слово
             // (`Constellation.cpp:3056`): «сдать готовое можно и раненым, а вот идти за новой
             // целью — нет».
-            if (ctx.World.NeedsRest())
+            // ПРИЗНАК ЗДЕСЬ ДЕШЁВЫЙ И ШИРОКИЙ, А РЕШАЕТ `Useful`. Условие ставки не должно быть
+            // УЖЕ условия полезности: `Useful` фильтрует поставленное, непоставленное он не
+            // спасёт. Первая редакция ставила по `NeedsRest`, то есть в полосе между порогами
+            // ставки не было вовсе — и расширенная проверка не спрашивалась ни разу.
+            //
+            // Форма та же, что у квестовой стратегии: она ставит на каждого квестодателя в
+            // обзоре, а разбирается `Useful`.
+            if (ctx.World.NeedsRest() || (ctx.St && ctx.St->RestingMs))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
         }
     };
