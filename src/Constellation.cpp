@@ -2818,7 +2818,8 @@ public:
             // на одном замке.
             c.EngineShadow.StrategyMask = Constellation::Ai::MaskOf(
                     Constellation::Ai::StrategyId::Quests)
-                | Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat);
+                | Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat)
+                | Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Survival);
             Constellation::Ai::Engine::Instance().Tick(c.EngineShadow, ctx, c.ModeEpoch,
                 Constellation::Ai::Engine::Run::Shadow);
             if (act.Refused() && !c.EngineShadowRefusedLogged)
@@ -13702,6 +13703,16 @@ namespace Constellation::Ai
             stopAt, dt, nullptr);
     }
 
+    bool NeedsRestFor(Player* self)
+    {
+        return Constellation::Manager::Instance()->NeedsRest(self);
+    }
+
+    bool RestedEnoughFor(Player* self)
+    {
+        return Constellation::Manager::Instance()->RestedEnough(self);
+    }
+
     void ScanObjectivesFor(Player* self, FightMemory const& mem, DangerView const& danger,
                            ObjectiveScan* out)
     {
@@ -13731,6 +13742,7 @@ namespace Constellation::Ai
         t.QuestGiverRange = Constellation::Cfg().QuestGiverRange;
         t.GiverSeekRange  = Constellation::Cfg().GiverSeekRange;
         t.WalkCapMs       = Constellation::Cfg().WalkCapMs;
+        t.RestMaxMs       = Constellation::Cfg().RestMaxMs;
         return t;
     }
 }

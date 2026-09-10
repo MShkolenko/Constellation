@@ -80,6 +80,16 @@ namespace Constellation::Ai
         return _self ? _self->GetHealthPct() : 0.0f;
     }
 
+    bool WorldView::NeedsRest() const
+    {
+        return _self && NeedsRestFor(_self);
+    }
+
+    bool WorldView::RestedEnough() const
+    {
+        return _self && RestedEnoughFor(_self);
+    }
+
     bool WorldView::HasAttackers() const
     {
         return _self && !_self->getAttackers().empty();

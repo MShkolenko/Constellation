@@ -603,6 +603,8 @@ namespace Constellation::Ai
             Ctx* ctx = static_cast<Ctx*>(user);
             if (!ctx)
                 return false;
+            if (opcode == CMSG_MOVE_STOP)
+                return ctx->Act.StopMoving();
             if (opcode != CMSG_MOVE_HEARTBEAT)
                 return false;
             return ctx->Act.Step(mi.pos, mi.flags);

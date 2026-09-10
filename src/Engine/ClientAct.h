@@ -142,6 +142,13 @@ namespace Constellation::Ai
         // condition to tolerate — it means an action tried to move somewhere it could not walk.
         bool Step(Position const& next, uint32 movementFlags);      // CMSG_MOVE_HEARTBEAT
 
+        // ОСТАНОВИТЬСЯ. Отдельная дверь, потому что перестать слать шаги — НЕ значит встать:
+        // сервер продолжает вести туда, куда его отправили в последний раз. Лестница шлёт этот
+        // же опкод первым делом, входя в отдых.
+        //
+        // Бюджет шага она не тратит и не может: остановка не покрывает расстояния.
+        bool StopMoving();                                          // CMSG_MOVE_STOP
+
         // How far this companion could walk in one slice, by the speed of the movement it is
         // actually doing. `MOVE_RUN` alone was wrong: a swimming companion is capped by
         // `MOVE_SWIM` and a flying one by `MOVE_FLIGHT`, and using the run speed for all three

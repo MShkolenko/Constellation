@@ -108,6 +108,21 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::StopMoving()                                    // from StopMoving, :12246
+    {
+        if (!Usable())
+            return false;
+        // СОСТОЯНИЕ КОПИРУЕТСЯ ЦЕЛИКОМ, как и у поворота: обработчик замещает им всё, что было,
+        // и собранный с нуля стёр бы транспорт, падение и тангаж.
+        MovementInfo mi = _self->m_movementInfo;
+        mi.guid = _self->GetGUID();
+        mi.pos.Relocate(_self->GetPosition());
+        mi.flags = 0;
+        mi.time = GameTime::GetGameTimeMS();
+        _session->HandleMovementOpcode(CMSG_MOVE_STOP, mi);
+        return true;
+    }
+
     bool ClientAct::Face(ObjectGuid target)                         // from FaceTarget, :12176
     {
         if (!Usable() || target.IsEmpty())
