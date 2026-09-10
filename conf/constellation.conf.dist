@@ -3,6 +3,15 @@
 #
 # Phase 0: keys are read from worldserver.conf under the Constellation.* prefix.
 # This file documents them; copy the lines you change into worldserver.conf.
+#
+# A KEY THE CODE READS AND THE CONFIG DOES NOT DECLARE FAILS THE DEPLOY GATE, and
+# that is by design rather than by accident: the gate boots a probe world on the
+# new binary beside one on the current binary and compares their startup output.
+# A newly read key adds one "Missing name ..." line that the old binary cannot
+# produce, the channels differ, and the swap is refused with the live realm
+# untouched. So a new key is added HERE and to worldserver.conf in the same
+# change as the code that reads it — otherwise the gate stops the deploy, which
+# is exactly what happened to Constellation.EngineStrategies on 2026-09-10.
 ###############################################################################
 
 #
@@ -13,3 +22,43 @@
 #
 
 Constellation.Enable = 0
+
+#
+#    Constellation.Engine
+#        Description: Lets the bid-queue engine DECIDE inside the Idle branch:
+#                     it runs first, and the ladder's Idle body runs only when
+#                     the engine had nothing to try. Off, the engine is not
+#                     ticked at all and any state it held is forgotten.
+#        Default:     0
+#
+
+Constellation.Engine = 0
+
+#
+#    Constellation.EngineShadow
+#        Description: The engine decides WITHOUT executing, beside the ladder,
+#                     and logs what it would have done against what the ladder
+#                     is doing. Independent of Constellation.Engine on purpose:
+#                     the shadow is meant to run on the whole roster, while the
+#                     seam is enabled only once there is something to execute.
+#        Default:     0
+#
+
+Constellation.EngineShadow = 0
+
+#
+#    Constellation.EngineStrategies
+#        Description: Which engine strategies may bid, as a bitmask. ZERO MEANS
+#                     NONE, which is a second lock independent of
+#                     Constellation.Engine: with the flag on and this at zero
+#                     the seam is silent, because nothing bids. This is the
+#                     staging unit — one capability at a time, globally for the
+#                     whole roster rather than for a subset of companions.
+#
+#                     Bits follow the strategy list in the engine's own header:
+#                     1 = Survival, 2 = Quests, 4 = Combat, 8 = Trade,
+#                     16 = Housekeeping, 32 = Follow.
+#        Default:     0
+#
+
+Constellation.EngineStrategies = 0
