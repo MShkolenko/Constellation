@@ -143,6 +143,14 @@ namespace Constellation::Ai
         //
         // ОБНУЛЯЕТСЯ, КОГДА ОТДЫХ НЕ ВЫБРАН, а не по времени: «подряд» здесь и значит «подряд».
         uint32 RestingMs = 0;
+
+        // ЗАНЯТОСТЬ ТАКТА — то, чего строка решения не измеряет по устройству: она пишется только
+        // на СМЕНЕ выбора, значит короткие окна не видят устойчивых состояний вовсе. Здесь
+        // считается, СКОЛЬКО тактов движку было чем заняться, а не сколько раз он передумал.
+        uint32 TicksIdle      = 0;      // пробовать было нечего
+        uint32 TicksAttempted = 0;      // взялся и не довёл
+        uint32 TicksCommitted = 0;      // провёл действие через дверь
+        uint32 ReportAtMs     = 0;      // когда сказать и обнулить
         // И КОГДА ОТДЫХАЛИ В ПОСЛЕДНИЙ РАЗ. Без этого «подряд» было неправдой: счётчик не
         // обнулялся, когда отдых просто переставали выбирать, и через минуту чужой работы
         // продолжал с прежнего, упираясь в потолок раньше срока (разбор). Разрыв лечится тем же
@@ -283,6 +291,13 @@ namespace Constellation::Ai
         };
 
         TickResult Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run = Run::Decide);
+
+    private:
+        // СЧЁТ В ОДНОЙ ТОЧКЕ. Возвратов у такта три, и три отдельных инкремента разошлись бы на
+        // первой же правке; пропустить эту, не убрав `return`, нельзя.
+        static TickResult Finish(EngineState& st, TickResult r);
+
+    public:
 
         // §2″ — give up the work, keep the mode, decide again next tick. THIS IS NOT A HANDOFF,
         // and the naming matters: calling it one is what produced a contract that contradicted

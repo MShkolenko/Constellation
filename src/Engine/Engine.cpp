@@ -633,6 +633,11 @@ namespace Constellation::Ai
     // Заводить здесь второе такое число значило бы завести второе мнение о том же.
     inline constexpr uint32 OBSERVATION_GAP_MS = 1000;
 
+    // КАК ЧАСТО ГОВОРИТЬ ПРО ЗАНЯТОСТЬ. Минута — не выбор из воздуха: при четырёх тактах в секунду
+    // это порядка двухсот сорока наблюдений на спутника, то есть доля уже что-то значит, а восемь
+    // строк в минуту на нынешнем составе ничего не топят.
+    inline constexpr uint32 OCCUPANCY_REPORT_MS = 60000;
+
     WalkVerdict AdvanceWalk(Ctx& ctx, Subject const& toward, float dist, uint32 sliceMs, bool stalled)
     {
         if (!ctx.St)
@@ -804,10 +809,21 @@ namespace Constellation::Ai
         st.BidsDropped = dropped;
     }
 
+    Engine::TickResult Engine::Finish(EngineState& st, TickResult r)
+    {
+        switch (r)
+        {
+            case TickResult::Idle:      ++st.TicksIdle;      break;
+            case TickResult::Attempted: ++st.TicksAttempted; break;
+            case TickResult::Committed: ++st.TicksCommitted; break;
+        }
+        return r;
+    }
+
     Engine::TickResult Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run)
     {
         if (!_ready)
-            return TickResult::Idle;
+            return TickResult::Idle;   // до счёта: движка ещё нет
 
         uint32 const now = ctx.NowMs;
 
@@ -864,6 +880,26 @@ namespace Constellation::Ai
             ctx.Act.ResetTick(slice, &st.StepsRefused);
         }
 
+        // ЗАНЯТОСТЬ — РАЗ В МИНУТУ И ПО СПУТНИКУ. За минуту набирается порядка двухсот сорока
+        // тактов, чего довольно для доли; восемь строк в минуту не топят журнал, который однажды
+        // выдал тридцать один миллион строк за десять минут.
+        //
+        // ГОВОРИТ И ТЕНЬ, И ШОВ, каждый про своё состояние: у тени это «сколько тактов движку
+        // было бы чем заняться», и знать это надо ДО того, как ему дадут решать.
+        if (!st.ReportAtMs)
+            st.ReportAtMs = now + OCCUPANCY_REPORT_MS;
+        else if (now - st.ReportAtMs < 0x80000000u)      // сравнение, переживающее переполнение
+        {
+            uint32 const total = st.TicksIdle + st.TicksAttempted + st.TicksCommitted;
+            if (total)
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЗАНЯТОСТЬ {} {}: тактов {}, провёл {}, взялся {}, нечего {}",
+                    run == Run::Shadow ? "ТЕНЬ" : "ШОВ", ctx.World.Name(),
+                    total, st.TicksCommitted, st.TicksAttempted, st.TicksIdle);
+            st.TicksIdle = st.TicksAttempted = st.TicksCommitted = 0;
+            st.ReportAtMs = now + OCCUPANCY_REPORT_MS;
+        }
+
         // §4.1 — a bid made three seconds ago is answering a world that has moved on.
         size_t const before = st.Queue.size();
         st.Queue.erase(std::remove_if(st.Queue.begin(), st.Queue.end(),
@@ -905,7 +941,7 @@ namespace Constellation::Ai
         }
 
         if (st.Queue.empty())
-            return TickResult::Idle;
+            return Finish(st, TickResult::Idle);
 
         // ВЗЯЛСЯ ЛИ ХОТЬ ЗА ЧТО-НИБУДЬ. Ставится РЯДОМ с вызовом исполнения, а не по его исходу:
         // в этом и весь смысл — мир мог быть тронут и при отказе.
@@ -1037,7 +1073,7 @@ namespace Constellation::Ai
                 st.RunningAbout  = bid.About;
                 st.RunningRel    = rel;
                 st.ReplanAfterMs = now + REPLAN_COOLDOWN_MS;
-                return TickResult::Committed;
+                return Finish(st, TickResult::Committed);
             }
 
             // EXECUTE FAILED, SO WE ARE NOT RUNNING IT ANY MORE.
@@ -1059,6 +1095,6 @@ namespace Constellation::Ai
             Push(st, st.Scratch, rel + REL_ALTERNATIVE, now);
         }
 
-        return attempted ? TickResult::Attempted : TickResult::Idle;
+        return Finish(st, attempted ? TickResult::Attempted : TickResult::Idle);
     }
 }
