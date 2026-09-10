@@ -804,10 +804,10 @@ namespace Constellation::Ai
         st.BidsDropped = dropped;
     }
 
-    bool Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run)
+    Engine::TickResult Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run)
     {
         if (!_ready)
-            return false;
+            return TickResult::Idle;
 
         uint32 const now = ctx.NowMs;
 
@@ -905,7 +905,11 @@ namespace Constellation::Ai
         }
 
         if (st.Queue.empty())
-            return false;
+            return TickResult::Idle;
+
+        // ВЗЯЛСЯ ЛИ ХОТЬ ЗА ЧТО-НИБУДЬ. Ставится РЯДОМ с вызовом исполнения, а не по его исходу:
+        // в этом и весь смысл — мир мог быть тронут и при отказе.
+        bool attempted = false;
 
         for (uint32 i = 0; i < ITERATIONS_PER_TICK && !st.Queue.empty(); ++i)
         {
@@ -1009,6 +1013,7 @@ namespace Constellation::Ai
 
             // §10 — В ТЕНИ ИСПОЛНЕНИЯ НЕТ. Считаем его удавшимся: иначе ветка альтернатив
             // разошлась бы с настоящей на первом же отказе, и сравнивать было бы нечего.
+            attempted = true;
             bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
             if (ran)
             {
@@ -1032,7 +1037,7 @@ namespace Constellation::Ai
                 st.RunningAbout  = bid.About;
                 st.RunningRel    = rel;
                 st.ReplanAfterMs = now + REPLAN_COOLDOWN_MS;
-                return true;
+                return TickResult::Committed;
             }
 
             // EXECUTE FAILED, SO WE ARE NOT RUNNING IT ANY MORE.
@@ -1054,6 +1059,6 @@ namespace Constellation::Ai
             Push(st, st.Scratch, rel + REL_ALTERNATIVE, now);
         }
 
-        return false;
+        return attempted ? TickResult::Attempted : TickResult::Idle;
     }
 }

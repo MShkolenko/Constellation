@@ -264,7 +264,25 @@ namespace Constellation::Ai
         // §4.1 — one tick. `modeEpoch` is the module's counter of mode changes for this
         // companion; if it moved since we last ticked, somebody else put us here and every bit
         // of our state is stale (§2″). Returns true if an action executed.
-        bool Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run = Run::Decide);
+        // ЧЕМ КОНЧИЛСЯ ТАКТ — ТРИ ИСХОДА, А НЕ ДВА.
+        //
+        // Шву нужен НЕ «получилось ли», а «занят ли спутник»: действие вправе написать в мир и
+        // потом вернуть ложь — поворот и выбор цели уходят раньше, чем может не удаться замах;
+        // два приветствия уходят раньше, чем выяснится, что меню пусто; остановка уходит раньше,
+        // чем сработает потолок отдыха. Отдав ход лестнице после такого отказа, мы получили бы
+        // двух управляющих ВНУТРИ ОДНОГО ТАКТА.
+        //
+        // Поэтому `Attempted` и `Committed` для шва одно и то же — такт принадлежит движку, —
+        // а различает их журнал и замер, которым нужен именно исход. Один `bool` на два вопроса
+        // снова дал бы ответ, который читают не тем вопросом.
+        enum class TickResult : uint8
+        {
+            Idle,       // пробовать было нечего: очередь пуста, всё подавлено или отсеяно
+            Attempted,  // исполнение начиналось и не дошло до конца — мир уже мог быть тронут
+            Committed,  // ровно одно действие проведено через дверь
+        };
+
+        TickResult Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run = Run::Decide);
 
         // §2″ — give up the work, keep the mode, decide again next tick. THIS IS NOT A HANDOFF,
         // and the naming matters: calling it one is what produced a contract that contradicted
