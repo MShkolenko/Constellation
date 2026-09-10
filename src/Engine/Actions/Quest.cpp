@@ -22,6 +22,7 @@
 #include "../Engine.h"
 #include "../ClientAct.h"
 
+#include <cstring>
 #include <memory>
 
 namespace
@@ -429,11 +430,37 @@ namespace
         {
             // ГОТОВОЕ СДАТЬ — ВЫШЕ ОБЫЧНОГО. Оно закрывает работу, которая уже сделана, и
             // освобождает слот журнала; отложить его значит носить законченное.
-            for (TurnInCandidate const& t : Val<ValueId::CompletedTurnIns>(ctx))
+            // ПРИБОР НА ОДНО РАСХОЖДЕНИЕ — см. `EngineState::TurnInGapLogged`. Считаем по
+            // ходу дела, чтобы не обходить список второй раз ради строки, которой чаще всего не
+            // будет.
+            uint32 emitted = 0, tooFar = 0;
+            float  nearestFar = 0.0f;
+            TurnInList const& ready = Val<ValueId::CompletedTurnIns>(ctx);
+            for (TurnInCandidate const& t : ready)
             {
                 if (t.Dist > TURNIN_MAX_YARDS)
+                {
+                    ++tooFar;
+                    if (!nearestFar || t.Dist < nearestFar)
+                        nearestFar = t.Dist;
                     continue;
+                }
+                ++emitted;
                 sink.Add(ActionId::TurnInQuest, REL_HIGH, Subject::OfQuest(t.QuestId));
+            }
+
+            // ГОВОРИМ ТОЛЬКО НА РАСХОЖДЕНИИ, и это возможно лишь потому, что тень теперь знает,
+            // что делает лестница. Пустой список укажет на обход (`ForEachCompletedTurnIn`
+            // выбрасывает кандидата, у которого не нашлось точки появления принимающего);
+            // непустой — на потолок, и сразу с числом, насколько он мал.
+            if (!emitted && ctx.St && !ctx.St->TurnInGapLogged
+                && ctx.Peer && std::strcmp(ctx.Peer, "сдаю квест") == 0)
+            {
+                ctx.St->TurnInGapLogged = true;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЩЕЛЬ {}: лестница сдаёт, у движка ставки нет — готовых {},"
+                    " за потолком {} (ближайший {:.0f} ярдов при потолке {:.0f})",
+                    ctx.World.Name(), uint32(ready.Size()), tooFar, nearestFar, TURNIN_MAX_YARDS);
             }
 
             // ВЗЯТИЕ НИЖЕ СДАЧИ, И ЭТО НЕ ВКУСОВЩИНА. Сдача закрывает уже сделанную работу и
