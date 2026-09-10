@@ -387,11 +387,18 @@ namespace Constellation::Ai
         // A decision that has not changed is not news; the counters live in the periodic line.
         if (chosen.Id() == st.Running)
             return;
+        // ТРИ ИМЕНИ, А НЕ ДВА, И ЭТО ИСПРАВЛЕНИЕ ПРИБОРА, А НЕ УКРАШЕНИЕ.
+        //
+        // «было» — прежнее действие САМОГО движка: строка пишется только на смене, и без него
+        // непонятно, что сменилось. «у лестницы» — что в этот момент делает другой механизм, и
+        // ровно этого здесь не хватало: я читал первое как второе и разбирал расхождения,
+        // которых строка не показывала.
         TC_LOG_INFO("server.worldserver",
-            "Constellation {} {}: «{}» {:.2f} вместо «{}» (эпоха {}, в очереди {}, сброшено {},"
-            " подавлено {}, шаг отвергнут {})",
+            "Constellation {} {}: «{}» {:.2f} (было «{}», у лестницы «{}») (эпоха {}, в очереди {},"
+            " сброшено {}, подавлено {}, шаг отвергнут {})",
             run == Run::Shadow ? "ТЕНЬ" : "РЕШЕНИЕ",
             ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
+            ctx.Peer ? ctx.Peer : "?",
             st.AssignmentEpoch, st.Queue.size(), st.BidsDropped, st.BidsSuppressed,
             st.StepsRefused);
     }

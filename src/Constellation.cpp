@@ -2810,7 +2810,8 @@ public:
             DangerBinding danger{ &c, self };
             Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
             Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(), &c.EngineShadow };
+            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(),
+                                        &c.EngineShadow, ModeName(c.Mode) };
             // §9 — БЕЗ МАСКИ СТРАТЕГИЯ НЕ РАБОТАЕТ НИ У КОГО: `StrategyMask` начинается
             // нулём, а фильтр — побитовое И. Ставим её ТОЛЬКО тени: шов и так закрыт
             // `Owns`, но разница между «движок думает» и «движок делает» не должна держаться
