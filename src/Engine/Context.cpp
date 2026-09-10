@@ -284,6 +284,16 @@ namespace Constellation::Ai
         return who && who->IsAlive() && _self->IsWithinMeleeRange(who);
     }
 
+    std::optional<ObjectGuid> WorldView::UsableObjectAt(ObjectGuid::LowType spawnId) const
+    {
+        if (!_self || !spawnId)
+            return std::nullopt;
+        GameObject* go = _self->GetMap()->GetGameObjectBySpawnId(spawnId);
+        if (!go || !go->isSpawned() || !_self->GetGameObjectIfCanInteractWith(go->GetGUID()))
+            return std::nullopt;
+        return go->GetGUID();
+    }
+
     std::optional<Position> WorldView::WhereIs(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

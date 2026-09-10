@@ -41,6 +41,15 @@ namespace
     // шагать, и он взят с запасом внутрь боевого охвата.
     inline constexpr float MELEE_STOP_YARDS = 2.0f;
 
+    // ДО КЛЕТКИ ИДЁМ ВПЛОТНУЮ, а не до порога обзора: у объекта нет ни ног, ни маршрута — он
+    // стоит там, где стоит, и «где-то рядом» тут не нужно. Разрешение всё равно даёт ядро, а
+    // этот порог лишь говорит двигателю, когда перестать шагать.
+    inline constexpr float CAGE_ARRIVED_YARDS = 2.0f;
+
+    // И тот же десятиминутный срок, что у похода к квестодателю, к принимающему и к боевой цели:
+    // случай один — «туда не дойти сейчас».
+    inline constexpr uint32 CAGE_UNREACHABLE_MS = 600000;
+
     class KillObjectiveAction final : public Action
     {
     public:
@@ -99,8 +108,14 @@ namespace
                 float const dt = ctx.Act.SliceSeconds();
                 bool const going = WalkTowards(ctx, *where, MELEE_STOP_YARDS, dt);
 
+                // «ДОШЁЛ» — НЕ «ЗАСТРЯЛ», И ЭТО НЕ ПРИДИРКА К СЛОВУ. Двигатель отвечает
+                // ложью на «дошли ИЛИ не можем», а приход здесь решает ядро (`InMeleeRange`),
+                // и между его меркой и порогом остановки есть зазор. Передавая `!going` как
+                // застревание, действие в такт прихода само ставило себе десятиминутный запрет
+                // и второго такта, в котором ударило бы, уже не получало (разбор).
                 uint32 const sliceMs = uint32(dt * 1000.0f);
-                if (AdvanceWalk(ctx, bid.About, *d, sliceMs, !going) != WalkVerdict::Going)
+                bool const stalled = !going && *d > MELEE_STOP_YARDS;
+                if (AdvanceWalk(ctx, bid.About, *d, sliceMs, stalled) != WalkVerdict::Going)
                 {
                     Defer(ctx, BackoffKind::CombatUnreachable, bid.About, 0, COMBAT_UNREACHABLE_MS);
                     return false;
@@ -121,6 +136,72 @@ namespace
         }
     };
 
+    // ОТКРЫТЬ КЛЕТКУ, ЧТОБЫ ОСВОБОДИТЬ ЦЕЛЬ, КОТОРУЮ НЕЛЬЗЯ ТРОНУТЬ.
+    //
+    // Второй потребитель того же обхода: он уже считает клетку, а читал её до сих пор никто —
+    // это признано долгом в заголовке значения, и вот его половина.
+    //
+    // ПОРЯДОК РАБОТ — ЛЕСТНИЦЫ, слово в слово (`Constellation.cpp:4404-4406`): пока далеко —
+    // идём по счислению, у самой точки берём ЖИВОЙ объект по идентификатору спавна прямым
+    // обращением к карте и спрашиваем разрешение у ядра. Расстояние взаимодействия не
+    // выдумывается ни здесь, ни там.
+    class OpenCageForTargetAction final : public Action
+    {
+    public:
+        OpenCageForTargetAction() : Action(ActionId::OpenCageForTarget) { }
+
+        // §14 — «ДО ЭТОЙ ТОЧКИ НЕ ДОБРАТЬСЯ». Отсрочка «этой клеткой ради этого пленника
+        // пробовали» — другой вопрос и другой ключ (пара видов), и его задаёт обход, а не это
+        // действие: он такую клетку просто не назовёт.
+        BackoffKind DeferKind() const override { return BackoffKind::ObjectUnreachable; }
+
+        bool Useful(Ctx& ctx, Bid const& bid) override
+        {
+            if (bid.About.What() != Subject::Kind::Spawn)
+                return false;
+            ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+            return scan.CageSpawn && uint32(scan.CageSpawn) == bid.About.Id();
+        }
+
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
+
+        float Score(Ctx& ctx, Bid const& bid, float relevance) const override
+        {
+            ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+            if (!scan.CageSpawn || uint32(scan.CageSpawn) != bid.About.Id())
+                return relevance;
+            return relevance - ctx.World.DistanceTo2d(scan.CagePos) * YARD_COST;
+        }
+
+        bool Execute(Ctx& ctx, Bid const& bid) override
+        {
+            if (!ctx.St)
+                return false;
+            ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+            if (!scan.CageSpawn || uint32(scan.CageSpawn) != bid.About.Id())
+                return false;
+
+            // ЯДРО РЕШАЕТ, ДОСТАТОЧНО ЛИ БЛИЗКО, И ОНО ЖЕ — ПОЯВИЛСЯ ЛИ ОБЪЕКТ ВООБЩЕ.
+            if (std::optional<ObjectGuid> const go = ctx.World.UsableObjectAt(scan.CageSpawn))
+                return ctx.Act.UseGameObject(*go);
+
+            float const dt = ctx.Act.SliceSeconds();
+            bool const going = WalkTowards(ctx, scan.CagePos, CAGE_ARRIVED_YARDS, dt);
+
+            float const d = ctx.World.DistanceTo2d(scan.CagePos);
+            // «Дошёл» — не «застрял»: то же, что у боя. Приход к объекту решает ядро
+            // (`UsableObjectAt`), а ходьба останавливается по расстоянию.
+            uint32 const sliceMs = uint32(dt * 1000.0f);
+            bool const stalled = !going && d > CAGE_ARRIVED_YARDS;
+            if (AdvanceWalk(ctx, bid.About, d, sliceMs, stalled) != WalkVerdict::Going)
+            {
+                Defer(ctx, BackoffKind::ObjectUnreachable, bid.About, 0, CAGE_UNREACHABLE_MS);
+                return false;
+            }
+            return true;
+        }
+    };
+
     // §9 — СТАВИТ КАЖДЫЙ ТАКТ, как и квестовая. «Есть кого бить» — состояние, а не происшествие.
     class CombatStrategy final : public Strategy
     {
@@ -130,6 +211,15 @@ namespace
         void DefaultBids(Ctx& ctx, BidSink& sink) const override
         {
             ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+
+            // КЛЕТКА СТАВИТСЯ НЕЗАВИСИМО ОТ БОЯ, и спорить им не о чем. У лестницы клетка
+            // достижима только когда бить некого; у движка это выходит само — существо,
+            // невосприимчивое к игрокам, обход в боевые кандидаты не берёт, значит ставки на
+            // бой по нему и нет.
+            if (scan.CageSpawn)
+                sink.Add(ActionId::OpenCageForTarget, REL_HIGH,
+                         Subject::OfSpawn(uint32(scan.CageSpawn)));
+
             if (scan.Fight.IsEmpty())
                 return;
             // REL_HIGH — РЯДОМ СО СДАЧЕЙ, А НЕ ПОД НЕЙ. Лестница ставит бой выше взятия и похода
@@ -150,6 +240,7 @@ namespace Constellation::Ai
     void RegisterFightActions(Engine& engine)
     {
         engine.Register(std::make_unique<KillObjectiveAction>());
+        engine.Register(std::make_unique<OpenCageForTargetAction>());
         engine.Register(std::make_unique<CombatStrategy>());
     }
 }

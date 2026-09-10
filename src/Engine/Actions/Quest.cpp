@@ -241,7 +241,10 @@ namespace
                 // РАССТОЯНИЕ БЕРЁМ ТЕКУЩЕЕ, А НЕ `t.Dist`: кэшированное посчитано при пересчёте
                 // значения и по дороге устаревает, а `AdvanceWalk` судит именно о приближении.
                 float const d = ctx.World.DistanceTo2d(t.Where);
+                // «Дошёл» — не «застрял»: приход решает обзор (`NearestQuestGiverOfEntry`),
+                // а ходьба останавливается по расстоянию, и между ними зазор.
                 uint32 const sliceMs = uint32(dt * 1000.0f);
+                bool const stalled = !going && d > TURNIN_ARRIVED_YARDS;
 
                 // ПРОГРЕСС КЛЮЧУЕТСЯ ПРИНИМАЮЩИМ, А НЕ КВЕСТОМ: он про ДОРОГУ. При пересчёте
                 // значение вправе выбрать другого принимающего того же квеста, и счётчик
@@ -253,7 +256,7 @@ namespace
                 // движении спутника; цена ошибки — один перезапуск счётчика, и заводить ради неё
                 // предмет-координату дороже.
                 Subject const road = Subject::OfSpecies(t.EnderEntry);
-                if (AdvanceWalk(ctx, road, d, sliceMs, !going) != WalkVerdict::Going)
+                if (AdvanceWalk(ctx, road, d, sliceMs, stalled) != WalkVerdict::Going)
                 {
                     // Дорога не идёт — отставляем КВЕСТ, а не принимающего: у сдачи ключ и есть
                     // сам квест, и лестница держит свой `TurnInBackoff` тоже по квесту.
