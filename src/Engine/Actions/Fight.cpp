@@ -244,13 +244,20 @@ namespace
         // отдыхала. Прибор показал это двумя строками через четыре минуты после выкладки. Я
         // перенёс оба числа и не перенёс то, ради чего они разные.
         //
-        // Новое состояние не нужно: `RestingMs` больше нуля и значит «отдыхали только что» — он
-        // обнуляется и по `RestedEnough`, и по разрыву в наблюдении.
+        // ОПОРА — РЕШЕНИЕ, А НЕ ИСПОЛНЕНИЕ, и это вторая правка того же места.
+        //
+        // Сначала здесь стоял `RestingMs`, который растёт в `Execute`. Но ТЕНЬ `Execute` НЕ
+        // ВЫЗЫВАЕТ — в этом её устройство, — значит в тени движок не бывает «уже отдыхающим»,
+        // полоса между порогами для неё не существует, и верность отдыха ею не измерить. Замер
+        // это и показал: походы при отдыхающей лестнице остались.
+        //
+        // `st.Running` ставится ПРИ ВЫБОРЕ и потому есть у обоих проходов. И это ближе к
+        // оригиналу: у лестницы режим — решение («ушёл отдыхать и остаюсь»), а не факт сидения.
         bool Useful(Ctx& ctx, Bid const&) override
         {
             if (ctx.World.NeedsRest())
                 return true;
-            return ctx.St && ctx.St->RestingMs && !ctx.World.RestedEnough();
+            return ctx.St && ctx.St->Running == ActionId::Rest && !ctx.World.RestedEnough();
         }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
@@ -334,7 +341,8 @@ namespace
             //
             // Форма та же, что у квестовой стратегии: она ставит на каждого квестодателя в
             // обзоре, а разбирается `Useful`.
-            if (ctx.World.NeedsRest() || (ctx.St && ctx.St->RestingMs))
+            if (ctx.World.NeedsRest()
+                || (ctx.St && ctx.St->Running == ActionId::Rest))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
         }
     };
