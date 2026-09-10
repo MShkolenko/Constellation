@@ -276,12 +276,38 @@ namespace Constellation::Ai
         return creature && creature->IsAlive() && _self->CanInteractWithQuestGiver(creature);
     }
 
+    bool WorldView::InMeleeRange(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who && who->IsAlive() && _self->IsWithinMeleeRange(who);
+    }
+
+    std::optional<Position> WorldView::WhereIs(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return std::nullopt;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        if (!who)
+            return std::nullopt;
+        return who->GetPosition();
+    }
+
     bool WorldView::StepFor(MoveState& m, Position const& to, float stopAt, float dt,
                             MoveSendFn send, void* user) const
     {
         if (!_self || !send)
             return false;
         return StepAlong(m, _self, send, user, to, stopAt, dt);
+    }
+
+    void WorldView::Objectives(FightMemory const& mem, DangerView const& danger,
+                               ObjectiveScan* out) const
+    {
+        if (!_self || !out)
+            return;
+        ScanObjectivesFor(_self, mem, danger, out);
     }
 
     bool WorldView::GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const

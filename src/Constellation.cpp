@@ -844,6 +844,8 @@ public:
             // §12 — ЗНАЧЕНИЯ РЕГИСТРИРУЮТСЯ ПЕРЕД ЗАПЕЧАТЫВАНИЕМ, иначе `Seal()` откажет
             // в готовности: он теперь требует поставщика на каждый объявленный `ValueId`.
             Constellation::Ai::RegisterQuestValues(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterFightValues(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterFightActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::RegisterQuestActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
@@ -2814,7 +2816,8 @@ public:
             // `Owns`, но разница между «движок думает» и «движок делает» не должна держаться
             // на одном замке.
             c.EngineShadow.StrategyMask = Constellation::Ai::MaskOf(
-                Constellation::Ai::StrategyId::Quests);
+                    Constellation::Ai::StrategyId::Quests)
+                | Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat);
             Constellation::Ai::Engine::Instance().Tick(c.EngineShadow, ctx, c.ModeEpoch,
                 Constellation::Ai::Engine::Run::Shadow);
             if (act.Refused() && !c.EngineShadowRefusedLogged)
@@ -13696,6 +13699,14 @@ namespace Constellation::Ai
         return Constellation::Manager::Instance()->StepTowardCore(
             m, self, send, user, to.GetPositionX(), to.GetPositionY(), to.GetPositionZ(),
             stopAt, dt, nullptr);
+    }
+
+    void ScanObjectivesFor(Player* self, FightMemory const& mem, DangerView const& danger,
+                           ObjectiveScan* out)
+    {
+        // Приборы — ноль: движок не печатает одноразовых строк лестницы, иначе тень съедала бы
+        // ту, что собиралась напечатать работающая ветка.
+        Constellation::Manager::Instance()->ScanObjectives(self, mem, danger, out, nullptr);
     }
 
     bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out)

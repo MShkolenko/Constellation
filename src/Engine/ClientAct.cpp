@@ -108,6 +108,35 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::Face(ObjectGuid target)                         // from FaceTarget, :12176
+    {
+        if (!Usable() || target.IsEmpty())
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, target);
+        if (!who)
+            return false;
+
+        // ЗНАКОВЫЙ УГОЛ, А НЕ НОРМАЛИЗОВАННЫЙ (правка Кодекса у лестницы, проход 9):
+        // `NormalizeOrientation` превращает -0.01 в 6.27, и полградуса отклонения читались бы
+        // как «повёрнут неверно» — с одной стороны цели пакеты без конца, с другой ни одного.
+        float const ang  = _self->GetAbsoluteAngle(who);
+        float diff = ang - _self->GetOrientation();
+        while (diff >  float(M_PI)) diff -= 2.0f * float(M_PI);
+        while (diff < -float(M_PI)) diff += 2.0f * float(M_PI);
+        if (std::fabs(diff) < 0.05f)
+            return true;                // уже смотрим куда надо — успех, и пакетами не сорим
+
+        // СОСТОЯНИЕ ДВИЖЕНИЯ КОПИРУЕТСЯ ЦЕЛИКОМ: обработчик замещает им всё, что было.
+        MovementInfo mi = _self->m_movementInfo;
+        mi.guid = _self->GetGUID();
+        Position pos = _self->GetPosition();
+        pos.SetOrientation(ang);
+        mi.pos.Relocate(pos);
+        mi.time = GameTime::GetGameTimeMS();
+        _session->HandleMovementOpcode(CMSG_MOVE_SET_FACING, mi);
+        return true;
+    }
+
     bool ClientAct::AttackSwing(ObjectGuid victim)                  // :7026
     {
         if (!Usable() || victim.IsEmpty())

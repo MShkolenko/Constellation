@@ -606,6 +606,11 @@ namespace Constellation::Ai
         return ctx.World.StepFor(ctx.St->Move, to, stopAt, dt, &SendThroughDoor, &ctx);
     }
 
+    // НА СКОЛЬКО ЗАБЫТЬ ОСОБЬ, ДО КОТОРОЙ НЕ ДОБРАТЬСЯ. Десять минут — срок лестницы для
+    // недостижимых собеседников; у неё этот набор вообще без срока, и это осознанная разница:
+    // её множество растёт без предела, наша таблица ограничена шестнадцатью записями.
+    inline constexpr uint32 UNREACHABLE_UNIT_MS = 600000;
+
     WalkVerdict AdvanceWalk(Ctx& ctx, Subject const& toward, float dist, uint32 sliceMs, bool stalled)
     {
         if (!ctx.St)
@@ -650,6 +655,83 @@ namespace Constellation::Ai
         Subject const point = Subject::OfSpawn(spawnId);
         return EngineRemembers(user, BackoffKind::Unreachable, point)
             || EngineRemembers(user, BackoffKind::Visited, point);
+    }
+
+    namespace
+    {
+        // Пара видов упакована в `PairKey(a, b) = (a << 32) | b` (`Constellation.cpp:2329`).
+        // Распаковка стоит здесь и нигде больше: разойдясь с упаковкой, она отвечала бы про
+        // чужую клетку, и заметить это было бы нечем.
+        inline Subject PairSubject(uint64 key)
+        {
+            return Subject::OfEntryPair(uint32(key >> 32), uint32(key & 0xFFFFFFFFull));
+        }
+
+        bool FightBannedByEngineId(void const* user, FightBan why, uint64 key)
+        {
+            switch (why)
+            {
+                case FightBan::TalkKind:
+                    return EngineRemembers(user, BackoffKind::TalkSpeciesDone,
+                                           Subject::OfSpecies(uint32(key)));
+                case FightBan::FreeUse:
+                    return EngineRemembers(user, BackoffKind::FreeUseDone, PairSubject(key));
+                case FightBan::GatherPoint:
+                    return EngineRemembers(user, BackoffKind::ApproachesDone,
+                                           Subject::OfSpawn(uint32(key)));
+                default:
+                    return false;
+            }
+        }
+
+        bool FightBannedByEngineGuid(void const* user, FightBan why, ObjectGuid guid)
+        {
+            switch (why)
+            {
+                case FightBan::Unreachable:
+                    return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfUnit(guid));
+                case FightBan::TargetRefused:
+                    return EngineRemembers(user, BackoffKind::CombatUnreachable,
+                                           Subject::OfUnit(guid));
+                // `TalkRetry` — стадия, а не исход: движок на неё запрета не держит.
+                default:
+                    return false;
+            }
+        }
+
+        // «ВПЕРВЫЕ» — ЭТО «ЗАПРЕТА ЕЩЁ НЕ БЫЛО», и спрашивается это ДО постановки. `Engine::Defer`
+        // возвращает другое — вытеснил ли он живую запись, — и принять одно за другое значило бы
+        // печатать строку прибора при каждом переполнении таблицы.
+        bool FightNoteByEngine(void* user, FightBan why, ObjectGuid guid)
+        {
+            Ctx* ctx = static_cast<Ctx*>(user);
+            if (!ctx || why != FightBan::Unreachable)
+                return false;
+            Subject const about = Subject::OfUnit(guid);
+            BackoffKey key;
+            key.Kind  = BackoffKind::Unreachable;
+            key.About = about;
+            bool const fresh = !ctx->St || !Engine::Deferred(*ctx->St, key, ctx->NowMs);
+            Defer(*ctx, BackoffKind::Unreachable, about, 0, UNREACHABLE_UNIT_MS);
+            return fresh;
+        }
+    }
+
+    FightMemory EngineFightMemory(Ctx& ctx)
+    {
+        // ЭТИ ДВА — УТВЕРЖДЕНИЯ, А НЕ ЗАГЛУШКИ, и сегодня оба ВЕРНЫ.
+        //
+        // `toolBusy=false` значит «предметом от квеста движок не занят» — у него нет ни одного
+        // действия с предметом, так что это правда, а не умолчание. `starvedMs=0` значит «голода
+        // не было», и это СТРОГАЯ сторона: порог стаи не отменяется, то есть людную цель движок
+        // просто не берёт. Разбор справедливо отверг формулировку «пока нет эквивалента» — она
+        // оправдывала бы ложь; проверка показала, что лжи нет.
+        //
+        // ОБА СТАНУТ ЛОЖЬЮ В ТОТ ДЕНЬ, КОГДА У ДВИЖКА ПОЯВИТСЯ ДЕЙСТВИЕ С ПРЕДМЕТОМ ИЛИ СЧЁТ
+        // ПРОСТОЯ. Тогда сюда обязаны прийти настоящие значения, и написано это здесь, потому что
+        // смотреть будут сюда.
+        return FightMemory(&FightBannedByEngineId, &FightBannedByEngineGuid, &FightNoteByEngine,
+                           &ctx, /*toolBusy=*/false, /*starvedMs=*/0);
     }
 
     void Defer(Ctx& ctx, BackoffKind kind, Subject const& about, uint8 detail, uint32 ttlMs)

@@ -174,6 +174,10 @@ namespace Constellation::Ai
     // readable without grepping. Called once at load beside the action registrations.
     class Engine;
     void RegisterQuestValues(Engine& engine);
+    // Обход целей — один дорогой проход по сетке на три ответа.
+    void RegisterFightValues(Engine& engine);
+    // Бой по целям задания: первое действие движка, которое бьёт.
+    void RegisterFightActions(Engine& engine);
     // Шаг 13 — действия ветки `Idle`, по одному, и стратегия, которая за них ставит.
     void RegisterQuestActions(Engine& engine);
 }
