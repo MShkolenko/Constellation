@@ -10744,6 +10744,14 @@ public:
         if (!b || !b->C || !b->Self)
             return;
         Companion& c = *b->C;
+        // ИСХОД БОЯ ДВИЖКА — В ЖУРНАЛ, ОДНОЙ СТРОКОЙ, иначе замер по исходам слеп: у лестницы
+        // «БОЙ … ПОБЕДА» пишет `LogFightOutcome`, а этот путь до сих пор молчал. Вступление не
+        // пишется — оно не исход, и строк было бы вдвое больше.
+        if (ev.What != Constellation::Ai::FightEvent::Engaged)
+            TC_LOG_INFO("server.worldserver",
+                "Constellation БОЙ-ДВИЖОК {}: против {} ({}) — {}",
+                b->Self->GetName(), c.FightVictimName.empty() ? "?" : c.FightVictimName,
+                ev.VictimEntry, ev.Why);
         switch (ev.What)
         {
             case Constellation::Ai::FightEvent::Engaged:
