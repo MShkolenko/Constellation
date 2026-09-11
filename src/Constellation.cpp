@@ -342,9 +342,10 @@ struct Companion
     uint32 GateOutOfRange = 0;          //   вне досягаемости
     uint32 GateBadFacing = 0;           //   вне сектора 120°
     uint32 CastMs = 0;                  // когда в последний раз решали про заклинание
-    uint32 CastsTried = 0;              // за этот бой: попыток произнести
-    uint32 CastsWent = 0;               //               и сколько ушло (по следу в ядре)
-    uint32 LastSpell = 0;               // что именно произносили — иначе выбор не проверить
+    // ПАМЯТЬ КАСТА — одной структурой, потому что тело каста теперь одно на два механизма
+    // (`CastAtTargetCore`); смысл полей — в `ClientAct.h`. `CastMs` остался: это таймер
+    // ветки `Attacking`, а не помощника.
+    Constellation::Ai::CastMemory Cast;
     float EngageRange = 0.0f;           // с какой дистанции драться: 0 = ещё не считали
     ObjectGuid ApproachFor;             // для кого посчитана точка подхода
     float ApproachX = 0.0f, ApproachY = 0.0f, ApproachZ = 0.0f;
@@ -361,11 +362,7 @@ struct Companion
     // ПЯТЬ СЧЁТЧИКОВ СТАЛИ ОДНОЙ СТРУКТУРОЙ, потому что тело лута теперь одно на два механизма
     // и пишет в неё, не зная чью (`LootFromCorpseCore`). Смысл полей — в `ClientAct.h`.
     Constellation::Ai::LootCounters Loot;
-    uint32 CastsBusy = 0;               // не просили: уже читаем или не истёк общий откат
-    bool CastFailNoted = false;         // величины момента без следа — по разу на бой
     uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
-    bool WasCasting = false;            // читали ли на прошлом такте (для счётчика выше)
-    std::set<uint32> SpellsLogged;      // о каком выборе уже написали — по разу за всё время
     bool PaletteDumped = false;         // палитра класса выписана — один раз на спутника
     uint32 WantedCheckMs = 0;           // когда в последний раз спрашивали счётчик цели
     uint32 GateNotReady = 0;            //   вентиль открыт, но таймер удара не готов
@@ -5555,7 +5552,7 @@ public:
                     // чем стоять; а если велико — смотреть, чем кончился бой: «ПОБЕДА»
                     // значит дочитали и добили сами, «добили не мы» — это ровно случай
                     // оператора.
-                    if (c.WasCasting)
+                    if (c.Cast.WasCasting)
                         ++c.CastsDiedUnder;
 
                     Manager::Blows const k = Manager::Instance()->BlowsOf(self->GetGUID());
@@ -7120,18 +7117,49 @@ public:
     //
     // Возвращает true, если ядро оставило след: заклинание идёт или встал откат. Ответа
     // ждать неоткуда — сокета нет, — поэтому проверяем ПОСЛЕДСТВИЕ, как и везде в модуле.
-    bool CastAtTarget(Companion& c, Player* self, Unit* victim)
-    {
-        DumpPalette(c, self);
+    // ---------------------------------------------------------------------------------------
+    // КАСТ — ОДНО ТЕЛО НА ДВА МЕХАНИЗМА; кто шлёт — параметр (та же форма, что у лута и мовера).
+    // Две отправки лестницы: запрос каста (пакет дословно из прежнего тела, `CastID` как в
+    // `Unit.cpp:12307`) и остановка её же мовером перед читаемым заклинанием.
+    // ---------------------------------------------------------------------------------------
+    struct LadderCastBinding { Companion* C; Player* Self; };
 
+    static bool LadderCastSpell(void* user, uint32 spellId, ObjectGuid target)
+    {
+        LadderCastBinding& b = *static_cast<LadderCastBinding*>(user);
+        WorldPacket raw(CMSG_CAST_SPELL);
+        WorldPackets::Spells::CastSpell cast(std::move(raw));
+        // ИДЕНТИФИКАТОР КАСТА ЛЕПИМ ТАК ЖЕ, КАК ЕГО ЛЕПИТ САМО ЯДРО (Unit.cpp:12307).
+        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            b.Self->GetMapId(), spellId, b.Self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        cast.Cast.SpellID = int32(spellId);
+        cast.Cast.Target.Flags = TARGET_FLAG_UNIT;
+        cast.Cast.Target.Unit = target;
+        // MoveUpdate НЕ ЗАПОЛНЯЕМ: обработчик при нём прогоняет CMSG_MOVE_STOP через
+        // HandleMovementOpcode, а тот ЗАМЕЩАЕТ всё состояние движения — ровно та ловушка,
+        // на которой пришлось разбираться с поворотом к цели.
+        b.C->Session->HandleCastSpellOpcode(cast);
+        return true;
+    }
+
+    static bool LadderCastStop(void* user)
+    {
+        LadderCastBinding& b = *static_cast<LadderCastBinding*>(user);
+        Manager::Instance()->StopMoving(*b.C, b.Self);
+        return true;
+    }
+
+    bool CastAtTargetCore(Player* self, Unit* victim,
+                          Constellation::Ai::CastSender const& send, Constellation::Ai::CastMemory& m)
+    {
         bool const castingNow = self->HasUnitState(UNIT_STATE_CASTING);
-        c.WasCasting = castingNow;
+        m.WasCasting = castingNow;
 
         // НЕ ПРОСИМ КАСТ ПОВЕРХ КАСТА. Ядро такую просьбу не отклоняет — оно её ОТКЛАДЫВАЕТ,
         // а следующая замещает отложенную (Player.cpp:30891). Просить каждый такт значит
         // восемь раз за двухсекундное заклинание выбросить собственный же запрос.
         if (castingNow)
-            { ++c.CastsBusy; return false; }
+            { ++m.CastsBusy; return false; }
 
         // РАНЕН — ЛЕЧИСЬ. Цель тогда мы сами, а не противник.
         Unit* castTarget = victim;
@@ -7140,7 +7168,7 @@ public:
             if (uint32 heal = PickSelfHeal(self))
                 { spellId = heal; castTarget = self; }
         if (!spellId)
-            spellId = PickAttackSpell(self, victim, c.LastSpell);
+            spellId = PickAttackSpell(self, victim, m.LastSpell);
         if (!spellId)
             return false;
         SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
@@ -7157,7 +7185,7 @@ public:
         // потоп в журнале на этом сервере: 14 МиБ в минуту от служебных строк ядра.
         // Набор конечен по своей природе — у спутника несколько боевых умений, — поэтому
         // журнал соберёт ровно нужный список и замолчит сам.
-        if (c.SpellsLogged.insert(spellId).second)
+        if (m.SpellsLogged.insert(spellId).second)
         {
             TC_LOG_INFO("server.worldserver",
                 "Constellation УМЕНИЕ {} (класс {}, ур {}) выбрал заклинание {} против {} ({}){}",
@@ -7172,7 +7200,7 @@ public:
         // (CanExecutePendingSpellCastRequest). Своя арифметика по времени здесь стоила бы
         // ровно того же, что стоила своя арифметика по здоровью и по прочности.
         if (self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
-            { ++c.CastsBusy; return false; }
+            { ++m.CastsBusy; return false; }
 
         // ЧИТАЕМОЕ ПРОИЗНОСИМ СТОЯ — одно правило на атаку и на лечение, для всех классов
         // (замер: жрец слал Mind Blast с чтением 1500 мс в движении, и ядро отказывало).
@@ -7181,26 +7209,15 @@ public:
         // после ворот «умения выключены» и «общий откат», иначе вставали бы там, где каст
         // всё равно не полетит (Кодекс, задача 72).
         if (si->CalcCastTime() > 0 && self->isMoving())
-            StopMoving(c, self);
+            send.Stop(send.User);
 
-        ++c.CastsTried;
-        WorldPacket raw(CMSG_CAST_SPELL);
-        WorldPackets::Spells::CastSpell cast(std::move(raw));
-        // ИДЕНТИФИКАТОР КАСТА ЛЕПИМ ТАК ЖЕ, КАК ЕГО ЛЕПИТ САМО ЯДРО (Unit.cpp:12307).
-        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
-            self->GetMapId(), spellId, self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-        cast.Cast.SpellID = int32(spellId);
-        cast.Cast.Target.Flags = TARGET_FLAG_UNIT;
-        cast.Cast.Target.Unit = castTarget->GetGUID();
-        // MoveUpdate НЕ ЗАПОЛНЯЕМ: обработчик при нём прогоняет CMSG_MOVE_STOP через
-        // HandleMovementOpcode, а тот ЗАМЕЩАЕТ всё состояние движения — ровно та ловушка,
-        // на которой пришлось разбираться с поворотом к цели.
-        c.Session->HandleCastSpellOpcode(cast);
+        ++m.CastsTried;
+        send.Cast(send.User, spellId, castTarget->GetGUID());
         // ЗАПИСЫВАЕМ ПОСЛЕ ОТПРАВКИ, А НЕ ПОСЛЕ ВЫБОРА. Кодекс: присвоение стояло выше ворот
         // «умения выключены» и «общий откат», поэтому на каждом такте внутри общего отката
         // спутник перевыбирал и перезаписывал его, ни разу ничего не отправив, — и ступень
         // следующего выбора зависела от числа тактов. Ротации нужно «что реально ушло».
-        c.LastSpell = spellId;
+        m.LastSpell = spellId;
 
         // СЛЕД УСПЕХА — ОБЩИЙ ОТКАТ, а не «идёт ли заклинание».
         //
@@ -7213,7 +7230,7 @@ public:
             || self->GetCurrentSpell(CURRENT_GENERIC_SPELL)
             || self->GetSpellHistory()->HasCooldown(si))
         {
-            ++c.CastsWent;
+            ++m.CastsWent;
             return true;
         }
 
@@ -7221,9 +7238,9 @@ public:
         // его проверки своими руками нельзя — обвинит не ту (Кодекс, трижды). Поэтому строка
         // НИЧЕГО НЕ УТВЕРЖДАЕТ: она записывает величины момента, а виноватого назовёт сводка
         // по классам за окно. По разу на бой, чтобы не залить журнал.
-        if (!c.CastFailNoted)
+        if (!m.CastFailNoted)
         {
-            c.CastFailNoted = true;
+            m.CastFailNoted = true;
             Powers const pw = si->PowerCosts[0] ? Powers(si->PowerCosts[0]->PowerType) : POWER_MANA;
             uint32 const maxPw = self->GetMaxPower(pw);
             // дружественность спрашиваем у ядра: флаг positive у границ означает именно её,
@@ -7239,6 +7256,17 @@ public:
                 maxPw ? Trinity::StringFormat("{}%", self->GetPower(pw) * 100 / maxPw) : std::string("нет"));
         }
         return false;
+    }
+
+    // Обёртка лестницы: подпись прежняя, вызов в `Attacking` (`:5697`) не тронут. Прибор
+    // палитры — здесь, первым, как и стоял: приборы остаются лестнице до переезда ветки.
+    bool CastAtTarget(Companion& c, Player* self, Unit* victim)
+    {
+        DumpPalette(c, self);
+        LadderCastBinding bind{ &c, self };
+        Constellation::Ai::CastSender send;
+        send.Cast = &LadderCastSpell; send.Stop = &LadderCastStop; send.User = &bind;
+        return CastAtTargetCore(self, victim, send, c.Cast);
     }
 
     // ЕДИНСТВЕННОЕ МЕСТО, ГДЕ РЕШАЕТСЯ «МОЖНО ЛИ НАМ ДРАТЬСЯ».
@@ -7358,7 +7386,7 @@ public:
             c.ModeMs / 1000,
             b.Swings - c.SwingsAtStart, b.Landed - c.LandedAtStart, b.Dealt - c.DealtAtStart,
             b.Zeroed - c.ZeroedAtStart,
-            c.CastsWent, c.CastsTried, c.LastSpell, c.CastsBusy, c.CastsDiedUnder,
+            c.Cast.CastsWent, c.Cast.CastsTried, c.Cast.LastSpell, c.Cast.CastsBusy, c.CastsDiedUnder,
             b.Hits - c.HitsAtStart, b.Taken - c.TakenAtStart,
             c.GateTicks, c.GateEvading, c.GateBusy, c.GateNoState, c.GateOutOfRange, c.GateBadFacing,
             c.GateNotReady, c.VictimSwaps);
@@ -7502,10 +7530,10 @@ public:
             c.GateNoState = c.GateOutOfRange = c.GateBadFacing = 0;
             c.GateNotReady = c.VictimSwaps = 0;
             c.CastMs = 1500;            // первое решение — сразу, а не через полторы секунды
-            c.CastsTried = c.CastsWent = c.LastSpell = 0;
-            c.CastsBusy = c.CastsDiedUnder = 0;
-            c.CastFailNoted = false;
-            c.WasCasting = false;
+            c.Cast.CastsTried = c.Cast.CastsWent = c.Cast.LastSpell = 0;
+            c.Cast.CastsBusy = c.CastsDiedUnder = 0;
+            c.Cast.CastFailNoted = false;
+            c.Cast.WasCasting = false;
             c.DamageVictim = target->GetGUID();
             c.VictimHp = b.Dealt;       // отсечка сторожа: урон НА НАЧАЛО этого боя
             c.NoDamageMs = 0;
@@ -13842,6 +13870,13 @@ namespace Constellation::Ai
     bool LootCorpse(Player* self, ObjectGuid corpse, LootSender const& send, LootCounters& n)
     {
         return Constellation::Manager::Instance()->LootFromCorpseCore(self, corpse, send, n);
+    }
+
+    // УМЕНИЕ ДЛЯ ДВИЖКА: цель — гуид, как всё у движка; объект ищем здесь, где есть игрок.
+    bool CastAt(Player* self, ObjectGuid victim, CastSender const& send, CastMemory& m)
+    {
+        Unit* who = ObjectAccessor::GetUnit(*self, victim);
+        return who && Constellation::Manager::Instance()->CastAtTargetCore(self, who, send, m);
     }
 
     bool NeedsRestFor(Player* self)

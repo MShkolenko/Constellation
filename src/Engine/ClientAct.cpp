@@ -22,6 +22,7 @@
 #include "Opcodes.h"
 #include "Player.h"
 #include "QuestPackets.h"
+#include "SpellPackets.h"
 #include "TaxiPackets.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -217,6 +218,25 @@ namespace Constellation::Ai
             req.LootListID = picks[i].LootListId;   // NOT the index in the list
         }
         _session->HandleAutostoreLootItemOpcode(take);
+        return true;
+    }
+
+    bool ClientAct::CastSpell(uint32 spellId, ObjectGuid target)    // :7187
+    {
+        if (!Usable() || !spellId || target.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_CAST_SPELL);
+        WorldPackets::Spells::CastSpell cast(std::move(raw));
+        // ИДЕНТИФИКАТОР КАСТА ЛЕПИМ ТАК ЖЕ, КАК ЕГО ЛЕПИТ САМО ЯДРО (Unit.cpp:12307).
+        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            _self->GetMapId(), spellId, _self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        cast.Cast.SpellID = int32(spellId);
+        cast.Cast.Target.Flags = TARGET_FLAG_UNIT;
+        cast.Cast.Target.Unit = target;
+        // MoveUpdate НЕ ЗАПОЛНЯЕМ: обработчик при нём прогоняет CMSG_MOVE_STOP через
+        // HandleMovementOpcode, а тот ЗАМЕЩАЕТ всё состояние движения — ровно та ловушка,
+        // на которой пришлось разбираться с поворотом к цели.
+        _session->HandleCastSpellOpcode(cast);
         return true;
     }
 

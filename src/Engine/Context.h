@@ -590,6 +590,11 @@ namespace Constellation::Ai
     // нет. Действие получит её через переходник, который держит игрока.
     bool LootCorpse(Player* self, ObjectGuid corpse, LootSender const& send, LootCounters& n);
 
+    // УМЕНИЕ В БОЮ: одна политика на лестницу и на движок — лечение при ≤35 %, выбор атакующего
+    // заклинания по ротации, очередь и общий откат у ядра, «читаемое произносим стоя», след
+    // успеха по откату. Тот же замок в подписи.
+    bool CastAt(Player* self, ObjectGuid victim, CastSender const& send, CastMemory& m);
+
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.
     struct Ctx

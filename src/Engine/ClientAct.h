@@ -29,6 +29,7 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 #include "Position.h"
+#include <set>
 
 class Player;
 class WorldSession;
@@ -79,6 +80,35 @@ namespace Constellation::Ai
         uint32 Money  = 0;      // взяли денег (в медяках)
         uint32 TooFar = 0;      // не дотянулись — мера нужды в ходьбе
         uint32 Denied = 0;      // ядро не дало (чужой лут, розыгрыш, пустой вид)
+    };
+
+    // КАСТ — ТА ЖЕ ФОРМА, ЧТО У ЛУТА: тело одно (`CastAtTargetCore`), кто шлёт — параметр. Две
+    // отправки: сам запрос каста и остановка перед читаемым заклинанием (у лестницы это её
+    // мовер, у движка — дверь `StopMoving`). Выбор заклинания, откаты и «стоя ли читаем» —
+    // политика, она в теле и читает игрока; дверь только строит и шлёт.
+    using CastSpellFn = bool (*)(void* user, uint32 spellId, ObjectGuid target);
+    using CastStopFn  = bool (*)(void* user);
+    struct CastSender
+    {
+        CastSpellFn Cast = nullptr;
+        CastStopFn  Stop = nullptr;
+        void*       User = nullptr;
+    };
+
+    // ПАМЯТЬ КАСТА — семь полей, которые у лестницы лежали в `Companion` порознь. `LastSpell` —
+    // ротации нужно «что реально ушло»; `WasCasting` читает ИСХОД боя (`CastsDiedUnder`), потому
+    // он здесь, а сам счётчик исхода — нет. `SpellsLogged` — прибор «каждая пара спутник +
+    // заклинание один раз за всё время»; выделяет память, как и у лестницы, на решении о
+    // касте раз в полторы секунды, не на такте.
+    struct CastMemory
+    {
+        uint32 LastSpell     = 0;       // что именно произносили — иначе выбор не проверить
+        uint32 CastsTried    = 0;       // за этот бой: попыток произнести
+        uint32 CastsWent     = 0;       //               и сколько ушло (по следу в ядре)
+        uint32 CastsBusy     = 0;       // не просили: уже читаем или не истёк общий откат
+        bool   CastFailNoted = false;   // величины момента без следа — по разу на бой
+        bool   WasCasting    = false;   // читали ли на прошлом такте (для счётчика исхода)
+        std::set<uint32> SpellsLogged;  // о каком выборе уже написали — по разу за всё время
     };
 
     class ClientAct
@@ -160,6 +190,10 @@ namespace Constellation::Ai
         bool LootMoney();                                           // CMSG_LOOT_MONEY
         bool LootItems(LootPick const* picks, uint32 count);        // CMSG_LOOT_ITEM
         bool LootRelease(ObjectGuid unit);                          // CMSG_LOOT_RELEASE
+
+        // -- spells: builds the request the way the client does and sends it. Body moved from
+        //    the ladder's CastAtTarget; WHAT to cast is policy and stays in `CastAtTargetCore`.
+        bool CastSpell(uint32 spellId, ObjectGuid target);          // CMSG_CAST_SPELL
 
         // -- the world ---------------------------------------------------------------------
         bool UseGameObject(ObjectGuid go);                          // CMSG_GAME_OBJ_USE
