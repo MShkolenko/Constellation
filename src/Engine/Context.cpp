@@ -304,6 +304,56 @@ namespace Constellation::Ai
         return go->GetGUID();
     }
 
+    ObjectGuid WorldView::CurrentVictim() const
+    {
+        Unit* v = _self ? _self->GetVictim() : nullptr;
+        return v ? v->GetGUID() : ObjectGuid::Empty;
+    }
+
+    bool WorldView::IsAliveUnit(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who && who->IsAlive();
+    }
+
+    uint32 WorldView::EntryOf(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return 0;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who ? who->GetEntry() : 0;
+    }
+
+    bool WorldView::StillWanted(uint32 entry) const
+    {
+        return _self && entry && StillWantedFor(_self, entry);
+    }
+
+    float WorldView::EngageRangeAgainst(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return 0.0f;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who ? EngageRangeFor(_self, who) : 0.0f;
+    }
+
+    bool WorldView::LootAllowed() const
+    {
+        return LootAllowedFor();
+    }
+
+    bool WorldView::CastFor(ObjectGuid victim, CastSender const& send, CastMemory& m) const
+    {
+        return _self && CastAt(_self, victim, send, m);
+    }
+
+    bool WorldView::LootFor(ObjectGuid corpse, LootSender const& send, LootCounters& n) const
+    {
+        return _self && LootCorpse(_self, corpse, send, n);
+    }
+
     std::optional<Position> WorldView::WhereIs(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

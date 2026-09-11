@@ -484,6 +484,13 @@ namespace Constellation::Ai
                 a->Cancel(ctx, st.RunningAbout, why);
             ++st.ActionsCancelled;
         }
+        // БОЙ ОТМЕНЯЕТСЯ ОТДЕЛЬНО ОТ ТЕКУЩЕГО ДЕЙСТВИЯ: его состояние переживает `Reset` и живёт
+        // дольше одного выбора, значит `Running` в момент смерти может быть и не им. Само
+        // действие решает, какая причина бой кончает (`EnteredFromOutside` — нет), поэтому зовём
+        // его `Cancel`, а не чистим поля здесь: правило одно, и оно у боя.
+        if (!st.Fight.Victim.IsEmpty() && st.Running != ActionId::KillObjective)
+            if (Action* fight = Find(ActionId::KillObjective))
+                fight->Cancel(ctx, Subject::OfUnit(st.Fight.Victim), why);
         st.Queue.clear();
         st.Scratch.clear();
         st.Running       = ActionId::None;
@@ -661,6 +668,52 @@ namespace Constellation::Ai
         if (!ctx.St)
             return false;
         return ctx.World.StepFor(ctx.St->Move, to, stopAt, dt, &SendThroughDoor, &ctx);
+    }
+
+    // ОТПРАВЩИКИ КАСТА И ЛУТА НАД ДВЕРЬЮ — тот же приём, что у шага: контекст — сама дверь,
+    // каждая отправка — ровно один её метод. Заглушённая дверь отказывает и считает, так что в
+    // тени ни один из этих пакетов в мир не уйдёт, и это свойство типа, а не обещание.
+    namespace
+    {
+        bool DoorCastSpell(void* user, uint32 spellId, ObjectGuid target)
+        {
+            return static_cast<ClientAct*>(user)->CastSpell(spellId, target);
+        }
+        bool DoorCastStop(void* user)
+        {
+            return static_cast<ClientAct*>(user)->StopMoving();
+        }
+        bool DoorLootOpen(void* user, ObjectGuid unit)
+        {
+            return static_cast<ClientAct*>(user)->LootUnit(unit);
+        }
+        bool DoorLootMoney(void* user)
+        {
+            return static_cast<ClientAct*>(user)->LootMoney();
+        }
+        bool DoorLootItems(void* user, LootPick const* picks, uint32 count)
+        {
+            return static_cast<ClientAct*>(user)->LootItems(picks, count);
+        }
+        bool DoorLootRelease(void* user, ObjectGuid unit)
+        {
+            return static_cast<ClientAct*>(user)->LootRelease(unit);
+        }
+    }
+
+    bool CastThroughDoor(Ctx& ctx, ObjectGuid victim, CastMemory& m)
+    {
+        CastSender send;
+        send.Cast = &DoorCastSpell; send.Stop = &DoorCastStop; send.User = &ctx.Act;
+        return ctx.World.CastFor(victim, send, m);
+    }
+
+    bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n)
+    {
+        LootSender send;
+        send.Open = &DoorLootOpen; send.Money = &DoorLootMoney;
+        send.Items = &DoorLootItems; send.Release = &DoorLootRelease; send.User = &ctx.Act;
+        return ctx.World.LootFor(corpse, send, n);
     }
 
     // НА СКОЛЬКО ЗАБЫТЬ ОСОБЬ, ДО КОТОРОЙ НЕ ДОБРАТЬСЯ. Десять минут — срок лестницы для

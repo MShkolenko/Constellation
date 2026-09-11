@@ -13963,6 +13963,33 @@ namespace Constellation::Ai
         return who && Constellation::Manager::Instance()->CastAtTargetCore(self, who, send, m);
     }
 
+    bool StillWantedFor(Player* self, uint32 entry)
+    {
+        return Constellation::Manager::Instance()->StillWanted(self, entry);
+    }
+
+    bool LootAllowedFor()
+    {
+        return Constellation::Cfg().Loot;
+    }
+
+    // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
+    // драться»): дальность лучшего заклинания минус два ярда, чтобы шаг не выбрасывал за
+    // границу; всё, что меньше восьми, — ближний бой. Только при включённых умениях.
+    float EngageRangeFor(Player* self, Unit* target)
+    {
+        if (!Constellation::Cfg().Abilities || !self || !target)
+            return 0.0f;
+        if (uint32 sp = Constellation::Manager::Instance()->PickAttackSpell(self, target, 0, true))
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(sp, self->GetMap()->GetDifficultyID()))
+            {
+                float const r = si->GetMaxRange(false, self);
+                if (r > 8.0f)
+                    return r - 2.0f;
+            }
+        return 0.0f;
+    }
+
     bool NeedsRestFor(Player* self)
     {
         return Constellation::Manager::Instance()->NeedsRest(self);

@@ -38,8 +38,10 @@ namespace
 
     // ОСТАНАВЛИВАЕМСЯ НЕ У САМОЙ ТОЧКИ. Ноль означал бы «встань в него», а достаточную близость
     // решает ядро своим `IsWithinMeleeRange`; этот порог — лишь то, на чём двигатель прекращает
-    // шагать, и он взят с запасом внутрь боевого охвата.
-    inline constexpr float MELEE_STOP_YARDS = 2.0f;
+    // шагать. ЧЕТЫРЕ — ЧИСЛО ЛЕСТНИЦЫ, и на подходе (`:4088`), и в погоне (`:5731`); прежнее
+    // действие ставило два «с запасом внутрь охвата» — своё число, и Кодекс назвал его самым
+    // вероятным дефектом переноса: другая длина пути, другая частота застреваний.
+    inline constexpr float MELEE_STOP_YARDS = 4.0f;
 
     // ДО КЛЕТКИ ИДЁМ ВПЛОТНУЮ, а не до порога обзора: у объекта нет ни ног, ни маршрута — он
     // стоит там, где стоит, и «где-то рядом» тут не нужно. Разрешение всё равно даёт ядро, а
@@ -59,14 +61,46 @@ namespace
     // недостоверным.
     inline constexpr uint32 REST_GAP_MS = 1000;
 
+    // СТОРОЖА — ЧИСЛА ЛЕСТНИЦЫ, С ЕЁ ЖЕ ПРИЧИНАМИ (`case Behavior::Attacking`).
+    inline constexpr uint32 NO_OWN_DAMAGE_MS   = 30000;   // тридцать, не пятнадцать: медленное оружие
+                                                          // даёт четыре-пять ударов, из них 21 из 117 на
+                                                          // ноль урона после брони (замер стенда)
+    inline constexpr uint32 CAST_EVERY_MS      = 1500;    // очередь каста этой сборки ЗАМЕЩАЕТ запрос
+    inline constexpr uint32 WANTED_EVERY_MS    = 1000;    // обход всего журнала — не на такте
+    inline constexpr uint32 FIGHT_FUSE_MS      = 300000;  // предохранитель, не судья: две минуты
+                                                          // обрывали бои, которые шли как надо
+    inline constexpr uint32 FIGHT_GAP_MS       = 1000;    // разрыв наблюдения: срез недостоверен
+
+    // БОЙ — ОДИН МЕХАНИЗМ, ОДИН ВЛАДЕЛЕЦ ЦЕЛИ (решение 2026-09-11, утверждено Мастером).
+    //
+    // Замер, который это написал: пятнадцать минут движка вживую, «провёл 95,7 %» — и две
+    // победы против пятидесяти девяти у лестницы, одиннадцать гибелей, девять из них «цели не
+    // было», предметы заданий не собраны, спутник трижды погиб на одном пятне. Прежнее
+    // действие было ТОЛЬКО замахом: дойти, повернуться, выбрать, ударить один раз. Всё, что
+    // делает бой боем, у лестницы живёт в `Attacking` и шести помощниках — и движок шёл мимо.
+    //
+    // ФАЗЫ, А НЕ ОТДЕЛЬНЫЕ СТАВКИ (Кодекс, дизайн боя, п. 1): подход → вступление → удержание →
+    // исход → лут. Одна ставка, один предмет, одно состояние `EngineState::Fight`, которое
+    // переживает `Reset` и кончается только исходом.
+    //
+    // ВСТУПЛЕНИЕ ПОДТВЕРЖДАЕТ ЯДРО, а не факт отправки: как `TryAttack` у лестницы, после замаха
+    // спрашиваем `GetVictim() == цель`, и только тогда снимаем базу телеметрии и докладываем
+    // «вступил» — с этого момента гибель припишется этой цели, как у лестницы.
+    //
+    // ИСХОД ПО АТРИБУЦИИ ЯДРА (`:5564`): победа — убийств стало больше ЗА ЭТОТ БОЙ И последний
+    // убитый — наш; одного счётчика мало (добили кого-то ещё), одного совпадения мало (существо
+    // возрождается с тем же GUID). Победа докладывается в память опасности и лутится — со своего
+    // убийства и только с него.
+    //
+    // ЧТО ЗДЕСЬ ЕЩЁ НЕ ПОРТИРОВАНО, НАЗВАНО: отвод (кайт) для дальников по маршруту мовера спиной
+    // — следующим коммитом того же переноса, до включения `Combat` вживую; и дистанция
+    // вступления для дальников (`EngageRangeAgainst`) читается, но сегодня равна нулю у всех:
+    // умения выключены (`Cfg().Abilities`), и лестница тоже дерётся вплотную.
     class KillObjectiveAction final : public Action
     {
     public:
         KillObjectiveAction() : Action(ActionId::KillObjective) { }
 
-        // §14 — ПОД КАКИМ ЗАПРЕТОМ ХОДИТ ЭТО ДЕЙСТВИЕ. Тот, который оно само и ставит, когда
-        // дорога не вышла. Второй вид, «не собеседник и не дойти», ловится значением: обход
-        // спрашивает оба и такую цель просто не назовёт.
         BackoffKind DeferKind() const override { return BackoffKind::CombatUnreachable; }
 
         bool Useful(Ctx& ctx, Bid const& bid) override
@@ -74,21 +108,31 @@ namespace
             if (bid.About.What() != Subject::Kind::Unit)
                 return false;
             ObjectGuid const victim = bid.About.Guid();
-            if (victim.IsEmpty())
+            if (victim.IsEmpty() || !ctx.St)
                 return false;
-            // ВСЁ ЕЩЁ ТА ЖЕ ЦЕЛЬ. Обход пересчитывается раз в секунду и вполне может выбрать
-            // другую — ставка прошлой секунды тогда больше не нужна.
+            // ИДУЩИЙ БОЙ ПОЛЕЗЕН, ПОКА НЕ КОНЧИЛСЯ: обход пересчитывается раз в секунду и может
+            // назвать другую цель, но брошенный на середине бой — это две цели у одного спутника
+            // (сторож подмены у лестницы ровно про это). Свою цель бой доводит до исхода.
+            if (ctx.St->Fight.Engaged && ctx.St->Fight.Victim == victim)
+                return true;
             return Val<ValueId::Objectives>(ctx).Fight == victim;
         }
 
-        // ЖИВ ЛИ ОН ЕЩЁ И ВИДИМ ЛИ — вопрос к ядру, между выбором и исполнением проходит время.
         bool Possible(Ctx& ctx, Bid const& bid) override
         {
+            // Вступивший бой возможен, пока цель есть в мире — живая или уже труп: исход
+            // разбирается внутри, иначе победа никогда не будет засчитана.
+            if (ctx.St && ctx.St->Fight.Engaged && ctx.St->Fight.Victim == bid.About.Guid())
+                return true;
             return ctx.World.CanSee(bid.About.Guid());
         }
 
         float Score(Ctx& ctx, Bid const& bid, float relevance) const override
         {
+            // ИДУЩИЙ БОЙ НЕ ТОРГУЕТСЯ ЗА РАССТОЯНИЕ: цель могла отбежать, и наклон по ярдам
+            // отдал бы такт походу по карте посреди боя.
+            if (ctx.St && ctx.St->Fight.Engaged && ctx.St->Fight.Victim == bid.About.Guid())
+                return relevance;
             if (std::optional<float> const d = ctx.World.DistanceTo(bid.About.Guid()))
                 return relevance - *d * YARD_COST;
             return relevance;
@@ -99,49 +143,240 @@ namespace
             ObjectGuid const victim = bid.About.Guid();
             if (victim.IsEmpty() || !ctx.St)
                 return false;
+            EngineState::FightState& f = ctx.St->Fight;
 
-            // ДОСТАЮ ЛИ — РЕШАЕТ ЯДРО. Оно считает охват с учётом размеров обоих тел, и своя
-            // мерка здесь уже однажды стоила модулю 916 кругов и ноль сдач.
+            // НОВАЯ ЦЕЛЬ — НОВЫЙ БОЙ. Вступивший по другой цели бой сюда не попадает: `Useful`
+            // держит его на своей цели до исхода. Невступивший — просто подход, его бросить
+            // ничего не стоит.
+            if (f.Victim != victim)
+                Begin(f, victim, ctx.World.EntryOf(victim), ctx.NowMs);
+
+            uint32 slice = ctx.NowMs - f.LastTickMs;
+            if (f.LastTickMs == 0 || slice > FIGHT_GAP_MS)
+                slice = 0;                          // первый такт или разрыв: срез недостоверен
+            f.LastTickMs = ctx.NowMs;
+
+            if (!f.Engaged)
+                return Engage(ctx, f, victim);
+
+            // ---- ИСХОД: ядро обнуляет `GetVictim()` в момент смерти цели -------------------
+            ObjectGuid const cur = ctx.World.CurrentVictim();
+            if (cur.IsEmpty() || !ctx.World.IsAliveUnit(victim))
+                return Outcome(ctx, f, victim);
+
+            // ---- СТОРОЖА, порядок лестницы --------------------------------------------------
+            // ЦЕЛЬ ПОДМЕНИЛАСЬ ПОД НАМИ: весь учёт привязан к ОДНОЙ цели, с другой он
+            // бессмыслен. Уходим и выбираем заново — но уже с новым отсчётом.
+            if (cur != victim)
+                return End(ctx, f, "цель подменилась", /*ban=*/false);
+
+            BlowsSnapshot const now = ctx.Fight.Snapshot();
+            if (now.Dealt > f.DealtHigh)
+            {
+                f.DealtHigh  = now.Dealt;
+                f.NoDamageMs = 0;                   // НАШ урон в ЭТОМ бою есть — считаем заново
+            }
+            else
+                f.NoDamageMs += slice;
+
+            // УМЕНИЕ — ДОБАВКА К АВТОУДАРУ, А НЕ ЗАМЕНА ЕМУ, раз в полторы секунды.
+            f.CastMs += slice;
+            if (f.CastMs >= CAST_EVERY_MS)
+            {
+                f.CastMs = 0;
+                CastThroughDoor(ctx, victim, f.Cast);
+            }
+
+            // ЦЕЛЬ НАБРАНА — БОЙ ОКОНЧЕН, ДАЖЕ ЕСЛИ ПРОТИВНИК ЖИВ (манекен, зачёт ударами).
+            f.WantedCheckMs += slice;
+            if (f.WantedCheckMs >= WANTED_EVERY_MS)
+            {
+                f.WantedCheckMs = 0;
+                if (!ctx.World.StillWanted(f.VictimEntry))
+                    return End(ctx, f, "цель задания набрана", /*ban=*/false);
+            }
+
+            if (f.NoDamageMs > NO_OWN_DAMAGE_MS)
+                return End(ctx, f, "бью, а следа нет — не наша цель", /*ban=*/true);
+
+            // ---- УДЕРЖАНИЕ: догнать или стоять лицом ---------------------------------------
             if (!ctx.World.InMeleeRange(victim))
             {
-                // ОДИН ВОПРОС, А НЕ ДВА. Раньше здесь спрашивалось расстояние, а потом
-                // отдельно положение, и между двумя чтениями цель могла исчезнуть — тогда шаг
-                // уходил в нулевые координаты (Кодекс). Положение отвечает и на «есть ли он».
+                std::optional<Position> const where = ctx.World.WhereIs(victim);
+                std::optional<float> const d = ctx.World.DistanceTo(victim);
+                if (!where || !d)
+                    return Outcome(ctx, f, victim);     // исчез между проверками — разобрать исход
+                float const dt = ctx.Act.SliceSeconds();
+                bool const going = WalkTowards(ctx, *where, MELEE_STOP_YARDS, dt);
+                bool const stalled = !going && *d > MELEE_STOP_YARDS;
+                if (AdvanceWalk(ctx, bid.About, *d, uint32(dt * 1000.0f), stalled) != WalkVerdict::Going)
+                    return End(ctx, f, "до цели в бою не дойти", /*ban=*/true);
+            }
+            else
+            {
+                // ДОШЛИ: сперва остановиться, потом повернуться. Порядок важен: пока догоняем,
+                // поворот задаёт само движение; остановка, не сделанная при входе в досягаемость,
+                // оставляла бы «иду вперёд» висеть, пока шагов уже нет.
+                ctx.Act.StopMoving();
+                ctx.Act.Face(victim);
+            }
+
+            f.FightMs += slice;
+            if (f.FightMs > FIGHT_FUSE_MS)
+                return End(ctx, f, "пять минут боя без исхода", /*ban=*/false);
+            return true;
+        }
+
+        // ЧТО КОНЧАЕТ БОЙ, А ЧТО НЕТ — В ЭТОМ ВСЁ ПОСТАНОВЛЕНИЕ. `EnteredFromOutside` приходит с
+        // каждой сменой эпохи у лестницы, а её предохранители идут под нашим боем; кончать бой по
+        // ней — стирать его на середине замаха. Настоящие концы — смерть, карта, выход, роспуск,
+        // выключение — докладываются как «кончил» и гасят состояние.
+        void Cancel(Ctx& ctx, Subject const& about, CancelReason why) override
+        {
+            if (!ctx.St)
+                return;
+            EngineState::FightState& f = ctx.St->Fight;
+            if (f.Victim.IsEmpty() || (about.What() == Subject::Kind::Unit && about.Guid() != f.Victim))
+                return;
+            switch (why)
+            {
+                case CancelReason::EnteredFromOutside:
+                case CancelReason::Finished:
+                    return;                         // бой продолжится следующим тактом
+                default:
+                    break;
+            }
+            if (f.Engaged)
+            {
+                Report(ctx, f, FightEvent::Ended, ReasonText(why));
+                ctx.Act.AttackStop();               // и руки тоже: ядро продолжало бы автоатаку
+            }
+            f = EngineState::FightState{ .Loot = f.Loot };
+        }
+
+    private:
+        static char const* ReasonText(CancelReason why)
+        {
+            switch (why)
+            {
+                case CancelReason::Died:           return "погиб";
+                case CancelReason::MapChanged:     return "сменилась карта";
+                case CancelReason::LoggedOut:      return "вышел";
+                case CancelReason::Dismissed:      return "распущен";
+                case CancelReason::EngineDisabled: return "движок выключен";
+                case CancelReason::SubjectGone:    return "цель исчезла";
+                case CancelReason::Failed:         return "не вышло";
+                default:                           return "прервано";
+            }
+        }
+
+        static void Begin(EngineState::FightState& f, ObjectGuid victim, uint32 entry, uint32 nowMs)
+        {
+            LootCounters const keep = f.Loot;       // за всё время — не за бой
+            f = EngineState::FightState{};
+            f.Loot        = keep;
+            f.Victim      = victim;
+            f.VictimEntry = entry;
+            f.LastTickMs  = nowMs;
+        }
+
+        // ДОШЛИ ИЛИ ИДЁМ; ДОШЛИ — ВСТУПАЕМ, ровно то, что делает игрок мышью, в том же порядке.
+        bool Engage(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
+        {
+            if (!ctx.World.InMeleeRange(victim))
+            {
                 std::optional<Position> const where = ctx.World.WhereIs(victim);
                 if (!where)
-                    return false;               // цель исчезла между выбором и шагом
+                    return false;                   // цель исчезла между выбором и шагом
                 std::optional<float> const d = ctx.World.DistanceTo(victim);
                 if (!d)
                     return false;
-
                 float const dt = ctx.Act.SliceSeconds();
-                bool const going = WalkTowards(ctx, *where, MELEE_STOP_YARDS, dt);
-
-                // «ДОШЁЛ» — НЕ «ЗАСТРЯЛ», И ЭТО НЕ ПРИДИРКА К СЛОВУ. Двигатель отвечает
-                // ложью на «дошли ИЛИ не можем», а приход здесь решает ядро (`InMeleeRange`),
-                // и между его меркой и порогом остановки есть зазор. Передавая `!going` как
-                // застревание, действие в такт прихода само ставило себе десятиминутный запрет
-                // и второго такта, в котором ударило бы, уже не получало (разбор).
-                uint32 const sliceMs = uint32(dt * 1000.0f);
-                bool const stalled = !going && *d > MELEE_STOP_YARDS;
-                if (AdvanceWalk(ctx, bid.About, *d, sliceMs, stalled) != WalkVerdict::Going)
+                // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
+                // включённых умениях, иначе четыре ярда. Сегодня умения выключены — ноль у всех.
+                float const engage = ctx.World.EngageRangeAgainst(victim);
+                float const stopAt = engage > 0.0f ? engage : MELEE_STOP_YARDS;
+                bool const going = WalkTowards(ctx, *where, stopAt, dt);
+                // «ДОШЁЛ» — НЕ «ЗАСТРЯЛ»: приход решает ядро, а между его меркой и порогом
+                // остановки есть зазор (разбор 2026-09-10 — три действия отсрочивали себя в
+                // такт прихода).
+                bool const stalled = !going && *d > stopAt;
+                if (AdvanceWalk(ctx, Subject::OfUnit(victim), *d, uint32(dt * 1000.0f), stalled) != WalkVerdict::Going)
                 {
-                    Defer(ctx, BackoffKind::CombatUnreachable, bid.About, 0, COMBAT_UNREACHABLE_MS);
+                    Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, COMBAT_UNREACHABLE_MS);
+                    f = EngineState::FightState{ .Loot = f.Loot };
                     return false;
                 }
                 return true;
             }
 
-            // ПРИШЛИ. Дальше — ровно то, что делает игрок мышью, и в том же порядке.
-            //
-            // ПОВОРОТ ПЕРВЫМ, И ЭТО НЕ ВЕЖЛИВОСТЬ: `Unit::UpdateMeleeAttackingState` требует
-            // `HasInArc`, и без него ядро отвергнет каждый замах. Дверь возвращает истину и
-            // тогда, когда поворачиваться уже не нужно.
+            // ПОВОРОТ ПЕРВЫМ: `Unit::UpdateMeleeAttackingState` требует `HasInArc`.
             if (!ctx.Act.Face(victim))
                 return false;
             if (!ctx.Act.SetSelection(victim))
                 return false;
-            return ctx.Act.AttackSwing(victim);
+            if (!ctx.Act.AttackSwing(victim))
+                return false;
+            // ПРОВЕРЯЕМ ПОСЛЕДСТВИЕ, А НЕ ФАКТ ВЫЗОВА: сокета нет, ответа не будет. Ядро приняло
+            // — оно и назвало нас атакующим. Не приняло — цель не наша, как у лестницы («удар
+            // не принят ядром» → отказ по цели).
+            if (ctx.World.CurrentVictim() != victim)
+            {
+                Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, COMBAT_UNREACHABLE_MS);
+                f = EngineState::FightState{ .Loot = f.Loot };
+                return false;
+            }
+            // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою.
+            f.Base      = ctx.Fight.Baseline();
+            f.DealtHigh = f.Base.Dealt;
+            f.Engaged   = true;
+            f.CastMs    = CAST_EVERY_MS;            // первое решение об умении — сразу
+            Report(ctx, f, FightEvent::Engaged, "вступил");
+            return true;
+        }
+
+        // ПОБЕДУ СЧИТАЕТ ЯДРО, А НЕ Я. Два условия, и оба нужны.
+        bool Outcome(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
+        {
+            BlowsSnapshot const now = ctx.Fight.Snapshot();
+            bool const won = now.Kills > f.Base.Kills && now.LastKilled == victim;
+            if (won)
+            {
+                Report(ctx, f, FightEvent::Won, "ПОБЕДА");
+                // ДОБЫЧА ТОЛЬКО СО СВОЕГО УБИЙСТВА: право проверит и ядро, но пакет, заведомо
+                // обречённый на отказ, лучше не слать. Настройка — лестницы.
+                if (ctx.World.LootAllowed())
+                    LootThroughDoor(ctx, victim, f.Loot);
+            }
+            else
+                Report(ctx, f, FightEvent::Ended,
+                       ctx.World.IsAliveUnit(victim) ? "бой прекратился" : "цель мертва, но добили не мы");
+            f = EngineState::FightState{ .Loot = f.Loot };
+            return true;                            // такт был боем — что бы ни вышло
+        }
+
+        bool End(Ctx& ctx, EngineState::FightState& f, char const* why, bool ban)
+        {
+            Report(ctx, f, FightEvent::Ended, why);
+            ctx.Act.AttackStop();
+            if (ban)
+                Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(f.Victim), 0, COMBAT_UNREACHABLE_MS);
+            f = EngineState::FightState{ .Loot = f.Loot };
+            return !ban;
+        }
+
+        static void Report(Ctx& ctx, EngineState::FightState const& f, FightEvent what, char const* why)
+        {
+            FightOutcome ev;
+            ev.What        = what;
+            ev.Victim      = f.Victim;
+            ev.VictimEntry = f.VictimEntry;
+            ev.MapId       = ctx.World.MapId();
+            Position const here = ctx.World.Where();
+            ev.X = here.GetPositionX();
+            ev.Y = here.GetPositionY();
+            ev.Why = why;
+            ctx.Fight.Report(ev);
         }
     };
 
@@ -355,6 +590,15 @@ namespace
 
         void DefaultBids(Ctx& ctx, BidSink& sink) const override
         {
+            // ВСТУПИВШИЙ БОЙ СТАВИТСЯ ПЕРВЫМ И ИЗ СОСТОЯНИЯ, а не из обхода: обход
+            // пересчитывается раз в секунду и вправе назвать другую цель, но у спутника одна
+            // пара рук и один противник, которого ядро уже считает его жертвой. Без этой ставки
+            // бой осиротел бы — `Useful` никто не спросит, состояние висело бы «вступил» вечно.
+            if (ctx.St && ctx.St->Fight.Engaged && !ctx.St->Fight.Victim.IsEmpty())
+            {
+                sink.Add(ActionId::KillObjective, REL_HIGH, Subject::OfUnit(ctx.St->Fight.Victim));
+                return;
+            }
             ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
 
             // КЛЕТКА СТАВИТСЯ НЕЗАВИСИМО ОТ БОЯ, и спорить им не о чем. У лестницы клетка

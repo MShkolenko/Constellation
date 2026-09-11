@@ -524,6 +524,24 @@ namespace Constellation::Ai
         // модуле уже стоила 916 кругов и ноль сдач. Тот же довод, что у `CanTalkTo`.
         bool InMeleeRange(ObjectGuid unit) const;
 
+        // -- БОЙ: пять вопросов, которых действию не хватало, чтобы бой был боем ------------
+        //
+        // Все — чтение у ядра, ни одного своего числа. Замер 2026-09-11: движок дрался одним
+        // замахом и ни на один из этих вопросов не отвечал — ни «кого я бью, по мнению ядра»
+        // (сторож подмены цели), ни «жив ли он» (исход), ни «нужен ли он ещё заданию».
+        ObjectGuid CurrentVictim() const;                   // `GetVictim()` — ядро обнуляет в момент смерти цели
+        bool       IsAliveUnit(ObjectGuid unit) const;      // жив ли (труп на месте — не жив)
+        uint32     EntryOf(ObjectGuid unit) const;          // вид существа, 0 если его нет
+        // ЦЕЛЬ ЕЩЁ НУЖНА ЗАДАНИЮ — предикат лестницы целиком (`StillWanted`): прямая цель,
+        // прокси-зачёт по `KillCredit`, источник нужного предмета. Раз в секунду, не на такте:
+        // он обходит весь журнал заданий.
+        bool       StillWanted(uint32 entry) const;
+        // С КАКОЙ ДИСТАНЦИИ ДРАТЬСЯ — правило лестницы (`:3969-3978`): дальность лучшего
+        // заклинания минус два ярда, и только при включённых умениях; иначе ближний бой (0).
+        float      EngageRangeAgainst(ObjectGuid unit) const;
+        // НАСТРОЙКА ЛУТА — лестницы (`Cfg().Loot`), читается у неё, а не копируется.
+        bool       LootAllowed() const;
+
         // ЖИВОЙ ОБЪЕКТ ПО ТОЧКЕ ПОЯВЛЕНИЯ, И ТОЛЬКО ЕСЛИ ЯДРО РАЗРЕШАЕТ ИМ ПОЛЬЗОВАТЬСЯ.
         //
         // Прямое обращение к карте вместо обхода сетки — способ лестницы
@@ -600,6 +618,13 @@ namespace Constellation::Ai
         friend bool WalkTowards(Ctx& ctx, Position const& to, float stopAt, float dt);
         bool StepFor(MoveState& m, Position const& to, float stopAt, float dt,
                      MoveSendFn send, void* user) const;
+        // ТЕ ЖЕ ДВА ЗАМКА для двух поднятых политик боя: тело держит игрока, отправка приходит
+        // от единственного друга в `Engine.cpp`, который строит её над дверью. Действие видит
+        // только `CastThroughDoor`/`LootThroughDoor(Ctx&, ...)`.
+        friend bool CastThroughDoor(Ctx& ctx, ObjectGuid victim, CastMemory& m);
+        friend bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n);
+        bool CastFor(ObjectGuid victim, CastSender const& send, CastMemory& m) const;
+        bool LootFor(ObjectGuid corpse, LootSender const& send, LootCounters& n) const;
 
         // ХРАНИТСЯ ИЗМЕНЯЕМЫМ, И ЭТО НЕ ПОСЛАБЛЕНИЕ ПРАВИЛА, А ОНО САМО. Заголовок выше
         // требует не ОТДАВАТЬ объект наружу — и он же объясняет, почему константность его не
@@ -680,6 +705,11 @@ namespace Constellation::Ai
     // заклинания по ротации, очередь и общий откат у ядра, «читаемое произносим стоя», след
     // успеха по откату. Тот же замок в подписи.
     bool CastAt(Player* self, ObjectGuid victim, CastSender const& send, CastMemory& m);
+
+    // Два предиката боя лестницы, целиком: одна реализация на оба механизма.
+    bool  StillWantedFor(Player* self, uint32 entry);
+    float EngageRangeFor(Player* self, Unit* target);
+    bool  LootAllowedFor();
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.
