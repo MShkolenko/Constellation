@@ -793,6 +793,13 @@ namespace Constellation::Ai
             || EngineRemembers(user, BackoffKind::Visited, point);
     }
 
+    bool QuestTravelBackedOffByEngine(void const* user, uint32 questId)
+    {
+        Subject const quest = Subject::OfQuest(questId);
+        return EngineRemembers(user, BackoffKind::Unreachable, quest)
+            || EngineRemembers(user, BackoffKind::Visited, quest);
+    }
+
     namespace
     {
         // Пара видов упакована в `PairKey(a, b) = (a << 32) | b` (`Constellation.cpp:2329`).
@@ -1175,7 +1182,18 @@ namespace Constellation::Ai
                 // §14 — УСПЕХ СНИМАЕТ ЗАПРЕТ, иначе он переживёт то изменение мира, которое
                 // сделало его неверным. НО НЕ В ТЕНИ: там `ran` выставлен без исполнения, и
                 // снимать по несостоявшемуся успеху значило бы чистить то, что не заработано.
-                if (run != Run::Shadow && suppress.Kind != BackoffKind::None)
+                //
+                // И НЕ ТОТ ЗАПРЕТ, ЧТО ДЕЙСТВИЕ ТОЛЬКО ЧТО НАПИСАЛО САМО. Прочитано против
+                // проверки выше (`:1120`): ставка с ЖИВЫМ ключом до `Execute` не доходит, значит
+                // здесь `Allow` находит либо просроченную запись (её и так подметёт `Defer`),
+                // либо ту, которую действие поставило в этом же `Execute` — приход:
+                // `Defer(Visited)` и `true`. Снимать её — это и есть круг «дорога → стою → та же
+                // дорога», который лестница закрыла шестым проходом Кодекса (`:3907`).
+                // `SeekGiverByMap` носил это с первого дня (`Actions/Quest.cpp:446`), и тень
+                // показать не могла: там `Execute` не зовётся. Найдено 2026-09-12 при переносе
+                // `TravelToObjective`, чей приход — та же пара.
+                if (run != Run::Shadow && suppress.Kind != BackoffKind::None
+                    && !Deferred(st, suppress, now))
                     Allow(st, suppress);
 
                 // §4.4′ — NEW work gets a new salt; continuing the same work keeps it, so the

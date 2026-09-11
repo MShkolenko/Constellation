@@ -460,6 +460,14 @@ namespace Constellation::Ai
         ScanObjectivesFor(_self, mem, danger, out);
     }
 
+    bool WorldView::ObjectiveSpotToWalkTo(DangerView const& danger, TravelMemory const& mem,
+                                          TravelSpot* out) const
+    {
+        if (!_self || !out)
+            return false;
+        return FindTravelSpotFor(_self, danger, mem, out);
+    }
+
     bool WorldView::GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const
     {
         if (!_self || !out)

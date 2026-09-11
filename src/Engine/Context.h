@@ -394,6 +394,7 @@ namespace Constellation::Ai
     {
         Position Where;
         uint32   QuestId = 0;
+        uint32   MapId   = 0;       // карта ответа — ставит значение движка, чтобы удержание не пережило смену карты
         float    Stop    = 10.0f;
         bool     Found   = false;
         bool     Worth   = false;
@@ -651,6 +652,8 @@ namespace Constellation::Ai
         // начинкой: потолок дальности, ближний порог, фракция, кэш по ВИДУ существа, проверка
         // яруса и разрешение маршрута патрулирующего. Память передаётся вызывающим.
         bool GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const;
+        // Место задания — та же поднятая политика, что у лестницы (`FindObjectiveSpotCore`).
+        bool ObjectiveSpotToWalkTo(DangerView const& danger, TravelMemory const& mem, TravelSpot* out) const;
 
         // ЧТО ВОКРУГ ГОДИТСЯ В ДЕЛО: кого бить, с кем говорить, какую клетку открыть. Один
         // дорогой обход сетки на три ответа — поэтому его зовёт ЗНАЧЕНИЕ, а не действие.

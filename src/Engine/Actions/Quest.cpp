@@ -83,6 +83,14 @@ namespace
     // И СТОЛЬКО ЖЕ — ТОЧКЕ, ДО КОТОРОЙ НЕ ДОШЛИ. Столько держит `GiverUnreachable` у лестницы.
     inline constexpr uint32 SEEK_UNREACHABLE_MS = 600000;
 
+    // ПОХОД К МЕСТУ ЗАДАНИЯ — числа лестницы, `case Behavior::Travelling` (`:3896-3961`).
+    // «Пришёл» — `TravelStop + 2` (порог отдаёт политика: 10 ярдов у точки, 3 у триггера);
+    // «пришёл — целей нет», «место стало смертельным» и «не дойти» — все три откладывают ЭТОТ
+    // квест на десять минут, остальным дорога открыта.
+    inline constexpr float  TRAVEL_ARRIVED_SLACK   = 2.0f;
+    inline constexpr uint32 TRAVEL_VISITED_MS      = 600000;
+    inline constexpr uint32 TRAVEL_UNREACHABLE_MS  = 600000;
+
     // ОТПРАВЩИКА ЗДЕСЬ НЕТ, И ЭТО ГЛАВНОЕ В ЭТОМ ШВЕ. Он один на весь движок и живёт в
     // `Engine.cpp`, где его нельзя подменить: `WalkTowards` не принимает его параметром. Первая
     // версия принимала — и Кодекс показал, что тогда любое действие вправе передать свой способ
@@ -463,6 +471,89 @@ namespace
         }
     };
 
+    // ПОХОД К МЕСТУ ЗАДАНИЯ. Замер 2026-09-11: 15 из 135 расхождений в узле «стою» — лестница
+    // «иду к месту задания», движок «идти к квестодателю по карте», потому что этого действия
+    // у него не было и он шёл за НОВЫМ квестом вместо цели текущего.
+    //
+    // ЧЕГО ЗДЕСЬ НЕТ, НАЗВАНО, А НЕ ПРОПУЩЕНО:
+    //   * «цель показалась» (`:3900`) — порядок ставок: `KillObjective` стоит REL_HIGH, поход
+    //     REL_BACKGROUND, любой увиденный по дороге перебивает поход тем же тактом;
+    //   * камень и полёт к далёкой точке (`:3344-3350`) — транспорт движка не написан (0014);
+    //   * `BrokenForFight` (`:3338`) — движок не смотрит на состояние экипировки нигде, и обход
+    //     целей тоже; ставить проверку одному походу значило бы врать про остальные;
+    //   * `TravelCooldownMs = 120000` (`:3947`) — общая пауза походам после неудачи. У движка
+    //     неудача откладывает КВЕСТ, а не походы вообще: это другое поведение, и оно измеряется
+    //     тенью, как всё, чем очередь отличается от `switch`.
+    class TravelToObjectiveAction final : public Action
+    {
+    public:
+        TravelToObjectiveAction() : Action(ActionId::TravelToObjective) { }
+
+        BackoffKind DeferKind() const override { return BackoffKind::Visited; }
+
+        bool Useful(Ctx& ctx, Bid const& bid) override
+        {
+            if (bid.About.What() != Subject::Kind::Quest)
+                return false;
+            TravelSpot const& t = Val<ValueId::ObjectiveSpot>(ctx);
+            if (!t.Worth || t.QuestId != bid.About.Id())
+                return false;       // ответ пересчитался и ведёт уже к другому квесту
+            return !QuestTravelBackedOffByEngine(&ctx, t.QuestId);
+        }
+
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
+
+        float Score(Ctx& ctx, Bid const& bid, float relevance) const override
+        {
+            TravelSpot const& t = Val<ValueId::ObjectiveSpot>(ctx);
+            if (!t.Worth || t.QuestId != bid.About.Id())
+                return relevance;
+            return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
+        }
+
+        bool Execute(Ctx& ctx, Bid const& bid) override
+        {
+            if (!ctx.St)
+                return false;
+            TravelSpot const& t = Val<ValueId::ObjectiveSpot>(ctx);
+            if (!t.Worth || t.QuestId != bid.About.Id())
+                return false;
+
+            // МЕСТО СТАЛО СМЕРТЕЛЬНЫМ, ПОКА МЫ ШЛИ — ПОВОРАЧИВАЕМ (`:3922`). Выбор точки делается
+            // на пересчёте, а гибель по дороге меняет ответ между пересчётами.
+            if (ctx.Danger.DeadlyToTravelTo(t.Where.GetPositionX(), t.Where.GetPositionY()))
+            {
+                Defer(ctx, BackoffKind::Visited, bid.About, 0, TRAVEL_VISITED_MS);
+                ctx.St->Values.ObjectiveSpot.Invalidate();
+                return false;
+            }
+
+            float const d = ctx.World.DistanceTo2d(t.Where);
+            if (d <= t.Stop + TRAVEL_ARRIVED_SLACK)
+            {
+                // ПРИШЛИ, А ЦЕЛЕЙ НЕТ — ВЫХОД, а не стояние до срока (`:3907`): будь цель в
+                // обзоре, ставка боя уже перебила бы поход. Область пуста — выбита или её
+                // наполняет скрипт волнами; откладываем этот квест, пересчёт даст следующий.
+                Defer(ctx, BackoffKind::Visited, bid.About, 0, TRAVEL_VISITED_MS);
+                ctx.St->Values.ObjectiveSpot.Invalidate();
+                return true;
+            }
+
+            float const dt = ctx.Act.SliceSeconds();
+            bool const going = WalkTowards(ctx, t.Where, t.Stop, dt);
+            uint32 const sliceMs = uint32(dt * 1000.0f);
+            if (AdvanceWalk(ctx, bid.About, d, sliceMs, !going) != WalkVerdict::Going)
+            {
+                // «до места задания не дойти» / «полминуты без приближения» / «в пути слишком
+                // долго» — три исхода лестницы, один ключ: сам квест (`:3953`).
+                Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TRAVEL_UNREACHABLE_MS);
+                ctx.St->Values.ObjectiveSpot.Invalidate();
+                return false;
+            }
+            return true;
+        }
+    };
+
     // §9 — СТРАТЕГИЯ СТАВИТ КАЖДЫЙ ТАКТ, а не по событию. Так задумано: ставка живёт один такт,
     // и «есть что сдать» — это состояние, а не происшествие. Триггер понадобился бы, если бы
     // нужно было поймать МОМЕНТ; здесь нужно постоянное присутствие в очереди.
@@ -495,10 +586,22 @@ namespace
             // там же: последняя ветка `Idle`, куда доходит тот, у кого нет ни готового к сдаче,
             // ни цели, ни собеседника. REL_BACKGROUND значит «когда больше нечем заняться»; всё
             // остальное в этой стратегии стоит выше по построению, а не по проверке условий.
-            SeekTarget const& seek = Val<ValueId::GiverToSeek>(ctx);
-            if (seek.Found)
-                sink.Add(ActionId::SeekGiverByMap, REL_BACKGROUND,
-                         Subject::OfSpawn(uint32(seek.SpawnId)));
+            // ПОХОД К МЕСТУ ЗАДАНИЯ ВЫШЕ ПОХОДА ЗА НОВЫМ КВЕСТОМ — ОТНОШЕНИЕМ, А НЕ ЧИСЛОМ.
+            // У лестницы это `if (FindObjectiveSpot) … else FindGiverByMap` (`:3340`, `:3383`):
+            // пока есть куда идти за целью текущего квеста, карту за новым она не перебирает
+            // вовсе. Две ставки на одном REL_BACKGROUND минус ярды решал бы ближний, и ближний
+            // квестодатель уводил бы от цели — ровно те 15 расхождений, ради которых это
+            // действие написано.
+            TravelSpot const& spot = Val<ValueId::ObjectiveSpot>(ctx);
+            if (spot.Worth)
+                sink.Add(ActionId::TravelToObjective, REL_BACKGROUND, Subject::OfQuest(spot.QuestId));
+            else
+            {
+                SeekTarget const& seek = Val<ValueId::GiverToSeek>(ctx);
+                if (seek.Found)
+                    sink.Add(ActionId::SeekGiverByMap, REL_BACKGROUND,
+                             Subject::OfSpawn(uint32(seek.SpawnId)));
+            }
         }
     };
 }
@@ -510,6 +613,7 @@ namespace Constellation::Ai
         engine.Register(std::make_unique<TurnInQuestAction>());
         engine.Register(std::make_unique<TakeQuestNearbyAction>());
         engine.Register(std::make_unique<SeekGiverByMapAction>());
+        engine.Register(std::make_unique<TravelToObjectiveAction>());
         engine.Register(std::make_unique<QuestsStrategy>());
     }
 }

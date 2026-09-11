@@ -451,6 +451,9 @@ namespace Constellation::Ai
     // которая их зовёт, константна.
     bool QuestRefusedByEngine(void const* user, uint32 questId);
     bool SpawnBackedOffByEngine(void const* user, uint32 spawnId);
+    // Память похода: «к этому квесту сходил впустую» и «до его места не дойти». Ключ — квест,
+    // и на `OfQuest` эти два вида больше никто не ставит (`CoreRefused` — третий, свой).
+    bool QuestTravelBackedOffByEngine(void const* user, uint32 questId);
 
     // ПАМЯТЬ ДВИЖКА ДЛЯ ОБХОДА ЦЕЛЕЙ — та же таблица отсрочек, только вопросов пять.
     //

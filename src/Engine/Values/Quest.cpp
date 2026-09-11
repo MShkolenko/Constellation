@@ -115,6 +115,57 @@ namespace
         }
     };
 
+    // КУДА ИДТИ ЗА ЦЕЛЬЮ ЗАДАНИЯ — ответ той же поднятой политики, что зовёт лестница в `Idle`
+    // (`Constellation.cpp:3340`, `FindObjectiveSpotCore`). Личные фильтры здесь по тому же
+    // праву, что у `GiverToSeek`: отсрочки движка лежат в `EngineState`, куда `Calculate`
+    // дотягивается; гибели и смертельные места — у `ctx.Danger`, как у обхода целей.
+    //
+    // ИНТЕРВАЛ — ДВЕ СЕКУНДЫ, число лестницы для ПУСТОГО ответа (`c.TravelScanMs = 2000`,
+    // `:3354`): найдя место, она ходит к нему не переспрашивая, а движок переоценивает — и
+    // лестница на каждом пересчёте платит ту же цену (обход журнала и POI). Пересчёт ЧАЩЕ
+    // двух секунд ничего не купил бы: ответ меняется, когда меняется журнал или отсрочка, и
+    // на оба события действие зовёт `Invalidate` само.
+    inline constexpr uint32 TRAVEL_SCAN_MS = 2000;
+
+    class ObjectiveSpotValue final : public Value<TravelSpot>
+    {
+    public:
+        ObjectiveSpotValue() : Value(ValueId::ObjectiveSpot, TRAVEL_SCAN_MS) { }
+
+    protected:
+        void Calculate(Ctx& ctx, TravelSpot& out) const override
+        {
+            // БЕЗ СОСТОЯНИЯ НЕ СЧИТАЕМ ВОВСЕ — то же правило, что у двух соседей выше.
+            if (!ctx.St)
+            {
+                out = TravelSpot();
+                return;
+            }
+
+            // НАЧАТЫЙ ПОХОД ДЕРЖИТСЯ ЗА СВОЮ ТОЧКУ — как лестница за `TravelPos` весь
+            // `Travelling`. Без этого «ближайшее место» на ходу переизбирается между двумя
+            // квестами, ставка роняется по несовпадению квеста, и `AdvanceWalk` заводит учёт
+            // заново на каждой смене — ни «полминуты без приближения», ни потолок пути не
+            // наступают никогда (Кодекс, поход, пункт 3). Точка отпускается тем же, чем у
+            // лестницы кончается `Travelling`: приход и смертельное место откладывают квест
+            // (и отсрочка снимает удержание здесь), неудача пути и отмена снимают `Running`.
+            if (ctx.St->Running == ActionId::TravelToObjective && out.Worth
+                && out.MapId == ctx.World.MapId()
+                && ctx.St->RunningAbout == Subject::OfQuest(out.QuestId)
+                && !QuestTravelBackedOffByEngine(&ctx, out.QuestId))
+                return;
+
+            out = TravelSpot();
+            TravelMemory mem;
+            mem.BackedOff = &QuestTravelBackedOffByEngine;
+            mem.User      = &ctx;
+            // Приборы («квест стоил гибелей», «место смертельно») не ставятся: те же две строки
+            // на того же спутника уже печатает лестница — см. довод у `GiverToSeek`.
+            ctx.World.ObjectiveSpotToWalkTo(ctx.Danger, mem, &out);
+            out.MapId = ctx.World.MapId();
+        }
+    };
+
     class GiversByIndexValue final : public Value<GiverIndexList>
     {
     public:
@@ -144,5 +195,6 @@ namespace Constellation::Ai
         engine.RegisterValue<ValueId::GiversInSight>(std::make_unique<GiversInSightValue>());
         engine.RegisterValue<ValueId::GiversByIndex>(std::make_unique<GiversByIndexValue>());
         engine.RegisterValue<ValueId::GiverToSeek>(std::make_unique<GiverToSeekValue>());
+        engine.RegisterValue<ValueId::ObjectiveSpot>(std::make_unique<ObjectiveSpotValue>());
     }
 }
