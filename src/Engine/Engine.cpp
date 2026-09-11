@@ -234,8 +234,53 @@ namespace Constellation::Ai
             float const rel = forced > 0.0f ? forced : b.Relevance;
             if (rel <= 0.0f)
                 continue;
+
+            // ОДНА СТАВКА НА ПАРУ «ДЕЙСТВИЕ + ПРЕДМЕТ», как у эталона (`Queue::Push`,
+            // mod-playerbots `Script/WorldThr/Queue.cpp:12-29`): найдя такую же, он оставляет
+            // СТАРУЮ, поднимает её цену до большей и новую выбрасывает. Ключ у нас шире имени —
+            // «взять квест» у двух квестодателей есть две работы, а не одна.
+            //
+            // БЕЗ ЭТОГО ОЧЕРЕДЬ НАБИВАЛАСЬ ПРОИГРАВШИМИ. Стратегии ставят каждый такт, ставка
+            // живёт три секунды — двенадцать копий каждой; победитель при этом из очереди
+            // ВЫНИМАЕТСЯ (такт, сразу после `Choose`), а проигравшие лежат. Через одиннадцать
+            // тактов очередь полна, и
+            // роняется на входе именно свежая выигрывающая — бой или сдача, — а выбор идёт среди
+            // залежавшихся дешёвых. Замер на живом реалме: глубина 23-31, `сброшено` до 428.
+            //
+            // ДЕНЬ РОЖДЕНИЯ НЕ ОБНОВЛЯЕТСЯ — по той же причине, что и у перевыставленной ставки
+            // в такте («KEEPS ITS ORIGINAL BIRTHDAY»): иначе всё, что ставится каждый такт, не
+            // истекало бы никогда. Истёкшую
+            // сметает начало такта, а стратегия тут же ставит её заново — разрыва нет.
+            // КЭШ СЧЁТА СБРАСЫВАЕТСЯ, если цена выросла: `Score` считан от прежней `Relevance`.
+            // `SkipPrerequisites` остаётся у стоящей: перевыставленная ждёт своё предусловие,
+            // которое лежит выше неё, и свежая копия по умолчанию этого не отменяет.
+            // СЛИЯНИЕ — ЭТО «ПОСТАВЛЕНО»: `Push` предусловий отвечает «да», когда предусловие в
+            // очереди есть, а уж стояло оно там или легло только что — исходной ставке всё равно.
+            bool merged = false;
+            for (Bid& e : st.Queue)
+            {
+                if (e.Action != b.Action || !(e.About == b.About))
+                    continue;
+                if (rel > e.Relevance)
+                {
+                    e.Relevance = rel;
+                    e.Scored    = false;
+                    e.Score     = REL_IDLE;
+                    e.ScoredMs  = 0;
+                }
+                merged = true;
+                break;
+            }
+            if (merged)
+            {
+                ++st.BidsMerged;
+                pushed = true;
+                continue;
+            }
+
             // §11 — THE CAP IS ENFORCED, not hoped for. A push beyond it is dropped and counted;
-            // the counter is the defect report.
+            // the counter is the defect report — and after the merge above it reports distinct
+            // work that did not fit, not the same work twelve times over.
             if (st.Queue.size() >= QUEUE_CAP)
             {
                 ++st.BidsDropped;
@@ -805,8 +850,11 @@ namespace Constellation::Ai
         // point for as long as the world runs — and the health metric reads green, because a
         // leak and a healthy registry look identical when nothing sweeps.
         uint32 const dropped = st.BidsDropped;      // kept: it is a defect report, not live state
+        uint32 const merged  = st.BidsMerged;       // kept until the minute report reads it:
+                                                    // Reset fires on every ladder mode switch
         st = EngineState();
         st.BidsDropped = dropped;
+        st.BidsMerged  = merged;
     }
 
     Engine::TickResult Engine::Finish(EngineState& st, TickResult r)
@@ -892,11 +940,18 @@ namespace Constellation::Ai
         {
             uint32 const total = st.TicksIdle + st.TicksAttempted + st.TicksCommitted;
             if (total)
+                // «сброшено» — НАКОПИТЕЛЬНОЕ (переживает Reset как отчёт о дефекте), «слито» —
+                // ЗА МИНУТУ (обнуляется ниже, но переживает Reset, иначе каждая смена режима
+                // лестницы обнуляла бы его раньше отчёта). Разные смыслы названы в самой строке,
+                // чтобы прибор читался без справки (Кодекс, встречный разбор: темп, не накопитель).
                 TC_LOG_INFO("server.worldserver",
-                    "Constellation ЗАНЯТОСТЬ {} {}: тактов {}, провёл {}, взялся {}, нечего {}",
+                    "Constellation ЗАНЯТОСТЬ {} {}: тактов {}, провёл {}, взялся {}, нечего {},"
+                    " в очереди {}, сброшено всего {}, слито за минуту {}",
                     run == Run::Shadow ? "ТЕНЬ" : "ШОВ", ctx.World.Name(),
-                    total, st.TicksCommitted, st.TicksAttempted, st.TicksIdle);
+                    total, st.TicksCommitted, st.TicksAttempted, st.TicksIdle,
+                    st.Queue.size(), st.BidsDropped, st.BidsMerged);
             st.TicksIdle = st.TicksAttempted = st.TicksCommitted = 0;
+            st.BidsMerged = 0;
             st.ReportAtMs = now + OCCUPANCY_REPORT_MS;
         }
 

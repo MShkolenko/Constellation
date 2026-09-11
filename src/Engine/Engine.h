@@ -174,6 +174,12 @@ namespace Constellation::Ai
         // measurement. A number that is never printed is a number nobody checks.
         uint32 BidsPushed       = 0;
         uint32 BidsDropped      = 0;         // hit a cap — a defect to find, not a cost to absorb
+        // СЛИТО С УЖЕ СТОЯЩЕЙ. Стратегии ставят одни и те же пары «действие + предмет» каждый
+        // такт, а ставка живёт три секунды — без слияния каждая лежала бы двенадцатью копиями
+        // (замер: очередь 23-31 при крышке 32, `сброшено` до 428 на спутника). Число здесь —
+        // доказательство, что слияние работает: оно идёт, а `сброшено` стоит. ЗА МИНУТУ:
+        // обнуляется отчётом занятости, а не сбросом состояния.
+        uint32 BidsMerged       = 0;
         uint32 BidsExpired      = 0;
         uint32 ActionsCancelled = 0;
         uint32 ReentriesReset   = 0;         // §2″ — how often somebody else moved us
