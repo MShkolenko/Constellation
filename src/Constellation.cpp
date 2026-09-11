@@ -358,11 +358,9 @@ struct Companion
     uint32 VendNoVendor = 0;            //               некому продать поблизости
     uint32 VendPoor = 0;                //               не хватило денег на ремонт
     ObjectGuid LootTarget;              // труп нашего убийства, который ещё не обобран
-    uint32 LootOpened = 0;              // за всё время: открыли трупов
-    uint32 LootItems = 0;               //               взяли предметов
-    uint32 LootMoney = 0;               //               взяли денег (в медяках)
-    uint32 LootTooFar = 0;              //               не дотянулись — мера нужды в ходьбе
-    uint32 LootDenied = 0;              //               ядро не дало (чужой лут, розыгрыш)
+    // ПЯТЬ СЧЁТЧИКОВ СТАЛИ ОДНОЙ СТРУКТУРОЙ, потому что тело лута теперь одно на два механизма
+    // и пишет в неё, не зная чью (`LootFromCorpseCore`). Смысл полей — в `ClientAct.h`.
+    Constellation::Ai::LootCounters Loot;
     uint32 CastsBusy = 0;               // не просили: уже читаем или не истёк общий откат
     bool CastFailNoted = false;         // величины момента без следа — по разу на бой
     uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
@@ -6820,20 +6818,82 @@ public:
     // печатает сама — по свободному месту до и после, а не по числу запросов.
     // Возвращает, сколько предметов РЕАЛЬНО ЛЕГЛО (не запрошено): Кодекс верно указал, что
     // счётчик по запросам называет успехом заход, с которого ничего не взяли.
-    uint32 TakeOpenLoot(Companion& c, Player* self, ObjectGuid src, std::string const& what, uint32 entry)
+    // ---------------------------------------------------------------------------------------
+    // ЛУТ — ОДНО ТЕЛО НА ДВА МЕХАНИЗМА; кто шлёт пакет — параметр.
+    //
+    // Замер 2026-09-11, движок вживую пятнадцать минут: его бой не лутил — предметы заданий не
+    // собирались, квесты не закрывались, — потому что исход боя у лестницы живёт здесь, а
+    // `KillObjective` шёл мимо. Форма подъёма — та же, что у мовера: тело в `...Core`, лестница
+    // держит обёртки с прежними подписями (вызовы в ветках не меняются — `:4919`, `:5592`),
+    // движок получит те же четыре отправки через дверь `ClientAct`. Что брать, сколько влезет и
+    // как считать лёгшее — ПОЛИТИКА, и она одна.
+    //
+    // Четыре отправки лестницы — над сессией спутника, тела дословно из прежних функций.
+    // ---------------------------------------------------------------------------------------
+    static bool LadderLootOpen(void* user, ObjectGuid unit)
     {
-// 2. ДЕНЬГИ — если они там есть. Пакет без GUID: обработчик берёт из всего
+        Companion& c = *static_cast<Companion*>(user);
+        WorldPacket raw(CMSG_LOOT_UNIT);
+        WorldPackets::Loot::LootUnit open(std::move(raw));
+        open.Unit = unit;
+        c.Session->HandleLootOpcode(open);
+        return true;
+    }
+
+    static bool LadderLootMoney(void* user)
+    {
+        Companion& c = *static_cast<Companion*>(user);
+        WorldPacket raw(CMSG_LOOT_MONEY);
+        WorldPackets::Loot::LootMoney money(std::move(raw));
+        c.Session->HandleLootMoneyOpcode(money);
+        return true;
+    }
+
+    static bool LadderLootItems(void* user, Constellation::Ai::LootPick const* picks, uint32 count)
+    {
+        Companion& c = *static_cast<Companion*>(user);
+        WorldPacket rawItems(CMSG_LOOT_ITEM);
+        WorldPackets::Loot::LootItem take(std::move(rawItems));
+        for (uint32 i = 0; i < count; ++i)
+        {
+            WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
+            req.Object     = picks[i].Object;       // КЛЮЧ вида — это и есть GUID объекта лута
+            req.LootListID = picks[i].LootListId;   // НЕ номер в списке
+        }
+        c.Session->HandleAutostoreLootItemOpcode(take);
+        return true;
+    }
+
+    static bool LadderLootRelease(void* user, ObjectGuid unit)
+    {
+        Companion& c = *static_cast<Companion*>(user);
+        WorldPacket raw(CMSG_LOOT_RELEASE);
+        WorldPackets::Loot::LootRelease done(std::move(raw));
+        done.Unit = unit;
+        c.Session->HandleLootReleaseOpcode(done);
+        return true;
+    }
+
+    static Constellation::Ai::LootSender LadderLootSender(Companion& c)
+    {
+        Constellation::Ai::LootSender s;
+        s.Open = &LadderLootOpen; s.Money = &LadderLootMoney;
+        s.Items = &LadderLootItems; s.Release = &LadderLootRelease;
+        s.User = &c;
+        return s;
+    }
+
+    uint32 TakeOpenLootCore(Player* self, ObjectGuid src, std::string const& what, uint32 entry,
+                            Constellation::Ai::LootSender const& send, Constellation::Ai::LootCounters& n)
+    {
+        // 2. ДЕНЬГИ — если они там есть. Пакет без GUID: обработчик берёт из всего
         //    открытого вида сразу, поэтому шлём его один раз.
         bool anyGold = false;
         for (auto const& [lootGuid, loot] : self->GetAELootView())
             if (loot && loot->gold)
-                { anyGold = true; c.LootMoney += loot->gold; }
+                { anyGold = true; n.Money += loot->gold; }
         if (anyGold)
-        {
-            WorldPacket raw(CMSG_LOOT_MONEY);
-            WorldPackets::Loot::LootMoney money(std::move(raw));
-            c.Session->HandleLootMoneyOpcode(money);
-        }
+            send.Money(send.User);
 
         // 3. ПРЕДМЕТЫ. Собираем запросы по всему открытому виду и шлём ОДНИМ пакетом:
         //    он и рассчитан на список (Array<LootRequest, 100>).
@@ -6842,10 +6902,16 @@ public:
         //    закроется; и серый хлам — его ядро само считает мусором и умеет продавать.
         //    Всё остальное пока мимо: чтобы решать про зелёное и выше, нужна логика
         //    сравнения с надетым, а её нет, и подобранная привязка необратима.
-        WorldPacket rawItems(CMSG_LOOT_ITEM);
-        WorldPackets::Loot::LootItem take(std::move(rawItems));
+        //
+        //    ЗАЯВКИ КОПЯТСЯ В МАССИВЕ НА СТЕКЕ, а пакет собирает отправитель: у лестницы это
+        //    пакет в сессию, у движка — дверь. Предел массива — предел самого пакета; прежде
+        //    обход упёрся бы в `Array` без отказа, теперь останавливается сам.
+        Constellation::Ai::LootPick picks[Constellation::Ai::LOOT_PICK_CAP];
         uint32 const freeSlots = FreeBagSpace(self);
         uint32 asked = 0, got = 0;
+        // lazy: `std::set` выделяет память, как и у лестницы; лут — событие, не такт, и на
+        // 122 спутниках это единицы выделений в минуту. Заменить на массив по `askedIds`,
+        // если профиль когда-нибудь покажет его.
         std::set<uint32> askedIds;      // ЧТО именно просили — чтобы сосчитать пришедшее
         for (auto const& [lootGuid, loot] : self->GetAELootView())
         {
@@ -6883,9 +6949,10 @@ public:
                         break;
                     continue;
                 }
-                WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
-                req.Object = lootGuid;          // КЛЮЧ вида — это и есть GUID объекта лута
-                req.LootListID = uint8(item.LootListId);   // НЕ номер в списке
+                if (asked >= Constellation::Ai::LOOT_PICK_CAP)
+                    break;
+                picks[asked].Object     = lootGuid;
+                picks[asked].LootListId = uint8(item.LootListId);
                 askedIds.insert(item.itemid);
                 ++asked;
             }
@@ -6910,7 +6977,7 @@ public:
             for (uint32 id : askedIds)
                 countBefore += self->GetItemCount(id, true);
             uint32 const spaceBefore = FreeBagSpace(self);
-            c.Session->HandleAutostoreLootItemOpcode(take);
+            send.Items(send.User, picks, asked);
             uint32 const spaceAfter = FreeBagSpace(self);
             uint32 countAfter = 0;
             for (uint32 id : askedIds)
@@ -6919,7 +6986,7 @@ public:
             uint32 const landed = countAfter > countBefore ? countAfter - countBefore : 0;
             uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
             got = landed;
-            c.LootItems += landed;
+            n.Items += landed;
             if (landed != asked)
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, легло {} (ячеек занято {}) — "
@@ -6932,21 +6999,23 @@ public:
             "за всё время трупов {}, предметов {}, денег {}",
             self->GetName(), what, entry,
             anyGold ? "да" : "нет", asked,
-            c.LootOpened, c.LootItems, c.LootMoney);
+            n.Opened, n.Items, n.Money);
 
         // 4. ОТПУСТИТЬ. Иначе вид остаётся открытым и следующий труп не откроется.
-        {
-            WorldPacket raw(CMSG_LOOT_RELEASE);
-            WorldPackets::Loot::LootRelease done(std::move(raw));
-            done.Unit = src;
-            c.Session->HandleLootReleaseOpcode(done);
-        }
+        send.Release(send.User, src);
         return got;
     }
 
-    bool LootFromCorpse(Companion& c, Player* self)
+    // Обёртка лестницы: подпись прежняя, вызовы в ветках (`:4919`) не тронуты.
+    uint32 TakeOpenLoot(Companion& c, Player* self, ObjectGuid src, std::string const& what, uint32 entry)
     {
-        Creature* corpse = ObjectAccessor::GetCreature(*self, c.LootTarget);
+        return TakeOpenLootCore(self, src, what, entry, LadderLootSender(c), c.Loot);
+    }
+
+    bool LootFromCorpseCore(Player* self, ObjectGuid corpseGuid,
+                            Constellation::Ai::LootSender const& send, Constellation::Ai::LootCounters& n)
+    {
+        Creature* corpse = ObjectAccessor::GetCreature(*self, corpseGuid);
         if (!corpse || corpse->IsAlive())
             return true;                        // исчез или воскрес — забыть
 
@@ -6954,7 +7023,7 @@ public:
         // (LootHandler.cpp: 30 ярдов от трупа). Своего числа не выдумываем.
         if (!self->IsWithinDistInMap(corpse, 30.0f))
         {
-            ++c.LootTooFar;
+            ++n.TooFar;
             TC_LOG_INFO("server.worldserver",
                 "Constellation ЛУТ {}: не дотянулся до {} ({}), {:.1f} ярдов",
                 self->GetName(), corpse->GetName(), corpse->GetEntry(),
@@ -6967,7 +7036,7 @@ public:
         // его сами, чтобы не слать пакет, который заведомо отвергнут.
         if (!self->isAllowedToLoot(corpse))
         {
-            ++c.LootDenied;
+            ++n.Denied;
             TC_LOG_INFO("server.worldserver",
                 "Constellation ЛУТ {}: ядро не дало обобрать {} ({})",
                 self->GetName(), corpse->GetName(), corpse->GetEntry());
@@ -6975,24 +7044,25 @@ public:
         }
 
         // 1. ОТКРЫТЬ. Без этого обработчик предмета не найдёт лут в m_AELootView.
-        {
-            WorldPacket raw(CMSG_LOOT_UNIT);
-            WorldPackets::Loot::LootUnit open(std::move(raw));
-            open.Unit = c.LootTarget;
-            c.Session->HandleLootOpcode(open);
-        }
+        send.Open(send.User, corpseGuid);
         if (self->GetAELootView().empty())
         {
-            ++c.LootDenied;                     // ядро отказало молча — не настаиваем
+            ++n.Denied;                         // ядро отказало молча — не настаиваем
             TC_LOG_INFO("server.worldserver",
                 "Constellation ЛУТ {}: открыл {} ({}), но вид лута пуст",
                 self->GetName(), corpse->GetName(), corpse->GetEntry());
             return true;
         }
-        ++c.LootOpened;
+        ++n.Opened;
 
-        TakeOpenLoot(c, self, c.LootTarget, corpse->GetName(), corpse->GetEntry());
+        TakeOpenLootCore(self, corpseGuid, corpse->GetName(), corpse->GetEntry(), send, n);
         return true;
+    }
+
+    // Обёртка лестницы: подпись прежняя, вызов в `Attacking` (`:5592`) не тронут.
+    bool LootFromCorpse(Companion& c, Player* self)
+    {
+        return LootFromCorpseCore(self, c.LootTarget, LadderLootSender(c), c.Loot);
     }
 
     // САМОЛЕЧЕНИЕ: ТОТ ЖЕ ОБХОД КНИГИ, НО ЛЕЧАЩЕЕ И НА СЕБЯ.
@@ -13764,6 +13834,14 @@ namespace Constellation::Ai
         return Constellation::Manager::Instance()->StepTowardCore(
             m, self, send, user, to.GetPositionX(), to.GetPositionY(), to.GetPositionZ(),
             stopAt, dt, nullptr);
+    }
+
+    // ЛУТ С ТРУПА ДЛЯ ДВИЖКА: то же тело, что у лестницы, — дистанция по числу обработчика,
+    // право на лут у ядра, политика «что брать», счёт лёгшего. Отправка — через дверь, которую
+    // подставит действие.
+    bool LootCorpse(Player* self, ObjectGuid corpse, LootSender const& send, LootCounters& n)
+    {
+        return Constellation::Manager::Instance()->LootFromCorpseCore(self, corpse, send, n);
     }
 
     bool NeedsRestFor(Player* self)

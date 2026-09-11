@@ -35,6 +35,52 @@ class WorldSession;
 
 namespace Constellation::Ai
 {
+    // ЛУТ — СЛОВАРЬ ДВЕРИ, потому что лут это протокол из четырёх отправок, а не одна.
+    //
+    // Замер 2026-09-11, движок вживую пятнадцать минут: его бой не лутил — предметы заданий не
+    // собирались, квесты не закрывались, а занятость при этом читалась «провёл 95,7 %». Исход
+    // боя у лестницы живёт в `LootFromCorpse`/`TakeOpenLoot`, которые шлют прямо в сессию.
+    // Теперь их тело одно (`LootFromCorpseCore`), а КТО ШЛЁТ — параметр: лестница над сессией,
+    // движок над этой дверью. Что брать и сколько влезет — политика, и она в теле, не здесь.
+    //
+    // ОДНА ЗАЯВКА — ГУИД ОБЪЕКТА ЛУТА И НОМЕР В ЕГО СПИСКЕ, ровно то, что несёт
+    // `WorldPackets::Loot::LootRequest`; пакет вмещает сто (`Array<LootRequest, 100>`), и это
+    // предел самого пакета, не выдуманный.
+    struct LootPick
+    {
+        ObjectGuid Object;
+        uint8      LootListId = 0;
+    };
+    inline constexpr uint32 LOOT_PICK_CAP = 100;
+
+    // ЧЕТЫРЕ ОТПРАВКИ ЧЕРЕЗ УКАЗАТЕЛИ С КОНТЕКСТОМ, не `std::function` — та аллоцирует, а лут
+    // хоть и не на такте, но той же дисциплины. Собраны в структуру с именованными полями:
+    // `Open` и `Release` одной сигнатуры, и позиционно их можно перепутать так, что компилятор
+    // не заметит, — по имени нельзя.
+    using LootOpenFn    = bool (*)(void* user, ObjectGuid unit);
+    using LootMoneyFn   = bool (*)(void* user);
+    using LootItemsFn   = bool (*)(void* user, LootPick const* picks, uint32 count);
+    using LootReleaseFn = bool (*)(void* user, ObjectGuid unit);
+    struct LootSender
+    {
+        LootOpenFn    Open    = nullptr;
+        LootMoneyFn   Money   = nullptr;
+        LootItemsFn   Items   = nullptr;
+        LootReleaseFn Release = nullptr;
+        void*         User    = nullptr;
+    };
+
+    // СЧЁТ ЗА ВСЁ ВРЕМЯ — у лестницы это были пять полей `Companion`, у движка будут поля
+    // `EngineState`; тело пишет в одну структуру, не зная чью.
+    struct LootCounters
+    {
+        uint32 Opened = 0;      // открыли трупов
+        uint32 Items  = 0;      // взяли предметов (лёгших, не запрошенных)
+        uint32 Money  = 0;      // взяли денег (в медяках)
+        uint32 TooFar = 0;      // не дотянулись — мера нужды в ходьбе
+        uint32 Denied = 0;      // ядро не дало (чужой лут, розыгрыш, пустой вид)
+    };
+
     class ClientAct
     {
     public:
@@ -106,6 +152,14 @@ namespace Constellation::Ai
         bool Face(ObjectGuid target);                               // CMSG_MOVE_SET_FACING
         bool AttackSwing(ObjectGuid victim);                        // CMSG_ATTACK_SWING
         bool AttackStop();                                          // CMSG_ATTACK_STOP
+
+        // -- loot: four opcodes, one protocol (open -> money -> items -> release). Bodies moved
+        //    from the ladder's LootFromCorpse/TakeOpenLoot; the protocol itself is
+        //    `LootFromCorpseCore` and it reaches these through a `LootSender`.
+        bool LootUnit(ObjectGuid unit);                             // CMSG_LOOT_UNIT
+        bool LootMoney();                                           // CMSG_LOOT_MONEY
+        bool LootItems(LootPick const* picks, uint32 count);        // CMSG_LOOT_ITEM
+        bool LootRelease(ObjectGuid unit);                          // CMSG_LOOT_RELEASE
 
         // -- the world ---------------------------------------------------------------------
         bool UseGameObject(ObjectGuid go);                          // CMSG_GAME_OBJ_USE

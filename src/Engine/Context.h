@@ -19,6 +19,7 @@
 #ifndef CONSTELLATION_ENGINE_CONTEXT_H
 #define CONSTELLATION_ENGINE_CONTEXT_H
 
+#include "ClientAct.h"       // LootSender / LootCounters — the door's vocabulary, shared by the lift
 #include "Define.h"
 #include "ObjectGuid.h"
 #include "Position.h"
@@ -582,6 +583,12 @@ namespace Constellation::Ai
     // `StepFor`; у `StepFor` замок пришлось ставить, здесь он уже стоял — в подписи.
     bool StepAlong(MoveState& m, Player* self, MoveSendFn send, void* user,
                    Position const& to, float stopAt, float dt);
+
+    // ЛУТ С ТРУПА: одна реализация на лестницу и на движок — дистанция по числу обработчика
+    // ядра, право на лут у ядра, что брать и сколько влезет, счёт ЛЁГШЕГО, и отпустить вид.
+    // Тот же замок в подписи, что у `StepAlong`: первым стоит `Player*`, которого у действия
+    // нет. Действие получит её через переходник, который держит игрока.
+    bool LootCorpse(Player* self, ObjectGuid corpse, LootSender const& send, LootCounters& n);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

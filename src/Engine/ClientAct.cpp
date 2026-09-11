@@ -16,6 +16,7 @@
 #include "MovementPackets.h"
 #include "GameObjectPackets.h"
 #include "ItemPackets.h"
+#include "LootPackets.h"
 #include "MiscPackets.h"
 #include "NPCPackets.h"
 #include "Opcodes.h"
@@ -170,6 +171,63 @@ namespace Constellation::Ai
         WorldPacket raw(CMSG_ATTACK_STOP);
         WorldPackets::Combat::AttackStop stop(std::move(raw));
         _session->HandleAttackStopOpcode(stop);
+        return true;
+    }
+
+    // ---- loot ------------------------------------------------------------------------------
+    //
+    // Four opcodes for one protocol. The bodies are the ladder's, moved from the named lines of
+    // LootFromCorpse/TakeOpenLoot; the ORDER and the policy (what to take, how much fits, count
+    // what landed) stay in `LootFromCorpseCore`, which reaches these through a `LootSender`.
+
+    bool ClientAct::LootUnit(ObjectGuid unit)                       // :6979
+    {
+        if (!Usable() || unit.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_LOOT_UNIT);
+        WorldPackets::Loot::LootUnit open(std::move(raw));
+        open.Unit = unit;
+        _session->HandleLootOpcode(open);
+        return true;
+    }
+
+    bool ClientAct::LootMoney()                                     // :6833
+    {
+        if (!Usable())
+            return false;
+        // No GUID: the handler takes from the whole open loot view at once, so it is sent once.
+        WorldPacket raw(CMSG_LOOT_MONEY);
+        WorldPackets::Loot::LootMoney money(std::move(raw));
+        _session->HandleLootMoneyOpcode(money);
+        return true;
+    }
+
+    bool ClientAct::LootItems(LootPick const* picks, uint32 count)  // :6845
+    {
+        // THE PACKET'S OWN CAP IS ENFORCED HERE, not trusted to the caller: `Array<LootRequest,
+        // 100>` does not refuse an overflow gracefully, and a refused send is a counted defect.
+        if (!Usable() || !picks || count == 0 || count > LOOT_PICK_CAP)
+            return false;
+        WorldPacket raw(CMSG_LOOT_ITEM);
+        WorldPackets::Loot::LootItem take(std::move(raw));
+        for (uint32 i = 0; i < count; ++i)
+        {
+            WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
+            req.Object     = picks[i].Object;       // the view's KEY is the loot object's GUID
+            req.LootListID = picks[i].LootListId;   // NOT the index in the list
+        }
+        _session->HandleAutostoreLootItemOpcode(take);
+        return true;
+    }
+
+    bool ClientAct::LootRelease(ObjectGuid unit)                    // :6939
+    {
+        if (!Usable() || unit.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_LOOT_RELEASE);
+        WorldPackets::Loot::LootRelease done(std::move(raw));
+        done.Unit = unit;
+        _session->HandleLootReleaseOpcode(done);
         return true;
     }
 
