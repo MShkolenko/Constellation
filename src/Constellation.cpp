@@ -2850,8 +2850,30 @@ public:
         // `Owns` сегодня ложно для всех веток, а `Seal()` отказывается стать готовым,
         // пока не зарегистрировано ни одного действия. Значит шов ложится ИНЕРТНЫМ, и
         // это проверяется, а не обещается.
+        // ДВА ВОРОТА У ОДНОГО ШВА, И ЭТО НЕ ВТОРОЙ ШОВ (постановление Мастера, 2026-09-11, п. 1).
+        //
+        // `Owns(режим)` — ворота ФИНАЛЬНОГО удаления: ветка переехала целиком, её тело стёрто в
+        // том же коммите, движок владеет режимом. Сегодня ложь для всех.
+        //
+        // Ворота ПО НАМЕРЕНИЮ — арбитраж боя. Замер 2026-09-11 (движок вживую, 15 минут) и разбор
+        // Кодекса: шов в `Idle` отдаёт лестнице всё, что не `Idle`, а лестница начинает тот же бой
+        // сама — `Travelling → ApproachingTarget → Attacking` (`:3871`, «цель показалась») — то
+        // есть два контроллера одного намерения, пусть и по очереди. Поэтому в трёх режимах, из
+        // которых у лестницы начинается бой, движок получает ход ПЕРВЫМ с одной стратегией —
+        // `Combat` — и ход уходит лестнице только когда у движка боевой ставки НЕТ (`Idle`-исход;
+        // не «когда `Execute` вернул ложь»: неудавшийся `Execute` мог уже написать в мир —
+        // контракт `Attempted`, 2026-09-10). Это и есть приоритет самой лестницы: она тоже уходит
+        // из похода в тот миг, когда видит цель.
+        //
+        // Маска — ТОЛЬКО бой, и только если бой включён в конфиге: квестовые и отдыхающие ставки
+        // здесь не ставятся, они не отбирают у лестницы её походы и разговоры.
+        bool const fightIntentMode = c.Mode == Behavior::Travelling
+                                  || c.Mode == Behavior::ApproachingTarget
+                                  || c.Mode == Behavior::Attacking;
+        uint32 const fightMask = Cfg().EngineStrategies
+                               & Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat);
         if (Cfg().Engine && Constellation::Ai::Engine::Instance().Ready()
-            && Constellation::Ai::Engine::Owns(uint8(c.Mode)))
+            && (Constellation::Ai::Engine::Owns(uint8(c.Mode)) || (fightIntentMode && fightMask)))
         {
             Constellation::Ai::WorldView view(self);
             DangerBinding danger{ &c, self };
@@ -2861,8 +2883,13 @@ public:
             Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
             Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS(),
                                         &c.Engine, ModeName(c.Mode) };
-            Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
-            return;
+            bool const owned = Constellation::Ai::Engine::Owns(uint8(c.Mode));
+            c.Engine.StrategyMask = owned ? Cfg().EngineStrategies : fightMask;
+            Constellation::Ai::Engine::TickResult const r =
+                Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
+            if (owned || r != Constellation::Ai::Engine::TickResult::Idle)
+                return;
+            // боевой ставки не было — ход лестнице, её режим идёт как шёл
         }
         switch (c.Mode)
         {
@@ -10786,7 +10813,28 @@ public:
         {
             case Constellation::Ai::FightBan::TalkRetry:     return c->TalkRetry.count(guid) != 0;
             case Constellation::Ai::FightBan::Unreachable:   return c->TalkUnreachable.count(guid) != 0;
-            case Constellation::Ai::FightBan::TargetRefused: return c->Refused.count(guid) != 0;
+            case Constellation::Ai::FightBan::TargetRefused:
+            {
+                if (c->Refused.count(guid) != 0)
+                    return true;
+                // ОДИН ПРЕДИКАТ ДОПУСТИМОСТИ БОЯ НА ДВА МЕХАНИЗМА (Кодекс, разбор шва по намерению,
+                // п. 3). Шов отдаёт лестнице ход, когда у движка боевой ставки нет, — в том числе
+                // потому, что движок ОТЛОЖИЛ цель (не дошёл, замах не принят, тридцать секунд без
+                // следа). Лестница со своей памятью взяла бы ту же цель следующим тактом, и отсрочка
+                // движка ничего бы не защищала. Поэтому пока бой у движка включён, его отсрочка —
+                // отказ и для лестницы. Чтение, не запись: таблица движка остаётся его.
+                if (Cfg().Engine
+                    && (Cfg().EngineStrategies & Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat)))
+                {
+                    Constellation::Ai::BackoffKey key;
+                    key.Kind   = Constellation::Ai::BackoffKind::CombatUnreachable;
+                    key.About  = Constellation::Ai::Subject::OfUnit(guid);
+                    key.Detail = 0;
+                    if (Constellation::Ai::Engine::Deferred(c->Engine, key, GameTime::GetGameTimeMS()))
+                        return true;
+                }
+                return false;
+            }
             default: return false;
         }
     }
