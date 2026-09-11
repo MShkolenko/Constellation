@@ -13973,6 +13973,11 @@ namespace Constellation::Ai
         return Constellation::Cfg().Loot;
     }
 
+    float KiteYardsFor()
+    {
+        return Constellation::Cfg().KiteYards;
+    }
+
     // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
     // драться»): дальность лучшего заклинания минус два ярда, чтобы шаг не выбрасывал за
     // границу; всё, что меньше восьми, — ближний бой. Только при включённых умениях.

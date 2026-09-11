@@ -70,6 +70,13 @@ namespace
     inline constexpr uint32 FIGHT_FUSE_MS      = 300000;  // предохранитель, не судья: две минуты
                                                           // обрывали бои, которые шли как надо
     inline constexpr uint32 FIGHT_GAP_MS       = 1000;    // разрыв наблюдения: срез недостоверен
+    // ОТВОД — числа лестницы (`ApproachingTarget`, «ОТВОД»): дошли (2 яр.), затянулось (12 с),
+    // застряли (3 с без сдвига на ярд), точка маршрута пройдена (1,5 яр.).
+    inline constexpr float  KITE_ARRIVED_YARDS = 2.0f;
+    inline constexpr uint32 KITE_MAX_MS        = 12000;
+    inline constexpr uint32 KITE_STUCK_MS      = 3000;
+    inline constexpr float  KITE_WAYPOINT_YARDS = 1.5f;
+    inline constexpr uint32 KITE_GAVE_UP       = 0xFFFFFFFFu;
 
     // БОЙ — ОДИН МЕХАНИЗМ, ОДИН ВЛАДЕЛЕЦ ЦЕЛИ (решение 2026-09-11, утверждено Мастером).
     //
@@ -149,15 +156,17 @@ namespace
             // держит его на своей цели до исхода. Невступивший — просто подход, его бросить
             // ничего не стоит.
             if (f.Victim != victim)
-                Begin(f, victim, ctx.World.EntryOf(victim), ctx.NowMs);
+                Begin(ctx, f, victim, ctx.World.EntryOf(victim), ctx.NowMs);
 
             uint32 slice = ctx.NowMs - f.LastTickMs;
             if (f.LastTickMs == 0 || slice > FIGHT_GAP_MS)
                 slice = 0;                          // первый такт или разрыв: срез недостоверен
             f.LastTickMs = ctx.NowMs;
 
-            if (!f.Engaged)
-                return Engage(ctx, f, victim);
+            // ПОКА ОТВОДИМ — ЕЩЁ ПОДХОД, даже если замах уже принят: сторожа удержания у лестницы
+            // живут в `Attacking`, куда она попадает только по окончании отвода.
+            if (!f.Engaged || f.Kiting)
+                return Engage(ctx, f, victim, slice);
 
             // ---- ИСХОД: ядро обнуляет `GetVictim()` в момент смерти цели -------------------
             ObjectGuid const cur = ctx.World.CurrentVictim();
@@ -270,7 +279,7 @@ namespace
             }
         }
 
-        static void Begin(EngineState::FightState& f, ObjectGuid victim, uint32 entry, uint32 nowMs)
+        static void Begin(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim, uint32 entry, uint32 nowMs)
         {
             LootCounters const keep = f.Loot;       // за всё время — не за бой
             f = EngineState::FightState{};
@@ -278,12 +287,117 @@ namespace
             f.Victim      = victim;
             f.VictimEntry = entry;
             f.LastTickMs  = nowMs;
+            // С ЧЕМ ШЛИ В БОЙ — снимок обхода на момент выбора, как `EngageAssists`/`PackCenter`
+            // у лестницы: обход пересчитается через секунду и уже про другую цель.
+            ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+            if (scan.Fight == victim)
+            {
+                f.Assists    = scan.Assists;
+                f.PackCenter = scan.PackCenter;
+                f.PackKnown  = scan.PackKnown;
+            }
         }
 
         // ДОШЛИ ИЛИ ИДЁМ; ДОШЛИ — ВСТУПАЕМ, ровно то, что делает игрок мышью, в том же порядке.
-        bool Engage(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
+        bool Engage(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim, uint32 slice)
         {
-            if (!ctx.World.InMeleeRange(victim))
+            if (!f.EngageRangeKnown)
+            {
+                f.EngageRange      = ctx.World.EngageRangeAgainst(victim);
+                f.EngageRangeKnown = true;
+            }
+            bool const closeEnough = ctx.World.CloseEnough(victim, f.EngageRange);
+
+            // ---- ОТВОД: УТАЩИТЬ ЦЕЛЬ ОТ ЛАГЕРЯ И ТАМ ДОБИТЬ (лестница, `:3986-4076`) -----
+            // Точку берём один раз — прочь от того места, где мы её зацепили; идём спиной,
+            // лицом к цели, поэтому удары не прерываются. Условия — её: уводить разрешено,
+            // у цели были заступники, мы уже в бою, и в этом бою ещё не пробовали.
+            if (ctx.World.KiteYards() > 0.0f && f.Assists > 0 && ctx.World.IsInCombat()
+                && !f.Kiting && f.KiteMs == 0 && ctx.St)
+            {
+                if (ctx.World.BuildKiteRoute(f.PackKnown, f.PackCenter, victim, ctx.World.KiteYards(),
+                                             ctx.St->Move.Waypoints, &f.KiteTo))
+                {
+                    ctx.St->Move.WaypointIndex = ctx.St->Move.Waypoints.size() > 1 ? 1 : 0;
+                    f.Kiting = true;
+                    f.KiteMs = 1;
+                    ctx.St->Move.LastX = ctx.World.Where().GetPositionX();
+                    ctx.St->Move.LastY = ctx.World.Where().GetPositionY();
+                    ctx.St->Move.StuckMs = 0;
+                    // ОСОЗНАННОЕ РАСХОЖДЕНИЕ С ЛЕСТНИЦЕЙ: `Stalled` ставит только её шаг к цели,
+                    // который во время отвода не зовётся, — у неё старое значение с подхода
+                    // может оборвать новый отвод мгновенно (Кодекс, п. 6). Здесь он гасится.
+                    ctx.St->Move.Stalled = false;
+                }
+                else
+                    f.KiteMs = KITE_GAVE_UP;        // некуда пятиться — больше не пробуем в этом бою
+            }
+            if (f.Kiting && ctx.St)
+            {
+                MoveState& mv = ctx.St->Move;
+                f.KiteMs += slice;
+                // ЗАСТРЕВАНИЕ ВО ВРЕМЯ ОТВОДА СУДИМ ТЕМ ЖЕ, ЧЕМ И ОБЫЧНЫЙ ШАГ: сдвинулись ли.
+                Position const here = ctx.World.Where();
+                if (here.GetExactDist2d(mv.LastX, mv.LastY) > 1.0f)
+                {
+                    mv.LastX = here.GetPositionX(); mv.LastY = here.GetPositionY();
+                    mv.StuckMs = 0;
+                }
+                else
+                    mv.StuckMs += slice;
+                float const left = here.GetExactDist2d(f.KiteTo.GetPositionX(), f.KiteTo.GetPositionY());
+                // ДОШЛИ, ЗАСТРЯЛИ ИЛИ ЗАТЯНУЛОСЬ — ДЕРЁМСЯ ЗДЕСЬ. И ОБЯЗАТЕЛЬНО ОСТАНАВЛИВАЕМСЯ:
+                // иначе сервер продолжает видеть «иду назад».
+                if (left <= KITE_ARRIVED_YARDS || f.KiteMs > KITE_MAX_MS || mv.Stalled
+                    || mv.StuckMs > KITE_STUCK_MS || mv.WaypointIndex >= mv.Waypoints.size())
+                {
+                    f.Kiting = false;
+                    // КАК `StopMovingCore` (`:1333`): отказ значит, что для сервера мы всё ещё
+                    // идём, и флаг сбрасывается только по принятой остановке.
+                    if (ctx.Act.StopMoving())
+                        mv.Moving = false;
+                    mv.Waypoints.clear();           // мовер перестроит: пустой маршрут — его
+                    mv.WaypointIndex = 0;           // первое условие пересчёта (`:1475`)
+                }
+                else
+                {
+                    // ДАЛЬНОБОЙНЫЙ ЧИТАЕТ СТОЯ: идёт каст — стоим и не мешаем себе.
+                    if (ctx.World.IsCasting())
+                    {
+                        ctx.Act.StopMoving();
+                        return true;
+                    }
+                    // ШАГ ПО ТОЧКАМ ПОСТРОИТЕЛЯ, А НЕ ПО ПРЯМОЙ, но спиной — лицом к цели.
+                    Position const& wp = mv.Waypoints[mv.WaypointIndex];
+                    if (here.GetExactDist2d(wp.GetPositionX(), wp.GetPositionY()) < KITE_WAYPOINT_YARDS)
+                        ++mv.WaypointIndex;
+                    else
+                    {
+                        Position next;
+                        if (ctx.World.BackStepToward(wp, victim, ctx.Act.SliceSeconds(), &next))
+                        {
+                            ctx.Act.Step(next, MOVEMENTFLAG_BACKWARD);
+                            mv.Moving = true;
+                        }
+                    }
+                    // И БЬЁМ, ЕСЛИ ДОСТАЁМ, не переставая пятиться — как `TryAttack` в отводе.
+                    // Лестница замахивается каждый такт и каждый раз снимает базу заново; здесь
+                    // замах один, а повторяется он только если ядро потеряло состояние атаки —
+                    // тогда `GetVictim()` уже не наша цель (Кодекс, п. 5: «остаётся ли автоатака»
+                    // не утверждается, а проверяется у ядра).
+                    if (closeEnough && (!f.Engaged || ctx.World.CurrentVictim() != victim))
+                        Swing(ctx, f, victim);
+                    return true;
+                }
+            }
+
+            // ОТВОД КОНЧИЛСЯ, А ЗАМАХ УЖЕ ПРИНЯТ — второй раз не вступаем: повторная база сдвинула
+            // бы отсчёт побед на середину боя (у лестницы `TryAttack` зовётся снова, и это её
+            // причуда, а не правило).
+            if (f.Engaged)
+                return true;
+
+            if (!closeEnough)
             {
                 std::optional<Position> const where = ctx.World.WhereIs(victim);
                 if (!where)
@@ -294,8 +408,7 @@ namespace
                 float const dt = ctx.Act.SliceSeconds();
                 // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
                 // включённых умениях, иначе четыре ярда. Сегодня умения выключены — ноль у всех.
-                float const engage = ctx.World.EngageRangeAgainst(victim);
-                float const stopAt = engage > 0.0f ? engage : MELEE_STOP_YARDS;
+                float const stopAt = f.EngageRange > 0.0f ? f.EngageRange : MELEE_STOP_YARDS;
                 bool const going = WalkTowards(ctx, *where, stopAt, dt);
                 // «ДОШЁЛ» — НЕ «ЗАСТРЯЛ»: приход решает ядро, а между его меркой и порогом
                 // остановки есть зазор (разбор 2026-09-10 — три действия отсрочивали себя в
@@ -310,6 +423,12 @@ namespace
                 return true;
             }
 
+            return Swing(ctx, f, victim);
+        }
+
+        // ВСТУПЛЕНИЕ: повернуться, выбрать, ударить — и спросить у ядра, приняло ли оно замах.
+        bool Swing(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
+        {
             // ПОВОРОТ ПЕРВЫМ: `Unit::UpdateMeleeAttackingState` требует `HasInArc`.
             if (!ctx.Act.Face(victim))
                 return false;
@@ -322,11 +441,17 @@ namespace
             // не принят ядром» → отказ по цели).
             if (ctx.World.CurrentVictim() != victim)
             {
+                // УЖЕ ВСТУПИВШИЙ БОЙ НЕ СТИРАЕТСЯ повторным замахом из отвода: это ядро потеряло
+                // состояние атаки, и что с этим делать, решит исход следующим тактом.
+                if (f.Engaged)
+                    return false;
                 Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, COMBAT_UNREACHABLE_MS);
                 f = EngineState::FightState{ .Loot = f.Loot };
                 return false;
             }
-            // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою.
+            if (f.Engaged)
+                return true;                        // повторный замах: база и доклад уже есть
+            // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою — ОДИН РАЗ.
             f.Base      = ctx.Fight.Baseline();
             f.DealtHigh = f.Base.Dealt;
             f.Engaged   = true;

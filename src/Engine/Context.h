@@ -541,6 +541,25 @@ namespace Constellation::Ai
         float      EngageRangeAgainst(ObjectGuid unit) const;
         // НАСТРОЙКА ЛУТА — лестницы (`Cfg().Loot`), читается у неё, а не копируется.
         bool       LootAllowed() const;
+        // ДОСТАЁМ ЛИ С ДИСТАНЦИИ ВСТУПЛЕНИЯ — правило лестницы (`:3982`): для дальника —
+        // дистанция И прямая видимость, для ближнего боя — охват ядра.
+        bool       CloseEnough(ObjectGuid unit, float engageRange) const;
+        bool       IsCasting() const;                       // `IsNonMeleeSpellCast(false)`
+
+        // -- ОТВОД (кайт): утащить цель от лагеря и там добить. Правило лестницы целиком -------
+        //
+        // Точка — прочь от центра пачки (если известен) или против цели, на `yards`; её обязан
+        // одобрить ПОСТРОИТЕЛЬ МАРШРУТА (без NOPATH/SHORTCUT/INCOMPLETE, перепад высоты < 12),
+        // иначе шаги по прямой протащили бы сквозь непроходимое. Маршрут кладётся в `out` —
+        // это `MoveState::Waypoints` движка (постановление Мастера: не второй контейнер), по
+        // нему потом идут спиной. Ложь = пятиться некуда.
+        bool       BuildKiteRoute(bool packKnown, Position const& packCenter, ObjectGuid target,
+                                  float yards, std::vector<Position>& out, Position* kiteTo) const;
+        // ШАГ СПИНОЙ К ТОЧКЕ, ЛИЦОМ К ЦЕЛИ — только расчёт следующей позиции (`StepBackFacing`,
+        // `:12276`: 0,9 скорости шага, высота с карты, ориентация на цель). Отправляет действие,
+        // через дверь. Ложь = шаг слишком мал.
+        bool       BackStepToward(Position const& wp, ObjectGuid face, float dt, Position* next) const;
+        float      KiteYards() const;                       // `Cfg().KiteYards`, 0 = не уводить
 
         // ЖИВОЙ ОБЪЕКТ ПО ТОЧКЕ ПОЯВЛЕНИЯ, И ТОЛЬКО ЕСЛИ ЯДРО РАЗРЕШАЕТ ИМ ПОЛЬЗОВАТЬСЯ.
         //
@@ -710,6 +729,7 @@ namespace Constellation::Ai
     bool  StillWantedFor(Player* self, uint32 entry);
     float EngageRangeFor(Player* self, Unit* target);
     bool  LootAllowedFor();
+    float KiteYardsFor();
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

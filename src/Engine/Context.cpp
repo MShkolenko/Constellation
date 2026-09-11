@@ -19,8 +19,11 @@
 #include "Creature.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Map.h"
+#include "MapManager.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "PathGenerator.h"
 #include "Player.h"
 
 namespace Constellation::Ai
@@ -342,6 +345,83 @@ namespace Constellation::Ai
     bool WorldView::LootAllowed() const
     {
         return LootAllowedFor();
+    }
+
+    bool WorldView::CloseEnough(ObjectGuid unit, float engageRange) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        if (!who || !who->IsAlive())
+            return false;
+        return engageRange > 0.0f
+            ? _self->IsWithinDistInMap(who, engageRange) && _self->IsWithinLOSInMap(who)
+            : _self->IsWithinMeleeRange(who);
+    }
+
+    bool WorldView::IsCasting() const
+    {
+        return _self && _self->IsNonMeleeSpellCast(false);
+    }
+
+    float WorldView::KiteYards() const
+    {
+        return KiteYardsFor();
+    }
+
+    // Тело — лестницы (`ApproachingTarget`, «ОТВОД», `:3994-4021`), дословно по решениям.
+    bool WorldView::BuildKiteRoute(bool packKnown, Position const& packCenter, ObjectGuid target,
+                                   float yards, std::vector<Position>& out, Position* kiteTo) const
+    {
+        if (!_self || yards <= 0.0f)
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, target);
+        if (!who)
+            return false;
+        // ПРОЧЬ ОТ ЦЕНТРА ПАЧКИ, А НЕ ПРОСТО ОТ ЦЕЛИ (разбор), и точку обязан одобрить
+        // ПОСТРОИТЕЛЬ МАРШРУТА: шаги по прямой протащили бы сквозь непроходимое.
+        float const ang = packKnown
+            ? packCenter.GetAbsoluteAngle(_self->GetPositionX(), _self->GetPositionY())
+            : _self->GetAbsoluteAngle(who) + float(M_PI);
+        float const kx = _self->GetPositionX() + std::cos(ang) * yards;
+        float const ky = _self->GetPositionY() + std::sin(ang) * yards;
+        if (!MapManager::IsValidMapCoord(_self->GetMapId(), kx, ky))
+            return false;
+        float const kz = _self->GetMap()->GetHeight(_self->GetPhaseShift(), kx, ky,
+                                                    _self->GetPositionZ() + 3.0f);
+        PathGenerator back(_self);
+        if (!(kz > INVALID_HEIGHT && std::fabs(kz - _self->GetPositionZ()) < 12.0f
+              && back.CalculatePath(kx, ky, kz, false)
+              && !(back.GetPathType() & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_INCOMPLETE))))
+            return false;
+        out.clear();
+        for (G3D::Vector3 const& v : back.GetPath())
+            out.emplace_back(v.x, v.y, v.z);
+        if (kiteTo)
+            kiteTo->Relocate(kx, ky, kz);
+        return !out.empty();
+    }
+
+    // Тело — `StepBackFacing` (`:12276-12291`), без отправки: её делает действие через дверь.
+    bool WorldView::BackStepToward(Position const& wp, ObjectGuid face, float dt, Position* next) const
+    {
+        if (!_self || !next)
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, face);
+        if (!who)
+            return false;
+        float const speed = _self->GetSpeed(MOVE_WALK) * 0.9f;   // пятимся медленнее, и это к лучшему
+        float const go = std::min(speed * dt, _self->GetExactDist2d(wp.GetPositionX(), wp.GetPositionY()));
+        if (go <= 0.05f)
+            return false;
+        float const ang = _self->GetAbsoluteAngle(wp.GetPositionX(), wp.GetPositionY());
+        float const nx = _self->GetPositionX() + std::cos(ang) * go;
+        float const ny = _self->GetPositionY() + std::sin(ang) * go;
+        float nz = _self->GetMap()->GetHeight(_self->GetPhaseShift(), nx, ny, _self->GetPositionZ() + 2.0f);
+        if (nz <= INVALID_HEIGHT)
+            nz = _self->GetPositionZ();
+        next->Relocate(nx, ny, nz, _self->GetAbsoluteAngle(who));   // ЛИЦОМ К ЦЕЛИ
+        return true;
     }
 
     bool WorldView::CastFor(ObjectGuid victim, CastSender const& send, CastMemory& m) const
