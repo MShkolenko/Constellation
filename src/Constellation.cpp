@@ -2814,7 +2814,10 @@ public:
             DangerBinding danger{ &c, self };
             Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
             Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(),
+            // Доклад — никуда: тень мерит, но в память опасности живого спутника не пишет.
+            FightBinding fightBind{ &c, self };
+            Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, nullptr, &fightBind);
+            Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS(),
                                         &c.EngineShadow, ModeName(c.Mode) };
             // §9 — БЕЗ МАСКИ СТРАТЕГИЯ НЕ РАБОТАЕТ НИ У КОГО: `StrategyMask` начинается
             // нулём, а фильтр — побитовое И. Ставим её ТОЛЬКО тени: шов и так закрыт
@@ -2854,7 +2857,10 @@ public:
             DangerBinding danger{ &c, self };
             Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
             Constellation::Ai::ClientAct act(self, c.Session);
-            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS(), &c.Engine };
+            FightBinding fightBind{ &c, self };
+            Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
+            Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS(),
+                                        &c.Engine, ModeName(c.Mode) };
             Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch);
             return;
         }
@@ -2934,7 +2940,9 @@ public:
                     DangerBinding bind{ &c, self };
                     Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
                     Constellation::Ai::ClientAct act(self, c.Session);
-                    Constellation::Ai::Ctx ctx{ view, danger, act, GameTime::GetGameTimeMS(),
+                    FightBinding fightBind{ &c, self };
+                    Constellation::Ai::FightView fight(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
+                    Constellation::Ai::Ctx ctx{ view, danger, fight, act, GameTime::GetGameTimeMS(),
                                                 &c.Engine, ModeName(c.Mode) };
                     c.Engine.StrategyMask = Cfg().EngineStrategies;
                     if (Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch)
@@ -10662,6 +10670,78 @@ public:
             && kills <= total && nearest <= 75.0f;
     }
 
+    // БОЙ ДВИЖКА: чем мерится и куда докладывает. Связка ИЗМЕНЯЕМАЯ — доклад пишет в память
+    // опасности спутника, — и это единственная дверь записи туда со стороны движка; правило
+    // записи живёт здесь, у лестницы, и совпадает с её собственным разбором исхода
+    // (`case Behavior::Attacking`, «ПОБЕДА»). См. `FightView` в `Engine/Context.h`.
+    struct FightBinding
+    {
+        Companion* C    = nullptr;
+        Player*    Self = nullptr;
+    };
+
+    static Constellation::Ai::BlowsSnapshot ToSnapshot(Manager::Blows const& b)
+    {
+        Constellation::Ai::BlowsSnapshot s;
+        s.Swings = b.Swings; s.Landed = b.Landed; s.Zeroed = b.Zeroed; s.Dealt = b.Dealt;
+        s.Hits = b.Hits; s.Taken = b.Taken; s.Kills = b.Kills; s.LastKilled = b.LastKilled;
+        return s;
+    }
+
+    static Constellation::Ai::BlowsSnapshot BlowsSnapshotFor(void* user)
+    {
+        FightBinding const* b = static_cast<FightBinding const*>(user);
+        if (!b || !b->Self)
+            return Constellation::Ai::BlowsSnapshot();
+        return ToSnapshot(Manager::Instance()->BlowsOf(b->Self->GetGUID()));
+    }
+
+    // ЗАВЕСТИ И СНЯТЬ ОДНОЙ ОПЕРАЦИЕЙ — тот же вход, что у `TryAttack` лестницы.
+    static Constellation::Ai::BlowsSnapshot BlowsBaselineFor(void* user)
+    {
+        FightBinding const* b = static_cast<FightBinding const*>(user);
+        if (!b || !b->Self)
+            return Constellation::Ai::BlowsSnapshot();
+        return ToSnapshot(Manager::Instance()->RegisterAndSnapshot(b->Self->GetGUID()));
+    }
+
+    // ЕДИНСТВЕННЫЙ ПИСАТЕЛЬ ПАМЯТИ ОПАСНОСТИ СО СТОРОНЫ ДВИЖКА. Правила — лестницы, дословно:
+    //   Engaged: `FightVictim/Name/Entry` как в `TryAttack` (`:7540-7542`) — и не гасятся, как и
+    //            там: обработчик гибели читает `FightVictimEntry` за неимением живой цели;
+    //   Won:     `DeathAt.clear()` («выиграл — значит зона по нему») и `KillSpots[клетка]++` с
+    //            потолком 60000 — клетка ПОБЕДИТЕЛЯ, как в `Attacking` (`:5569-5578`);
+    //   Ended:   ничего — у лестницы бой без победы в память опасности не пишет.
+    static void FightOutcomeFor(void* user, Constellation::Ai::FightOutcome const& ev)
+    {
+        FightBinding* b = static_cast<FightBinding*>(user);
+        if (!b || !b->C || !b->Self)
+            return;
+        Companion& c = *b->C;
+        switch (ev.What)
+        {
+            case Constellation::Ai::FightEvent::Engaged:
+            {
+                c.FightVictim      = ev.Victim;
+                c.FightVictimEntry = ev.VictimEntry;
+                // БЕЗУСЛОВНО, как у лестницы: иначе при уже недоступной цели осталось бы имя
+                // из ПРОШЛОГО боя, и строка исхода назвала бы не того (Кодекс).
+                Unit* u = ObjectAccessor::GetUnit(*b->Self, ev.Victim);
+                c.FightVictimName = u ? u->GetName() : std::string();
+                break;
+            }
+            case Constellation::Ai::FightEvent::Won:
+            {
+                c.DeathAt.clear();
+                auto& ks = c.KillSpots[SpotKey(ev.MapId, ev.X, ev.Y)];
+                if (ks < 60000)
+                    ++ks;
+                break;
+            }
+            case Constellation::Ai::FightEvent::Ended:
+                break;
+        }
+    }
+
     // ПАМЯТЬ ЛЕСТНИЦЫ О СОБСТВЕННЫХ ПОПЫТКАХ — одним переключателем на все её контейнеры.
     //
     // ПОРОГИ ЖИВУТ ЗДЕСЬ, И ЭТО ИХ МЕСТО. «Сколько раз пробовать, прежде чем бросить» —
@@ -13557,10 +13637,13 @@ private:
         Constellation::Ai::WorldView view(self);
         DangerBinding danger{ &c, self };
         Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
+        FightBinding fightBind{ &c, self };
         if (Cfg().Engine)
         {
             Constellation::Ai::ClientAct act(self, c.Session);
-            Constellation::Ai::Ctx ctx{ view, dangerView, act, GameTime::GetGameTimeMS() };
+            // `Reset` зовёт `Cancel`, а бой вправе доложить «кончил» — живому спутнику по-настоящему.
+            Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
+            Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS() };
             Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
         }
         if (Cfg().EngineShadow)
@@ -13568,7 +13651,8 @@ private:
             // Своя дверь и тоже заглушённая: `Reset` зовёт `Action::Cancel`, а тот
             // вполне может захотеть отправить пакет — отмена цели, остановка атаки.
             Constellation::Ai::ClientAct shadowAct(self, c.Session, /*muted=*/true);
-            Constellation::Ai::Ctx shadowCtx{ view, dangerView, shadowAct, GameTime::GetGameTimeMS() };
+            Constellation::Ai::FightView shadowFight(&BlowsSnapshotFor, &BlowsBaselineFor, nullptr, &fightBind);
+            Constellation::Ai::Ctx shadowCtx{ view, dangerView, shadowFight, shadowAct, GameTime::GetGameTimeMS() };
             Constellation::Ai::Engine::Instance().Reset(c.EngineShadow, shadowCtx, why);
         }
     }
