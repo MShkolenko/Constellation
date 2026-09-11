@@ -340,10 +340,63 @@ namespace Constellation::Ai
             return _deadly && _deadly(_user, x, y);
         }
 
+        // ДВА ВОПРОСА ПОХОДА — те же две памяти, другие правила, и потому отдельные вопросы
+        // (тот же довод, что развёл бой и маршрут выше). «Туда не идём»: голый `DeathSpotBlocked`
+        // по точке НАЗНАЧЕНИЯ без боевых сужений (`FindObjectiveSpot`, `:8956`). «Этот квест
+        // стоил мне гибелей»: `QuestBlockedByDeaths` — вторая половина того же правила, потому что
+        // источник предмета и прокси-зачёт планировщик по виду не знает, зато знает квест
+        // (Кодекс, задача 86). Оба нулевых провода — разрешающие; провайдер обязан их дать.
+        using DeadlyThereFn   = bool (*)(void const* user, float x, float y);
+        using QuestDeathsFn   = bool (*)(void const* user, uint32 questId);
+        void WireTravel(DeadlyThereFn deadlyThere, QuestDeathsFn questDeaths)
+        {
+            _deadlyThere = deadlyThere; _questDeaths = questDeaths;
+        }
+        bool DeadlyToTravelTo(float x, float y) const { return _deadlyThere && _deadlyThere(_user, x, y); }
+        bool QuestCostMeDeaths(uint32 questId) const { return _questDeaths && _questDeaths(_user, questId); }
+
     private:
-        KilledByFn   _killed;
-        DeadlyHereFn _deadly;
-        void const*  _user;
+        KilledByFn     _killed;
+        DeadlyHereFn   _deadly;
+        void const*    _user;
+        DeadlyThereFn  _deadlyThere = nullptr;
+        QuestDeathsFn  _questDeaths = nullptr;
+    };
+
+    // ---------------------------------------------------------------------------------------
+    // ПОХОД К МЕСТУ ЗАДАНИЯ: выбор точки — одна политика на два механизма (`FindObjectiveSpot`).
+    //
+    // Замер 2026-09-11, узел «стою»: 15 из 135 расхождений — лестница «иду к месту задания», а
+    // движок «идти к квестодателю по карте», потому что у него не было этого действия, и он
+    // шёл за новым квестом вместо цели текущего.
+    //
+    // ПАМЯТЬ МЕХАНИЗМА ПРИХОДИТ ОТ ВЫЗЫВАЮЩЕГО: «к этому квесту недавно сходили впустую» — у
+    // лестницы `TravelBackoff`, у движка таблица отсрочек. Приборы — два callback'а, которые
+    // движок не подаёт (`nullptr` = молчать): «квест закрыт гибелями» и «место смертельно» —
+    // лестница пишет их по разу и берёт числа для строки у своего же полного предиката.
+    // ---------------------------------------------------------------------------------------
+    using TravelBackoffFn  = bool (*)(void const* user, uint32 questId);
+    using TravelNoteQuestFn = void (*)(void* user, uint32 questId);
+    using TravelNoteSpotFn  = void (*)(void* user, float x, float y);
+    struct TravelMemory
+    {
+        TravelBackoffFn   BackedOff = nullptr;      // nullptr = памяти нет: НЕ безобидно, см. SeekMemory
+        void const*       User      = nullptr;
+        TravelNoteQuestFn NoteQuest = nullptr;      // прибор, nullptr = молчать
+        TravelNoteSpotFn  NoteSpot  = nullptr;
+        void*             DiagUser  = nullptr;
+    };
+    // ВЫХОД: `Found` — кандидат есть (квест и порог остановки названы), `Worth` — идти стоит
+    // (не ближе `FightRange`, там цель и так увидит обычный поиск). Два флага, а не один, потому
+    // что лестница пишет `TravelQuest`/`TravelStop` и тогда, когда идти незачем, — и обработчик
+    // гибели читает `TravelQuest` для атрибуции смерти к квесту. Подъём это сохраняет.
+    struct TravelSpot
+    {
+        Position Where;
+        uint32   QuestId = 0;
+        float    Stop    = 10.0f;
+        bool     Found   = false;
+        bool     Worth   = false;
     };
 
     // ---------------------------------------------------------------------------------------
@@ -730,6 +783,9 @@ namespace Constellation::Ai
     float EngageRangeFor(Player* self, Unit* target);
     bool  LootAllowedFor();
     float KiteYardsFor();
+
+    // Место задания: одна реализация на лестницу и на движок (см. `TravelMemory`).
+    bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

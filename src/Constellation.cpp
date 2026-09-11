@@ -2813,6 +2813,7 @@ public:
             Constellation::Ai::WorldView view(self);
             DangerBinding danger{ &c, self };
             Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
+        dangerView.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
             Constellation::Ai::ClientAct act(self, c.Session, /*muted=*/true);
             // Доклад — никуда: тень мерит, но в память опасности живого спутника не пишет.
             FightBinding fightBind{ &c, self };
@@ -2878,6 +2879,7 @@ public:
             Constellation::Ai::WorldView view(self);
             DangerBinding danger{ &c, self };
             Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
+        dangerView.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
             Constellation::Ai::ClientAct act(self, c.Session);
             FightBinding fightBind{ &c, self };
             Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
@@ -2966,6 +2968,7 @@ public:
                     Constellation::Ai::WorldView view(self);
                     DangerBinding bind{ &c, self };
                     Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
+                    danger.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
                     Constellation::Ai::ClientAct act(self, c.Session);
                     FightBinding fightBind{ &c, self };
                     Constellation::Ai::FightView fight(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
@@ -8814,7 +8817,9 @@ public:
             && self->GetLevel() <= uint32(q->second.second) + 2;
     }
 
-    bool FindObjectiveSpot(Companion& c, Player* self) const
+    bool FindObjectiveSpotCore(Player* self, Constellation::Ai::DangerView const& danger,
+                               Constellation::Ai::TravelMemory const& mem,
+                               Constellation::Ai::TravelSpot* out) const
     {
         Position best;
         float bestDist = 100000.0f;
@@ -8824,7 +8829,7 @@ public:
             uint32 questId = self->GetQuestSlotQuestId(slot);
             if (!questId || self->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
                 continue;
-            if (c.TravelBackoff.count(questId))
+            if (mem.BackedOff && mem.BackedOff(mem.User, questId))
                 continue;                   // недавно сходили впустую — не повторяем
             Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
             if (!quest)
@@ -8842,19 +8847,15 @@ public:
                     continue;
                 // К ТОМУ, КТО УБИВАЛ ДВАЖДЫ, НЕ ИДЁМ, ПОКА НЕ ПЕРЕРОСЛИ: иначе поход к точке
                 // квеста, отказ бить, откат и снова поход. Цель откроется сама с уровнем.
-                if (isMonster && KilledByBlocked(c, self, uint32(obj.ObjectID)))
+                if (isMonster && danger.KilledMeTwice(uint32(obj.ObjectID)))
                     continue;
                 // И ЗА КВЕСТ, ЗА КОТОРЫЙ ГИБ ДВАЖДЫ, НЕ ИДЁМ ВОВСЕ — какой бы ни была цель:
                 // предмет, прокси-зачёт, второй моб у точки. Планировщик источник предмета по
                 // виду не знает, зато знает квест (Кодекс, задача 86).
-                if (QuestBlockedByDeaths(c, self, questId))
+                if (danger.QuestCostMeDeaths(questId))
                 {
-                    if (c.KilledOnQuestNoted.insert(questId).second)
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation ПОХОД {}: квест {} «{}» стоил мне {} гибел. — маршрут не строю, пока не перерасту (был ур {}, нужен {})",
-                            self->GetName(), questId, quest->GetLogTitle(),
-                            uint32(c.KilledOnQuest.at(questId).first), uint32(c.KilledOnQuest.at(questId).second),
-                            uint32(c.KilledOnQuest.at(questId).second) + 3);
+                    if (mem.NoteQuest)
+                        mem.NoteQuest(mem.DiagUser, questId);
                     continue;
                 }
                 if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
@@ -8951,27 +8952,81 @@ public:
                     {
                         // В КЛЕТКУ, ГДЕ МЕНЯ УЖЕ УБИВАЛИ ТРИЖДЫ, НЕ ИДЁМ. Проверяем саму ТОЧКУ
                         // назначения, а не текущее место: смерть случалась именно там.
-                        uint64 deadly = 0;
-                        uint32 deadlyTotal = 0, deadlyLevel = 0;
-                        if (DeathSpotBlocked(c, self, self->GetMapId(), dest.GetPositionX(), dest.GetPositionY(),
-                                             &deadly, &deadlyTotal, &deadlyLevel))
+                        if (danger.DeadlyToTravelTo(dest.GetPositionX(), dest.GetPositionY()))
                         {
-                            if (c.DeathSpotNoted.insert(deadly).second)
-                                TC_LOG_INFO("server.worldserver",
-                                    "Constellation ПОХОД {}: вокруг места {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
-                                    self->GetName(), dest.GetPositionX(), dest.GetPositionY(),
-                                    deadlyTotal, deadlyLevel, deadlyLevel + 3);
+                            if (mem.NoteSpot)
+                                mem.NoteSpot(mem.DiagUser, dest.GetPositionX(), dest.GetPositionY());
                             continue;
                         }
-                        bestDist = d; best = dest; found = true; c.TravelQuest = questId; c.TravelStop = stop;
+                        bestDist = d; best = dest; found = true; out->QuestId = questId; out->Stop = stop;
                     }
             }
         }
+        out->Found = found;
         // ближе FightRange идти незачем: там цель и так увидит обычный поиск
         if (!found || bestDist < Cfg().FightRange)
             return false;
-        c.TravelPos = best;
+        out->Where = best;
+        out->Worth = true;
         return true;
+    }
+
+    // ПРИБОРЫ ЛЕСТНИЦЫ ДЛЯ ПОХОДА — по разу, с числами от её же полного предиката (тот же приём,
+    // что у строки смертельного места в обходе целей, шаг 14B).
+    static void TravelNoteQuestFor(void* user, uint32 questId)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        Companion& c = *const_cast<Companion*>(b->C);
+        if (!c.KilledOnQuestNoted.insert(questId).second)
+            return;
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        auto const& q = c.KilledOnQuest.at(questId);
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПОХОД {}: квест {} «{}» стоил мне {} гибел. — маршрут не строю, пока не перерасту (был ур {}, нужен {})",
+            b->Self->GetName(), questId, quest ? quest->GetLogTitle() : "?",
+            uint32(q.first), uint32(q.second), uint32(q.second) + 3);
+    }
+
+    static void TravelNoteSpotFor(void* user, float x, float y)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        Companion& c = *const_cast<Companion*>(b->C);
+        uint64 deadly = 0; uint32 deadlyTotal = 0, deadlyLevel = 0;
+        Manager::Instance()->DeathSpotBlocked(c, b->Self, b->Self->GetMapId(), x, y,
+                                              &deadly, &deadlyTotal, &deadlyLevel);
+        if (c.DeathSpotNoted.insert(deadly).second)
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПОХОД {}: вокруг места {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
+                b->Self->GetName(), x, y, deadlyTotal, deadlyLevel, deadlyLevel + 3);
+    }
+
+    static bool TravelBackedOffFor(void const* user, uint32 questId)
+    {
+        Companion const* c = static_cast<Companion const*>(user);
+        return c && c->TravelBackoff.count(questId) != 0;
+    }
+
+    // Обёртка лестницы: подпись прежняя, вызов в `Idle` (`:3337`) не тронут. Выходы копируются
+    // ровно так, как их писало старое тело: квест и порог — на каждого найденного кандидата
+    // (обработчик гибели читает `TravelQuest`), точка — только когда идти стоит.
+    bool FindObjectiveSpot(Companion& c, Player* self) const
+    {
+        DangerBinding bind{ &c, self };
+        Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
+        danger.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
+        Constellation::Ai::TravelMemory mem;
+        mem.BackedOff = &TravelBackedOffFor; mem.User = &c;
+        mem.NoteQuest = &TravelNoteQuestFor; mem.NoteSpot = &TravelNoteSpotFor; mem.DiagUser = &bind;
+        Constellation::Ai::TravelSpot out;
+        bool const worth = FindObjectiveSpotCore(self, danger, mem, &out);
+        if (out.Found)
+        {
+            c.TravelQuest = out.QuestId;
+            c.TravelStop  = out.Stop;
+        }
+        if (worth)
+            c.TravelPos = out.Where;
+        return worth;
     }
 
     // НАДЕТЬ ЛУЧШЕЕ ИЗ ТОГО, ЧТО ЛЕЖИТ В СУМКАХ. Задача 0009, часть А, по журналу Легиона.
@@ -10695,6 +10750,25 @@ public:
         return Manager::Instance()->DeathSpotBlocked(*b->C, b->Self, b->Self->GetMapId(), x, y,
                                                      &which, &total, &level, &kills, &nearest)
             && kills <= total && nearest <= 75.0f;
+    }
+
+    // ДВА ВОПРОСА ПОХОДА для `DangerView` — та же связка, что у боевых.
+    static bool DeadlyToTravelToFor(void const* user, float x, float y)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        if (!b || !b->C || !b->Self)
+            return false;
+        uint64 which = 0; uint32 total = 0, level = 0;
+        return Manager::Instance()->DeathSpotBlocked(*b->C, b->Self, b->Self->GetMapId(), x, y,
+                                                     &which, &total, &level);
+    }
+
+    static bool QuestCostMeDeathsFor(void const* user, uint32 questId)
+    {
+        DangerBinding const* b = static_cast<DangerBinding const*>(user);
+        if (!b || !b->C || !b->Self)
+            return false;
+        return Manager::Instance()->QuestBlockedByDeaths(*b->C, b->Self, questId);
     }
 
     // БОЙ ДВИЖКА: чем мерится и куда докладывает. Связка ИЗМЕНЯЕМАЯ — доклад пишет в память
@@ -13693,6 +13767,7 @@ private:
         Constellation::Ai::WorldView view(self);
         DangerBinding danger{ &c, self };
         Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
+        dangerView.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
         FightBinding fightBind{ &c, self };
         if (Cfg().Engine)
         {
@@ -14032,6 +14107,11 @@ namespace Constellation::Ai
     float KiteYardsFor()
     {
         return Constellation::Cfg().KiteYards;
+    }
+
+    bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out)
+    {
+        return Constellation::Manager::Instance()->FindObjectiveSpotCore(self, danger, mem, out);
     }
 
     // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
