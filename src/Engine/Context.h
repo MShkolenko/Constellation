@@ -25,6 +25,9 @@
 #include "Position.h"
 #include "QuestDef.h"
 #include <optional>
+#include <set>
+#include <utility>
+#include <vector>
 
 class Player;
 
@@ -821,6 +824,68 @@ namespace Constellation::Ai
     };
     bool TalkPlanFor(Player* self, Creature* who, TalkPlan* out);      // false = отказ (см. Why)
     bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan);
+
+    // ---------------------------------------------------------------------------------------
+    // РАЗГОВОР, часть 3 — ПРИШЛИ И ЗАКРЫВАЕМ (`Constellation.cpp:5198-5561`): окно ожидания
+    // зачёта, три предохранителя из Легиона, клик, предмет с условиями из базы, обход меню по
+    // правилам SmartAI. Тело одно; у механизмов свои память, отправитель и что делать с исходом.
+    //
+    // СОСТОЯНИЕ ПОПЫТКИ — `TalkState`: живёт у спутника (`c.Talk`) и у движка (`EngineState`);
+    // Switch из `Talking` обнуляет окно и счётчик бесплодных (`:7447`) — у движка это делает
+    // отмена действия. Снимок `Was` переживает выход намеренно: по нему ловится зачёт, пришедший
+    // после окна (`ReconcileLateCreditCore`).
+    // ---------------------------------------------------------------------------------------
+    struct TalkState
+    {
+        uint32 WaitMs = 0;              // сколько ещё ждать зачёта (0 = попытка не сделана)
+        uint32 Ms = 0;                  // сколько уже идём / ждём готовности предмета
+        float  Dist = 0.0f;             // и с какого расстояния начали
+        uint8  Fruitless = 0;           // окон подряд без зачёта на особи (предохранитель)
+        uint32 FruitlessEntry = 0;      // для какого вида считаем отставленных особей
+        uint8  GiveUps = 0;             // сколько особей этого вида отставлено подряд
+        uint8  ActionFruitless = 0;     // отставленных особей подряд по ВСЕМ видам (Легион, 0012)
+        std::vector<std::pair<std::pair<uint32, uint32>, int32>> Was;   // счётчики целей ДО попытки
+        uint32 WasEntry = 0;            // по какому виду снят снимок
+        bool   CondNoted = false;       // строка «не отвечает условиям» — один раз
+    };
+    // ПАМЯТЬ МЕХАНИЗМА — что делать с исходами. Лестница: TalkBackoff / TalkUnreachable /
+    // TalkRetry / ToolActionMs / Talked; движок: свои отсрочки. Все указатели обязательны.
+    struct TalkMemory
+    {
+        uint32 (*Talked)(void* user) = nullptr;                              // ++ и вернуть
+        void (*SpeciesBackoff)(void* user, uint32 entry, uint32 ms) = nullptr;
+        void (*Individual)(void* user, ObjectGuid guid) = nullptr;           // «эту особь — нет»
+        void (*Retry)(void* user, ObjectGuid guid, uint32 ms) = nullptr;     // особь, со сроком
+        void (*ActionPause)(void* user, uint32 ms) = nullptr;                // 0 = снять
+        void* User = nullptr;
+    };
+    // ОТПРАВИТЕЛЬ — четыре двери и поворот; лестница шлёт через сессию, движок через `ctx.Act`.
+    struct TalkSender
+    {
+        void (*Face)(void* user, ObjectGuid who) = nullptr;
+        void (*SpellClick)(void* user, ObjectGuid unit) = nullptr;
+        void (*UseItem)(void* user, uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
+                        ClientAct::UseItemTarget const& target) = nullptr;
+        void (*GossipHello)(void* user, ObjectGuid unit) = nullptr;
+        void (*GossipSelect)(void* user, ObjectGuid unit, uint32 menuId, uint32 optionId) = nullptr;
+        void* User = nullptr;
+    };
+    // ИСХОДЫ — по одному на каждый выход лестницы из этой половины ветки (`:5226-5560`), плюс
+    // два «ещё не конец»: окно идёт, попытка отправлена.
+    enum class TalkOutcome : uint8
+    {
+        Waiting, Sent,
+        Credited,           // «закрыл цель»
+        Fruitless,          // «без зачёта»
+        NotByConditions,    // «цель не по условиям»
+        ToolNotReady,       // «предмет не готов минуту»
+        NothingToSay,       // «говорить не о чем»
+        Talked,             // «поговорил»
+        TalkFailed          // «разговор без толку»
+    };
+    TalkOutcome TalkEngageFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st,
+                              TalkMemory const& mem, TalkSender const& send, uint32 sliceMs);
+    bool ReconcileLateCreditFor(Player* self, TalkState& st, TalkMemory const& mem);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

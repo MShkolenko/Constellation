@@ -417,7 +417,6 @@ struct Companion
     uint32 NoTargetMs = 0;              // сколько уже нет боя: долго — порог стаи отступает
     bool EliteNoted = false;            // и что элитных в одиночку не берём
     bool ToughNoted = false;            // и что слишком крепких тоже
-    bool CondNoted = false;             // и что цель не отвечает условиям заклинания
     // ОТМЕТКИ ГИБЕЛЕЙ, А НЕ СЧЁТЧИК С ТАЙМЕРОМ (Кодекс): таймер, который каждая смерть
     // ставит заново, считает тремя за десять минут даже смерти на 0-й, 9-й и 18-й.
     std::deque<uint32> DeathAt;         // время гибелей, мс игрового времени
@@ -558,10 +557,8 @@ struct Companion
     // их нельзя. То же держит тауренов с десятью такими целями.
     ObjectGuid TalkCandidate;           // нашлась при поиске боевой цели
     ObjectGuid TalkGuid;                // к кому идём говорить
-    uint32 TalkMs = 0;                  // сколько уже идём
-    float TalkDist = 0.0f;              // и с какого расстояния начали
+    Constellation::Ai::TalkState Talk;  // состояние попытки разговора/применения — тело поднято (TalkEngageCore)
     uint32 Talked = 0;                  // сколько разговоров и применений дало зачёт
-    uint8 ToolFruitless = 0;            // применений подряд без зачёта (предохранитель)
     uint32 EquipScanMs = 0;             // когда снова смотреть сумки на предмет обновок
     uint32 Equipped = 0;                // сколько вещей надето за жизнь
     std::map<std::pair<ObjectGuid, uint8>, uint32> EquipRefused;
@@ -572,16 +569,9 @@ struct Companion
     // временем произнесения и ставится ядром в очередь (Player::RequestSpellCast), поэтому
     // результат меряется не в том же вызове, а по окну. Предохранитель считает ОКНА без
     // зачёта, а не отправленные пакеты — отказ по откату или занятости попыткой не является.
-    uint32 ToolWaitMs = 0;              // сколько ещё ждать зачёта (0 = попытка не сделана)
-    uint32 ToolFruitlessEntry = 0;      // для какого вида считаем отставленных особей
-    uint8 ToolGiveUps = 0;              // сколько особей этого вида отставлено подряд
-    uint8 ToolActionFruitless = 0;      // отставленных особей подряд по ВСЕМ видам (Легион, 0012)
     uint32 ToolActionMs = 0;            // и пауза всему действию, когда их накопилось шесть
     float WalkBest = 1.0e9f;            // лучшее расстояние до точки в этом режиме
     uint32 WalkStuckMs = 0;             // сколько подряд не приближаемся к ней
-    std::vector<std::pair<std::pair<uint32, uint32>, int32>> ToolWas;   // счётчики целей ДО попытки
-    uint32 ToolWasEntry = 0;            // по какому виду снят снимок: зачёт, пришедший после окна,
-                                        // сверяется с ним перед СЛЕДУЮЩЕЙ попыткой (Кодекс)
     // ТОРГОВЕЦ ПО КАРТЕ: когда в обзоре никого, идём к ближайшему из указателя спавнов —
     // так же, как к принимающему квест. VendorGuid заполняется, когда он показался.
     uint32 VendorEntry = 0;             // к какому виду торговца идём (0 = ни к какому)
@@ -3304,8 +3294,8 @@ public:
                     {
                         c.TalkGuid = c.TalkCandidate;
                         c.TalkCandidate.Clear();
-                        c.TalkMs = 0;
-                        c.TalkDist = self->GetExactDist(who);
+                        c.Talk.Ms = 0;
+                        c.Talk.Dist = self->GetExactDist(who);
                         Switch(c, self, Behavior::Talking, "надо поговорить, а не драться");
                         return;
                     }
@@ -5081,8 +5071,6 @@ public:
                 bool const planned = TalkPlanCore(self, who, &plan);
                 bool const gossip = plan.What == Constellation::Ai::TalkPlan::Gossip;
                 bool const click  = plan.What == Constellation::Ai::TalkPlan::Click;
-                uint32 const clickCastMs = plan.ClickCastMs;
-                bool const clickTied = plan.ClickTied;
                 if (!planned && plan.Why == Constellation::Ai::TalkPlan::ClickNotAllowed)
                 {
                     TC_LOG_INFO("server.worldserver",
@@ -5093,10 +5081,7 @@ public:
                     Switch(c, self, Behavior::Idle, "клик не по правилам");
                     return;
                 }
-                uint32 const toolSpell = plan.ToolSpell, toolQuest = plan.ToolQuest;
-                std::set<uint32> const& toolCredits = plan.ToolCredits;
                 Item* tool = plan.What == Constellation::Ai::TalkPlan::Tool ? self->GetItemByGuid(plan.ToolItem) : nullptr;
-                SpellInfo const* toolInfo = tool ? sSpellMgr->GetSpellInfo(toolSpell, DIFFICULTY_NONE) : nullptr;
                 if (!planned || (!tool && !gossip && !click))
                 {
                     // ЭТО СВОЙСТВО ОСОБИ, А НЕ ВИДА. Правило раненого пехотинца СНИМАЕТ с него
@@ -5105,19 +5090,19 @@ public:
                     // весь квест на десять минут — так и вышло на живом у четверых людей.
                     // Отставляем особь; вид — только когда подряд не вышло с четырьмя.
                     c.TalkUnreachable.insert(c.TalkGuid);
-                    if (c.ToolFruitlessEntry != who->GetEntry())
-                        { c.ToolFruitlessEntry = who->GetEntry(); c.ToolGiveUps = 0; }
-                    bool const wholeKind = ++c.ToolGiveUps >= 4;
+                    if (c.Talk.FruitlessEntry != who->GetEntry())
+                        { c.Talk.FruitlessEntry = who->GetEntry(); c.Talk.GiveUps = 0; }
+                    bool const wholeKind = ++c.Talk.GiveUps >= 4;
                     if (wholeKind)
                     {
-                        c.ToolGiveUps = 0;
+                        c.Talk.GiveUps = 0;
                         c.TalkBackoff[who->GetEntry()] = 600000;
                     }
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ПРИМЕНЕНИЕ {}: у {} ({}) ни беседы, ни клика, ни предмета от квеста — отставляю {}",
                         self->GetName(), who->GetName(), who->GetEntry(), wholeKind ? "вид" : "особь");
                     c.TalkGuid.Clear();
-                    c.ToolWaitMs = 0;
+                    c.Talk.WaitMs = 0;
                     Switch(c, self, Behavior::Idle, "закрыть нечем");
                     return;
                 }
@@ -5128,13 +5113,12 @@ public:
                 // (conditions: 13/80208 -> 31/3/42940), а сам триггер невыбираем
                 // (UNIT_FLAG_UNINTERACTIBLE) — клиент шлёт его без цели, стоя рядом.
                 float const reach = plan.Reach;
-                bool const toolUnit = plan.ToolUnit;
 
                 // ДОШЁЛ — поднято (`TalkArrivedCore`). И идём тогда к САМОЙ цели, а не к точке
                 // подхода: та лежит в ~4.5 ярдах от цели, и остановка «в reach от неё»
                 // оставляла бы до цели вдвое больше.
                 bool const arrived = TalkArrivedCore(self, who, plan);
-                if (!arrived && !c.ToolWaitMs)
+                if (!arrived && !c.Talk.WaitMs)
                 {
                     float tx, ty, tz;
                     if (gossip)
@@ -5157,19 +5141,19 @@ public:
                         Switch(c, self, Behavior::Idle, "к собеседнику нет дороги");
                         return;
                     }
-                    c.TalkMs += slice;
+                    c.Talk.Ms += slice;
                     float const now = ProgressDist(c, self, who);
-                    bool const noProgress = c.TalkMs >= 20000 && now > c.TalkDist - 1.0f;
-                    bool const talkDone = c.Move.Stalled || noProgress || c.TalkMs >= 45000;
+                    bool const noProgress = c.Talk.Ms >= 20000 && now > c.Talk.Dist - 1.0f;
+                    bool const talkDone = c.Move.Stalled || noProgress || c.Talk.Ms >= 45000;
                     if (talkDone && FindReachableApproach(c, self, who))
-                        { c.TalkMs = 0; c.TalkDist = ProgressDist(c, self, who); return; }
+                        { c.Talk.Ms = 0; c.Talk.Dist = ProgressDist(c, self, who); return; }
                     if (talkDone)
                     {
                         LogApproachFailure(c, self, who, "собеседнику");
                         TC_LOG_INFO("server.worldserver",
                             "Constellation РЕЧЬ {}: до {} ({}) не дойти за {} с, было {:.0f}, стало {:.0f}",
                             self->GetName(), who->GetName(), who->GetEntry(),
-                            c.TalkMs / 1000, c.TalkDist, now);
+                            c.Talk.Ms / 1000, c.Talk.Dist, now);
                         c.TalkUnreachable.insert(c.TalkGuid);
                         c.TalkGuid.Clear();
                         Switch(c, self, Behavior::Idle, "до собеседника не дойти");
@@ -5177,370 +5161,29 @@ public:
                     return;
                 }
 
-                // ПРИШЛИ. Поворачиваемся — так делает игрок, и это видно в клиенте.
-                self->SetFacingToObject(who);
-
-                std::string const name = who->GetName();
-                uint32 const entry = who->GetEntry();
-
-                // ОКНО ОЖИДАНИЯ ЗАЧЁТА — общее для клика и предмета. Успех меряется ростом
-                // счётчика цели, а не отсутствием ошибки; ждём до трёх секунд (время
-                // произнесения плюс очередь ядра). Окно без зачёта — бесплодная попытка.
-                if (c.ToolWaitMs)
+                // ПРИШЛИ И ЗАКРЫВАЕМ — поднято (`TalkEngageCore`). Здесь остались только выходы:
+                // те же одиннадцать причин `Switch`, что и были, по исходу.
                 {
-                    c.ToolWaitMs = (c.ToolWaitMs <= slice) ? 0 : c.ToolWaitMs - slice;
-                    bool credited = false;
-                    for (auto const& [key, before] : c.ToolWas)
-                        if (self->GetQuestObjectiveData(key.first, key.second) > before)
-                            { credited = true; break; }
-                    if (credited)
+                    TalkBinding bind{ &c, self };
+                    using Constellation::Ai::TalkOutcome;
+                    TalkOutcome const o = TalkEngageCore(self, who, plan, c.Talk, TalkMemoryOf(&bind), TalkSenderOf(&bind), slice);
+                    char const* reason = nullptr;
+                    switch (o)
                     {
-                        ++c.Talked;
-                        c.ToolFruitless = 0;
-                        c.ToolGiveUps = 0;
-                        c.ToolActionFruitless = 0;
-                        c.ToolWaitMs = 0;
-                        c.ToolWas.clear();
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation ПРИМЕНЕНИЕ {}: {} ({}) — зачёт; всего {}",
-                            self->GetName(), name, entry, c.Talked);
-                        c.TalkGuid.Clear();
-                        Switch(c, self, Behavior::Idle, "закрыл цель");
-                        return;
+                        case TalkOutcome::Waiting:
+                        case TalkOutcome::Sent:            return;
+                        case TalkOutcome::Credited:        reason = "закрыл цель"; break;
+                        case TalkOutcome::Fruitless:       reason = "без зачёта"; break;
+                        case TalkOutcome::NotByConditions: reason = "цель не по условиям"; break;
+                        case TalkOutcome::ToolNotReady:    reason = "предмет не готов минуту"; break;
+                        case TalkOutcome::NothingToSay:    reason = "говорить не о чем"; break;
+                        case TalkOutcome::Talked:          reason = "поговорил"; break;
+                        case TalkOutcome::TalkFailed:      reason = "разговор без толку"; break;
                     }
-                    if (c.ToolWaitMs)
-                        return;             // окно ещё идёт
-                    // ПРЕДОХРАНИТЕЛЬ ИЗ ЛЕГИОНА, С ПОПРАВКОЙ КОДЕКСА: считаем окна без зачёта,
-                    // не отправки. Два окна на одной особи — отставляем ЕЁ (пожар уже потушен,
-                    // пехотинец уже поднят); четыре особи подряд — отставляем вид на две минуты.
-                    // На Легионе шесть ботов сутки лупили дубинкой БОДРСТВУЮЩИХ батраков:
-                    // 606 успешных применений, ноль продвижения.
-                    if (++c.ToolFruitless >= 2)
-                    {
-                        c.ToolFruitless = 0;
-                        c.TalkUnreachable.insert(c.TalkGuid);
-                        if (c.ToolFruitlessEntry != entry)
-                            { c.ToolFruitlessEntry = entry; c.ToolGiveUps = 0; }
-                        if (++c.ToolGiveUps >= 4)
-                        {
-                            c.ToolGiveUps = 0;
-                            c.TalkBackoff[entry] = 120000;
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation ПРИМЕНЕНИЕ {}: четыре особи {} ({}) без зачёта — отставляю вид",
-                                self->GetName(), name, entry);
-                        }
-                        else
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation ПРИМЕНЕНИЕ {}: {} ({}) два окна без зачёта — отставляю особь",
-                                self->GetName(), name, entry);
-                        // ПРЕДОХРАНИТЕЛЬ НА ВСЁ ДЕЙСТВИЕ (Легион, 0012; Кодекс): шесть
-                        // отставленных особей подряд по любым видам — пять минут без разговоров
-                        // и применений вовсе, чтобы одна ошибочная связка не ходила по кругу.
-                        if (++c.ToolActionFruitless >= 6)
-                        {
-                            c.ToolActionFruitless = 0;
-                            c.ToolActionMs = 300000;
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation ПРИМЕНЕНИЕ {}: шесть особей подряд без зачёта — пять минут без взаимодействий",
-                                self->GetName());
-                        }
-                        c.TalkGuid.Clear();
-                        Switch(c, self, Behavior::Idle, "без зачёта");
-                        return;
-                    }
-                    // первое окно без зачёта: остаёмся и пробуем ещё раз с этой же особью
-                }
-
-                // СТАРЫЙ СНИМОК СВЕРЯЕТСЯ ДО НОВОГО (Кодекс): рост после окна гасит предохранители,
-                // но зачётом не считается — причина не доказана. Попытка идёт своим чередом.
-                ReconcileLateCredit(c, self);
-
-                if (click)
-                {
-                    SnapshotObjectives(self, entry, c.ToolWas);
-                    c.ToolWasEntry = entry;
-                    WorldPacket raw(CMSG_SPELL_CLICK);
-                    WorldPackets::Spells::SpellClick sc(std::move(raw));
-                    sc.SpellClickUnitGuid = c.TalkGuid;
-                    sc.TryAutoDismount = false;
-                    c.Session->HandleSpellClick(sc);
-                    c.ToolWaitMs = std::max<uint32>(4000, clickCastMs + 2500);   // окно от времени произнесения
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) с {:.1f} ярдов, связь с зачётом {}",
-                        self->GetName(), name, entry, self->GetExactDist(who), clickTied ? "прямая" : "через сценарий");
-                    return;
-                }
-
-                if (toolInfo)
-                {
-                    // ПРЕДВАРИТЕЛЬНЫЕ УСЛОВИЯ вместо подсчёта отказов попытками (Кодекс):
-                    // занят другим заклинанием, общий откат, откат предмета — ждём, не шлём.
-                    // УСЛОВИЯ ЗАКЛИНАНИЯ ИЗ БАЗЫ — ТОТ ЖЕ ВОПРОС, ЧТО ЗАДАЁТ ЯДРО ПЕРЕД КАСТОМ.
-                    //
-                    // Замер: 79 применений ведра пробуждения по ленивым батракам и три зачёта.
-                    // Условие лежит в данных: заклинание 19938 требует, чтобы на ЦЕЛИ висела
-                    // аура сна 17743 (conditions 17/19938 -> тип 1, цель 1). Спящий её имеет,
-                    // бодрствующий нет, и по бодрствующему каст просто не проходит. Ядро
-                    // спрашивает это в Spell::CheckCast; спросим и мы — до отправки, а не
-                    // после. Правило общее: любое условие на цель у любого квестового предмета.
-                    {
-                        ConditionSourceInfo cond(self, who);
-                        if (!sConditionMgr->IsObjectMeetingNotGroupedConditions(
-                                CONDITION_SOURCE_TYPE_SPELL, toolInfo->Id, cond))
-                        {
-                            if (!c.CondNoted)
-                            {
-                                c.CondNoted = true;
-                                TC_LOG_INFO("server.worldserver",
-                                    "Constellation ПРИМЕНЕНИЕ {}: {} ({}) не отвечает условиям заклинания {} — не трачу",
-                                    self->GetName(), name, entry, toolSpell);
-                            }
-                            c.TalkRetry[c.TalkGuid] = 60000;    // условие временное — и запрет тоже
-                            c.TalkGuid.Clear();
-                            Switch(c, self, Behavior::Idle, "цель не по условиям");
-                            return;
-                        }
-                    }
-                    if (self->IsNonMeleeSpellCast(false) || self->GetSpellHistory()->HasGlobalCooldown(toolInfo)
-                        || !self->GetSpellHistory()->IsReady(toolInfo, tool->GetEntry()))
-                    {
-                        c.TalkMs += slice;
-                        if (c.TalkMs >= 60000)
-                        {
-                            c.TalkBackoff[entry] = 60000;
-                            c.TalkGuid.Clear();
-                            Switch(c, self, Behavior::Idle, "предмет не готов минуту");
-                        }
-                        return;
-                    }
-                    // СНИМОК — ПО ЗАСЧИТЫВАЕМЫМ ЦЕЛЯМ, А НЕ ПО НОМЕРУ СУЩЕСТВА: у раненого горца
-                    // номер 37080, а зачёт идёт маркеру 37079 — снимок по 37080 был бы пуст, и
-                    // всякий успех читался бы как «без зачёта».
-                    if (toolQuest)
-                        SnapshotQuestObjectives(self, toolQuest, toolCredits, c.ToolWas);
-                    else
-                        SnapshotObjectives(self, entry, c.ToolWas);
-                    c.ToolWasEntry = entry;
-                    // ЛИЧНОСТЬ ПРЕДМЕТА — ДО ВЫЗОВА: успешное применение может израсходовать
-                    // и уничтожить его (Spell::TakeCastItem), и указатель после обработчика
-                    // трогать нельзя (Кодекс: use-after-free в первой редакции).
-                    uint32 const toolEntry = tool->GetEntry();
-                    WorldPacket raw(CMSG_USE_ITEM);
-                    WorldPackets::Spells::UseItem use(std::move(raw));
-                    use.PackSlot = tool->GetBagSlot();
-                    use.Slot = tool->GetSlot();
-                    use.CastItem = tool->GetGUID();
-                    use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
-                        SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), toolSpell,
-                        self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-                    use.Cast.SpellID = int32(toolSpell);
-                    // ЦЕЛЬ — ПО КОНТРАКТУ ЗАКЛИНАНИЯ, а не «всегда существо»: явная цель,
-                    // точка на земле или вовсе без цели (область вокруг себя).
-                    if (toolUnit)
-                    {
-                        use.Cast.Target.Flags = TARGET_FLAG_UNIT;
-                        use.Cast.Target.Unit = c.TalkGuid;
-                    }
-                    else if (plan.ToolDest)
-                    {
-                        use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
-                        WorldPackets::Spells::TargetLocation loc;
-                        loc.Location = who->GetPosition();
-                        use.Cast.Target.DstLocation = loc;
-                    }
-                    else
-                        use.Cast.Target.Flags = TARGET_FLAG_NONE;
-                    tool = nullptr;
-                    uint32 const castMs = toolInfo->CalcCastTime();
-                    c.Session->HandleUseItemOpcode(use);
-                    c.ToolWaitMs = std::max<uint32>(4000, castMs + 2500);   // окно от времени произнесения
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПРИМЕНЕНИЕ {}: предмет {} (закл. {}, {}) на {} ({}) с {:.1f} ярдов",
-                        self->GetName(), toolEntry, toolSpell,
-                        toolUnit ? "по цели" : (use.Cast.Target.Flags == TARGET_FLAG_DEST_LOCATION ? "по месту" : "без цели"),
-                        name, entry, self->GetExactDist(who));
-                    return;
-                }
-
-                // ПЕРЕБИРАТЬ ПУНКТЫ БЕСЕДЫ НЕЛЬЗЯ. ЭТО БЫЛ ИСПОЛНИТЕЛЬ ЧЕГО УГОДНО.
-                //
-                // Первая версия выбирала подряд все пункты меню, пока цель не закроется.
-                // Кодекс отказал в выкладке и перечислил, что один такой пакет исполняет
-                // НЕМЕДЛЕННО, без всякого следующего: снятие денег за пункт, отключение
-                // получения опыта, произвольный сценарий существа — а значит телепорт,
-                // уничтожение предметов и даже убийство персонажа. Я собирался запустить
-                // это на ста двадцати двух живых персонажах.
-                //
-                // Правильный отбор берётся из САМИХ ДАННЫХ, а не из моей эвристики. У
-                // существа есть его правила (SmartAIMgr отдаёт их модулю), и среди них
-                // видно, какой пункт даёт зачёт: событие «выбран пункт меню» с действием
-                // «применить заклинание» или «выдать зачёт убийства». Пара «отправитель +
-                // действие» из правила совпадает с такими же полями пункта меню — по ним
-                // и опознаём. Всё остальное не трогаем ВООБЩЕ: телепорт, торговля, обучение,
-                // плата за пункт в этот список по построению не попадут.
-                std::set<std::pair<uint32, uint32>> allowed, scripted;
-                for (SmartScriptHolder const& e :
-                     sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE))
-                {
-                    if (e.GetEventType() != SMART_EVENT_GOSSIP_SELECT)
-                        continue;
-                    uint32 const act = e.GetActionType();
-                    // ВСЕ пары со сценарием — чтобы знать, на что НЕ нажимать по дороге
-                    scripted.insert({ e.event.gossip.sender, e.event.gossip.action });
-                    if (act != SMART_ACTION_CALL_KILLEDMONSTER && act != SMART_ACTION_SELF_CAST)
-                        continue;
-                    allowed.insert({ e.event.gossip.sender, e.event.gossip.action });
-                }
-                if (allowed.empty())
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation РЕЧЬ {}: у {} ({}) нет пункта, дающего зачёт — не трогаю",
-                        self->GetName(), name, entry);
-                    c.TalkBackoff[entry] = 600000;
                     c.TalkGuid.Clear();
-                    Switch(c, self, Behavior::Idle, "говорить не о чем");
+                    Switch(c, self, Behavior::Idle, reason);
                     return;
                 }
-
-                // ТОЧНОЕ ПРОДВИЖЕНИЕ, А НЕ «ВИД ИСЧЕЗ ИЗ СПИСКА» (Кодекс).
-                //
-                // Прежняя проверка смотрела, остался ли вид в общем наборе нужных. Она лгала
-                // в обе стороны: цель могла закрыться в тот же такт по другой причине, а при
-                // двух заданиях на один вид не менялась вовсе. Запоминаем счётчики именно
-                // тех целей, что ссылаются на это существо, и сверяем их же.
-                std::vector<std::pair<std::pair<uint32, uint32>, int32>> before;
-                for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-                {
-                    uint32 const qid = self->GetQuestSlotQuestId(slot);
-                    if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
-                        continue;
-                    Quest const* q = sObjectMgr->GetQuestTemplate(qid);
-                    if (!q)
-                        continue;
-                    for (QuestObjective const& obj : q->GetObjectives())
-                        if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == entry)
-                            before.push_back({ { qid, obj.ID }, self->GetQuestObjectiveData(qid, obj.ID) });
-                }
-
-                {
-                    WorldPacket raw(CMSG_TALK_TO_GOSSIP);
-                    WorldPackets::NPC::Hello hello(std::move(raw));
-                    hello.Unit = c.TalkGuid;
-                    c.Session->HandleGossipHelloOpcode(hello);
-                }
-
-                // Меню читаем ТЕКУЩЕЕ и сразу: снимок устаревает, а устаревший номер пункта
-                // может попасть в сценарий уже другим действием (Кодекс).
-                GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
-                uint32 const menuId = menu.GetMenuId();
-                int32 pick = -1;
-                // РАЗГОВОР ДВУХШАГОВЫЙ, И ЭТО ВИДНО В ДАННЫХ.
-                //
-                // Существо привязано к одному меню, а зачёт лежит в другом: Лилиан Восс
-                // открывает 12483, а правило ждёт выбора в 12484; у Маршала Редпата 12485
-                // против 12486, у Валдреда Морея 12487 против 12489. Первый шаг разговора —
-                // это переход в следующее окно, и только там нужный пункт.
-                //
-                // Прежний защитный фильтр отвергал пункты с переходом в подменю — то есть
-                // ровно тот шаг, без которого до цели не дойти. Замер: «разрешённых пунктов
-                // 1, выбран -1» у всех восьмидесяти разговоров.
-                //
-                // Переход разрешаем, но НЕ любой: только в то меню, которое само числится в
-                // разрешённых по данным. Такой пункт ничего не делает, кроме открытия
-                // следующего окна, и увести в торговлю или телепорт не может.
-                //
-                // Сверяем при этом то же, что сверяет ядро: обработчик передаёт сценарию
-                // номер меню и OrderIndex пункта (NPCHandler.cpp), а сценарий сличает их со
-                // своими sender и action (SmartScript.cpp:3563) — не поля Sender/Action
-                // самого пункта, как я решил вначале по созвучию имён.
-                std::set<uint32> wantMenus;
-                for (auto const& [m, o] : allowed)
-                    wantMenus.insert(m);
-
-                auto safeOption = [](GossipMenuItem const& item) -> bool
-                {
-                    return !item.BoxCoded && item.BoxMoney == 0 && item.ActionPoiID == 0
-                        && !item.SpellID && item.OptionNpc == GossipOptionNpc::None;
-                };
-
-                bool done = false;
-                pick = -1;
-                for (uint8 hop = 0; hop < 3 && !done; ++hop)
-                {
-                    GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
-                    uint32 const menuId = menu.GetMenuId();
-
-                    // 1) есть ли прямо здесь пункт, дающий зачёт
-                    pick = -1;
-                    for (GossipMenuItem const& item : menu.GetMenuItems())
-                        if (allowed.count({ menuId, item.OrderIndex }) && safeOption(item)
-                            && item.ActionMenuID == 0)
-                            { pick = item.GossipOptionID; break; }
-
-                    if (pick >= 0)
-                    {
-                        WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
-                        WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
-                        sel.GossipUnit = c.TalkGuid;
-                        sel.GossipID = menuId;
-                        sel.GossipOptionID = pick;
-                        c.Session->HandleGossipSelectOptionOpcode(sel);
-
-                        for (auto const& [key, was] : before)
-                            if (self->GetQuestObjectiveData(key.first, key.second) > was)
-                                { done = true; break; }
-                        break;
-                    }
-
-                    // 2) иначе ищем переход ИМЕННО в нужное меню
-                    // ПЕРЕХОД БЫВАЕТ НЕ ОДИН. У Валдреда Морея цепочка 12487 -> 12488 -> 12489,
-                    // и прямого пункта в нужное меню из первого окна просто нет. Замер: у него
-                    // одного 24 отказа «выбран -1», при двенадцати удачных разговорах с теми,
-                    // у кого переход соседний.
-                    //
-                    // Поэтому разрешаем и промежуточный переход, но с жёстким условием: на
-                    // этот пункт НЕ навешено ни одного правила сценария. Тогда он физически
-                    // не может сделать ничего, кроме открытия следующего окна — ни каста, ни
-                    // телепорта, ни платы. Сначала всё же пробуем прямой путь в нужное меню.
-                    int32 step = -1;
-                    uint32 stepMenu = menuId;
-                    for (GossipMenuItem const& item : menu.GetMenuItems())
-                        if (item.ActionMenuID != 0 && wantMenus.count(item.ActionMenuID)
-                            && safeOption(item))
-                            { step = item.GossipOptionID; break; }
-                    if (step < 0)
-                        for (GossipMenuItem const& item : menu.GetMenuItems())
-                            if (item.ActionMenuID != 0 && safeOption(item)
-                                && !scripted.count({ menuId, item.OrderIndex }))
-                                { step = item.GossipOptionID; break; }
-                    if (step < 0)
-                        break;                  // дальше идти некуда — не тычемся наугад
-
-                    WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
-                    WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
-                    sel.GossipUnit = c.TalkGuid;
-                    sel.GossipID = stepMenu;
-                    sel.GossipOptionID = step;
-                    c.Session->HandleGossipSelectOptionOpcode(sel);
-                }
-
-                if (done)
-                {
-                    ++c.Talked;
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation РЕЧЬ {}: поговорил с {} ({}), пункт {}; всего разговоров {}",
-                        self->GetName(), name, entry, pick, c.Talked);
-                }
-                else
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation РЕЧЬ {}: {} ({}) — разрешённых пар {}, выбран {}, зачёта нет",
-                        self->GetName(), name, entry, uint32(allowed.size()), pick);
-                    c.TalkBackoff[entry] = 120000;
-                }
-                c.TalkGuid.Clear();
-                Switch(c, self, Behavior::Idle, done ? "поговорил" : "разговор без толку");
-                return;
             }
             case Behavior::Attacking:
             {
@@ -7446,8 +7089,8 @@ public:
         // не в каждом из девяти выходов, потому что и гибель проходит через Switch.
         if (c.Mode == Behavior::Talking && to != Behavior::Talking)
         {
-            c.ToolWaitMs = 0;           // окно — не переживает; снимок ToolWas остаётся: он помечен
-            c.ToolFruitless = 0;        // видом и нужен, чтобы увидеть зачёт, пришедший после окна
+            c.Talk.WaitMs = 0;           // окно — не переживает; снимок ToolWas остаётся: он помечен
+            c.Talk.Fruitless = 0;        // видом и нужен, чтобы увидеть зачёт, пришедший после окна
         }
         if (c.Mode == Behavior::Vending && to != Behavior::Vending)
             c.VendorEntry = 0;          // поход по карте кончился — любым исходом
@@ -9572,26 +9215,453 @@ public:
     // что это наше применение (ту же цель мог убить кто-то другой), поэтому зачётом не
     // считается; но предохранители сбрасывает: ложное «бесплодно» хуже неучтённого успеха
     // (Кодекс, третий проход).
-    bool ReconcileLateCredit(Companion& c, Player* self) const
+    bool ReconcileLateCreditCore(Player* self, Constellation::Ai::TalkState& st,
+                                 Constellation::Ai::TalkMemory const& mem) const
     {
-        if (c.ToolWas.empty())
+        if (st.Was.empty())
             return false;
         bool grew = false;
-        for (auto const& [key, before] : c.ToolWas)
+        for (auto const& [key, before] : st.Was)
             if (self->GetQuestObjectiveData(key.first, key.second) > before)
                 { grew = true; break; }
         if (!grew)
             return false;
-        c.ToolWas.clear();
-        c.ToolFruitless = 0;
-        c.ToolGiveUps = 0;
-        c.ToolActionFruitless = 0;
-        c.ToolActionMs = 0;
+        st.Was.clear();
+        st.Fruitless = 0;
+        st.GiveUps = 0;
+        st.ActionFruitless = 0;
+        mem.ActionPause(mem.User, 0);
         TC_LOG_INFO("server.worldserver",
             "Constellation ПРИМЕНЕНИЕ {}: по виду {} продвижение после окна — причина не доказана, предохранители сброшены",
-            self->GetName(), c.ToolWasEntry);
+            self->GetName(), st.WasEntry);
         return true;
     }
+
+    // ПАМЯТЬ И ОТПРАВИТЕЛЬ ЛЕСТНИЦЫ — те же контейнеры и та же сессия, что были в ветке.
+    struct TalkBinding { Companion* C; Player* Self; };
+    static uint32 TalkTalkedFor(void* u)                       { return ++static_cast<TalkBinding*>(u)->C->Talked; }
+    static void TalkSpeciesFor(void* u, uint32 entry, uint32 ms) { static_cast<TalkBinding*>(u)->C->TalkBackoff[entry] = ms; }
+    static void TalkIndividualFor(void* u, ObjectGuid g)       { static_cast<TalkBinding*>(u)->C->TalkUnreachable.insert(g); }
+    static void TalkRetryFor(void* u, ObjectGuid g, uint32 ms) { static_cast<TalkBinding*>(u)->C->TalkRetry[g] = ms; }
+    static void TalkPauseFor(void* u, uint32 ms)               { static_cast<TalkBinding*>(u)->C->ToolActionMs = ms; }
+    static void TalkFaceFor(void* u, ObjectGuid g)
+    {
+        TalkBinding* b = static_cast<TalkBinding*>(u);
+        if (Creature* who = ObjectAccessor::GetCreature(*b->Self, g))
+            b->Self->SetFacingToObject(who);
+    }
+    static void TalkSpellClickFor(void* u, ObjectGuid unit)
+    {
+        WorldPacket raw(CMSG_SPELL_CLICK);
+        WorldPackets::Spells::SpellClick sc(std::move(raw));
+        sc.SpellClickUnitGuid = unit;
+        sc.TryAutoDismount = false;
+        static_cast<TalkBinding*>(u)->C->Session->HandleSpellClick(sc);
+    }
+    static void TalkUseItemFor(void* u, uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
+                               Constellation::Ai::ClientAct::UseItemTarget const& target)
+    {
+        using Constellation::Ai::ClientAct;
+        TalkBinding* b = static_cast<TalkBinding*>(u);
+        WorldPacket raw(CMSG_USE_ITEM);
+        WorldPackets::Spells::UseItem use(std::move(raw));
+        use.PackSlot = bag;
+        use.Slot = slot;
+        use.CastItem = item;
+        use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
+            SPELL_CAST_SOURCE_NORMAL, b->Self->GetMapId(), spellId,
+            b->Self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        use.Cast.SpellID = int32(spellId);
+        if (target.What == ClientAct::UseItemTarget::Unit)
+        {
+            use.Cast.Target.Flags = TARGET_FLAG_UNIT;
+            use.Cast.Target.Unit = target.Guid;
+        }
+        else if (target.What == ClientAct::UseItemTarget::Dest)
+        {
+            use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
+            WorldPackets::Spells::TargetLocation loc;
+            loc.Location = target.Where;
+            use.Cast.Target.DstLocation = loc;
+        }
+        else
+            use.Cast.Target.Flags = TARGET_FLAG_NONE;
+        b->C->Session->HandleUseItemOpcode(use);
+    }
+    static void TalkGossipHelloFor(void* u, ObjectGuid unit)
+    {
+        WorldPacket raw(CMSG_TALK_TO_GOSSIP);
+        WorldPackets::NPC::Hello hello(std::move(raw));
+        hello.Unit = unit;
+        static_cast<TalkBinding*>(u)->C->Session->HandleGossipHelloOpcode(hello);
+    }
+    static void TalkGossipSelectFor(void* u, ObjectGuid unit, uint32 menuId, uint32 optionId)
+    {
+        WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
+        WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
+        sel.GossipUnit = unit;
+        sel.GossipID = menuId;
+        sel.GossipOptionID = optionId;
+        static_cast<TalkBinding*>(u)->C->Session->HandleGossipSelectOptionOpcode(sel);
+    }
+    static Constellation::Ai::TalkMemory TalkMemoryOf(TalkBinding* b)
+    {
+        Constellation::Ai::TalkMemory m;
+        m.Talked = &TalkTalkedFor; m.SpeciesBackoff = &TalkSpeciesFor; m.Individual = &TalkIndividualFor;
+        m.Retry = &TalkRetryFor; m.ActionPause = &TalkPauseFor; m.User = b;
+        return m;
+    }
+    static Constellation::Ai::TalkSender TalkSenderOf(TalkBinding* b)
+    {
+        Constellation::Ai::TalkSender s;
+        s.Face = &TalkFaceFor; s.SpellClick = &TalkSpellClickFor; s.UseItem = &TalkUseItemFor;
+        s.GossipHello = &TalkGossipHelloFor; s.GossipSelect = &TalkGossipSelectFor; s.User = b;
+        return s;
+    }
+
+    // Обёртка лестницы, подпись прежняя (вызов из `Idle`, `:3124`, не тронут).
+    bool ReconcileLateCredit(Companion& c, Player* self) const
+    {
+        TalkBinding b{ &c, self };
+        return ReconcileLateCreditCore(self, c.Talk, TalkMemoryOf(&b));
+    }
+
+    // ПРИШЛИ И ЗАКРЫВАЕМ — тело из `case Behavior::Talking` (`:5198-5561`), одно на лестницу и
+    // на движок. Ни одной записи в спутника: состояние попытки — `st`, память механизма — `mem`,
+    // отправка — `send`, выход — исходом. Строки журнала остались здесь: они про само
+    // взаимодействие, и по ним же доказывается равенство двух механизмов.
+    Constellation::Ai::TalkOutcome TalkEngageCore(Player* self, Creature* who,
+        Constellation::Ai::TalkPlan const& plan, Constellation::Ai::TalkState& st,
+        Constellation::Ai::TalkMemory const& mem, Constellation::Ai::TalkSender const& send,
+        uint32 sliceMs) const
+    {
+        using Constellation::Ai::TalkPlan;
+        using Constellation::Ai::TalkOutcome;
+        using Constellation::Ai::ClientAct;
+        // ПРИШЛИ. Поворачиваемся — так делает игрок, и это видно в клиенте.
+        send.Face(send.User, who->GetGUID());
+
+        std::string const name = who->GetName();
+        uint32 const entry = who->GetEntry();
+        uint32 const slice = sliceMs;
+        uint32 const clickCastMs = plan.ClickCastMs;
+        bool const clickTied = plan.ClickTied;
+        bool const click = plan.What == TalkPlan::Click;
+        bool const toolUnit = plan.ToolUnit;
+        uint32 const toolSpell = plan.ToolSpell, toolQuest = plan.ToolQuest;
+        std::set<uint32> const& toolCredits = plan.ToolCredits;
+        SpellInfo const* toolInfo = plan.What == TalkPlan::Tool ? sSpellMgr->GetSpellInfo(toolSpell, DIFFICULTY_NONE) : nullptr;
+
+        // ОКНО ОЖИДАНИЯ ЗАЧЁТА — общее для клика и предмета. Успех меряется ростом
+        // счётчика цели, а не отсутствием ошибки; ждём до трёх секунд (время
+        // произнесения плюс очередь ядра). Окно без зачёта — бесплодная попытка.
+        if (st.WaitMs)
+        {
+            st.WaitMs = (st.WaitMs <= slice) ? 0 : st.WaitMs - slice;
+            bool credited = false;
+            for (auto const& [key, before] : st.Was)
+                if (self->GetQuestObjectiveData(key.first, key.second) > before)
+                    { credited = true; break; }
+            if (credited)
+            {
+                uint32 const talked = mem.Talked(mem.User);
+                st.Fruitless = 0;
+                st.GiveUps = 0;
+                st.ActionFruitless = 0;
+                st.WaitMs = 0;
+                st.Was.clear();
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПРИМЕНЕНИЕ {}: {} ({}) — зачёт; всего {}",
+                    self->GetName(), name, entry, talked);
+                return TalkOutcome::Credited;
+            }
+            if (st.WaitMs)
+                return TalkOutcome::Waiting;             // окно ещё идёт
+            // ПРЕДОХРАНИТЕЛЬ ИЗ ЛЕГИОНА, С ПОПРАВКОЙ КОДЕКСА: считаем окна без зачёта,
+            // не отправки. Два окна на одной особи — отставляем ЕЁ (пожар уже потушен,
+            // пехотинец уже поднят); четыре особи подряд — отставляем вид на две минуты.
+            // На Легионе шесть ботов сутки лупили дубинкой БОДРСТВУЮЩИХ батраков:
+            // 606 успешных применений, ноль продвижения.
+            if (++st.Fruitless >= 2)
+            {
+                st.Fruitless = 0;
+                mem.Individual(mem.User, who->GetGUID());
+                if (st.FruitlessEntry != entry)
+                    { st.FruitlessEntry = entry; st.GiveUps = 0; }
+                if (++st.GiveUps >= 4)
+                {
+                    st.GiveUps = 0;
+                    mem.SpeciesBackoff(mem.User, entry, 120000);
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: четыре особи {} ({}) без зачёта — отставляю вид",
+                        self->GetName(), name, entry);
+                }
+                else
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: {} ({}) два окна без зачёта — отставляю особь",
+                        self->GetName(), name, entry);
+                // ПРЕДОХРАНИТЕЛЬ НА ВСЁ ДЕЙСТВИЕ (Легион, 0012; Кодекс): шесть
+                // отставленных особей подряд по любым видам — пять минут без разговоров
+                // и применений вовсе, чтобы одна ошибочная связка не ходила по кругу.
+                if (++st.ActionFruitless >= 6)
+                {
+                    st.ActionFruitless = 0;
+                    mem.ActionPause(mem.User, 300000);
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ПРИМЕНЕНИЕ {}: шесть особей подряд без зачёта — пять минут без взаимодействий",
+                        self->GetName());
+                }
+                return TalkOutcome::Fruitless;
+            }
+            // первое окно без зачёта: остаёмся и пробуем ещё раз с этой же особью
+        }
+
+        // СТАРЫЙ СНИМОК СВЕРЯЕТСЯ ДО НОВОГО (Кодекс): рост после окна гасит предохранители,
+        // но зачётом не считается — причина не доказана. Попытка идёт своим чередом.
+        ReconcileLateCreditCore(self, st, mem);
+
+        if (click)
+        {
+            SnapshotObjectives(self, entry, st.Was);
+            st.WasEntry = entry;
+            send.SpellClick(send.User, who->GetGUID());
+            st.WaitMs = std::max<uint32>(4000, clickCastMs + 2500);   // окно от времени произнесения
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) с {:.1f} ярдов, связь с зачётом {}",
+                self->GetName(), name, entry, self->GetExactDist(who), clickTied ? "прямая" : "через сценарий");
+            return TalkOutcome::Sent;
+        }
+
+        if (toolInfo)
+        {
+            // ПРЕДВАРИТЕЛЬНЫЕ УСЛОВИЯ вместо подсчёта отказов попытками (Кодекс):
+            // занят другим заклинанием, общий откат, откат предмета — ждём, не шлём.
+            // УСЛОВИЯ ЗАКЛИНАНИЯ ИЗ БАЗЫ — ТОТ ЖЕ ВОПРОС, ЧТО ЗАДАЁТ ЯДРО ПЕРЕД КАСТОМ.
+            //
+            // Замер: 79 применений ведра пробуждения по ленивым батракам и три зачёта.
+            // Условие лежит в данных: заклинание 19938 требует, чтобы на ЦЕЛИ висела
+            // аура сна 17743 (conditions 17/19938 -> тип 1, цель 1). Спящий её имеет,
+            // бодрствующий нет, и по бодрствующему каст просто не проходит. Ядро
+            // спрашивает это в Spell::CheckCast; спросим и мы — до отправки, а не
+            // после. Правило общее: любое условие на цель у любого квестового предмета.
+            {
+                ConditionSourceInfo cond(self, who);
+                if (!sConditionMgr->IsObjectMeetingNotGroupedConditions(
+                        CONDITION_SOURCE_TYPE_SPELL, toolInfo->Id, cond))
+                {
+                    if (!st.CondNoted)
+                    {
+                        st.CondNoted = true;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ПРИМЕНЕНИЕ {}: {} ({}) не отвечает условиям заклинания {} — не трачу",
+                            self->GetName(), name, entry, toolSpell);
+                    }
+                    mem.Retry(mem.User, who->GetGUID(), 60000);    // условие временное — и запрет тоже
+                    return TalkOutcome::NotByConditions;
+                }
+            }
+            if (self->IsNonMeleeSpellCast(false) || self->GetSpellHistory()->HasGlobalCooldown(toolInfo)
+                || !self->GetSpellHistory()->IsReady(toolInfo, plan.ToolItemEntry))
+            {
+                st.Ms += slice;
+                if (st.Ms >= 60000)
+                {
+                    mem.SpeciesBackoff(mem.User, entry, 60000);
+                    return TalkOutcome::ToolNotReady;
+                }
+                return TalkOutcome::Waiting;
+            }
+            // СНИМОК — ПО ЗАСЧИТЫВАЕМЫМ ЦЕЛЯМ, А НЕ ПО НОМЕРУ СУЩЕСТВА: у раненого горца
+            // номер 37080, а зачёт идёт маркеру 37079 — снимок по 37080 был бы пуст, и
+            // всякий успех читался бы как «без зачёта».
+            if (toolQuest)
+                SnapshotQuestObjectives(self, toolQuest, toolCredits, st.Was);
+            else
+                SnapshotObjectives(self, entry, st.Was);
+            st.WasEntry = entry;
+            // ЛИЧНОСТЬ ПРЕДМЕТА — ИЗ ПЛАНА, снятая до любой отправки: успешное применение
+            // может израсходовать и уничтожить его (Spell::TakeCastItem).
+            uint32 const toolEntry = plan.ToolItemEntry;
+            // ЦЕЛЬ — ПО КОНТРАКТУ ЗАКЛИНАНИЯ, а не «всегда существо»: явная цель,
+            // точка на земле или вовсе без цели (область вокруг себя).
+            ClientAct::UseItemTarget target;
+            if (toolUnit)
+                { target.What = ClientAct::UseItemTarget::Unit; target.Guid = who->GetGUID(); }
+            else if (plan.ToolDest)
+                { target.What = ClientAct::UseItemTarget::Dest; target.Where = who->GetPosition(); }
+            uint32 const castMs = toolInfo->CalcCastTime();
+            send.UseItem(send.User, plan.ToolBag, plan.ToolSlot, plan.ToolItem, toolSpell, target);
+            st.WaitMs = std::max<uint32>(4000, castMs + 2500);   // окно от времени произнесения
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРИМЕНЕНИЕ {}: предмет {} (закл. {}, {}) на {} ({}) с {:.1f} ярдов",
+                self->GetName(), toolEntry, toolSpell,
+                toolUnit ? "по цели" : (plan.ToolDest ? "по месту" : "без цели"),
+                name, entry, self->GetExactDist(who));
+            return TalkOutcome::Sent;
+        }
+
+        // ПЕРЕБИРАТЬ ПУНКТЫ БЕСЕДЫ НЕЛЬЗЯ. ЭТО БЫЛ ИСПОЛНИТЕЛЬ ЧЕГО УГОДНО.
+        //
+        // Первая версия выбирала подряд все пункты меню, пока цель не закроется.
+        // Кодекс отказал в выкладке и перечислил, что один такой пакет исполняет
+        // НЕМЕДЛЕННО, без всякого следующего: снятие денег за пункт, отключение
+        // получения опыта, произвольный сценарий существа — а значит телепорт,
+        // уничтожение предметов и даже убийство персонажа. Я собирался запустить
+        // это на ста двадцати двух живых персонажах.
+        //
+        // Правильный отбор берётся из САМИХ ДАННЫХ, а не из моей эвристики. У
+        // существа есть его правила (SmartAIMgr отдаёт их модулю), и среди них
+        // видно, какой пункт даёт зачёт: событие «выбран пункт меню» с действием
+        // «применить заклинание» или «выдать зачёт убийства». Пара «отправитель +
+        // действие» из правила совпадает с такими же полями пункта меню — по ним
+        // и опознаём. Всё остальное не трогаем ВООБЩЕ: телепорт, торговля, обучение,
+        // плата за пункт в этот список по построению не попадут.
+        std::set<std::pair<uint32, uint32>> allowed, scripted;
+        for (SmartScriptHolder const& e :
+             sSmartScriptMgr->GetScript(int32(entry), SMART_SCRIPT_TYPE_CREATURE))
+        {
+            if (e.GetEventType() != SMART_EVENT_GOSSIP_SELECT)
+                continue;
+            uint32 const act = e.GetActionType();
+            // ВСЕ пары со сценарием — чтобы знать, на что НЕ нажимать по дороге
+            scripted.insert({ e.event.gossip.sender, e.event.gossip.action });
+            if (act != SMART_ACTION_CALL_KILLEDMONSTER && act != SMART_ACTION_SELF_CAST)
+                continue;
+            allowed.insert({ e.event.gossip.sender, e.event.gossip.action });
+        }
+        if (allowed.empty())
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation РЕЧЬ {}: у {} ({}) нет пункта, дающего зачёт — не трогаю",
+                self->GetName(), name, entry);
+            mem.SpeciesBackoff(mem.User, entry, 600000);
+            return TalkOutcome::NothingToSay;
+        }
+
+        // ТОЧНОЕ ПРОДВИЖЕНИЕ, А НЕ «ВИД ИСЧЕЗ ИЗ СПИСКА» (Кодекс).
+        //
+        // Прежняя проверка смотрела, остался ли вид в общем наборе нужных. Она лгала
+        // в обе стороны: цель могла закрыться в тот же такт по другой причине, а при
+        // двух заданиях на один вид не менялась вовсе. Запоминаем счётчики именно
+        // тех целей, что ссылаются на это существо, и сверяем их же.
+        std::vector<std::pair<std::pair<uint32, uint32>, int32>> before;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q)
+                continue;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_MONSTER && uint32(obj.ObjectID) == entry)
+                    before.push_back({ { qid, obj.ID }, self->GetQuestObjectiveData(qid, obj.ID) });
+        }
+
+        send.GossipHello(send.User, who->GetGUID());
+
+        // Меню читаем ТЕКУЩЕЕ и сразу: снимок устаревает, а устаревший номер пункта
+        // может попасть в сценарий уже другим действием (Кодекс).
+        GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
+        uint32 const menuId = menu.GetMenuId();
+        int32 pick = -1;
+        // РАЗГОВОР ДВУХШАГОВЫЙ, И ЭТО ВИДНО В ДАННЫХ.
+        //
+        // Существо привязано к одному меню, а зачёт лежит в другом: Лилиан Восс
+        // открывает 12483, а правило ждёт выбора в 12484; у Маршала Редпата 12485
+        // против 12486, у Валдреда Морея 12487 против 12489. Первый шаг разговора —
+        // это переход в следующее окно, и только там нужный пункт.
+        //
+        // Прежний защитный фильтр отвергал пункты с переходом в подменю — то есть
+        // ровно тот шаг, без которого до цели не дойти. Замер: «разрешённых пунктов
+        // 1, выбран -1» у всех восьмидесяти разговоров.
+        //
+        // Переход разрешаем, но НЕ любой: только в то меню, которое само числится в
+        // разрешённых по данным. Такой пункт ничего не делает, кроме открытия
+        // следующего окна, и увести в торговлю или телепорт не может.
+        //
+        // Сверяем при этом то же, что сверяет ядро: обработчик передаёт сценарию
+        // номер меню и OrderIndex пункта (NPCHandler.cpp), а сценарий сличает их со
+        // своими sender и action (SmartScript.cpp:3563) — не поля Sender/Action
+        // самого пункта, как я решил вначале по созвучию имён.
+        std::set<uint32> wantMenus;
+        for (auto const& [m, o] : allowed)
+            wantMenus.insert(m);
+
+        auto safeOption = [](GossipMenuItem const& item) -> bool
+        {
+            return !item.BoxCoded && item.BoxMoney == 0 && item.ActionPoiID == 0
+                && !item.SpellID && item.OptionNpc == GossipOptionNpc::None;
+        };
+
+        bool done = false;
+        pick = -1;
+        for (uint8 hop = 0; hop < 3 && !done; ++hop)
+        {
+            GossipMenu const& menu = self->PlayerTalkClass->GetGossipMenu();
+            uint32 const menuId = menu.GetMenuId();
+
+            // 1) есть ли прямо здесь пункт, дающий зачёт
+            pick = -1;
+            for (GossipMenuItem const& item : menu.GetMenuItems())
+                if (allowed.count({ menuId, item.OrderIndex }) && safeOption(item)
+                    && item.ActionMenuID == 0)
+                    { pick = item.GossipOptionID; break; }
+
+            if (pick >= 0)
+            {
+                send.GossipSelect(send.User, who->GetGUID(), menuId, uint32(pick));
+
+                for (auto const& [key, was] : before)
+                    if (self->GetQuestObjectiveData(key.first, key.second) > was)
+                        { done = true; break; }
+                break;
+            }
+
+            // 2) иначе ищем переход ИМЕННО в нужное меню
+            // ПЕРЕХОД БЫВАЕТ НЕ ОДИН. У Валдреда Морея цепочка 12487 -> 12488 -> 12489,
+            // и прямого пункта в нужное меню из первого окна просто нет. Замер: у него
+            // одного 24 отказа «выбран -1», при двенадцати удачных разговорах с теми,
+            // у кого переход соседний.
+            //
+            // Поэтому разрешаем и промежуточный переход, но с жёстким условием: на
+            // этот пункт НЕ навешено ни одного правила сценария. Тогда он физически
+            // не может сделать ничего, кроме открытия следующего окна — ни каста, ни
+            // телепорта, ни платы. Сначала всё же пробуем прямой путь в нужное меню.
+            int32 step = -1;
+            uint32 stepMenu = menuId;
+            for (GossipMenuItem const& item : menu.GetMenuItems())
+                if (item.ActionMenuID != 0 && wantMenus.count(item.ActionMenuID)
+                    && safeOption(item))
+                    { step = item.GossipOptionID; break; }
+            if (step < 0)
+                for (GossipMenuItem const& item : menu.GetMenuItems())
+                    if (item.ActionMenuID != 0 && safeOption(item)
+                        && !scripted.count({ menuId, item.OrderIndex }))
+                        { step = item.GossipOptionID; break; }
+            if (step < 0)
+                break;                  // дальше идти некуда — не тычемся наугад
+
+            send.GossipSelect(send.User, who->GetGUID(), stepMenu, uint32(step));
+        }
+
+        if (done)
+        {
+            uint32 const talked = mem.Talked(mem.User);
+            TC_LOG_INFO("server.worldserver",
+                "Constellation РЕЧЬ {}: поговорил с {} ({}), пункт {}; всего разговоров {}",
+                self->GetName(), name, entry, pick, talked);
+        }
+        else
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation РЕЧЬ {}: {} ({}) — разрешённых пар {}, выбран {}, зачёта нет",
+                self->GetName(), name, entry, uint32(allowed.size()), pick);
+            mem.SpeciesBackoff(mem.User, entry, 120000);
+        }
+        return done ? TalkOutcome::Talked : TalkOutcome::TalkFailed;
+    }
+
 
     // ВОЙТИ В ЗОНУ ОСМОТРА — ЭТО ПАКЕТ, А НЕ ФАКТ. Ядро проверит IsInAreaTrigger само и
     // откажет, если мы снаружи; повторно в ту же зону не шлём минуту.
@@ -14169,6 +14239,17 @@ namespace Constellation::Ai
     bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan)
     {
         return Constellation::Manager::TalkArrivedCore(self, who, plan);
+    }
+
+    TalkOutcome TalkEngageFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st,
+                              TalkMemory const& mem, TalkSender const& send, uint32 sliceMs)
+    {
+        return Constellation::Manager::Instance()->TalkEngageCore(self, who, plan, st, mem, send, sliceMs);
+    }
+
+    bool ReconcileLateCreditFor(Player* self, TalkState& st, TalkMemory const& mem)
+    {
+        return Constellation::Manager::Instance()->ReconcileLateCreditCore(self, st, mem);
     }
 
     // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
