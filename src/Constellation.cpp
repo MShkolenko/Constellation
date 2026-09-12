@@ -5077,9 +5077,31 @@ public:
                 Item* tool = plan.What == Constellation::Ai::TalkPlan::Tool ? self->GetItemByGuid(plan.ToolItem) : nullptr;
                 if (!planned || (!tool && !gossip && !click))
                 {
+                    TalkBinding bind{ &c, self };
+                    // ПОПЫТКА ЕЩЁ ЖДЁТ ЗАЧЁТА — СУДИТЬ ЕЁ ПО ОКНУ, А НЕ ПО СВЕЖЕМУ ПЛАНУ. Удачный
+                    // клик по раненому пехотинцу СНИМАЕТ с него флаг клика в тот же такт, что
+                    // даёт зачёт (SmartAI 50047: SPELLHIT 93097 → REMOVE_NPC_FLAG, → KILLEDMONSTER).
+                    // План следующего такта видел «закрыть нечем», обнулял окно, отставлял особь,
+                    // а зачёт находился потом как «после окна»: замер часа после вайпа 08:13 —
+                    // 89 кликов, 0 зачётов в окне, 24 после, 30 ложных «закрыть нечем». Прочитано
+                    // по данным (`smart_scripts` 50047, `spell_quest.cpp:1466`), не угадано.
+                    if (c.Talk.WaitMs)
+                    {
+                        using Constellation::Ai::TalkOutcome;
+                        Constellation::Ai::TalkPlan pending;          // What == Nothing: только окно
+                        TalkOutcome const o = TalkEngageCore(self, who, pending, c.Talk, TalkMemoryOf(&bind), TalkSenderOf(&bind), slice);
+                        if (o == TalkOutcome::Waiting)
+                            return;
+                        if (o == TalkOutcome::Credited || o == TalkOutcome::Fruitless)
+                        {
+                            c.TalkGuid.Clear();
+                            Switch(c, self, Behavior::Idle, o == TalkOutcome::Credited ? "закрыл цель" : "без зачёта");
+                            return;
+                        }
+                        // Unclosable: окно кончилось без зачёта — отказ плана, как и без окна
+                    }
                     // ОТКАЗ — ПОДНЯТ (`TalkRefusedCore`): те же две строки, та же память
                     // (вид на десять минут; особь, вид после четырёх подряд), та же причина.
-                    TalkBinding bind{ &c, self };
                     Constellation::Ai::TalkPlan refused = plan;
                     if (planned)
                         refused.Why = Constellation::Ai::TalkPlan::NothingToCloseWith;   // предмет исчез между планом и тактом
@@ -5161,6 +5183,7 @@ public:
                         case TalkOutcome::NothingToSay:    reason = "говорить не о чем"; break;
                         case TalkOutcome::Talked:          reason = "поговорил"; break;
                         case TalkOutcome::TalkFailed:      reason = "разговор без толку"; break;
+                        case TalkOutcome::Unclosable:      reason = "без зачёта"; break;   // сюда не приходит: план здесь не пуст
                     }
                     c.TalkGuid.Clear();
                     Switch(c, self, Behavior::Idle, reason);
@@ -9433,6 +9456,11 @@ public:
             }
             // первое окно без зачёта: остаёмся и пробуем ещё раз с этой же особью
         }
+
+        // ПЛАН УЖЕ ОТКАЗАЛ — ЗДЕСЬ БЫЛО ТОЛЬКО ОКНО. Без этого выхода отказавший план шёл бы в
+        // ветку беседы и получал «говорить не о чем» с запретом виду на десять минут.
+        if (plan.What == TalkPlan::Nothing)
+            return TalkOutcome::Unclosable;
 
         // СТАРЫЙ СНИМОК СВЕРЯЕТСЯ ДО НОВОГО (Кодекс): рост после окна гасит предохранители,
         // но зачётом не считается — причина не доказана. Попытка идёт своим чередом.

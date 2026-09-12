@@ -82,6 +82,19 @@ namespace
             {
                 if (plan.Why == TalkPlan::None)
                     return false;                       // собеседник исчез
+                // ПОПЫТКА ЕЩЁ ЖДЁТ ЗАЧЁТА — СУДИТЬ ЕЁ ПО ОКНУ, А НЕ ПО СВЕЖЕМУ ПЛАНУ: удачный клик
+                // снимает флаг клика в тот же такт, что даёт зачёт (лестница, то же место).
+                if (st.WaitMs)
+                {
+                    TalkPlan pending;                   // What == Nothing: только окно
+                    switch (TalkThroughDoor(ctx, who, pending, st))
+                    {
+                        case TalkOutcome::Waiting:
+                        case TalkOutcome::Credited:  return true;
+                        case TalkOutcome::Fruitless: return false;
+                        default: break;                 // Unclosable — отказ плана, как и без окна
+                    }
+                }
                 TalkRefuseThroughDoor(ctx, who, plan, st);
                 return false;
             }
@@ -121,6 +134,7 @@ namespace
                 case TalkOutcome::ToolNotReady:
                 case TalkOutcome::NothingToSay:
                 case TalkOutcome::TalkFailed:
+                case TalkOutcome::Unclosable:
                     return false;
             }
             return false;
