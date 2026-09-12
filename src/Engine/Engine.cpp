@@ -502,6 +502,10 @@ namespace Constellation::Ai
         if (!st.Fight.Victim.IsEmpty() && st.Running != ActionId::KillObjective)
             if (Action* fight = Find(ActionId::KillObjective))
                 fight->Cancel(ctx, Subject::OfUnit(st.Fight.Victim), why);
+        // ОТДЫХ ПЕРЕЖИВАЕТ СБРОС (см. `RestHeld`): решение отдыхать — состояние между порогами, а
+        // не снимок исполняемого действия.
+        if (st.Running == ActionId::Rest)
+            st.RestHeld = true;
         st.Queue.clear();
         st.Scratch.clear();
         st.Running       = ActionId::None;

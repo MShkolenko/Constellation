@@ -782,12 +782,24 @@ namespace Constellation::Ai
         BackoffKey skip;
         skip.Kind = BackoffKind::Visited; skip.About = Subject(); skip.Detail = REST_DETAIL;
         if (Engine::Deferred(*ctx.St, skip, ctx.NowMs))
+        {
+            ctx.St->RestHeld = false;
             return false;
+        }
+        // НАПАЛИ — РЕШЕНИЕ ОТДЫХАТЬ ОТМЕНЕНО, а не приостановлено: лестница уходит из `Recovering`
+        // «в бою не до отдыха» и после боя возвращается к отдыху только снизу порога (`:3148`).
+        // Без этой строки удержание, снятое с `Running` сбросом эпохи на том же выходе, вернуло бы
+        // спутника отдыхать выше порога (Кодекс, п. 4).
+        if (ctx.World.IsInCombat())
+            ctx.St->RestHeld = false;
         if (ctx.World.NeedsRest())
             return true;
         if (ctx.World.RestedEnough())
+        {
+            ctx.St->RestHeld = false;
             return false;
-        return ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive;
+        }
+        return ctx.St->Running == ActionId::Rest || ctx.St->RestHeld || ctx.St->RestAfterRevive;
     }
 
     void RegisterFightActions(Engine& engine)
