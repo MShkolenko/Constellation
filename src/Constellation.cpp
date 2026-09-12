@@ -2019,6 +2019,7 @@ public:
                     RepairIfBroken(self, "после смерти");
                     c.BrokenNoted = false;
                     c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
+                    c.Engine.RestAfterRevive = true;    // событие видит только лестница — см. EngineState
                     Switch(c, self, Behavior::Recovering, "поднялся у своего тела");
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ТЕЛО {}: поднялся у своего тела", self->GetName());
@@ -2185,6 +2186,7 @@ public:
             c.GraveWalkNoted = false;
             c.HealerStepNoted = false;
             c.HealerRings = 0;
+            c.Engine.RestAfterRevive = true;            // событие видит только лестница — см. EngineState
             Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
             TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
                 self->GetName());
@@ -7067,6 +7069,10 @@ public:
         // (Кодекс): иначе следующий разговор с другой целью начинался бы со старым окном и
         // зачёл бы чужой рост счётчика или записал бы бесплодное окно новой особи. Здесь, а
         // не в каждом из девяти выходов, потому что и гибель проходит через Switch.
+        // ВЫХОД ИЗ ОТДЫХА ПОСЛЕ ВОСКРЕШЕНИЯ — любым из трёх («отдышался», «в бою», «не помогает»)
+        // — снимает флаг движку: он видит событие только через лестницу.
+        if (c.Mode == Behavior::Recovering && to != Behavior::Recovering)
+            c.Engine.RestAfterRevive = false;
         if (c.Mode == Behavior::Talking && to != Behavior::Talking)
         {
             c.Talk.WaitMs = 0;           // окно — не переживает; снимок ToolWas остаётся: он помечен

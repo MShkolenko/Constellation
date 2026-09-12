@@ -617,7 +617,14 @@ namespace
         {
             if (ctx.World.NeedsRest())
                 return true;
-            return ctx.St && ctx.St->Running == ActionId::Rest && !ctx.World.RestedEnough();
+            if (!ctx.St || ctx.World.RestedEnough())
+                return false;
+            // ФЛАГ ПОДЪЁМА ЗДЕСЬ ТОЛЬКО ЧИТАЕТСЯ. Ставит и снимает его лестница (вход в `Recovering`
+            // по событию, выход из него любой из трёх причин) — у неё и часы режима (`ModeMs`), по
+            // которым считается потолок; движок своим `RestingMs` мерит другое (исполненные ломти),
+            // и снимал бы флаг раньше или позже неё (Кодекс). Пока подъём живёт у лестницы, флаг —
+            // её собственность целиком.
+            return ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive;
         }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
@@ -702,7 +709,7 @@ namespace
             // Форма та же, что у квестовой стратегии: она ставит на каждого квестодателя в
             // обзоре, а разбирается `Useful`.
             if (ctx.World.NeedsRest()
-                || (ctx.St && ctx.St->Running == ActionId::Rest))
+                || (ctx.St && (ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive)))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
         }
     };
