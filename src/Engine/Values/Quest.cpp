@@ -166,6 +166,21 @@ namespace
         }
     };
 
+    // НЕЗАКРЫТЫХ ЦЕЛЕЙ В ЖУРНАЛЕ — ворота похода по карте (`Constellation.cpp:3357-3358`). Тот же
+    // обход `WantedEntries`, что зовёт `Idle` под `idleScan` раз в секунду; интервал тот же
+    // (Кодекс: свежий обход журнала на каждой ставке — лишнее, и две выборки разного возраста).
+    class UnmetObjectivesValue final : public Value<uint32>
+    {
+    public:
+        UnmetObjectivesValue() : Value(ValueId::UnmetObjectives, QUEST_SCAN_MS) { }
+
+    protected:
+        void Calculate(Ctx& ctx, uint32& out) const override
+        {
+            out = ctx.World.UnmetObjectives();
+        }
+    };
+
     class GiversByIndexValue final : public Value<GiverIndexList>
     {
     public:
@@ -196,5 +211,6 @@ namespace Constellation::Ai
         engine.RegisterValue<ValueId::GiversByIndex>(std::make_unique<GiversByIndexValue>());
         engine.RegisterValue<ValueId::GiverToSeek>(std::make_unique<GiverToSeekValue>());
         engine.RegisterValue<ValueId::ObjectiveSpot>(std::make_unique<ObjectiveSpotValue>());
+        engine.RegisterValue<ValueId::UnmetObjectives>(std::make_unique<UnmetObjectivesValue>());
     }
 }

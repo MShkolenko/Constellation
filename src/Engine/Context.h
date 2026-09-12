@@ -634,6 +634,7 @@ namespace Constellation::Ai
         bool        IsEligibleFor(uint32 questId) const;   // CanTakeQuest — would it be offered
         bool        MayAccept(uint32 questId) const;       // + SatisfyQuestLog + CanAddQuest
         uint32      QuestSlotsUsed() const;                // занятых слотов журнала — ВСЕХ, не первых трёх
+        uint32      UnmetObjectives() const;               // незакрытых целей в журнале (`WantedEntries … &unmet`)
 
         // -- the bags ----------------------------------------------------------------------
         uint32 FreeBagSlots() const;
@@ -896,6 +897,9 @@ namespace Constellation::Ai
     float EngageRangeFor(Player* self, Unit* target);
     bool  LootAllowedFor();
     float KiteYardsFor();
+
+    // Незакрытые цели журнала — тот же обход `WantedEntries`, что зовёт `Idle` перед походом по карте.
+    uint32 UnmetObjectivesFor(Player* self);
 
     // Место задания: одна реализация на лестницу и на движок (см. `TravelMemory`).
     bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out);

@@ -616,10 +616,34 @@ namespace
             // вовсе. Две ставки на одном REL_BACKGROUND минус ярды решал бы ближний, и ближний
             // квестодатель уводил бы от цели — ровно те 15 расхождений, ради которых это
             // действие написано.
+            // НАЧАТЫЙ ПОХОД ПО КАРТЕ ИДЁТ ДО ПРИХОДА — раньше любых ворот и раньше похода к месту
+            // задания: у лестницы `SeekingGiver` не прерывается ни взятым по дороге квестом, ни
+            // появившимся местом задания (`:3380-3394`); ставится по `Running`, как отдых (Кодекс,
+            // проходы 1–2). Его конец — приход или отказ самого действия.
+            if (ctx.St && ctx.St->Running == ActionId::SeekGiverByMap)
+            {
+                SeekTarget const& seek = Val<ValueId::GiverToSeek>(ctx);
+                if (seek.Found)
+                {
+                    sink.Add(ActionId::SeekGiverByMap, REL_BACKGROUND,
+                             Subject::OfSpawn(uint32(seek.SpawnId)));
+                    return;
+                }
+            }
+
             TravelSpot const& spot = Val<ValueId::ObjectiveSpot>(ctx);
             if (spot.Worth)
                 sink.Add(ActionId::TravelToObjective, REL_BACKGROUND, Subject::OfQuest(spot.QuestId));
-            else
+            // ПО КАРТЕ ЗА НОВЫМ КВЕСТОМ — ТОЛЬКО КОГДА НЕЗАКРЫТЫХ ЦЕЛЕЙ НЕТ ВОВСЕ. Ворота лестницы
+            // (`Constellation.cpp:3357-3358`: `!unmetNow && TalkCandidate.IsEmpty()`), которые
+            // разбор 2026-09-12 оставил на суд живого окна как «стояние хуже похода». Окно
+            // рассудило числом: за час вживую 51 решение «по карте», боёв вчетверо меньше
+            // (63 против ~300), сдач втрое, гибелей больше — состав ушёл через зоны за новыми
+            // квестами, бросив цели рядом. Лестница с этими воротами бьёт то, что рядом, и
+            // стоит лишь тогда, когда бить и правда некого. Отношение переносится как есть;
+            // счётчик — значение с интервалом обхода лестницы. Ворота — на НАЧАЛО похода.
+            else if (Val<ValueId::UnmetObjectives>(ctx) == 0
+                     && Val<ValueId::Objectives>(ctx).Talk.IsEmpty())
             {
                 SeekTarget const& seek = Val<ValueId::GiverToSeek>(ctx);
                 if (seek.Found)

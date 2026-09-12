@@ -92,7 +92,8 @@ namespace Constellation::Ai
     X(GiversByIndex,    "квестодатели по карте", GiverIndexList)                 \
     X(GiverToSeek,      "куда идти за квестом",  SeekTarget)                    \
     X(Objectives,       "цели задания вокруг",   ObjectiveScan)                  \
-    X(ObjectiveSpot,    "куда идти за целью",    TravelSpot)
+    X(ObjectiveSpot,    "куда идти за целью",    TravelSpot)                    \
+    X(UnmetObjectives,  "незакрытых целей",      uint32)
 
     enum class ValueId : uint8
     {

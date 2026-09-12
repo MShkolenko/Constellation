@@ -14272,6 +14272,14 @@ namespace Constellation::Ai
         return Constellation::Cfg().KiteYards;
     }
 
+    uint32 UnmetObjectivesFor(Player* self)
+    {
+        uint32 unmet = 0;
+        std::set<uint32> wanted;
+        Constellation::Manager::Instance()->WantedEntries(self, wanted, nullptr, nullptr, nullptr, &unmet);
+        return unmet;
+    }
+
     bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out)
     {
         return Constellation::Manager::Instance()->FindObjectiveSpotCore(self, danger, mem, out);

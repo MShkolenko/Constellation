@@ -141,6 +141,11 @@ namespace Constellation::Ai
         return used;
     }
 
+    uint32 WorldView::UnmetObjectives() const
+    {
+        return _self ? UnmetObjectivesFor(_self) : 0u;
+    }
+
     bool WorldView::MayAccept(uint32 questId) const
     {
         if (!_self)
