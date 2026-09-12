@@ -613,19 +613,8 @@ namespace
         //
         // `st.Running` ставится ПРИ ВЫБОРЕ и потому есть у обоих проходов. И это ближе к
         // оригиналу: у лестницы режим — решение («ушёл отдыхать и остаюсь»), а не факт сидения.
-        bool Useful(Ctx& ctx, Bid const&) override
-        {
-            if (ctx.World.NeedsRest())
-                return true;
-            if (!ctx.St || ctx.World.RestedEnough())
-                return false;
-            // ФЛАГ ПОДЪЁМА ЗДЕСЬ ТОЛЬКО ЧИТАЕТСЯ. Ставит и снимает его лестница (вход в `Recovering`
-            // по событию, выход из него любой из трёх причин) — у неё и часы режима (`ModeMs`), по
-            // которым считается потолок; движок своим `RestingMs` мерит другое (исполненные ломти),
-            // и снимал бы флаг раньше или позже неё (Кодекс). Пока подъём живёт у лестницы, флаг —
-            // её собственность целиком.
-            return ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive;
-        }
+        bool Useful(Ctx& ctx, Bid const&) override { return RestWanted(ctx); }
+
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
 
@@ -708,8 +697,8 @@ namespace
             //
             // Форма та же, что у квестовой стратегии: она ставит на каждого квестодателя в
             // обзоре, а разбирается `Useful`.
-            if (ctx.World.NeedsRest()
-                || (ctx.St && (ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive)))
+            // ОДИН ВОПРОС на ставку, на `Useful` и на стратегии, которые уступают отдыху: `RestWanted`.
+            if (RestWanted(ctx))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
         }
     };
@@ -732,6 +721,17 @@ namespace
                 return;
             }
             ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+
+            // ОТДЫХ ПРЕЖДЕ БОЯ — ОТНОШЕНИЕ, А НЕ ЧИСЛО (постановление Мастера 2026-09-12, п. 3).
+            // У лестницы `Idle` уходит в `Recovering` ДО обхода целей (`:3148` против `:3249`) и
+            // держит его до `RestedEnough`; бой из отдыха начинается только если напали (`:3458`).
+            // Замер часа после вайпа: «перевести дух» 20.00 против «бить цель» 19.4–19.7 — внутри
+            // `TIE_EPSILON`, ничью решала соль, согласие 47 %. Поднять цену отдыха значило бы
+            // снова оказаться в полосе ничьей при первом новом действии; поэтому ставка на цель
+            // из обхода и на клетку (обе REL_HIGH) НЕ СТАВИТСЯ, пока отдых хочется и мы не в бою.
+            // Вступивший бой выше не трогается: он ставится из состояния, как и у лестницы.
+            if (RestWanted(ctx) && !ctx.World.IsInCombat())
+                return;
 
             // КЛЕТКА СТАВИТСЯ НЕЗАВИСИМО ОТ БОЯ, и спорить им не о чем. У лестницы клетка
             // достижима только когда бить некого; у движка это выходит само — существо,
@@ -765,6 +765,31 @@ namespace
 
 namespace Constellation::Ai
 {
+    // Тело `Rest::Useful`, вынесенное сюда, чтобы стратегии уступали отдыху ТЕМ ЖЕ вопросом.
+    // ФЛАГ ПОДЪЁМА ЗДЕСЬ ТОЛЬКО ЧИТАЕТСЯ. Ставит и снимает его лестница (вход в `Recovering` по
+    // событию, выход из него любой из трёх причин) — у неё и часы режима (`ModeMs`), по которым
+    // считается потолок; движок своим `RestingMs` мерит другое (исполненные ломти) и снимал бы
+    // флаг раньше или позже неё (Кодекс). Пока подъём живёт у лестницы, флаг — её собственность.
+    bool RestWanted(Ctx& ctx)
+    {
+        if (!ctx.St)
+            return ctx.World.NeedsRest();
+        // ОТДЫХ, КОТОРЫЙ НЕ ПОМОГ, ЗАПРЕЩЁН — и запрет читается ЗДЕСЬ, а не только в отборе
+        // ставок. `Execute` ставит его на удвоенный потолок (ниже, `Visited/REST_DETAIL`); лестница
+        // на том же месте ставит `RestSkipMs` и «идёт как есть» (`:3483-3486`). Без этой строки
+        // гарда «отдых прежде боя» держала бы бой до `RestedEnough` у того, кому отдых запрещён, —
+        // столб вместо действия, ровно то, от чего потолок и заведён (Кодекс).
+        BackoffKey skip;
+        skip.Kind = BackoffKind::Visited; skip.About = Subject(); skip.Detail = REST_DETAIL;
+        if (Engine::Deferred(*ctx.St, skip, ctx.NowMs))
+            return false;
+        if (ctx.World.NeedsRest())
+            return true;
+        if (ctx.World.RestedEnough())
+            return false;
+        return ctx.St->Running == ActionId::Rest || ctx.St->RestAfterRevive;
+    }
+
     void RegisterFightActions(Engine& engine)
     {
         engine.Register(std::make_unique<RestAction>());

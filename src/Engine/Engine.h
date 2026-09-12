@@ -477,6 +477,11 @@ namespace Constellation::Ai
     bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
     void RegisterTalkActions(Engine& engine);
 
+    // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
+    // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,
+    // которые ему уступают: две копии разошлись бы на первом же изменении.
+    bool RestWanted(Ctx& ctx);
+
     // ПАМЯТЬ ДВИЖКА ДЛЯ ОБХОДА ЦЕЛЕЙ — та же таблица отсрочек, только вопросов пять.
     //
     // Шестого, `TalkRetry`, здесь нет НАМЕРЕННО: по разбору дизайна это стадия управления, а не
