@@ -629,6 +629,7 @@ namespace Constellation::Ai
         // giver's menu is built from; permission additionally needs log space and bag space.
         bool        IsEligibleFor(uint32 questId) const;   // CanTakeQuest — would it be offered
         bool        MayAccept(uint32 questId) const;       // + SatisfyQuestLog + CanAddQuest
+        uint32      QuestSlotsUsed() const;                // занятых слотов журнала — ВСЕХ, не первых трёх
 
         // -- the bags ----------------------------------------------------------------------
         uint32 FreeBagSlots() const;
@@ -844,6 +845,9 @@ namespace Constellation::Ai
         // Потолок на одну дорогу. Читается у конфига каждый раз, как и радиусы: `.reload config`
         // меняет его на живом мире.
         uint32 WalkCapMs      = 900000;   // как далеко готовы идти по указателю
+        // Потолок журнала МОДУЛЯ, ниже потолка ядра (`Constellation.MaxQuests`, по умолчанию 10):
+        // лестница не берёт квесты, когда занято столько слотов (`QuestTick`, `:7290`).
+        uint32 MaxQuests      = 10;
     };
     EngineTuning Tuning();
 

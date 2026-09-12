@@ -130,6 +130,17 @@ namespace Constellation::Ai
         return quest && _self->CanTakeQuest(quest, false);
     }
 
+    uint32 WorldView::QuestSlotsUsed() const
+    {
+        if (!_self)
+            return 0;
+        uint32 used = 0;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (_self->GetQuestSlotQuestId(slot))
+                ++used;
+        return used;
+    }
+
     bool WorldView::MayAccept(uint32 questId) const
     {
         if (!_self)

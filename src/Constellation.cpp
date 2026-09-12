@@ -14326,6 +14326,7 @@ namespace Constellation::Ai
         t.GiverSeekRange  = Constellation::Cfg().GiverSeekRange;
         t.WalkCapMs       = Constellation::Cfg().WalkCapMs;
         t.RestMaxMs       = Constellation::Cfg().RestMaxMs;
+        t.MaxQuests       = Constellation::Cfg().MaxQuests;
         return t;
     }
 }

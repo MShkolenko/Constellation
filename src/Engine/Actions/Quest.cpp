@@ -284,6 +284,20 @@ namespace
     // которую зовёт и лестница (`PickFromQuestMenu`, через `WorldView::BestQuestOffered`).
     // Поэтому движок и лестница выбирают одинаково ПО ПОСТРОЕНИЮ, а не потому что два списка
     // правил совпали. Ровно из-за этого действие и не было написано утром.
+    // ЖУРНАЛ ПОЛОН — ЭТО ВСЕ СЛОТЫ, А НЕ ПЕРВЫЕ ТРИ, и полон он по потолку МОДУЛЯ, не ядра:
+    // `QuestTick` лестницы (`Constellation.cpp:7290`) не берёт квесты при `used >= MaxQuests`
+    // (по умолчанию 10 при 25 у ядра). `MayAccept` спрашивает ядро и знает только 25.
+    //
+    // Замер 2026-09-12: 16 из 66 переходов «лестница идёт к месту задания» — движок «взять
+    // квест рядом». Спутник со всеми слотами занят проходит мимо квестодателя, а движок ставил
+    // на него каждый такт REL_NORMAL — выше похода — и уводил бы к нему, чтобы упереться в
+    // отказ ядра и записать пустоту квестодателю, которым он не был.
+    inline bool QuestLogFull(Ctx& ctx)
+    {
+        uint32 const used = ctx.World.QuestSlotsUsed();
+        return used >= MAX_QUEST_LOG_SIZE || used >= Tuning().MaxQuests;
+    }
+
     class TakeQuestNearbyAction final : public Action
     {
     public:
@@ -300,7 +314,7 @@ namespace
             if (bid.About.What() != Subject::Kind::Unit)
                 return false;
             ObjectGuid const giver = bid.About.Guid();
-            if (giver.IsEmpty())
+            if (giver.IsEmpty() || QuestLogFull(ctx))
                 return false;
             // ВСЁ ЕЩЁ В ОБЗОРЕ И ВСЁ ЕЩЁ СО ЗНАКОМ. Значение фильтрует по флагу квестодателя и
             // по статусу диалога; ушёл из обзора или знак погас — ставка больше не нужна.
@@ -579,8 +593,9 @@ namespace
             // Кодекс назвал предел: на восьми спутниках это ничто, на 122 в плотном хабе нужен
             // замер, а возможно и указатель вместо перебора. Очередь ставок ограничена 32, и
             // перебор считается полем `сброшено` в строке решения — по нему и станет видно.
-            for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
-                sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
+            if (!QuestLogFull(ctx))
+                for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
+                    sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
 
             // ПОХОД ПО КАРТЕ — САМОЕ НИЖНЕЕ, ЧТО МОЖНО ДЕЛАТЬ ПО КВЕСТАМ, и у лестницы он ровно
             // там же: последняя ветка `Idle`, куда доходит тот, у кого нет ни готового к сдаче,
