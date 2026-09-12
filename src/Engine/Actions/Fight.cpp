@@ -734,6 +734,13 @@ namespace
                 sink.Add(ActionId::OpenCageForTarget, REL_HIGH,
                          Subject::OfSpawn(uint32(scan.CageSpawn)));
 
+            // БИТЬ НЕКОГО, НО МОЖЕТ БЫТЬ ЕСТЬ С КЕМ ПОГОВОРИТЬ (`Constellation.cpp:3285`): выше боя
+            // намеренно не ставим — REL_NORMAL против REL_HIGH; ниже сдачи по построению. С
+            // взятием квеста — на одном уровне, порядок решает расстояние; лестница ставит взятие
+            // выше (`:3262` против `:3291`), и разницу мерит тень.
+            if (!scan.Talk.IsEmpty())
+                sink.Add(ActionId::TalkToTarget, REL_NORMAL, Subject::OfUnit(scan.Talk));
+
             if (scan.Fight.IsEmpty())
                 return;
             // REL_HIGH — РЯДОМ СО СДАЧЕЙ, А НЕ ПОД НЕЙ. Лестница ставит бой выше взятия и похода

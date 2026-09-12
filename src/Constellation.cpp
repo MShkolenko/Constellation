@@ -841,6 +841,7 @@ public:
         Constellation::Ai::RegisterFightValues(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterFightActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::RegisterQuestActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterTalkActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -5071,39 +5072,18 @@ public:
                 bool const planned = TalkPlanCore(self, who, &plan);
                 bool const gossip = plan.What == Constellation::Ai::TalkPlan::Gossip;
                 bool const click  = plan.What == Constellation::Ai::TalkPlan::Click;
-                if (!planned && plan.Why == Constellation::Ai::TalkPlan::ClickNotAllowed)
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) не даёт зачёта или небезопасен — не трогаю",
-                        self->GetName(), who->GetName(), who->GetEntry());
-                    c.TalkBackoff[who->GetEntry()] = 600000;
-                    c.TalkGuid.Clear();
-                    Switch(c, self, Behavior::Idle, "клик не по правилам");
-                    return;
-                }
                 Item* tool = plan.What == Constellation::Ai::TalkPlan::Tool ? self->GetItemByGuid(plan.ToolItem) : nullptr;
                 if (!planned || (!tool && !gossip && !click))
                 {
-                    // ЭТО СВОЙСТВО ОСОБИ, А НЕ ВИДА. Правило раненого пехотинца СНИМАЕТ с него
-                    // флаг клика, как только его подняли: поднятый кем-то другим выглядит
-                    // «незакрываемым», а рядом стоят семнадцать целых. Запрет по виду глушил
-                    // весь квест на десять минут — так и вышло на живом у четверых людей.
-                    // Отставляем особь; вид — только когда подряд не вышло с четырьмя.
-                    c.TalkUnreachable.insert(c.TalkGuid);
-                    if (c.Talk.FruitlessEntry != who->GetEntry())
-                        { c.Talk.FruitlessEntry = who->GetEntry(); c.Talk.GiveUps = 0; }
-                    bool const wholeKind = ++c.Talk.GiveUps >= 4;
-                    if (wholeKind)
-                    {
-                        c.Talk.GiveUps = 0;
-                        c.TalkBackoff[who->GetEntry()] = 600000;
-                    }
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПРИМЕНЕНИЕ {}: у {} ({}) ни беседы, ни клика, ни предмета от квеста — отставляю {}",
-                        self->GetName(), who->GetName(), who->GetEntry(), wholeKind ? "вид" : "особь");
+                    // ОТКАЗ — ПОДНЯТ (`TalkRefusedCore`): те же две строки, та же память
+                    // (вид на десять минут; особь, вид после четырёх подряд), та же причина.
+                    TalkBinding bind{ &c, self };
+                    Constellation::Ai::TalkPlan refused = plan;
+                    if (planned)
+                        refused.Why = Constellation::Ai::TalkPlan::NothingToCloseWith;   // предмет исчез между планом и тактом
+                    char const* reason = TalkRefusedCore(self, who, refused, c.Talk, TalkMemoryOf(&bind));
                     c.TalkGuid.Clear();
-                    c.Talk.WaitMs = 0;
-                    Switch(c, self, Behavior::Idle, "закрыть нечем");
+                    Switch(c, self, Behavior::Idle, reason);
                     return;
                 }
 
@@ -8988,6 +8968,38 @@ public:
             out->What = TalkPlan::Gossip;
         out->Reach = reach;
         return true;
+    }
+
+    // ОТКАЗ ПЛАНА — ЧТО ПОМНИТЬ: тело из ветки (`:5085-5093`, `:5100-5122`). «Клик не по
+    // правилам» — вид на десять минут; «закрыть нечем» — свойство ОСОБИ, а не вида (правило
+    // раненого пехотинца снимает флаг клика с поднятого), вид — только после четырёх подряд.
+    // Возвращает причину для `Switch` лестницы; движок причину не печатает.
+    char const* TalkRefusedCore(Player* self, Creature* who, Constellation::Ai::TalkPlan const& plan,
+                                Constellation::Ai::TalkState& st, Constellation::Ai::TalkMemory const& mem) const
+    {
+        using Constellation::Ai::TalkPlan;
+        if (plan.Why == TalkPlan::ClickNotAllowed)
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) не даёт зачёта или небезопасен — не трогаю",
+                self->GetName(), who->GetName(), who->GetEntry());
+            mem.SpeciesBackoff(mem.User, who->GetEntry(), 600000);
+            return "клик не по правилам";
+        }
+        mem.Individual(mem.User, who->GetGUID());
+        if (st.FruitlessEntry != who->GetEntry())
+            { st.FruitlessEntry = who->GetEntry(); st.GiveUps = 0; }
+        bool const wholeKind = ++st.GiveUps >= 4;
+        if (wholeKind)
+        {
+            st.GiveUps = 0;
+            mem.SpeciesBackoff(mem.User, who->GetEntry(), 600000);
+        }
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПРИМЕНЕНИЕ {}: у {} ({}) ни беседы, ни клика, ни предмета от квеста — отставляю {}",
+            self->GetName(), who->GetName(), who->GetEntry(), wholeKind ? "вид" : "особь");
+        st.WaitMs = 0;
+        return "закрыть нечем";
     }
 
     // ДОШЁЛ — для клика и предмета ТОЧНОЕ расстояние до самой цели, без прибавки радиусов
@@ -14239,6 +14251,11 @@ namespace Constellation::Ai
     bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan)
     {
         return Constellation::Manager::TalkArrivedCore(self, who, plan);
+    }
+
+    char const* TalkRefusedFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem)
+    {
+        return Constellation::Manager::Instance()->TalkRefusedCore(self, who, plan, st, mem);
     }
 
     TalkOutcome TalkEngageFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st,

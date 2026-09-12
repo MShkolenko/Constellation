@@ -719,6 +719,56 @@ namespace Constellation::Ai
         return ctx.World.CastFor(victim, send, m);
     }
 
+    namespace
+    {
+        // Отправитель разговора — пять дверей `ClientAct`; заглушённая дверь молчит и считает.
+        void DoorTalkFace(void* u, ObjectGuid who)            { static_cast<ClientAct*>(u)->Face(who); }
+        void DoorTalkClick(void* u, ObjectGuid unit)          { static_cast<ClientAct*>(u)->SpellClick(unit); }
+        void DoorTalkUseItem(void* u, uint8 bag, uint8 slot, ObjectGuid item, uint32 spell,
+                             ClientAct::UseItemTarget const& t) { static_cast<ClientAct*>(u)->UseItem(bag, slot, item, spell, t); }
+        void DoorTalkHello(void* u, ObjectGuid unit)          { static_cast<ClientAct*>(u)->GossipHello(unit); }
+        void DoorTalkSelect(void* u, ObjectGuid unit, uint32 menu, uint32 opt) { static_cast<ClientAct*>(u)->GossipSelect(unit, menu, opt); }
+
+        // Память разговора — таблица отсрочек движка, ключи те же, что читает обход целей
+        // (`FightBannedByEngine*`): вид → TalkSpeciesDone, особь → Unreachable, «позже» → TalkRetry.
+        inline constexpr uint32 TALK_INDIVIDUAL_MS = 3600000;   // лестница держит особь до переполнения (>40)
+        uint32 TalkTalkedByEngine(void* u)                    { return ++static_cast<Ctx*>(u)->St->Talked; }
+        void TalkSpeciesByEngine(void* u, uint32 entry, uint32 ms) { Defer(*static_cast<Ctx*>(u), BackoffKind::TalkSpeciesDone, Subject::OfSpecies(entry), 0, ms); }
+        void TalkIndividualByEngine(void* u, ObjectGuid g)   { Defer(*static_cast<Ctx*>(u), BackoffKind::Unreachable, Subject::OfUnit(g), 0, TALK_INDIVIDUAL_MS); }
+        void TalkRetryByEngine(void* u, ObjectGuid g, uint32 ms) { Defer(*static_cast<Ctx*>(u), BackoffKind::TalkRetry, Subject::OfUnit(g), 0, ms); }
+        void TalkPauseByEngine(void* u, uint32 ms)
+        {
+            Ctx* ctx = static_cast<Ctx*>(u);
+            ctx->St->TalkPauseSetMs = ctx->NowMs;
+            ctx->St->TalkPauseMs    = ms;
+        }
+        TalkMemory TalkMemoryByEngine(Ctx& ctx)
+        {
+            TalkMemory m;
+            m.Talked = &TalkTalkedByEngine; m.SpeciesBackoff = &TalkSpeciesByEngine;
+            m.Individual = &TalkIndividualByEngine; m.Retry = &TalkRetryByEngine;
+            m.ActionPause = &TalkPauseByEngine; m.User = &ctx;
+            return m;
+        }
+    }
+
+    TalkOutcome TalkThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st)
+    {
+        if (!ctx.St)
+            return TalkOutcome::TalkFailed;
+        TalkSender send;
+        send.Face = &DoorTalkFace; send.SpellClick = &DoorTalkClick; send.UseItem = &DoorTalkUseItem;
+        send.GossipHello = &DoorTalkHello; send.GossipSelect = &DoorTalkSelect; send.User = &ctx.Act;
+        return ctx.World.TalkEngageAt(who, plan, st, TalkMemoryByEngine(ctx), send, uint32(ctx.Act.SliceSeconds() * 1000.0f));
+    }
+
+    bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st)
+    {
+        if (!ctx.St)
+            return false;
+        return ctx.World.TalkRefuseAt(who, plan, st, TalkMemoryByEngine(ctx));
+    }
+
     bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n)
     {
         LootSender send;
@@ -836,7 +886,8 @@ namespace Constellation::Ai
                 case FightBan::TargetRefused:
                     return EngineRemembers(user, BackoffKind::CombatUnreachable,
                                            Subject::OfUnit(guid));
-                // `TalkRetry` — стадия, а не исход: движок на неё запрета не держит.
+                case FightBan::TalkRetry:
+                    return EngineRemembers(user, BackoffKind::TalkRetry, Subject::OfUnit(guid));
                 default:
                     return false;
             }
@@ -871,8 +922,11 @@ namespace Constellation::Ai
         // три строки в такте. Ценой нуля была бы не неточность, а тупик — порог стаи не отступал
         // бы никогда, и цели, которые водятся только стаями, стали бы для движка невыполнимы
         // навсегда. Тень успела показать это одним расхождением до того, как ветка переключена.
+        // `toolBusy` — ТЕПЕРЬ НАСТОЯЩИЙ: пауза после шести особей без зачёта (`TalkEngageCore`),
+        // лестница спрашивает то же у `ToolActionMs` (`Constellation.cpp:11812`).
+        bool const toolBusy = ctx.St && ctx.St->TalkPaused(ctx.NowMs);
         return FightMemory(&FightBannedByEngineId, &FightBannedByEngineGuid, &FightNoteByEngine,
-                           &ctx, /*toolBusy=*/false,
+                           &ctx, toolBusy,
                            ctx.St ? ctx.St->NoCombatMs : 0u);
     }
 

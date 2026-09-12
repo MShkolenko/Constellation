@@ -468,6 +468,43 @@ namespace Constellation::Ai
         return FindTravelSpotFor(_self, danger, mem, out);
     }
 
+    bool WorldView::TalkPlanOf(ObjectGuid who, TalkPlan* out) const
+    {
+        if (!_self || !out)
+            return false;
+        Creature* c = ObjectAccessor::GetCreature(*_self, who);
+        if (!c || !c->IsAlive())
+        {
+            *out = TalkPlan();
+            return false;
+        }
+        return TalkPlanFor(_self, c, out);
+    }
+
+    bool WorldView::TalkArrivedAt(ObjectGuid who, TalkPlan const& plan) const
+    {
+        Creature* c = _self ? ObjectAccessor::GetCreature(*_self, who) : nullptr;
+        return c && TalkArrivedFor(_self, c, plan);
+    }
+
+    TalkOutcome WorldView::TalkEngageAt(ObjectGuid who, TalkPlan const& plan, TalkState& st,
+                                        TalkMemory const& mem, TalkSender const& send, uint32 sliceMs) const
+    {
+        Creature* c = _self ? ObjectAccessor::GetCreature(*_self, who) : nullptr;
+        if (!c)
+            return TalkOutcome::TalkFailed;
+        return TalkEngageFor(_self, c, plan, st, mem, send, sliceMs);
+    }
+
+    bool WorldView::TalkRefuseAt(ObjectGuid who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem) const
+    {
+        Creature* c = _self ? ObjectAccessor::GetCreature(*_self, who) : nullptr;
+        if (!c)
+            return false;
+        TalkRefusedFor(_self, c, plan, st, mem);
+        return true;
+    }
+
     bool WorldView::GiverToWalkTo(SeekMemory const& mem, SeekTarget* out) const
     {
         if (!_self || !out)

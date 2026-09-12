@@ -181,6 +181,15 @@ namespace Constellation::Ai
         };
         FightState Fight;
 
+        // РАЗГОВОР — состояние попытки (то же, что `c.Talk` у лестницы), пауза всему действию
+        // после шести особей без зачёта (лестница: `ToolActionMs`) и счётчик зачётов.
+        TalkState Talk;
+        uint32    TalkPauseSetMs = 0;   // пауза — «когда поставлена + сколько», а не «до когда»:
+        uint32    TalkPauseMs = 0;      // разность uint32 переживает переполнение часов, сумма — нет (Кодекс)
+        uint32    Talked = 0;
+
+        bool TalkPaused(uint32 nowMs) const { return TalkPauseMs && nowMs - TalkPauseSetMs < TalkPauseMs; }
+
         // СКОЛЬКО ПОДРЯД ОТДЫХАЕМ. Нужен ради потолка: у лестницы после `RestMaxMs` отдых
         // запрещается вдвое дольше, и её разбор объясняет, почему просто «выйти по сроку» не
         // работает — `NeedsRest` всё ещё истинно, и следующий такт возвращает в отдых.
@@ -454,6 +463,11 @@ namespace Constellation::Ai
     // Память похода: «к этому квесту сходил впустую» и «до его места не дойти». Ключ — квест,
     // и на `OfQuest` эти два вида больше никто не ставит (`CoreRefused` — третий, свой).
     bool QuestTravelBackedOffByEngine(void const* user, uint32 questId);
+
+    // Разговор через дверь: отправитель над `ctx.Act`, память над таблицей отсрочек.
+    TalkOutcome TalkThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
+    bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
+    void RegisterTalkActions(Engine& engine);
 
     // ПАМЯТЬ ДВИЖКА ДЛЯ ОБХОДА ЦЕЛЕЙ — та же таблица отсрочек, только вопросов пять.
     //
