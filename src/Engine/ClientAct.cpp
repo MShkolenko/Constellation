@@ -240,6 +240,55 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::SpellClick(ObjectGuid unit)                     // :5280
+    {
+        if (!Usable() || unit.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_SPELL_CLICK);
+        WorldPackets::Spells::SpellClick sc(std::move(raw));
+        sc.SpellClickUnitGuid = unit;
+        sc.TryAutoDismount = false;
+        _session->HandleSpellClick(sc);
+        return true;
+    }
+
+    bool ClientAct::UseItem(uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
+                            UseItemTarget const& target)            // :5346
+    {
+        if (!Usable() || !spellId || item.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_USE_ITEM);
+        WorldPackets::Spells::UseItem use(std::move(raw));
+        use.PackSlot = bag;
+        use.Slot = slot;
+        use.CastItem = item;
+        use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            _self->GetMapId(), spellId, _self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        use.Cast.SpellID = int32(spellId);
+        switch (target.What)
+        {
+            case UseItemTarget::Unit:
+                use.Cast.Target.Flags = TARGET_FLAG_UNIT;
+                use.Cast.Target.Unit = target.Guid;
+                break;
+            case UseItemTarget::Dest:
+            {
+                use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
+                WorldPackets::Spells::TargetLocation loc;
+                loc.Location = target.Where;
+                use.Cast.Target.DstLocation = loc;
+                break;
+            }
+            default:
+                use.Cast.Target.Flags = TARGET_FLAG_NONE;
+                break;
+        }
+        // ЛИЧНОСТЬ ПРЕДМЕТА — У ВЫЗЫВАЮЩЕГО ДО ВЫЗОВА: успешное применение может израсходовать
+        // и уничтожить его (Spell::TakeCastItem); дверь получает гуид и слоты, не указатель.
+        _session->HandleUseItemOpcode(use);
+        return true;
+    }
+
     bool ClientAct::LootRelease(ObjectGuid unit)                    // :6939
     {
         if (!Usable() || unit.IsEmpty())

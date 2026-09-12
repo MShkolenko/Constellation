@@ -195,6 +195,20 @@ namespace Constellation::Ai
         //    the ladder's CastAtTarget; WHAT to cast is policy and stays in `CastAtTargetCore`.
         bool CastSpell(uint32 spellId, ObjectGuid target);          // CMSG_CAST_SPELL
 
+        // -- the two remaining raw writes of the ladder's `Talking` (`Constellation.cpp:5280`,
+        //    `:5346`). The click is one guid. The item's TARGET is the spell's contract, not
+        //    «always the creature»: explicit unit, a point on the ground, or none (an area
+        //    around oneself) — the door carries the three, the policy picks one.
+        struct UseItemTarget
+        {
+            enum Kind : uint8 { None, Unit, Dest } What = None;
+            ObjectGuid Guid;                                        // Unit
+            Position   Where;                                       // Dest
+        };
+        bool SpellClick(ObjectGuid unit);                           // CMSG_SPELL_CLICK
+        bool UseItem(uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
+                     UseItemTarget const& target);                  // CMSG_USE_ITEM
+
         // -- the world ---------------------------------------------------------------------
         bool UseGameObject(ObjectGuid go);                          // CMSG_GAME_OBJ_USE
         bool EnterAreaTrigger(int32 areaTriggerId);                 // CMSG_AREA_TRIGGER

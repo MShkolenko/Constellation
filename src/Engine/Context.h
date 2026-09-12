@@ -790,6 +790,38 @@ namespace Constellation::Ai
     // Место задания: одна реализация на лестницу и на движок (см. `TravelMemory`).
     bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out);
 
+    // ---------------------------------------------------------------------------------------
+    // РАЗГОВОР, часть 1 — КАК ЗАКРЫВАЕТСЯ ЦЕЛЬ, говорят данные существа, и по ним же мерится
+    // «дошёл» (`Constellation.cpp:5066-5154`). Три вида: беседа/квесты (приход — вопрос ядра),
+    // клик (точная дистанция взаимодействия), предмет (дальность ЕГО заклинания или доля
+    // радиуса области). Личность предмета снимается ЗДЕСЬ, до любой отправки: успешное
+    // применение может его уничтожить (Spell::TakeCastItem).
+    //
+    // Два отказа — тоже ответ плана, а не действие: что с ними делать (вид на десять минут;
+    // особь, вид после четырёх подряд) — память механизма, и у каждого своя.
+    // ---------------------------------------------------------------------------------------
+    struct TalkPlan
+    {
+        enum Kind : uint8 { Nothing, Gossip, Click, Tool } What = Nothing;
+        enum Refusal : uint8 { None, ClickNotAllowed, NothingToCloseWith } Why = None;
+        float      Reach = 0.0f;        // порог прихода для клика/предмета; для беседы — шаг подхода
+        // предмет
+        bool       ToolUnit = false;    // заклинание требует явную цель…
+        bool       ToolDest = false;    // …или точку на земле; иначе — без цели
+        uint32     ToolSpell = 0;
+        uint32     ToolQuest = 0;
+        uint32     ToolItemEntry = 0;
+        uint8      ToolBag = 0;
+        uint8      ToolSlot = 0;
+        ObjectGuid ToolItem;
+        std::set<uint32> ToolCredits;   // засчитываемые цели — снимок по ним, не по номеру существа
+        // клик
+        uint32     ClickCastMs = 0;
+        bool       ClickTied = false;
+    };
+    bool TalkPlanFor(Player* self, Creature* who, TalkPlan* out);      // false = отказ (см. Why)
+    bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan);
+
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.
     struct Ctx

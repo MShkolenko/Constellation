@@ -5075,14 +5075,15 @@ public:
                 //   * беседа/квесты — у ядра, тем же вопросом, что задаёт обработчик;
                 //   * клик — дистанция взаимодействия (INTERACTION_DISTANCE), как у клиента;
                 //   * предмет — дальность ЕГО заклинания или радиус его области.
-                bool const gossip = who->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP) || who->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER);
-                bool const click = !gossip && who->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK);
-                uint32 clickCastMs = 0;
-                bool clickTied = false;
-                std::set<uint32> wantedNow;
-                if (click)
-                    WantedEntries(self, wantedNow);
-                if (click && !ClickGivesCredit(who->GetEntry(), wantedNow, self, &clickCastMs, &clickTied))
+                // ПЛАН — ПОДНЯТ (`TalkPlanCore`): та же выкладка, что стояла здесь, одна на
+                // лестницу и на движок. Отказы приходят ответом; их память — ниже, как была.
+                Constellation::Ai::TalkPlan plan;
+                bool const planned = TalkPlanCore(self, who, &plan);
+                bool const gossip = plan.What == Constellation::Ai::TalkPlan::Gossip;
+                bool const click  = plan.What == Constellation::Ai::TalkPlan::Click;
+                uint32 const clickCastMs = plan.ClickCastMs;
+                bool const clickTied = plan.ClickTied;
+                if (!planned && plan.Why == Constellation::Ai::TalkPlan::ClickNotAllowed)
                 {
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ПРИМЕНЕНИЕ {}: клик по {} ({}) не даёт зачёта или небезопасен — не трогаю",
@@ -5092,12 +5093,11 @@ public:
                     Switch(c, self, Behavior::Idle, "клик не по правилам");
                     return;
                 }
-                uint32 toolSpell = 0, toolQuest = 0;
-                std::set<uint32> toolCredits;
-                Item* tool = (!gossip && !click)
-                    ? QuestToolFor(self, who->GetEntry(), &toolSpell, who, &toolQuest, &toolCredits) : nullptr;
+                uint32 const toolSpell = plan.ToolSpell, toolQuest = plan.ToolQuest;
+                std::set<uint32> const& toolCredits = plan.ToolCredits;
+                Item* tool = plan.What == Constellation::Ai::TalkPlan::Tool ? self->GetItemByGuid(plan.ToolItem) : nullptr;
                 SpellInfo const* toolInfo = tool ? sSpellMgr->GetSpellInfo(toolSpell, DIFFICULTY_NONE) : nullptr;
-                if (!gossip && !click && !toolInfo)
+                if (!planned || (!tool && !gossip && !click))
                 {
                     // ЭТО СВОЙСТВО ОСОБИ, А НЕ ВИДА. Правило раненого пехотинца СНИМАЕТ с него
                     // флаг клика, как только его подняли: поднятый кем-то другим выглядит
@@ -5127,31 +5127,13 @@ public:
                 // пожары виноградника бьёт по области с условием «цель — триггер пожара»
                 // (conditions: 13/80208 -> 31/3/42940), а сам триггер невыбираем
                 // (UNIT_FLAG_UNINTERACTIBLE) — клиент шлёт его без цели, стоя рядом.
-                float reach = who->GetCombatReach() + 2.0f;
-                bool toolUnit = false;
-                if (toolInfo)
-                {
-                    toolUnit = toolInfo->NeedsExplicitUnitTarget();
-                    if (toolUnit)
-                        reach = std::clamp(toolInfo->GetMaxRange(false, self) - 2.0f, 3.0f, 25.0f);
-                    else
-                    {
-                        float const radius = toolInfo->GetEffects().empty() ? 0.0f
-                            : toolInfo->GetEffect(EFFECT_0).CalcRadius(self);
-                        reach = radius > 1.0f ? std::clamp(radius * 0.6f, 2.0f, 15.0f) : 4.0f;
-                    }
-                }
-                else if (click)
-                    reach = INTERACTION_DISTANCE - 0.5f;
+                float const reach = plan.Reach;
+                bool const toolUnit = plan.ToolUnit;
 
-                // ДОШЁЛ — для клика и предмета ТОЧНОЕ расстояние до самой цели, без прибавки
-                // радиусов (Кодекс: IsWithinDist3d прибавляет радиус игрока). И идём тогда
-                // к САМОЙ цели, а не к точке подхода: та лежит в ~4.5 ярдах от цели, и
-                // остановка «в reach от неё» оставляла бы до цели вдвое больше.
-                bool const arrived = gossip
-                    ? (self->CanInteractWithQuestGiver(who) || self->GetNPCIfCanInteractWith(
-                          c.TalkGuid, UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE) != nullptr)
-                    : self->GetExactDist(who) <= reach;
+                // ДОШЁЛ — поднято (`TalkArrivedCore`). И идём тогда к САМОЙ цели, а не к точке
+                // подхода: та лежит в ~4.5 ярдах от цели, и остановка «в reach от неё»
+                // оставляла бы до цели вдвое больше.
+                bool const arrived = TalkArrivedCore(self, who, plan);
                 if (!arrived && !c.ToolWaitMs)
                 {
                     float tx, ty, tz;
@@ -5359,7 +5341,7 @@ public:
                         use.Cast.Target.Flags = TARGET_FLAG_UNIT;
                         use.Cast.Target.Unit = c.TalkGuid;
                     }
-                    else if (toolInfo->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION)
+                    else if (plan.ToolDest)
                     {
                         use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
                         WorldPackets::Spells::TargetLocation loc;
@@ -9308,6 +9290,71 @@ public:
                 && uint32(eff->SpellID) != useSpell)
                 { useSpell = uint32(eff->SpellID); ++useCount; }
         return useCount == 1 ? useSpell : 0;
+    }
+
+    // ПЛАН РАЗГОВОРА — тело из `case Behavior::Talking` (`:5078-5145`), без единой записи в
+    // спутника: отказы возвращаются ответом, их память пишет вызывающий.
+    bool TalkPlanCore(Player* self, Creature* who, Constellation::Ai::TalkPlan* out) const
+    {
+        using Constellation::Ai::TalkPlan;
+        *out = TalkPlan();
+        bool const gossip = who->HasNpcFlag(UNIT_NPC_FLAG_GOSSIP) || who->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER);
+        bool const click = !gossip && who->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK);
+        std::set<uint32> wantedNow;
+        if (click)
+            WantedEntries(self, wantedNow);
+        if (click && !ClickGivesCredit(who->GetEntry(), wantedNow, self, &out->ClickCastMs, &out->ClickTied))
+        {
+            out->Why = TalkPlan::ClickNotAllowed;
+            return false;
+        }
+        Item* tool = (!gossip && !click)
+            ? QuestToolFor(self, who->GetEntry(), &out->ToolSpell, who, &out->ToolQuest, &out->ToolCredits) : nullptr;
+        SpellInfo const* toolInfo = tool ? sSpellMgr->GetSpellInfo(out->ToolSpell, DIFFICULTY_NONE) : nullptr;
+        if (!gossip && !click && !toolInfo)
+        {
+            out->Why = TalkPlan::NothingToCloseWith;
+            return false;
+        }
+
+        float reach = who->GetCombatReach() + 2.0f;
+        if (toolInfo)
+        {
+            out->What = TalkPlan::Tool;
+            out->ToolUnit = toolInfo->NeedsExplicitUnitTarget();
+            out->ToolDest = !out->ToolUnit && (toolInfo->GetExplicitTargetMask() & TARGET_FLAG_DEST_LOCATION);
+            if (out->ToolUnit)
+                reach = std::clamp(toolInfo->GetMaxRange(false, self) - 2.0f, 3.0f, 25.0f);
+            else
+            {
+                float const radius = toolInfo->GetEffects().empty() ? 0.0f
+                    : toolInfo->GetEffect(EFFECT_0).CalcRadius(self);
+                reach = radius > 1.0f ? std::clamp(radius * 0.6f, 2.0f, 15.0f) : 4.0f;
+            }
+            out->ToolItemEntry = tool->GetEntry();
+            out->ToolBag  = tool->GetBagSlot();
+            out->ToolSlot = tool->GetSlot();
+            out->ToolItem = tool->GetGUID();
+        }
+        else if (click)
+        {
+            out->What = TalkPlan::Click;
+            reach = INTERACTION_DISTANCE - 0.5f;
+        }
+        else
+            out->What = TalkPlan::Gossip;
+        out->Reach = reach;
+        return true;
+    }
+
+    // ДОШЁЛ — для клика и предмета ТОЧНОЕ расстояние до самой цели, без прибавки радиусов
+    // (Кодекс: IsWithinDist3d прибавляет радиус игрока); для беседы — вопрос самого ядра.
+    static bool TalkArrivedCore(Player* self, Creature* who, Constellation::Ai::TalkPlan const& plan)
+    {
+        if (plan.What == Constellation::Ai::TalkPlan::Gossip)
+            return self->CanInteractWithQuestGiver(who) || self->GetNPCIfCanInteractWith(
+                       who->GetGUID(), UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE) != nullptr;
+        return self->GetExactDist(who) <= plan.Reach;
     }
 
     Item* QuestToolFor(Player* self, uint32 targetEntry, uint32* spellOut,
@@ -14112,6 +14159,16 @@ namespace Constellation::Ai
     bool FindTravelSpotFor(Player* self, DangerView const& danger, TravelMemory const& mem, TravelSpot* out)
     {
         return Constellation::Manager::Instance()->FindObjectiveSpotCore(self, danger, mem, out);
+    }
+
+    bool TalkPlanFor(Player* self, Creature* who, TalkPlan* out)
+    {
+        return Constellation::Manager::Instance()->TalkPlanCore(self, who, out);
+    }
+
+    bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan)
+    {
+        return Constellation::Manager::TalkArrivedCore(self, who, plan);
     }
 
     // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
