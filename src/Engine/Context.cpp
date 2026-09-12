@@ -512,6 +512,11 @@ namespace Constellation::Ai
         return TalkEngageFor(_self, c, plan, st, mem, send, sliceMs);
     }
 
+    bool WorldView::TurnInAt(ObjectGuid ender, uint32 questId, TurnInSender const& send) const
+    {
+        return _self && TurnInFor(_self, ender, questId, send);
+    }
+
     bool WorldView::TalkRefuseAt(ObjectGuid who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem) const
     {
         Creature* c = _self ? ObjectAccessor::GetCreature(*_self, who) : nullptr;

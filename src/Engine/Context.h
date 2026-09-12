@@ -480,6 +480,17 @@ namespace Constellation::Ai
     };
     // ИСХОДЫ — по одному на каждый выход лестницы из этой половины ветки (`:5226-5560`), плюс
     // два «ещё не конец»: окно идёт, попытка отправлена.
+    // СДАЧА — ОДНО ТЕЛО НА ДВА МЕХАНИЗМА (`Constellation.cpp:8027`): поздороваться, сдать, выбрать
+    // награду по правилам экипировки, спросить ядро, награждён ли квест. Отправитель — три двери;
+    // лестница шлёт через сессию, движок через `ctx.Act`. Пустой принимающий = самосдача.
+    struct TurnInSender
+    {
+        void (*Hello)(void* user, ObjectGuid ender) = nullptr;
+        void (*Complete)(void* user, ObjectGuid ender, uint32 questId) = nullptr;
+        void (*Choose)(void* user, ObjectGuid ender, uint32 questId, uint32 itemId, LootItemType type) = nullptr;
+        void* User = nullptr;
+    };
+
     enum class TalkOutcome : uint8
     {
         Waiting, Sent,
@@ -808,6 +819,8 @@ namespace Constellation::Ai
         TalkOutcome TalkEngageAt(ObjectGuid who, TalkPlan const& plan, TalkState& st,
                                  TalkMemory const& mem, TalkSender const& send, uint32 sliceMs) const;
         bool TalkRefuseAt(ObjectGuid who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem) const;
+        friend bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId);
+        bool TurnInAt(ObjectGuid ender, uint32 questId, TurnInSender const& send) const;
 
         // ХРАНИТСЯ ИЗМЕНЯЕМЫМ, И ЭТО НЕ ПОСЛАБЛЕНИЕ ПРАВИЛА, А ОНО САМО. Заголовок выше
         // требует не ОТДАВАТЬ объект наружу — и он же объясняет, почему константность его не
@@ -911,6 +924,8 @@ namespace Constellation::Ai
                               TalkMemory const& mem, TalkSender const& send, uint32 sliceMs);
     bool ReconcileLateCreditFor(Player* self, TalkState& st, TalkMemory const& mem);
     char const* TalkRefusedFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem);
+
+    bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.

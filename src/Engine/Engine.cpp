@@ -756,6 +756,24 @@ namespace Constellation::Ai
         }
     }
 
+    namespace
+    {
+        void DoorTurnInHello(void* u, ObjectGuid ender) { static_cast<ClientAct*>(u)->QuestGiverHello(ender); }
+        void DoorTurnInComplete(void* u, ObjectGuid ender, uint32 q) { static_cast<ClientAct*>(u)->CompleteQuest(ender, q); }
+        void DoorTurnInChoose(void* u, ObjectGuid ender, uint32 q, uint32 item, LootItemType type)
+        {
+            static_cast<ClientAct*>(u)->ChooseReward(ender, q, item, type);
+        }
+    }
+
+    bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId)
+    {
+        TurnInSender send;
+        send.Hello = &DoorTurnInHello; send.Complete = &DoorTurnInComplete; send.Choose = &DoorTurnInChoose;
+        send.User = &ctx.Act;
+        return ctx.World.TurnInAt(ender, questId, send);
+    }
+
     TalkOutcome TalkThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st)
     {
         if (!ctx.St)

@@ -28,6 +28,7 @@
 
 #include "Define.h"
 #include "ObjectGuid.h"
+#include "LootItemType.h"
 #include "Position.h"
 #include <set>
 
@@ -166,6 +167,11 @@ namespace Constellation::Ai
         // The call site couples the two — `FromScript = (ender == nullptr)` — so the coupling is
         // derived here rather than offered as a parameter a caller could contradict.
         bool CompleteQuest(ObjectGuid ender, uint32 questId);       // CMSG_QUEST_GIVER_COMPLETE_QUEST
+        // ВТОРОЙ ПАКЕТ СДАЧИ, БЕЗ КОТОРОГО КВЕСТ НЕ НАГРАЖДАЕТСЯ: `CompleteQuest` лишь открывает окно
+        // награды, награждает `ChooseReward` (лестница, `Constellation.cpp:8041-8058`). Живой час
+        // 2026-09-12: 53 решения «сдать квест», 25 сдач — все лестницы; движок стоял у принимающего.
+        bool ChooseReward(ObjectGuid ender, uint32 questId, uint32 itemId,
+                          LootItemType type);                       // CMSG_QUEST_GIVER_CHOOSE_REWARD
 
         // -- combat ------------------------------------------------------------------------
         bool SetSelection(ObjectGuid target);                       // CMSG_SET_SELECTION
@@ -276,8 +282,6 @@ namespace Constellation::Ai
         // NOT YET HERE, and deliberately listed so the gap is visible rather than discovered:
         //   UseItem     — CMSG_USE_ITEM needs the cast id built at the call site; moved when
         //                 the hearthstone action is written.
-        //   ChooseReward— CMSG_QUEST_GIVER_CHOOSE_REWARD carries a LootItemType and an index
-        //                 chosen by the gear rules; moved with the turn-in action.
         //   Loot*       — four opcodes that always travel together; moved as one group.
 
     private:

@@ -99,6 +99,21 @@ namespace Constellation::Ai
 
     // ---- combat ----------------------------------------------------------------------------
 
+    bool ClientAct::ChooseReward(ObjectGuid ender, uint32 questId, uint32 itemId,
+                                 LootItemType type)                 // :8048
+    {
+        if (!Usable() || !questId)
+            return false;
+        WorldPacket raw(CMSG_QUEST_GIVER_CHOOSE_REWARD);
+        WorldPackets::Quest::QuestGiverChooseReward pick(std::move(raw));
+        pick.QuestGiverGUID = ender.IsEmpty() ? _self->GetGUID() : ender;
+        pick.QuestID = questId;
+        pick.Choice.Item.ItemID = itemId;
+        pick.Choice.LootItemType = type;
+        _session->HandleQuestgiverChooseRewardOpcode(pick);
+        return true;
+    }
+
     bool ClientAct::SetSelection(ObjectGuid target)                 // :7020
     {
         if (!Usable())

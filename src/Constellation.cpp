@@ -8024,51 +8024,76 @@ public:
     // спрашиваем, числится ли квест награждённым.
     // ender == nullptr означает самостоятельную сдачу: ядро в этом режиме берёт
     // самого игрока как «объект», и здороваться не с кем.
-    bool TurnInAt(Companion& c, Player* self, Creature* ender)
+    // ТЕЛО СДАЧИ — одно на лестницу и на движок; пакеты идут через отправителя. Строки журнала
+    // здесь: они про сдачу, и по ним же считаются сдачи обоих механизмов (`fight_outcomes.py`).
+    bool TurnInCore(Player* self, ObjectGuid ender, uint32 questId, Constellation::Ai::TurnInSender const& send)
     {
-        if (ender)
-        {
-            WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
-            WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
-            hello.QuestGiverGUID = ender->GetGUID();
-            c.Session->HandleQuestgiverHelloOpcode(hello);
-        }
+        if (!ender.IsEmpty())
+            send.Hello(send.User, ender);
 
-        Quest const* quest = sObjectMgr->GetQuestTemplate(c.TurnInQuest);
-        if (!quest || self->GetQuestStatus(c.TurnInQuest) != QUEST_STATUS_COMPLETE)
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest || self->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
             return false;
 
-        WorldPacket rawDone(CMSG_QUEST_GIVER_COMPLETE_QUEST);
-        WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(rawDone));
-        done.QuestGiverGUID = ender ? ender->GetGUID() : self->GetGUID();
-        done.QuestID = c.TurnInQuest;
-        done.FromScript = (ender == nullptr);
-        c.Session->HandleQuestgiverCompleteQuest(done);
+        send.Complete(send.User, ender, questId);
 
-        WorldPacket rawPick(CMSG_QUEST_GIVER_CHOOSE_REWARD);
-        WorldPackets::Quest::QuestGiverChooseReward pick(std::move(rawPick));
-        pick.QuestGiverGUID = ender ? ender->GetGUID() : self->GetGUID();
-        pick.QuestID = c.TurnInQuest;
         // ВЫБОР НАГРАДЫ — ОСМЫСЛЕННЫЙ (оператор): годное по классу и лучшее для слота, при
         // равенстве — дороже; ничего годного — самое дорогое, его продадут.
         LootItemType rewardType = LootItemType::Item;
         uint32 const reward = PickReward(self, quest, &rewardType);
-        pick.Choice.Item.ItemID = reward;
-        pick.Choice.LootItemType = rewardType;
-        c.Session->HandleQuestgiverChooseRewardOpcode(pick);
+        send.Choose(send.User, ender, questId, reward, rewardType);
 
-        if (self->IsQuestRewarded(c.TurnInQuest))
+        if (self->IsQuestRewarded(questId))
         {
             TC_LOG_INFO("server.worldserver", "Constellation: {} сдал квест {} '{}' (уровень {}){}",
-                self->GetName(), c.TurnInQuest, quest->GetLogTitle(), uint32(self->GetLevel()),
+                self->GetName(), questId, quest->GetLogTitle(), uint32(self->GetLevel()),
                 reward ? Trinity::StringFormat(", выбрал награду {} из {}", reward, quest->GetRewChoiceItemsCount()) : "");
             ++_questsTurnedIn;
             Constellation::Plan::Planner::Instance()->OnTakeOrTurnIn(self);
             return true;
         }
         TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла ({})",
-            self->GetName(), c.TurnInQuest, ender ? "у принимающего" : "самому себе");
+            self->GetName(), questId, ender.IsEmpty() ? "самому себе" : "у принимающего");
         return false;
+    }
+
+    // ОТПРАВИТЕЛЬ ЛЕСТНИЦЫ — те же три пакета через её сессию, что стояли в этом теле.
+    static void TurnInHelloFor(void* u, ObjectGuid ender)
+    {
+        WorldPacket raw(CMSG_QUEST_GIVER_HELLO);
+        WorldPackets::Quest::QuestGiverHello hello(std::move(raw));
+        hello.QuestGiverGUID = ender;
+        static_cast<Companion*>(u)->Session->HandleQuestgiverHelloOpcode(hello);
+    }
+    static void TurnInCompleteFor(void* u, ObjectGuid ender, uint32 questId)
+    {
+        Companion* c = static_cast<Companion*>(u);
+        WorldPacket raw(CMSG_QUEST_GIVER_COMPLETE_QUEST);
+        WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(raw));
+        done.QuestGiverGUID = ender.IsEmpty() ? c->Session->GetPlayer()->GetGUID() : ender;
+        done.QuestID = questId;
+        done.FromScript = ender.IsEmpty();
+        c->Session->HandleQuestgiverCompleteQuest(done);
+    }
+    static void TurnInChooseFor(void* u, ObjectGuid ender, uint32 questId, uint32 itemId, LootItemType type)
+    {
+        Companion* c = static_cast<Companion*>(u);
+        WorldPacket raw(CMSG_QUEST_GIVER_CHOOSE_REWARD);
+        WorldPackets::Quest::QuestGiverChooseReward pick(std::move(raw));
+        pick.QuestGiverGUID = ender.IsEmpty() ? c->Session->GetPlayer()->GetGUID() : ender;
+        pick.QuestID = questId;
+        pick.Choice.Item.ItemID = itemId;
+        pick.Choice.LootItemType = type;
+        c->Session->HandleQuestgiverChooseRewardOpcode(pick);
+    }
+
+    // Обёртка лестницы, подпись прежняя (`:4140`, `:4201`); ender == nullptr — самосдача.
+    bool TurnInAt(Companion& c, Player* self, Creature* ender)
+    {
+        Constellation::Ai::TurnInSender send;
+        send.Hello = &TurnInHelloFor; send.Complete = &TurnInCompleteFor; send.Choose = &TurnInChooseFor;
+        send.User = &c;
+        return TurnInCore(self, ender ? ender->GetGUID() : ObjectGuid::Empty, c.TurnInQuest, send);
     }
 
     // Существо рядом, которое ЧИСЛИТСЯ ЦЕЛЬЮ незакрытого квеста в журнале.
@@ -14293,6 +14318,11 @@ namespace Constellation::Ai
     bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan)
     {
         return Constellation::Manager::TalkArrivedCore(self, who, plan);
+    }
+
+    bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send)
+    {
+        return Constellation::Manager::Instance()->TurnInCore(self, ender, questId, send);
     }
 
     char const* TalkRefusedFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem)

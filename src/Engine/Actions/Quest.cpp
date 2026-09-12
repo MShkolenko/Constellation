@@ -56,6 +56,9 @@ namespace
     // и у недостижимой боевой цели. Одно число на все три случая потому, что случай один:
     // «туда не дойти сейчас».
     inline constexpr uint32 TURNIN_UNREACHABLE_MS = 600000;
+    // Сдача не прошла у принимающего / самому себе — сроки лестницы (`:4207`, `:4144`).
+    inline constexpr uint32 TURNIN_FAILED_MS      = 60000;
+    inline constexpr uint32 TURNIN_SELF_FAILED_MS = 300000;
 
     // НА СКОЛЬКО ЗАБЫТЬ КВЕСТОДАТЕЛЯ, У КОТОРОГО МЕНЮ ПУСТОЕ. Десять минут — не моё число:
     // ровно столько держит `GiverUnreachable` у лестницы (`Constellation.cpp`, ветка выбора из
@@ -229,8 +232,24 @@ namespace
                 // САМОСДАЧА — ПУСТОЙ ПРИНИМАЮЩИЙ, и дверь выводит это сама (ClientAct.h:83):
                 // «сдать самому себе» и «это скриптовая сдача» — одно и то же условие, поэтому
                 // оно не предлагается параметром, который вызывающий мог бы опровергнуть.
+                // ТРИ ПАКЕТА, А НЕ ОДИН. Первая редакция слала только `CompleteQuest` — он лишь
+                // открывает окно награды, награждает `ChooseReward`; квест не сдавался, спутник
+                // стоял у принимающего и перевыбирал сдачу весь живой час (53 решения, 25 сдач —
+                // все лестницы). Тело сдачи теперь общее (`TurnInCore`), истина — ответ ядра.
+                //
+                // НЕ ВЫШЛО — ОТЛОЖИТЬ ЭТОТ КВЕСТ, а не пробовать снова четыре раза в секунду:
+                // у лестницы минута (`:4144` пять минут самосдаче, `:4207` минута у принимающего),
+                // у движка тот же ключ — квест — и тот же срок (Кодекс, проход 1). Вид отсрочки —
+                // Unreachable: это ключ ЭТОГО действия (DeferKind), по нему предварительный
+                // фильтр снимает ставку до Useful; «ядро не наградило» и «не дойти» для сдачи —
+                // одно и то же: этот квест сейчас не сдать.
                 if (!t.EnderEntry)
-                    return ctx.Act.CompleteQuest(ObjectGuid::Empty, quest);
+                {
+                    if (TurnInThroughDoor(ctx, ObjectGuid::Empty, quest))
+                        return true;
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_SELF_FAILED_MS);
+                    return false;
+                }
 
                 // ВИДНО ЛИ ЕГО ПРЯМО СЕЙЧАС. Поиск отдаёт только тех, кому ядро само
                 // разрешило сдавать, и спрашивается он ЗДЕСЬ, а не берётся из `Possible`: между
@@ -238,7 +257,12 @@ namespace
                 // взлететь или уйти.
                 if (std::optional<ObjectGuid> const ender =
                         ctx.World.NearestQuestGiverOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
-                    return ctx.Act.CompleteQuest(*ender, quest);
+                {
+                    if (TurnInThroughDoor(ctx, *ender, quest))
+                        return true;
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_FAILED_MS);
+                    return false;
+                }
 
                 // НЕ ВИДНО — ЗНАЧИТ ИДЁМ. Это и есть та «отдельная работа», которую прежний
                 // комментарий обещал вынести в своё действие: она не понадобилась. Форма та же,
