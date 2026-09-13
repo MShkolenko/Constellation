@@ -974,15 +974,26 @@ public:
             Player::DeleteFromDB(guid, account, true, true);
             ++deleted;
 
-            // Конвейер создаёт заново ровно при пустом Guid (BehaveTick, Stage::Offline).
-            c.Guid.Clear();
-            c.State = Stage::Offline;
-            c.TicksInState = 0;
-            c.Retries = 0;
-            c.PaletteDumped = false;
-            c.QuestRefused.clear();
+            // НОВОРОЖДЁННЫЙ НЕ НАСЛЕДУЕТ ГИБЕЛИ ПРЕДШЕСТВЕННИКА. Первая редакция чистила четыре
+            // поля и оставляла всё остальное: память об убийцах (`KilledBy`), смертельные места
+            // (`DeathSpots`), квесты, стоившие гибелей, отсрочки походов, разговоров, сдач,
+            // «до кого не дойти», счётчики. Живое окно 2026-09-13 13:58 показало это одной
+            // строкой: Adeline, ур. 1, только что создана — «вокруг места -9811 179 меня убивали
+            // 3 раз(а) — не иду, пока не перерасту (был ур 5, нужен 8)» — и стояла четверть часа
+            // без единого боя у своей же стартовой точки. Гнездо (слот) — это конвейер и учётка;
+            // всё, что персонаж узнал о мире, умирает вместе с ним. Свежий `Companion` с одной
+            // личностью слота: `Entry`, имя, учётки. Пустой `Guid` + `Offline` — конвейер создаёт
+            // заново (BehaveTick, Stage::Offline); движок и тень тоже начинают с нуля.
+            Companion fresh;
+            fresh.Entry          = c.Entry;
+            fresh.PersistentName = c.PersistentName;
+            fresh.AccountId      = c.AccountId;
+            fresh.BnetId         = c.BnetId;
+            fresh.BnetEmail      = c.BnetEmail;
+            fresh.PendingDismiss = c.PendingDismiss;    // просьба роспуска — дело гнезда, не персонажа (Кодекс)
+            c = std::move(fresh);
             TC_LOG_INFO("server.worldserver",
-                "Constellation WIPE: удалён персонаж {} (учётка {}), будет создан заново",
+                "Constellation WIPE: удалён персонаж {} (учётка {}), будет создан заново — память слота обнулена",
                 guid.ToString(), account);
         }
 
