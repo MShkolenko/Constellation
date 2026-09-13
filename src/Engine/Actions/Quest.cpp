@@ -51,6 +51,12 @@ namespace
     // (`GIVER_SEARCH_YARDS`) спрашивается КАЖДЫЙ такт по дороге, поэтому сдача случается сразу,
     // как только ядро увидело принимающего, а не по формальному приходу.
     inline constexpr float TURNIN_ARRIVED_YARDS = 25.0f;
+// К САМОМУ СДАТЧИКУ, КОГДА ОН ВИДЕН, НО ЯДРО НЕ ДАЁТ С НИМ ГОВОРИТЬ (2026-09-14, час 00:13):
+// четверо стояли в 24 ярдах от Farley (295) в таверне Златоземья пятнадцать минут — дорога к
+// точке таблицы «пришла» на 25, а `CanInteractWithQuestGiver` нужны ~5 ярдов и видимость;
+// сдача откладывалась как недостижимая, и 37112 не сдавался. Лестница здесь подходила к самому
+// NPC (`ApproachPoint`); движок — как к торговцу (`Vendor.cpp`): к живому существу, стоп 4.
+inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
 
     // ДОРОГА К ПРИНИМАЮЩЕМУ НЕ ИДЁТ — ДЕСЯТЬ МИНУТ, столько же, сколько у похода к квестодателю
     // и у недостижимой боевой цели. Одно число на все три случая потому, что случай один:
@@ -279,6 +285,32 @@ namespace
                 // комментарий обещал вынести в своё действие: она не понадобилась. Форма та же,
                 // что у похода к квестодателю и у боя, — дойти и сделать, — и части те же.
                 float const dt = ctx.Act.SliceSeconds();
+
+                // ВИДЕН, НО НЕ ДОСЯГАЕМ — идём к нему самому (см. `TURNIN_TALK_YARDS`).
+                if (std::optional<ObjectGuid> const seen = ctx.World.NearestCreatureOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
+                {
+                    std::optional<Position> const at = ctx.World.WhereIs(*seen);
+                    std::optional<float> const dn = ctx.World.DistanceTo(*seen);
+                    // Увиденный, но без места — не повод возвращаться к точке таблицы (это и была
+                    // ложная «пришёл»); откладываем, как недостижимого (Кодекс, п. 4).
+                    if (!at || !dn)
+                    {
+                        Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_UNREACHABLE_MS);
+                        return false;
+                    }
+                    // Ключ прогресса — ВИД, как и у дороги к точке таблицы: смена стадии не
+                    // перезапускает счёт, а второй живой той же породы в обзоре (редкость) не
+                    // сбрасывает его каждым тактом (Кодекс, п. 2).
+                    bool const near = WalkTowards(ctx, *at, TURNIN_TALK_YARDS, dt);
+                    uint32 const sliceNear = uint32(dt * 1000.0f);
+                    if (AdvanceWalk(ctx, Subject::OfSpecies(t.EnderEntry), *dn, sliceNear, !near) != WalkVerdict::Going)
+                    {
+                        Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_UNREACHABLE_MS);
+                        return false;
+                    }
+                    return true;
+                }
+
                 bool const going = WalkTowards(ctx, t.Where, TURNIN_ARRIVED_YARDS, dt);
 
                 // РАССТОЯНИЕ БЕРЁМ ТЕКУЩЕЕ, А НЕ `t.Dist`: кэшированное посчитано при пересчёте
