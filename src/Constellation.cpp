@@ -844,6 +844,7 @@ public:
         Constellation::Ai::RegisterTalkActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterVendorActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterGatherActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterFleeActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -3069,36 +3070,9 @@ public:
                         {
                             c.FleeMs = c.FleeHasPoint ? 0 : c.FleeMs;   // сменили точку — время заново
                             c.FleeHasPoint = false;
-                            float const away = nearest->GetAbsoluteAngle(self);
-                            static float const fan[8] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, 1.9f, -1.9f, 2.6f };
-                            for (float off : fan)
-                            {
-                                float const ang = away + off;
-                                float const fx = self->GetPositionX() + 45.0f * std::cos(ang);
-                                float const fy = self->GetPositionY() + 45.0f * std::sin(ang);
-                                float const fz = self->GetMap()->GetHeight(self->GetPhaseShift(),
-                                    fx, fy, self->GetPositionZ() + 5.0f, true);
-                                if (fz <= INVALID_HEIGHT || std::fabs(fz - self->GetPositionZ()) > 20.0f)
-                                    continue;               // нет земли или обрыв
-                                if (self->GetMap()->IsInWater(self->GetPhaseShift(), fx, fy, fz))
-                                    continue;               // в воду не бежим
-                                // и не в другой лагерь: рядом с точкой не должно быть враждебных
-                                Position cand(fx, fy, fz);
-                                bool crowded = false;
-                                std::list<Creature*> near;
-                                Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
-                                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
-                                Cell::VisitGridObjects(self, searcher, 60.0f);
-                                for (Creature* cr : near)
-                                    if (cr->IsAlive() && self->IsValidAttackTarget(cr)
-                                        && cr->GetExactDist2d(fx, fy) < 15.0f)
-                                        { crowded = true; break; }
-                                if (crowded)
-                                    continue;
-                                c.FleeTo = cand;
-                                c.FleeHasPoint = true;
-                                break;
-                            }
+                            // ПОДНЯТО (`FleePointCore`): веер из восьми точек — одно тело для обоих
+                            // механизмов.
+                            c.FleeHasPoint = FleePointCore(self, nearest, &c.FleeTo);
                             if (!c.FleeHasPoint)
                             {
                                 // ни одно направление не годится — не мечемся, ждём
@@ -7049,6 +7023,42 @@ public:
     // (цель бьёт в ответ, а выхода из боя как поведения пока нет) и уже начатая дорога
     // (обычный путь к поломке — смерть, а она и так возвращает в «стою»). Оба выхода ведут
     // в «стою», откуда новый бой уже не начать.
+    // ТОЧКА ОТХОДА — ОДНО ТЕЛО НА ОБА МЕХАНИЗМА (2026-09-13). 45 ярдов от нападающего веером из
+    // восьми углов; без обрыва, без воды, без толпы в 15 ярдах. Дословно из `Idle` (`:3072-3101`).
+    bool FleePointCore(Player* self, Unit* from, Position* out) const
+    {
+        float const away = from->GetAbsoluteAngle(self);
+        static float const fan[8] = { 0.0f, 0.6f, -0.6f, 1.2f, -1.2f, 1.9f, -1.9f, 2.6f };
+        for (float off : fan)
+        {
+            float const ang = away + off;
+            float const fx = self->GetPositionX() + 45.0f * std::cos(ang);
+            float const fy = self->GetPositionY() + 45.0f * std::sin(ang);
+            float const fz = self->GetMap()->GetHeight(self->GetPhaseShift(),
+                fx, fy, self->GetPositionZ() + 5.0f, true);
+            if (fz <= INVALID_HEIGHT || std::fabs(fz - self->GetPositionZ()) > 20.0f)
+                continue;               // нет земли или обрыв
+            if (self->GetMap()->IsInWater(self->GetPhaseShift(), fx, fy, fz))
+                continue;               // в воду не бежим
+            // и не в другой лагерь: рядом с точкой не должно быть враждебных
+            Position cand(fx, fy, fz);
+            bool crowded = false;
+            std::list<Creature*> near;
+            Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
+            Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+            Cell::VisitGridObjects(self, searcher, 60.0f);
+            for (Creature* cr : near)
+                if (cr->IsAlive() && self->IsValidAttackTarget(cr)
+                    && cr->GetExactDist2d(fx, fy) < 15.0f)
+                    { crowded = true; break; }
+            if (crowded)
+                continue;
+            *out = cand;
+            return true;
+        }
+        return false;
+    }
+
     bool BrokenForFight(Companion& c, Player* self) const
     {
         uint32 broken = BrokenCount(self);
@@ -14570,6 +14580,17 @@ namespace Constellation::Ai
         if (Constellation::Companion* c = m->FindByPlayer(self))
             if (c->GatherSpawnId)
                 m->GatherLeaveCore(*c, self, 0, false);
+    }
+
+    uint32 BrokenGearFor(Player* self)
+    {
+        return Constellation::Manager::Instance()->BrokenCount(self);
+    }
+
+    bool FleePointFor(Player* self, ObjectGuid from, Position* out)
+    {
+        Unit* who = ObjectAccessor::GetUnit(*self, from);
+        return who && Constellation::Manager::Instance()->FleePointCore(self, who, out);
     }
 
     bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send)

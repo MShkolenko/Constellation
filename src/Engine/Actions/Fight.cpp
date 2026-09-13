@@ -714,6 +714,24 @@ namespace
             // ОДИН ВОПРОС на ставку, на `Useful` и на стратегии, которые уступают отдыху: `RestWanted`.
             if (RestWanted(ctx))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
+
+            // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший
+            // бой, с нападающим — отходить. REL_MOVE: выше боя и отдыха, которым в бою со
+            // сломанным делать нечего; ниже прерываний. Начатый нами бой (`Fight.Engaged`)
+            // доводится, как у лестницы `Attacking` без проверки экипировки.
+            if (ctx.St && ctx.World.IsInCombat() && ctx.World.BrokenGear() > 0
+                && !(ctx.St->Fight.Engaged && !ctx.St->Fight.Victim.IsEmpty()))
+            {
+                BackoffKey pause;
+                pause.Kind = BackoffKind::FleePause; pause.About = Subject();
+                if (!Engine::Deferred(*ctx.St, pause, ctx.NowMs))
+                    sink.Add(ctx.World.NearestAttacker() ? ActionId::FleeCombat : ActionId::EndEmptyCombat,
+                             REL_MOVE, Subject());
+            }
+            // ВЫШЛИ ИЗ БОЯ — СЧЁТЧИКИ ОТХОДА ЗАНОВО (`:3128-3131`).
+            if (ctx.St && !ctx.World.IsInCombat()
+                && (ctx.St->Flee.Ms || ctx.St->Flee.Noted || ctx.St->Flee.HasPoint))
+                ctx.St->Flee = EngineState::FleeState();
         }
     };
 
@@ -774,6 +792,10 @@ namespace
             }
 
             if (scan.Fight.IsEmpty())
+                return;
+            // СЛОМАН — НОВЫХ БОЁВ НЕ НАЧИНАЕМ (`ApproachingTarget`, `:3952`): к торговцу и отход —
+            // дела Quests и Survival. Начатый бой выше по `Fight.Engaged` не сюда не доходит.
+            if (ctx.World.BrokenGear() > 0)
                 return;
             // REL_HIGH — РЯДОМ СО СДАЧЕЙ, А НЕ ПОД НЕЙ. Лестница ставит бой выше взятия и похода
             // (`Constellation.cpp:3154` против `:3262`) и ниже сдачи; очередь выражает «выше»

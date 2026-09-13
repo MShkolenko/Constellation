@@ -98,6 +98,43 @@ namespace Constellation::Ai
         return _self && !_self->getAttackers().empty();
     }
 
+    std::optional<ObjectGuid> WorldView::NearestAttacker() const
+    {
+        if (!_self)
+            return std::nullopt;
+        Unit* nearest = nullptr;
+        float best = 1000.0f;
+        for (Unit* a : _self->getAttackers())
+        {
+            float const d = _self->GetExactDist(a);
+            if (d < best)
+                { best = d; nearest = a; }
+        }
+        if (!nearest)
+            nearest = _self->getAttackerForHelper();
+        if (!nearest)
+            return std::nullopt;
+        return nearest->GetGUID();
+    }
+
+    uint32 WorldView::BrokenGear() const
+    {
+        return _self ? BrokenGearFor(_self) : 0;
+    }
+
+    bool WorldView::FleePointFrom(ObjectGuid from, Position* out) const
+    {
+        return _self && out && FleePointFor(_self, from, out);
+    }
+
+    char const* WorldView::NameOf(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return "?";
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who ? who->GetName().c_str() : "?";
+    }
+
     QuestStatus WorldView::StatusOf(uint32 questId) const
     {
         return _self ? _self->GetQuestStatus(questId) : QUEST_STATUS_NONE;

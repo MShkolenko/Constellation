@@ -684,7 +684,8 @@ namespace
             }
 
             TravelSpot const& spot = Val<ValueId::ObjectiveSpot>(ctx);
-            if (spot.Worth)
+            // СЛОМАН — В ПОХОД ЗА ЦЕЛЬЮ НЕ ИДЁМ (`Idle`, `:3340`): сперва к торговцу.
+            if (spot.Worth && ctx.World.BrokenGear() == 0)
                 sink.Add(ActionId::TravelToObjective, REL_BACKGROUND, Subject::OfQuest(spot.QuestId));
             // ПО КАРТЕ ЗА НОВЫМ КВЕСТОМ — ТОЛЬКО КОГДА НЕЗАКРЫТЫХ ЦЕЛЕЙ НЕТ ВОВСЕ. Ворота лестницы
             // (`Constellation.cpp:3357-3358`: `!unmetNow && TalkCandidate.IsEmpty()`), которые

@@ -111,6 +111,18 @@ namespace Constellation::Ai
         // и одна цель пути; смена предмета ставки — это новая дорога, а не продолжение старой.
         WalkProgress Walk;
 
+        // ОТХОД (`:516-535` лестницы): сколько идём к точке, общий бюджет, сама точка, сказали ли.
+        // Пауза после провала — отсрочка `FleePause`, не поле.
+        struct FleeState
+        {
+            uint32   Ms       = 0;
+            uint32   TotalMs  = 0;
+            Position To;
+            bool     HasPoint = false;
+            bool     Noted    = false;
+        };
+        FleeState Flee;
+
         // §31 — И САМО СОСТОЯНИЕ ДВИГАТЕЛЯ. `Walk` выше — прогресс уровня ДЕЙСТВИЯ: приближаемся
         // ли к цели. `Move` — внутренности ходьбы: маршрут ядра и место в нём, отступы вбок,
         // отсрочка построителя, примерзание. Два разных яруса, и путать их дорого: один отвечает
@@ -499,6 +511,7 @@ namespace Constellation::Ai
     void RegisterTalkActions(Engine& engine);
     void RegisterVendorActions(Engine& engine);
     void RegisterGatherActions(Engine& engine);
+    void RegisterFleeActions(Engine& engine);
 
     // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
     // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,

@@ -372,6 +372,14 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::CombatStop()                                    // :3035
+    {
+        if (!Usable())
+            return false;
+        _self->CombatStop(true);
+        return true;
+    }
+
     bool ClientAct::EnterAreaTrigger(int32 areaTriggerId)           // :9046
     {
         if (!Usable())

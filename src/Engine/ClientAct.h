@@ -226,6 +226,9 @@ namespace Constellation::Ai
 
         // -- the world ---------------------------------------------------------------------
         bool UseGameObject(ObjectGuid go);                          // CMSG_GAME_OBJ_USE
+        // THE ONE WRITE WITH NO PACKET, moved from the ladder's Idle (`:3035`) as it was: a
+        // stale combat flag with nobody attacking has no client-side act that clears it.
+        bool CombatStop();                                          // Player::CombatStop(true)
         bool EnterAreaTrigger(int32 areaTriggerId);                 // CMSG_AREA_TRIGGER
 
         // -- trade -------------------------------------------------------------------------

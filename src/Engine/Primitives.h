@@ -299,6 +299,7 @@ namespace Constellation::Ai
     X(SellRefused,      "предмет не покупают")                                               \
     X(VendorNoSell,     "торговец не продавец")                                              \
     X(VendorPause,      "к торговцу — позже")                                                \
+    X(FleePause,        "отход не удался — жду")                                             \
     X(FreeUseDone,      "этой клеткой ради этого пленника — всё")                         \
     X(ApproachesDone,   "заходы к точке исчерпаны")                                       \
     X(CombatUnreachable, "до цели боя не добраться")                                  \

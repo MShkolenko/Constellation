@@ -561,6 +561,11 @@ namespace Constellation::Ai
     void GatherUnreachableFor(Player* self, uint32 backoffMs);    // дорога не вышла — как `GatherLeave`
     void GatherCancelFor(Player* self);                           // ставку сняли на полпути: отпустить точку
 
+    // ОТХОД (2026-09-13): сломанных вещей на теле (`BrokenCount`) и точка отхода от нападающего
+    // (`FleePointCore`) — те же тела, что у `Idle` лестницы.
+    uint32 BrokenGearFor(Player* self);
+    bool FleePointFor(Player* self, ObjectGuid from, Position* out);
+
     enum class TalkOutcome : uint8
     {
         Waiting, Sent,
@@ -696,6 +701,13 @@ namespace Constellation::Ai
         bool  IsInWater() const;
         float HealthPct() const;
         bool  HasAttackers() const;
+        // Ближайший нападающий (`:3010-3019`): по списку, а без него — `getAttackerForHelper`.
+        std::optional<ObjectGuid> NearestAttacker() const;
+        // Сломанных вещей на теле; ноль — драться есть чем.
+        uint32 BrokenGear() const;
+        // Точка отхода от этого нападающего; false — некуда.
+        bool FleePointFrom(ObjectGuid from, Position* out) const;
+        char const* NameOf(ObjectGuid unit) const;         // имя существа для журнала, «?» если нет
 
         // НАДО ЛИ ПЕРЕВЕСТИ ДУХ, И ХВАТИТ ЛИ УЖЕ. Два предиката лестницы целиком
         // (`Constellation.cpp:8371-8387`), а не их пересказ: пороги живут в её настройке, и
