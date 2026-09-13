@@ -541,6 +541,26 @@ namespace Constellation::Ai
     // Прилавок открыт: продать, починить, страховка; true = хоть что-то вышло или чинить было нечего.
     bool TradeAtFor(Player* self, ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send);
 
+    // СБОР (2026-09-13). Точка — ответ отбора лестницы (`FindGatherCandidate`): объект по
+    // идентификатору спавна, или фокус (кузня), у которого применяют заготовку/руну. Память
+    // сбора — 39 полей, приговор кузни по таймеру вне `switch`, общий резерв замков — ОСТАЁТСЯ
+    // В СЛОТЕ СПУТНИКА для обоих механизмов; здесь только то, что нужно ставке.
+    struct GatherSpot
+    {
+        uint32   SpawnId = 0, Entry = 0;
+        Position Where;
+        bool     Focus = false;         // кузня: не открывать, а применить у точки
+        uint32   MapId = 0;
+    };
+    bool GatherSpotFor(Player* self, GatherSpot* out);            // выбирает И настраивает слот
+    uint32 GatherSpawnFor(Player* self);                          // на какую точку слот настроен
+    // Тела у точки: nullptr = «стою, вернусь тем же тактом», иначе причина ухода (слот сброшен).
+    char const* GatherFocusFor(Player* self, ClientAct& act, MoveState& move);
+    char const* GatherOpenFor(Player* self, uint32 spawnId, ClientAct& act, MoveState& move);
+    char const* GatherArrivedEmptyFor(Player* self);
+    void GatherUnreachableFor(Player* self, uint32 backoffMs);    // дорога не вышла — как `GatherLeave`
+    void GatherCancelFor(Player* self);                           // ставку сняли на полпути: отпустить точку
+
     enum class TalkOutcome : uint8
     {
         Waiting, Sent,
@@ -844,6 +864,15 @@ namespace Constellation::Ai
         bool VendorNeed(VendorMemory const& mem, struct VendorNeed* out) const;
         friend bool TradeThroughDoor(Ctx& ctx, ObjectGuid vendor);
         bool TradeAt(ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send) const;
+        // Сбор — общие тела над слотом спутника (см. `GatherSpot`). Читатели пишут в слот —
+        // это память МИРА про этого спутника, не движка; ставка держится за `GatherSpawn()`.
+        bool GatherSpotOf(GatherSpot* out) const;
+        uint32 GatherSpawn() const;
+        char const* GatherFocus(ClientAct& act, MoveState& move) const;
+        char const* GatherOpen(uint32 spawnId, ClientAct& act, MoveState& move) const;
+        char const* GatherArrivedEmpty() const;
+        void GatherUnreachable(uint32 backoffMs) const;
+        void GatherCancel() const;
 
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
@@ -927,6 +956,7 @@ namespace Constellation::Ai
         // лестница не берёт квесты, когда занято столько слотов (`QuestTick`, `:7290`).
         uint32 MaxQuests      = 10;
         bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
+        bool   Quests         = true;     // `Constellation.Quests`: сбор и квесты разрешены (`Idle`, `:3314`)
     };
     EngineTuning Tuning();
 

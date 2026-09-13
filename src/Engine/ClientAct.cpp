@@ -255,6 +255,50 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::CastSpellAtObject(uint32 spellId, ObjectGuid go, ObjectGuid* castId)  // :4793
+    {
+        if (!Usable() || !spellId || go.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_CAST_SPELL);
+        WorldPackets::Spells::CastSpell cast(std::move(raw));
+        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            _self->GetMapId(), spellId, _self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        cast.Cast.SpellID = int32(spellId);
+        cast.Cast.Target.Flags = TARGET_FLAG_GAMEOBJECT;
+        cast.Cast.Target.Unit = go;
+        if (castId)
+            *castId = cast.Cast.CastID;
+        _session->HandleCastSpellOpcode(cast);
+        return true;
+    }
+
+    bool ClientAct::CastSpellOnItem(uint32 spellId, ObjectGuid item)  // :4394
+    {
+        if (!Usable() || !spellId || item.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_CAST_SPELL);
+        WorldPackets::Spells::CastSpell cast(std::move(raw));
+        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            _self->GetMapId(), spellId, _self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        cast.Cast.SpellID = int32(spellId);
+        cast.Cast.Target.Flags = TARGET_FLAG_ITEM;
+        cast.Cast.Target.Item = item;
+        _session->HandleCastSpellOpcode(cast);
+        return true;
+    }
+
+    bool ClientAct::CancelCast(uint32 spellId, ObjectGuid castId)   // :4635 — as the client on Escape
+    {
+        if (!Usable() || !spellId)
+            return false;
+        WorldPacket raw(CMSG_CANCEL_CAST);
+        WorldPackets::Spells::CancelCast cancel(std::move(raw));
+        cancel.SpellID = spellId;
+        cancel.CastID = castId;
+        _session->HandleCancelCastOpcode(cancel);
+        return true;
+    }
+
     bool ClientAct::SpellClick(ObjectGuid unit)                     // :5280
     {
         if (!Usable() || unit.IsEmpty())

@@ -215,6 +215,15 @@ namespace Constellation::Ai
         bool UseItem(uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
                      UseItemTarget const& target);                  // CMSG_USE_ITEM
 
+        // -- the three raw writes of the ladder's `Gathering` (2026-09-13). A click on a LOCKED
+        //    object is a cast at the object, not a use packet — the client takes the spell the
+        //    lock names and casts it (`GetSpellForLock`); the CastID the client made comes back
+        //    so the cancel stays addressed. A rune goes on the weapon: TARGET_FLAG_ITEM, and
+        //    `Spell::CheckCast` refuses an empty item target for ENCHANT_ITEM outright.
+        bool CastSpellAtObject(uint32 spellId, ObjectGuid go, ObjectGuid* castId);  // CMSG_CAST_SPELL
+        bool CastSpellOnItem(uint32 spellId, ObjectGuid item);      // CMSG_CAST_SPELL
+        bool CancelCast(uint32 spellId, ObjectGuid castId);         // CMSG_CANCEL_CAST
+
         // -- the world ---------------------------------------------------------------------
         bool UseGameObject(ObjectGuid go);                          // CMSG_GAME_OBJ_USE
         bool EnterAreaTrigger(int32 areaTriggerId);                 // CMSG_AREA_TRIGGER

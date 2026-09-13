@@ -94,7 +94,8 @@ namespace Constellation::Ai
     X(Objectives,       "цели задания вокруг",   ObjectiveScan)                  \
     X(ObjectiveSpot,    "куда идти за целью",    TravelSpot)                    \
     X(UnmetObjectives,  "незакрытых целей",      uint32)                       \
-    X(VendorTrip,       "к торговцу",            VendorNeed)
+    X(VendorTrip,       "к торговцу",            VendorNeed)                   \
+    X(GatherTarget,     "нужное лежит на земле", GatherSpot)
 
     enum class ValueId : uint8
     {

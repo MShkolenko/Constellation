@@ -339,6 +339,43 @@ namespace Constellation::Ai
         return _self && out && VendorNeedFor(_self, mem, out);
     }
 
+    bool WorldView::GatherSpotOf(GatherSpot* out) const
+    {
+        return _self && out && GatherSpotFor(_self, out);
+    }
+
+    uint32 WorldView::GatherSpawn() const
+    {
+        return _self ? GatherSpawnFor(_self) : 0;
+    }
+
+    char const* WorldView::GatherFocus(ClientAct& act, MoveState& move) const
+    {
+        return _self ? GatherFocusFor(_self, act, move) : "спутника нет";
+    }
+
+    char const* WorldView::GatherOpen(uint32 spawnId, ClientAct& act, MoveState& move) const
+    {
+        return _self ? GatherOpenFor(_self, spawnId, act, move) : "спутника нет";
+    }
+
+    char const* WorldView::GatherArrivedEmpty() const
+    {
+        return _self ? GatherArrivedEmptyFor(_self) : "спутника нет";
+    }
+
+    void WorldView::GatherUnreachable(uint32 backoffMs) const
+    {
+        if (_self)
+            GatherUnreachableFor(_self, backoffMs);
+    }
+
+    void WorldView::GatherCancel() const
+    {
+        if (_self)
+            GatherCancelFor(_self);
+    }
+
     bool WorldView::TradeAt(ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send) const
     {
         return _self && TradeAtFor(_self, vendor, mem, send);

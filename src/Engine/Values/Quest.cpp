@@ -232,8 +232,43 @@ namespace Constellation::Ai
 {
     // ОДНО МЕСТО, ГДЕ ВИДНО, ЧТО СУЩЕСТВУЕТ. Регистрация вразброс — это инвентарь, который
     // приходится собирать грепом; `Seal()` при этом всё равно откажет, но уже на живом мире.
+    // КУДА ИДТИ ЗА ОБЪЕКТОМ — тот же отбор, что зовёт `Idle` под `idleScan` (`:3314`), и та же
+    // память (слот спутника: отсрочки точек, холостые заходы, отработанные задачи, приговоры
+    // кузни). Интервал — как у похода. НАЧАТЫЙ СБОР ДЕРЖИТСЯ ЗА СВОЮ ТОЧКУ (довод у
+    // `ObjectiveSpotValue`): пока действие идёт и слот настроен на неё, точку не переизбираем.
+    // Отпускается тем же, чем у лестницы кончается `Gathering`: уход телом сбрасывает слот, и
+    // `GatherSpawn()` перестаёт совпадать.
+    class GatherTargetValue final : public Value<GatherSpot>
+    {
+    public:
+        GatherTargetValue() : Value(ValueId::GatherTarget, TRAVEL_SCAN_MS) { }
+
+    protected:
+        void Calculate(Ctx& ctx, GatherSpot& out) const override
+        {
+            if (!ctx.St || !Tuning().Quests)
+            {
+                out = GatherSpot();
+                return;
+            }
+            if (ctx.St->Running == ActionId::GatherObjective && out.SpawnId
+                && out.MapId == ctx.World.MapId()
+                && ctx.St->RunningAbout == Subject::OfSpawn(out.SpawnId)
+                && ctx.World.GatherSpawn() == out.SpawnId)
+                return;
+            out = GatherSpot();
+            // В БОЮ НЕ ВЫБИРАЕМ — `Idle` не бывает в бою; и слот не трогаем, чтобы идущий каст
+            // замка (если бой застал у двери) не потерял свою точку.
+            if (ctx.World.IsInCombat())
+                return;
+            ctx.World.GatherSpotOf(&out);
+            out.MapId = ctx.World.MapId();
+        }
+    };
+
     void RegisterQuestValues(Engine& engine)
     {
+        engine.RegisterValue<ValueId::GatherTarget>(std::make_unique<GatherTargetValue>());
         engine.RegisterValue<ValueId::CompletedTurnIns>(std::make_unique<CompletedTurnInsValue>());
         engine.RegisterValue<ValueId::GiversInSight>(std::make_unique<GiversInSightValue>());
         engine.RegisterValue<ValueId::GiversByIndex>(std::make_unique<GiversByIndexValue>());

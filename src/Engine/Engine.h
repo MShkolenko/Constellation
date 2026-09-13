@@ -498,6 +498,7 @@ namespace Constellation::Ai
     bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
     void RegisterTalkActions(Engine& engine);
     void RegisterVendorActions(Engine& engine);
+    void RegisterGatherActions(Engine& engine);
 
     // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
     // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,

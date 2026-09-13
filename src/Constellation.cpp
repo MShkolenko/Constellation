@@ -843,6 +843,7 @@ public:
             Constellation::Ai::RegisterQuestActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterTalkActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterVendorActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterGatherActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -1130,6 +1131,15 @@ public:
     {
         for (Companion& c : _companions)
             if (name == c.Entry->Name)
+                return &c;
+        return nullptr;
+    }
+    Companion* FindByPlayer(Player const* self)
+    {
+        if (!self)
+            return nullptr;
+        for (Companion& c : _companions)
+            if (c.Guid == self->GetGUID())
                 return &c;
         return nullptr;
     }
@@ -4294,183 +4304,11 @@ public:
                         }
                         return;
                     }
-                    // ДОРОГА B: ПРОИЗНОСИМ СВОЁ ЗАКЛИНАНИЕ У ФОКУСА, НЕСЯ ОРУЖИЕ ЦЕЛЬЮ.
-                    //
-                    // Зачёт за рунную кузню даёт не предмет: spell_chapter1_runeforging_credit
-                    // (chapter1.cpp:1147-1165) висит на EFFECT_1 восьми рунических заклинаний и
-                    // при незакрытом 12842 кастует 54586. Связь «руна -> зачёт» живёт в C++, и
-                    // указатель _focusCreditSpells её не находит: он строится по эффектам
-                    // KILL_CREDIT самого заклинания (:7373-7382), а у руны такого эффекта нет.
-                    //
-                    // ЦЕЛЬ-ПРЕДМЕТ ОБЯЗАТЕЛЬНА, И ЭТО НЕ ОСТОРОЖНОСТЬ. Spell::CheckCast
-                    // (Spell.cpp:7784-7787) на SPELL_EFFECT_ENCHANT_ITEM возвращает
-                    // SPELL_FAILED_ITEM_NOT_FOUND, если m_targets.GetItemTarget() пуст. Первая
-                    // редакция слала TARGET_FLAG_NONE — ядро отвергло бы её молча, и я искал
-                    // бы причину в третий раз. Руна ложится на оружие в главной руке.
-                    if (c.GatherCastSpell)
-                    {
-                        uint32 const spellId = c.GatherCastSpell;
-                        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
-                        Item* weapon = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
-                        if (!si || !self->HasSpell(spellId) || !weapon)
-                        {
-                            GatherLeave(c, self, 0, true, "заклинания или оружия нет");
-                            return;
-                        }
-                        if (!self->CanRequestSpellCast(si, self)
-                            || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
-                            return;                 // ещё не время, вернёмся тем же тактом
-                        // СПРАШИВАЕМ У ЯДРА ЕГО ПРИЧИНУ, А НЕ ВЫВОДИМ ЕЁ.
-                        //
-                        // Круг 73: 108 кастов, ноль зачётов, чары на оружии нули — ядро каст
-                        // отвергло. Круг 74 напечатал числа и снял единственную гипотезу:
-                        // BaseLevel у всех восьми рун ноль, значит SPELL_FAILED_LOWLEVEL
-                        // невозможен, MaxLevel ноль — проверка не выполняется, у оружия нет
-                        // ни своего применения, ни гнёзд, ни призматики, и владелец свой.
-                        // Ни один из шести отказов ветки чар не применим, а каст всё равно
-                        // не проходит. Значит отказ раньше, и угадывать его — пятая по счёту
-                        // правдоподобная история за сутки. Четыре предыдущие пришлось снять.
-                        //
-                        // ЭТОТ ПРИЁМ — ИЗ САМОГО ЯДРА, не выдумка: WorldSession::HandleAcceptTrade
-                        // (TradeHandler.cpp:386-401) строит Spell, ставит ему m_targets, зовёт
-                        // CheckCast(true) и удаляет. CheckCast и m_targets публичны (Spell.h:516
-                        // и :640). Берём TRIGGERED_NONE, а не FULL_MASK: нам нужны те же
-                        // проверки, что у настоящего каста, а не облегчённые.
-                        //
-                        // И ЭТО НЕ ТОЛЬКО ПРИБОР. Отказной каст больше не отправляется вовсе:
-                        // три попытки на руну тратились на то, что ядро отвергает сразу.
-                        SpellCastResult probe = SPELL_CAST_OK;
-                        {
-                            Spell* ask = new Spell(self, si, TRIGGERED_NONE);
-                            ask->m_targets.SetItemTarget(weapon);
-                            probe = ask->CheckCast(true);
-                            delete ask;
-                        }
-                        if (probe != SPELL_CAST_OK)
-                        {
-                            // ОТКАЗ НЕ ТРАТИТ ПОПЫТКУ (Кодекс). Счётчик CastTried отвечает на
-                            // другой вопрос: «каст УШЁЛ, а цель не сдвинулась». Отказ до
-                            // отправки этого не говорит вовсе, и половина отказов временна —
-                            // откат, бой, вышли из радиуса фокуса. Три таких проверки
-                            // навсегда сняли бы рабочую руну, хотя пакета не было.
-                            //
-                            // Печатаем один раз на каждый НОВЫЙ код: устойчивый отказ иначе
-                            // залил бы журнал строкой в минуту на спутника, а смена кода —
-                            // это как раз то, что интересно.
-                            uint64 const rk = PairKey(spellId, c.GatherCastCreature);
-                            if (c.CastRefusal[rk] != uint32(probe))
-                            {
-                                c.CastRefusal[rk] = uint32(probe);
-                                TC_LOG_INFO("server.worldserver",
-                                    "Constellation КУЗНЯ {}: ядро отказало заклинанию {} на {} — причина {}; "
-                                    "не отправляю, попытку не трачу",
-                                    self->GetName(), spellId, weapon->GetEntry(), uint32(probe));
-                            }
-                            // У ОТКАЗА ДОЛЖЕН БЫТЬ КОНЕЦ (Кодекс, второй проход). Минута
-                            // ограничивает частоту, а не срок: устойчиво отказная руна
-                            // водила бы спутника к кузнице раз в минуту вечно. Счётчик
-                            // отдельный от попыток — они про «каст ушёл и не сработал», —
-                            // а вот СНЯТИЕ переиспользует уже готовый предел, чтобы не
-                            // заводить второй механизм с той же судьбой.
-                            //
-                            // Десять отказов при минутном откате — это около десяти минут
-                            // попыток. Последний код остаётся в CastRefusal для разбора.
-                            if (++c.CastRefused[rk] >= 10)
-                            {
-                                c.CastTried[rk] = 3;        // тем же путём, что и бесплодные касты
-                                _focusPairDead.insert(rk);  // и для всего состава тоже
-                                TC_LOG_INFO("server.worldserver",
-                                    "Constellation КУЗНЯ {}: заклинание {} отказано десять раз подряд "
-                                    "(последняя причина {}) — снимаю его",
-                                    self->GetName(), spellId, uint32(probe));
-                            }
-                            GatherLeave(c, self, 60000, true, "ядро отказало");
-                            return;
-                        }
-                        uint64 const okKey = PairKey(spellId, c.GatherCastCreature);
-                        c.CastRefusal.erase(okKey);     // прошло — прежний отказ больше не факт
-                        c.CastRefused.erase(okKey);     // и череда отказов прервалась
-                        int32 const had = ObjectiveCount(self, c.GatherCastQuest, c.GatherCastCreature);
-                        WorldPacket raw(CMSG_CAST_SPELL);
-                        WorldPackets::Spells::CastSpell cast(std::move(raw));
-                        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
-                            SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), spellId,
-                            self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-                        cast.Cast.SpellID = int32(spellId);
-                        cast.Cast.Target.Flags = TARGET_FLAG_ITEM;
-                        cast.Cast.Target.Item = weapon->GetGUID();
-                        c.Session->HandleCastSpellOpcode(cast);
-                        c.CraftSpell = spellId;
-                        c.CraftObjQuest = c.GatherCastQuest;
-                        c.CraftObjCreature = c.GatherCastCreature;
-                        c.CraftObjBefore = had;
-                        c.CraftWaitMs = 15000;      // каст, скрипт ядра и его зачёт
-                        c.CraftSpawn = c.GatherSpawnId;
-                        c.GatherCastSpell = 0;      // взведено было на эту точку и отработало
-                        c.GatherCastQuest = 0;
-                        c.GatherCastCreature = 0;
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation КУЗНЯ {}: произнёс {} (фокус {}) на {} у точки {}, "
-                            "цель {}/{} была {} — жду 15 с",
-                            self->GetName(), spellId, si->RequiresSpellFocus,
-                            weapon->GetEntry(), c.GatherSpawnId,
-                            c.CraftObjQuest, c.CraftObjCreature, had);
-                        GatherLeave(c, self, 60000, true, "произнёс у фокуса");
-                        return;
-                    }
-                    uint32 const useEntry = c.GatherUseItem;
-                    Item* blank = nullptr;
-                    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !blank; ++i)
-                        if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
-                            if (it->GetEntry() == useEntry)
-                                blank = it;
-                    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !blank; ++b)
-                        if (Bag* bag = self->GetBagByPos(b))
-                            for (uint32 j = 0; j < bag->GetBagSize() && !blank; ++j)
-                                if (Item* it = bag->GetItemByPos(j))
-                                    if (it->GetEntry() == useEntry)
-                                        blank = it;
-                    uint32 const spellId = _craftSpellOfItem.count(useEntry) ? _craftSpellOfItem.at(useEntry) : 0;
-                    SpellInfo const* si = spellId ? sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE) : nullptr;
-                    if (!blank || !si)
-                    {
-                        GatherLeave(c, self, 0, true, "заготовки или заклинания нет");
-                        return;
-                    }
-                    // ОЧЕРЕДЬ И ОТКАТ СПРАШИВАЕМ ДО ОТПРАВКИ — тем же вопросом, что и бой.
-                    if (!self->CanRequestSpellCast(si, self)
-                        || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
-                        return;                 // ещё не время, вернёмся тем же тактом
-                    std::vector<std::pair<uint32, int32>> const snapBefore = QuestSnapshot(self);
-                    // СЧИТАЕМ ДО ОТПРАВКИ: обработчик может истратить предмет синхронно, и
-                    // тогда счёт «после» уже уменьшен, а признак «истрачена» стал бы ложным
-                    // (Кодекс, задача 101).
-                    uint32 const hadBefore = self->GetItemCount(useEntry, false);
-                    WorldPacket raw(CMSG_USE_ITEM);
-                    WorldPackets::Spells::UseItem use(std::move(raw));
-                    use.PackSlot = blank->GetBagSlot();
-                    use.Slot = blank->GetSlot();
-                    use.CastItem = blank->GetGUID();
-                    use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
-                        SPELL_CAST_SOURCE_NORMAL, self->GetMapId(), spellId,
-                        self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-                    use.Cast.SpellID = int32(spellId);
-                    use.Cast.Target.Flags = TARGET_FLAG_NONE;   // заклинание на себя, у фокуса
-                    blank = nullptr;                            // обработчик мог его уничтожить
-                    c.Session->HandleUseItemOpcode(use);
-                    // СУДИМ НЕ ЗДЕСЬ. Ставим окно ожидания и вернёмся к приговору, когда
-                    // очередь ядра и вся цепочка успеют отработать.
-                    c.CraftItem = useEntry;
-                    c.CraftSnap = snapBefore;
-                    c.CraftHadBefore = hadBefore;
-                    c.CraftWaitMs = 15000;      // ВЫБРАННОЕ число: каст, аура и её триггер
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation КУЗНЯ {}: применил {} (закл. {}, фокус {}) у точки {} — жду 15 с и сверю цели",
-                        self->GetName(), useEntry, spellId, si->RequiresSpellFocus, c.GatherSpawnId);
-                    // ЗАХОД СЧИТАЕМ СРАЗУ, А ПРИ УДАЧЕ ПРИГОВОР ЕГО СНИМЕТ: иначе фокус, у
-                    // которого применение никогда не срабатывает, оставался бы вечным.
-                    c.CraftSpawn = c.GatherSpawnId;
-                    GatherLeave(c, self, 60000, true, "применил у фокуса");
+                    // ПОДНЯТО (`GatherFocusCore`): руна или заготовка у фокуса — одно тело для
+                    // обоих механизмов; здесь остались дорога и переход.
+                    Constellation::Ai::ClientAct act(self, c.Session);
+                    if (char const* why = GatherFocusCore(c, self, act, c.Move))
+                        Switch(c, self, Behavior::Idle, why);
                     return;
                 }
                 GameObject* go = near <= 12.0f
@@ -4519,503 +4357,15 @@ public:
                     // ПРИШЛИ, А ОБЪЕКТА НЕТ. Это не ошибка и не навсегда: в пуле живёт один
                     // член из многих, событие может быть выключено, а взятый объект
                     // возрождается по своему сроку (Кодекс перечислил все эти случаи).
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: пришёл к точке {} (вид {}), а объекта там нет — холостой заход {} из 8",
-                        self->GetName(), c.GatherSpawnId, c.GatherEntry, uint32(c.GatherEmpty[c.GatherSpawnId] + 1));
-                    GatherLeave(c, self, 120000, true, "объекта на месте нет");
+                    Switch(c, self, Behavior::Idle, GatherArrivedEmptyCore(c, self));
                     return;
                 }
 
-                // ОТКРЫВАЕМ ТЕМ ЖЕ ОПКОДОМ, КАКИМ ЭТО ДЕЛАЕТ КЛИЕНТ ПО КЛИКУ.
-                // Пакет несёт ровно один GUID (GameObjectPackets.h), обработчик зовёт
-                // GetGameObjectIfCanInteractWith и затем obj->Use(player).
-                std::string const name = go->GetName();
-                uint32 const entry = go->GetEntry();
-
-                // ВОЗОБНОВЛЕНИЕ ПОСЛЕ КАСТА ЗАМКА — ДО ВОРОТ ДОСТУПНОСТИ, И ЭТО СУЩЕСТВЕННО.
-                //
-                // Открытая дверь перестаёт быть «нашей» по IsLootAllowedFor и может выпасть из
-                // ActivateToQuest, поэтому проверять их на возврате нельзя: спутник ушёл бы с
-                // отговоркой «добыча не наша», потеряв вместе с ней и исход собственного
-                // каста, и точку.
-                // ЧУЖОЙ КАСТ НА ЭТОЙ ТОЧКЕ — ЭТО ЗАНЯТОСТЬ, А НЕ ИСХОД.
-                //
-                // Держатель резерва имеет право продолжить; всякий другой уходит, не тратя
-                // точку. Просроченный резерв снимается на месте: держатель мог погибнуть.
-                if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end())
-                {
-                    // ЧУЖОЙ РЕЗЕРВ НЕ СНИМАЕТСЯ ПО ВОЗРАСТУ (Кодекс, задачи 145 и 146).
-                    //
-                    // Сначала он снимался через пятнадцать секунд, потом через тридцать, и
-                    // каждый раз оставался один и тот же вопрос: доказано ли, что к этому
-                    // мгновению чужой каст кончился. Доказать это можно было только
-                    // рассуждением о том, кто когда тикает и что делает диспетчер поведения, —
-                    // то есть выводом, а не проверкой, и Кодекс справедливо отказывался его
-                    // принимать четыре прохода подряд. Поэтому возраста здесь больше нет:
-                    // резерв снимает ТОЛЬКО владелец, и только теми путями, которые сперва
-                    // гасят своё заклинание. Инвариант «двое не читают одну точку» виден в
-                    // коде целиком.
-                    //
-                    // НО «НИКОГДА» ОБОРАЧИВАЛОСЬ НАКОПЛЕНИЕМ: каждый спутник, исчезнувший в
-                    // чтении, забирал ещё одну точку навсегда, и в пределе отряд терял их все
-                    // вместе с возможностью закрыть квест. Отпускаем такой резерв по условию,
-                    // которое ВИДНО, а не выводится: владельца нет среди спутников модуля.
-                    // Кого модуль не ведёт, тот и не кастует — рассуждать про диспетчер
-                    // поведения и снятие юнита с карты для этого не нужно.
-                    bool ownerGone = true;
-                    for (Companion const& other : _companions)
-                        if (other.Guid.GetCounter() == hold->second.first)
-                        {
-                            ownerGone = false;
-                            break;
-                        }
-                    if (ownerGone)
-                    {
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: резерв на {} ({}) остался от спутника, которого больше нет — снимаю",
-                            self->GetName(), name, entry);
-                        _lockCastHold.erase(hold);
-                    }
-                    else if (hold->second.first != self->GetGUID().GetCounter())
-                    {
-                        // И НИЧЕГО НЕ СПИСЫВАЕМ. Здесь стоял счёт занятости, а GatherLeave
-                        // сверху добавлял холостой заход, и повторные встречи у одной двери
-                        // откладывали её, хотя спутник не сделал по ней НИ ОДНОЙ собственной
-                        // попытки. Соседство напарника — свойство трафика, а не двери.
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: у {} ({}) сейчас читает замок другой спутник — не мешаю",
-                            self->GetName(), name, entry);
-                        GatherLeave(c, self, 5000, false, "замок: точку читает другой");
-                        return;
-                    }
-                }
-
-                bool resuming = false;
-                bool usedLockCast = false;
-                uint32 spaceBefore = 0;
-                bool wasReady = false;
-                std::vector<std::pair<uint32, int32>> snapBefore;
-                if (c.LockCastSpawn == c.GatherSpawnId)
-                {
-                    // СРОК ПРОВЕРЯЕТСЯ ВСЕГДА, А НЕ ТОЛЬКО ПОКА ИДЁТ КАСТ (Кодекс, задача 138).
-                    // Проверка стояла внутри ветки «ещё читаем», поэтому просроченный снимок,
-                    // доживший до возврата уже без каста, принимался безусловно и мерил мир
-                    // мерой пятнадцатиминутной давности.
-                    bool const expired = GameTime::GetGameTimeMS() - c.LockCastStartMs >= 15000;
-                    if (expired || self->IsNonMeleeSpellCast(false))
-                    {
-                        // Ещё читаем и срок не вышел — стоим и ничего не судим.
-                        if (!expired)
-                        {
-                            // ОТМЕТКА РЕЗЕРВА ОСВЕЖАЕТСЯ, ПОКА МЫ ЖДЁМ. Возраст резерва никто
-                            // больше не читает — ни код, ни журнал (Кодекс, задача 147, [P2]:
-                            // прежний комментарий обещал видимость в журнале, которой нет).
-                            // Освежение оставлено как дешёвая отметка живого владельца на
-                            // случай, если возраст снова кому-то понадобится.
-                            if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end()
-                                && hold->second.first == self->GetGUID().GetCounter())
-                                hold->second.second = GameTime::GetGameTimeMS();
-                            return;
-                        }
-                        // Срок вышел — это не исход, а тупик. Точка цела, засчитываем
-                        // занятость и уходим.
-                        // СНАЧАЛА ОТМЕНЯЕМ СВОЙ КАСТ, ПОТОМ ОТПУСКАЕМ ТОЧКУ (Кодекс, 142).
-                        //
-                        // Тайм-аут освобождал резерв, а заклинание при этом продолжало
-                        // читаться, и второй спутник мог начать поверх живого первого. Отмена
-                        // делает пересечение невозможным по построению, а не по расчёту
-                        // времени: после неё живого каста на этой точке просто нет.
-                        //
-                        // Отменяем так же, как клиент по Escape: CMSG_CANCEL_CAST через
-                        // настоящий обработчик сессии, с тем же идентификатором каста, что
-                        // отправляли. Обработчик сам проверит, что читать ещё есть что
-                        // (SpellHandler.cpp:268).
-                        if (c.LockCastSpellId)
-                        {
-                            WorldPacket rawCancel(CMSG_CANCEL_CAST);
-                            WorldPackets::Spells::CancelCast cancel(std::move(rawCancel));
-                            cancel.SpellID = c.LockCastSpellId;
-                            cancel.CastID = c.LockCastId;
-                            c.Session->HandleCancelCastOpcode(cancel);
-                            c.LockCastSpellId = 0;
-                        }
-                        // РЕЗЕРВ СНИМАЕМ ЗДЕСЬ ЖЕ, А НЕ НАДЕЯСЬ НА GatherLeave (Кодекс, 141).
-                        //
-                        // Обнуление LockCastSpawn строкой ниже гасит и проверку внутри
-                        // GatherLeave, поэтому резерв висел бы до собственного срока — и
-                        // обещание «владелец всегда отпускает первым» на этом пути было
-                        // неправдой. Когда владелец отпускает на ВСЕХ своих путях, у истечения
-                        // остаётся единственный смысл: владелец исчез, а с ним исчез и каст,
-                        // и пересечься уже не с чем.
-                        if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end()
-                            && hold->second.first == self->GetGUID().GetCounter())
-                            _lockCastHold.erase(hold);
-                        c.LockCastSpawn = 0;
-                        c.LockCastSnap.clear();
-                        ++c.GooberIdle[c.GatherSpawnId];
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: ожидание каста замка у {} ({}) вышло за срок — точка цела",
-                            self->GetName(), name, entry);
-                        GatherLeave(c, self, 30000, true, "замок: срок ожидания вышел");
-                        return;
-                    }
-                    _lockCastHold.erase(c.GatherSpawnId);
-                    c.LockCastSpellId = 0;
-                    c.LockCastId.Clear();
-                    resuming = true;
-                    usedLockCast = true;
-                    spaceBefore = c.LockCastSpace;
-                    wasReady = c.LockCastReady;
-                    snapBefore = std::move(c.LockCastSnap);
-                    c.LockCastSnap.clear();
-                    c.LockCastSpawn = 0;
-                }
-
-                // ДОСТУПНОСТЬ СУНДУКА ЗАВИСИТ ОТ САМОГО ИГРОКА, И ЭТО НАДО СПРОСИТЬ.
-                //
-                // Кодекс называл это среди того, чего строка в таблице не знает: для
-                // сундуков и точек сбора ядро проверяет квестовое состояние игрока через
-                // GameObject::ActivateToQuest, и без этого добыча для него не создаётся
-                // вовсе. Замер на боевом после переделки: 106 заходов, из них НИ ОДНОГО
-                // с добычей — «открыл, но ничего не легло». Проверки не было.
-                //
-                // Здесь же — права на добычу: IsLootAllowedFor знает про уже опустошённое,
-                // разрешённых собирателей, личную добычу и список захвативших.
-                if (!resuming && !go->ActivateToQuest(self))
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: {} ({}) для меня не активен по квесту",
-                        self->GetName(), name, entry);
-                    GatherLeave(c, self, 300000, true, "объект не мой по квесту");
-                    return;
-                }
-                if (!resuming && !go->IsLootAllowedFor(self))
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: {} ({}) уже занят или обобран другим",
-                        self->GetName(), name, entry);
-                    GatherLeave(c, self, 120000, true, "добыча не наша");
-                    return;
-                }
-                if (!resuming)
-                {
-                    spaceBefore = FreeBagSpace(self);
-                    // СОСТОЯНИЕ ОБЩЕГО ОБЪЕКТА ДО ПРИМЕНЕНИЯ: не готов — значит его только что
-                    // использовал другой, и наш отказ ничего не говорит о самом объекте.
-                    wasReady = go->getLootState() == GO_READY;
-                    if (c.GatherIsGoober)
-                        snapBefore = QuestSnapshot(self);
-                }
-                // КЛИК ПО ЗАПЕРТОМУ ОБЪЕКТУ — ЭТО КАСТ, А НЕ ПАКЕТ «ИСПОЛЬЗОВАТЬ»
-                // (оператор, 2026-09-05: «боты действуют как люди»; замер того же дня).
-                //
-                // Дверь квеста 14098 несёт замок (goober.open = 1944). Живой клиент по клику
-                // такой объект НЕ «использует»: он берёт заклинание, которым объект
-                // открывается, и кастует его — а уже `Spell::EffectOpenLock` вызывает
-                // `Use(player, true)`. Именно этот каст и запускает всё остальное: у двери
-                // это 67869 «Стук», чей сценарий (gilneas_chapter_1.cpp) случайно призывает
-                // либо жителя, дающего зачёт существа 35830, либо воргена.
-                //
-                // Спутники слали голый CMSG_GAME_OBJ_USE. Дверь при этом открывалась и
-                // засчитывала САМУ СЕБЯ (KillCreditGO по entry), но заклинание не звучало
-                // никогда — отсюда замер круга 66: 102 клика по одиннадцати разным дверям,
-                // ноль жителей, ноль воргенов, ноль зачёта. Оператор закрыл этот квест
-                // руками, и это было прямым опровержением вывода «дверь ничего не делает».
-                //
-                // НОМЕР ЗАКЛИНАНИЯ НЕ ПОДСТАВЛЯЕМ — СПРАШИВАЕМ У ЯДРА.
-                // `GameObject::GetSpellForLock` (GameObject.cpp:4687) читает Lock.db2 и
-                // возвращает то заклинание, которое открывает ИМЕННО этот объект: для
-                // LOCK_KEY_SPELL это прямо `Index[i]`, для LOCK_KEY_SKILL — известное игроку
-                // заклинание с нужным SPELL_EFFECT_OPEN_LOCK. Поэтому правка чинит не одну
-                // дверь, а весь класс запертых объектов, и данные Lock.db2 читать не нужно.
-                SpellInfo const* lockSpell = resuming ? nullptr : go->GetSpellForLock(self);
-                // ЧИТАЕМОЕ ЗАКЛИНАНИЕ БОЛЬШЕ НЕ ОТВЕРГАЕТСЯ, А ДОЖИДАЕТСЯ (замер круга 67).
-                //
-                // Прошлый круг исключал не мгновенные, чтобы не судить исход раньше времени,
-                // и замер показал цену этого решения: у двери 195327 ядро возвращает 67869
-                // «Стук» — то самое заклинание, что призывает жителя или воргена, — и все 153
-                // находки за пятнадцать минут были отвергнуты именно этим ограничением.
-                // Отвергнут был ровно нужный случай. Теперь он обслуживается стадией ожидания
-                // выше: спутник стоит на точке до конца каста и судит по сохранённым снимкам.
-                // И ТОЛЬКО ТАМ, ГДЕ ПРИМЕНЕНИЕ БУДЕТ ДОКАЗУЕМО (Кодекс, задача 136).
-                //
-                // Кастовать имеет смысл лишь при двух условиях, и оба проверяются здесь, до
-                // отправки. Иначе — прежний пакет использования и прежняя мерка, то есть в
-                // точности то поведение, что было до этого круга; хуже стать не может.
-                //
-                // 1. НЕ MULTI-INTERACT. У такого объекта ядро не трогает состояние добычи, а
-                //    гасит объект персонально или переводит состояние для одного игрока —
-                //    наблюдаемого следа не остаётся вовсе. Кодекс показал, чем это кончается:
-                //    `EffectOpenLock` может выйти без применения (иммунитет, отказ
-                //    `CanOpenLock`), а модуль по одной готовности до отправки списал бы
-                //    нетронутую точку. Доказать нечем — значит не касту.
-                // 2. ДВИЖЕТ СОБОЙ САМ СПУТНИК. Обработчик выбирает исполнителя через
-                //    `GetUnitBeingMoved()` (SpellHandler.cpp:242): если спутник управляет
-                //    существом, проверенный откат ИГРОКА ничего не говорит об откате того
-                //    существа, и каст снова может уйти в очередь.
-                if (lockSpell && (multiInteractGoober(go) || self->GetUnitBeingMoved() != self))
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: у {} ({}) применение недоказуемо — открываю пакетом",
-                        self->GetName(), name, entry);
-                    lockSpell = nullptr;
-                }
-                if (resuming)
-                {
-                    // Уже применили в прошлом заходе: слать нечего, идём прямо к учёту.
-                }
-                else if (lockSpell)
-                {
-                    // ШЛЁМ ТОЛЬКО ТО, ЧТО ИСПОЛНИТСЯ ПРЯМО СЕЙЧАС (Кодекс, задачи 133 и 135).
-                    //
-                    // `CanRequestSpellCast` — не тот порог. Он ПУСКАЕТ В ОЧЕРЕДЬ и при
-                    // непустом откате, лишь бы остаток укладывался в окно очереди
-                    // (Player.cpp:30936, SPELL_QUEUE_TIME_WINDOW), а исполнение тогда ждёт
-                    // конца отката. Обработчик при этом вернётся раньше, чем объект будет
-                    // применён, и весь учёт вокруг — добыча, снимок квестов, трата точки —
-                    // посчитается по ещё не наступившему исходу.
-                    //
-                    // Поэтому требуем строго больше: откат уже вышел И ничего не читается.
-                    // Тогда `RequestSpellCast` исполняет запрос немедленно, и немедленный
-                    // учёт становится верным. Иначе уходим ни с чем — это то же «объект
-                    // занят», только занят наш собственный спутник.
-                    if (self->GetSpellHistory()->GetRemainingGlobalCooldown(lockSpell) > 0ms
-                        || self->IsNonMeleeSpellCast(false)
-                        || !self->CanRequestSpellCast(lockSpell, self))
-                    {
-                        ++c.GooberIdle[c.GatherSpawnId];
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: {} ({}) заперт, но каст сейчас не примут — вернусь",
-                            self->GetName(), name, entry);
-                        GatherLeave(c, self, 5000, true, "замок: каст не примут сейчас");
-                        return;
-                    }
-                    WorldPacket raw(CMSG_CAST_SPELL);
-                    WorldPackets::Spells::CastSpell cast(std::move(raw));
-                    cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
-                        self->GetMapId(), lockSpell->Id, self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-                    cast.Cast.SpellID = int32(lockSpell->Id);
-                    // ЦЕЛЬ-ОБЪЕКТ КЛАДЁТСЯ В ТО ЖЕ ПОЛЕ, что и цель-существо: ядро пишет и
-                    // читает его по флагу (Spell.cpp:147).
-                    cast.Cast.Target.Flags = TARGET_FLAG_GAMEOBJECT;
-                    cast.Cast.Target.Unit = go->GetGUID();
-                    // ЧИТАЕМОЕ ПРОИЗНОСИМ СТОЯ — то же правило, что и у боевых заклинаний:
-                    // ядро отказывает движущемуся, и отказ выглядел бы как «дверь молчит».
-                    if (lockSpell->CalcCastTime() > 0 && self->isMoving())
-                        StopMoving(c, self);
-                    c.Session->HandleCastSpellOpcode(cast);
-                    usedLockCast = true;
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: {} ({}) заперт — открываю заклинанием {} «{}», как клиент",
-                        self->GetName(), name, entry, lockSpell->Id,
-                        lockSpell->SpellName ? lockSpell->SpellName->Str[LOCALE_ruRU] : "?");
-
-                    // ЧИТАЕТСЯ — ЗНАЧИТ ЖДЁМ ЗДЕСЬ ЖЕ, НЕ УХОДЯ И НЕ СУДЯ.
-                    //
-                    // Уход через GatherLeave обнулил бы точку и увёл спутника, а снимки
-                    // пропали бы вместе с ним. Остаёмся на месте, сохранив ровно то, чем
-                    // будем мерить исход, и вернёмся сюда следующим тактом.
-                    if (self->IsNonMeleeSpellCast(false))
-                    {
-                        _lockCastHold[c.GatherSpawnId] = { self->GetGUID().GetCounter(),
-                                                            GameTime::GetGameTimeMS() };
-                        c.LockCastSpawn = c.GatherSpawnId;
-                        c.LockCastSpace = spaceBefore;
-                        c.LockCastReady = wasReady;
-                        c.LockCastSnap = snapBefore;
-                        c.LockCastStartMs = GameTime::GetGameTimeMS();
-                        c.LockCastSpellId = lockSpell->Id;
-                        c.LockCastId = cast.Cast.CastID;
-                        return;
-                    }
-                }
-                else
-                {
-                    WorldPacket raw(CMSG_GAME_OBJ_USE);
-                    WorldPackets::GameObject::GameObjUse use(std::move(raw));
-                    use.Guid = go->GetGUID();
-                    c.Session->HandleGameObjectUseOpcode(use);
-                    // ВОТ ЗДЕСЬ ПОПЫТКА И СОСТОЯЛАСЬ: объект использован, а не «мы вышли».
-                    // У КЛЕТКИ НЕТ ПРИЗНАКА, КОТОРЫЙ МОЖНО СНЯТЬ ЗДЕСЬ, И ПОЭТОМУ НЕТ ОТСТАВКИ.
-                    //
-                    // Замер круга 78: три тюрьмы отставлены ДЛЯ ВСЕГО СОСТАВА по приговору
-                    // «квесты не сдвинулись» — и четверо оставшихся лишились ровно тех
-                    // клеток, которые им нужны. Признак был неверный: клетка квест не
-                    // двигает, она выпускает того, кто даёт зачёт при убийстве
-                    // (29520.KillCredit1 = 29519).
-                    //
-                    // Обзор предложил считать, не появился ли рядом засчитываемый за нашу
-                    // цель. Я это написал, а потом прочитал ядро и выбросил:
-                    // npc_unworthy_initiateAI::EventStart (chapter1.cpp:175-188) ничего не
-                    // освобождает, он ставит wait_timer = 5000 и меняет фазу. Уязвимым
-                    // послушник становится в UpdateAI: PHASE_TO_EQUIP через пять секунд шлёт
-                    // его к якорю, PHASE_TO_ATTACK ещё по таймеру делает SetImmuneToPC(false)
-                    // и AttackStart. Десяток секунд, и спутник к тому времени уже ушёл.
-                    //
-                    // Значит внутри захода наблюдать нечего и никакой срок этого не
-                    // исправит. Вывод — убрать механизм, а не чинить его: предел на
-                    // повторные походы уже есть и он правильный — восемь холостых заходов
-                    // на ТОЧКУ у этого спутника, и отбор клетки его спрашивает. Общая
-                    // отставка была нужна рунам, где приговор наблюдаем; здесь она только
-                    // убивала работающие клетки.
-                    if (c.FreeGoFor && c.FreeGoSpawnUsed == c.GatherSpawnId)
-                    {
-                        // ПРЕДЕЛ ЛИЧНЫЙ, И ЭТО ТРЕТЬЯ РЕДАКЦИЯ ЭТОГО МЕСТА.
-                        //
-                        // Сначала попытка считалась при ВЫХОДЕ — три долгих похода убивали
-                        // пару, и рабочие клетки умирали для всего состава. Потом я убрал
-                        // общую отставку вовсе, сказав, что предел даёт счёт холостых
-                        // заходов. Проверка это опровергла: применение клетки уходит через
-                        // GatherLeave(..., !success, "собрал") с success = true, значит
-                        // fruitless = false и GatherEmpty не растёт. Предела не было.
-                        //
-                        // Середина: считаем ЗДЕСЬ, по факту применения, и держим счёт
-                        // ЛИЧНЫМ. Три применения одной клетки ради одной цели — и этот
-                        // спутник идёт к другой; клеток двадцать одна. Общей отставки нет
-                        // и быть не может: судить о клетке внутри захода нечем, потому что
-                        // EventStart (chapter1.cpp:175) только взводит таймер на пять
-                        // секунд, а освобождение приходит много позже, из UpdateAI.
-                        uint64 const fk = PairKey(c.FreeGoEntry, c.FreeGoFor);
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation КЛЕТКА {}: применил {} ради {} (раз {} из 3) — освобождение"
-                            " придёт через ядро, здесь его не увидеть",
-                            self->GetName(), c.FreeGoEntry, c.FreeGoFor,
-                            uint32(++c.FreeTried[fk]));
-                        c.FreeGoFor = 0;
-                        c.FreeGoEntry = 0;
-                        c.FreeGoSpawnUsed = 0;
-                    }
-                }
-
-                // ПРИМЕНЕНИЕ ДОКАЗЫВАЕТ САМ ОБЪЕКТ, А НЕ ОТКАТ У СПУТНИКА (Кодекс, задача 134).
-                //
-                // Прежний признак «пошёл общий откат» имел ложные отрицания: мгновенное
-                // заклинание без отката оставляло оба следа пустыми, и состоявшееся открытие
-                // читалось как отказ. Спрашиваем то, что меняет САМ объект: `GameObject::Use`
-                // на гуубере выставляет GO_FLAG_IN_USE и переводит состояние добычи в
-                // GO_ACTIVATED (GameObject.cpp, ветка без AllowMultiInteract). Значит уход
-                // состояния из GO_READY и есть прямое доказательство, что применение прошло.
-                //
-                // И ЭТО ИМЕННО ПЕРЕХОД, А НЕ ЗНАЧЕНИЕ (Кодекс, задача 135, [P1]). Проверять
-                // одно лишь «состояние не GO_READY» нельзя: объект мог быть открыт кем-то
-                // раньше, наш каст при этом отклонён, а выражение всё равно сказало бы
-                // «применено» и списало нетронутую точку. `wasReady` — снимок ДО отправки,
-                // поэтому доказательством служит пара «был готов и перестал».
-                bool const stateMoved = wasReady && go->getLootState() != GO_READY;
-                // НО ЭТОТ ПРИЗНАК ГОДИТСЯ НЕ ДЛЯ ВСЯКОГО ГУУБЕРА. При AllowMultiInteract ядро
-                // идёт другой веткой: гасит объект персонально для игрока либо переводит его
-                // состояние для него одного — и состояние ДОБЫЧИ не трогает вовсе. Замер по
-                // базе: таких среди квестовых гууберов 319 из 845, то есть больше трети.
-                // Требовать от них ухода из GO_READY значило бы трижды счесть отказом
-                // работающую точку и отложить её — ровно та ошибка, которую этот круг снимает.
-                // Для них остаёмся на прежней мерке: готовность объекта до отправки.
-                // Прежний путь судим прежней меркой: там пакет использования, и готовность
-                // до отправки была единственным, что о нём известно. Новый путь берётся
-                // только там, где переход состояния наблюдаем, — это обеспечено выше.
-                bool const interacted = usedLockCast ? stateMoved : wasReady;
-
-                // Считаем ЛЁГШЕЕ, а не запрошенное: предмет, ушедший в имеющуюся стопку,
-                // места не занимает, и по свободным ячейкам удачный сбор выглядел бы пустым.
-                // ЧАСТЬ СУНДУКОВ КЛАДЁТ ДОБЫЧУ СРАЗУ, БЕЗ ОКНА (Кодекс).
-                //
-                // При флаге chestPushLoot ядро складывает предметы прямо внутри Use, и
-                // окна добычи не появляется вовсе. Прежний счёт считал такой заход
-                // неудачей — вид пуст, значит «ничего не легло», — и ставил объекту
-                // отсрочку, хотя предмет реально лежал в сумке. Поэтому меряем по месту
-                // в сумках вокруг самого Use, а не только по окну.
-                uint32 const landed = self->GetAELootView().empty()
-                    ? (spaceBefore > FreeBagSpace(self) ? spaceBefore - FreeBagSpace(self) : 0u)
-                    : TakeOpenLoot(c, self, go->GetGUID(), name, entry);
-                // УСПЕХ — ЭТО ДОБЫЧА ИЛИ СДВИГ ЦЕЛЕЙ, И НИЧТО ИНОЕ. Объединённый выход раньше
-                // объявлял успехом любой заход, из-за чего предел не действовал ровно там, где
-                // он и был нужен (Кодекс, задача 104).
-                bool success = landed > 0;
-                if (landed)
-                {
-                    ++c.Gathered;
-                    c.GatherEmpty.erase(c.GatherSpawnId);   // взяли — точка снова хорошая
-                    // КВЕСТОВАЯ ТОЧКА ТРАТИТСЯ И ЗДЕСЬ, БЕЗ ОГЛЯДКИ НА ГОТОВНОСТЬ
-                    // (Кодекс, задачи 130 и 131).
-                    //
-                    // Сначала правило одноразовости стояло только в ветке «добычи не было», а
-                    // добыча перехватывает выход раньше неё: гуубер, отдающий предмет без
-                    // сдвига целей, оставался доступным навсегда, и очистка GatherEmpty строкой
-                    // выше снимала последний предел. Первая правка добавила сюда отметку, но
-                    // под условием `wasReady` — и Кодекс показал, что дыра осталась: при
-                    // `landed > 0 && !wasReady` отметка пропускается, до счётчика занятости
-                    // исполнение не доходит, и возвраты снова ничем не ограничены.
-                    //
-                    // Условие снято. `wasReady` — это снимок `getLootState() == GO_READY`,
-                    // взятый ДО применения, и он отвечает на вопрос «не занял ли объект
-                    // кто-то раньше». Но добыча, которая легла в сумку, отвечает на более
-                    // сильный вопрос: применение СОСТОЯЛОСЬ. Спорить с этим снимком нечем,
-                    // поэтому точка тратится.
-                    //
-                    // Жилы и травы сюда не попадают: GatherIsGoober ставится только для точек
-                    // из квестового указателя.
-                    if (c.GatherIsGoober)
-                        c.GooberDone.insert(c.GatherSpawnId);
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СБОР {}: обобрал {} ({}), предметов легло {}{}; всего объектов {}",
-                        self->GetName(), name, entry, landed,
-                        c.GatherIsGoober ? "; точка отработана" : "",
-                        c.Gathered);
-                }
-                else
-                {
-                    // ОБЪЕКТ-ЗАДАЧА СУДИТСЯ ПО СДВИГУ ЦЕЛЕЙ, А НЕ ПО ДОБЫЧЕ: он её и не даёт.
-                    // Сдвинул — своё отработал, больше не ходим. Не сдвинул — это дверь,
-                    // рычаг или реквизит, привязанный к квесту: вернёмся, только если мир
-                    // вокруг сам изменится (Кодекс, задача 90).
-                    if (c.GatherIsGoober && QuestSnapshot(self) != snapBefore)
-                    {
-                        success = true;                 // цели сдвинулись — заход не холостой
-                        c.GooberDone.insert(c.GatherSpawnId);
-                        c.GooberIdle.erase(c.GatherSpawnId);
-                        c.GatherEmpty.erase(c.GatherSpawnId);
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: применил {} ({}) — состояние квестов изменилось, больше не хожу",
-                            self->GetName(), name, entry);
-                    }
-                    else if (c.GatherIsGoober)
-                    {
-                        // ОДИН КЛИК НА ТОЧКУ, ДАЛЬШЕ СЛЕДУЮЩАЯ (оператор, 2026-09-05: «не
-                        // долбить дверь, а по разу кликать двери по порядку… до тех пор, пока
-                        // не будет спасено 3 жителя»; «они ОДНОРАЗОВЫЕ для каждого персонажа»).
-                        //
-                        // «КВЕСТЫ НЕ СДВИНУЛИСЬ» ЗДЕСЬ НЕ УЛИКА, А ПОЛОВИНА ИСХОДОВ. Дверь
-                        // квеста 14098 — лотерея: заклинание 67869 «Стук»
-                        // (gilneas_chapter_1.cpp, spell_gilneas_knocking) случайным образом
-                        // выбирает между двумя своими эффектами, и выбегает либо мирный житель,
-                        // чей сценарий даёт зачёт существа 35830, либо ворген, не дающий
-                        // ничего. Отсечка круга 65 считала такие исходы уликой и выключала вид
-                        // после шести — то есть обрывала обход на шестой двери из четырнадцати.
-                        // Правильный ответ на «не сдвинулось» ровно один: идти к следующей.
-                        //
-                        // Обход кончается сам: точек у вида конечное число, каждая тратится
-                        // одним готовым кликом. Для двери 195327 это четырнадцать кликов на
-                        // спутника вместо девяноста ударов в одну.
-                        //
-                        // ЗАНЯТЫЙ ОБЪЕКТ ТОЧКУ НЕ ТРАТИТ: клика не было. От вечного возврата к
-                        // вечно занятой точке защищает GooberIdle (три захода) и GatherEmpty
-                        // (восемь холостых) — обе отсечки по ТОЧКЕ, а не по виду.
-                        if (interacted)
-                            c.GooberDone.insert(c.GatherSpawnId);
-                        else
-                            ++c.GooberIdle[c.GatherSpawnId];
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись{}, холостой заход {} из 8",
-                            self->GetName(), name, entry,
-                            interacted ? "; точка отработана, иду к следующей"
-                                       : " (применение не состоялось — точка цела)",
-                            uint32(c.GatherEmpty[c.GatherSpawnId] + 1));
-                    }
-                    else
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
-                            self->GetName(), name, entry);
-                }
-                GatherLeave(c, self, landed ? 60000 : 120000, !success, "собрал");
+                // ПОДНЯТО (`GatherOpenCore`): замок, пакет, приговор — одно тело для обоих
+                // механизмов; здесь остались дорога и переход.
+                Constellation::Ai::ClientAct act(self, c.Session);
+                if (char const* why = GatherOpenCore(c, self, go, act, c.Move))
+                    Switch(c, self, Behavior::Idle, why);
                 return;
             }
             // РАЗГОВОР КАК СПОСОБ ЗАКРЫТЬ ЦЕЛЬ ЗАДАНИЯ.
@@ -5884,7 +5234,689 @@ public:
     // (Кодекс, задача 103): недостижимая точка, чужой по квесту объект, занятый объект, обычный
     // объект без добычи и применение у фокуса счёт обходили. Теперь каждый уход из сбора идёт
     // отсюда, и обещание совпадает с кодом.
+    // ---------------------------------------------------------------------------------------
+    // СБОР — ОДНО ТЕЛО НА ОБА МЕХАНИЗМА (2026-09-13). Память сбора остаётся в слоте
+    // `Companion` (39 полей, сервис приговора кузни вне `switch`, общий `_lockCastHold`) —
+    // дублировать её в отсрочки движка значило бы оторвать приговор от того, что он судит.
+    // Отличаются только дорога (лестница: StepToward; движок: WalkTowards/AdvanceWalk),
+    // дверь (`ClientAct` — одна на обоих) и переход (Switch(Idle) против «ставка снята»).
+    // Тела возвращают причину ухода или nullptr «стою, вернусь тем же тактом».
+    char const* GatherFocusCore(Companion& c, Player* self, Constellation::Ai::ClientAct& act,
+                                Constellation::Ai::MoveState& move)
+    {
+        (void)move;
+        // ДОРОГА B: ПРОИЗНОСИМ СВОЁ ЗАКЛИНАНИЕ У ФОКУСА, НЕСЯ ОРУЖИЕ ЦЕЛЬЮ.
+        //
+        // Зачёт за рунную кузню даёт не предмет: spell_chapter1_runeforging_credit
+        // (chapter1.cpp:1147-1165) висит на EFFECT_1 восьми рунических заклинаний и
+        // при незакрытом 12842 кастует 54586. Связь «руна -> зачёт» живёт в C++, и
+        // указатель _focusCreditSpells её не находит: он строится по эффектам
+        // KILL_CREDIT самого заклинания (:7373-7382), а у руны такого эффекта нет.
+        //
+        // ЦЕЛЬ-ПРЕДМЕТ ОБЯЗАТЕЛЬНА, И ЭТО НЕ ОСТОРОЖНОСТЬ. Spell::CheckCast
+        // (Spell.cpp:7784-7787) на SPELL_EFFECT_ENCHANT_ITEM возвращает
+        // SPELL_FAILED_ITEM_NOT_FOUND, если m_targets.GetItemTarget() пуст. Первая
+        // редакция слала TARGET_FLAG_NONE — ядро отвергло бы её молча, и я искал
+        // бы причину в третий раз. Руна ложится на оружие в главной руке.
+        if (c.GatherCastSpell)
+        {
+            uint32 const spellId = c.GatherCastSpell;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
+            Item* weapon = self->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            if (!si || !self->HasSpell(spellId) || !weapon)
+            {
+                GatherLeaveCore(c, self, 0, true);
+                return "заклинания или оружия нет";
+            }
+            if (!self->CanRequestSpellCast(si, self)
+                || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
+                return nullptr;                 // ещё не время, вернёмся тем же тактом
+            // СПРАШИВАЕМ У ЯДРА ЕГО ПРИЧИНУ, А НЕ ВЫВОДИМ ЕЁ.
+            //
+            // Круг 73: 108 кастов, ноль зачётов, чары на оружии нули — ядро каст
+            // отвергло. Круг 74 напечатал числа и снял единственную гипотезу:
+            // BaseLevel у всех восьми рун ноль, значит SPELL_FAILED_LOWLEVEL
+            // невозможен, MaxLevel ноль — проверка не выполняется, у оружия нет
+            // ни своего применения, ни гнёзд, ни призматики, и владелец свой.
+            // Ни один из шести отказов ветки чар не применим, а каст всё равно
+            // не проходит. Значит отказ раньше, и угадывать его — пятая по счёту
+            // правдоподобная история за сутки. Четыре предыдущие пришлось снять.
+            //
+            // ЭТОТ ПРИЁМ — ИЗ САМОГО ЯДРА, не выдумка: WorldSession::HandleAcceptTrade
+            // (TradeHandler.cpp:386-401) строит Spell, ставит ему m_targets, зовёт
+            // CheckCast(true) и удаляет. CheckCast и m_targets публичны (Spell.h:516
+            // и :640). Берём TRIGGERED_NONE, а не FULL_MASK: нам нужны те же
+            // проверки, что у настоящего каста, а не облегчённые.
+            //
+            // И ЭТО НЕ ТОЛЬКО ПРИБОР. Отказной каст больше не отправляется вовсе:
+            // три попытки на руну тратились на то, что ядро отвергает сразу.
+            SpellCastResult probe = SPELL_CAST_OK;
+            {
+                Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+                ask->m_targets.SetItemTarget(weapon);
+                probe = ask->CheckCast(true);
+                delete ask;
+            }
+            if (probe != SPELL_CAST_OK)
+            {
+                // ОТКАЗ НЕ ТРАТИТ ПОПЫТКУ (Кодекс). Счётчик CastTried отвечает на
+                // другой вопрос: «каст УШЁЛ, а цель не сдвинулась». Отказ до
+                // отправки этого не говорит вовсе, и половина отказов временна —
+                // откат, бой, вышли из радиуса фокуса. Три таких проверки
+                // навсегда сняли бы рабочую руну, хотя пакета не было.
+                //
+                // Печатаем один раз на каждый НОВЫЙ код: устойчивый отказ иначе
+                // залил бы журнал строкой в минуту на спутника, а смена кода —
+                // это как раз то, что интересно.
+                uint64 const rk = PairKey(spellId, c.GatherCastCreature);
+                if (c.CastRefusal[rk] != uint32(probe))
+                {
+                    c.CastRefusal[rk] = uint32(probe);
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КУЗНЯ {}: ядро отказало заклинанию {} на {} — причина {}; "
+                        "не отправляю, попытку не трачу",
+                        self->GetName(), spellId, weapon->GetEntry(), uint32(probe));
+                }
+                // У ОТКАЗА ДОЛЖЕН БЫТЬ КОНЕЦ (Кодекс, второй проход). Минута
+                // ограничивает частоту, а не срок: устойчиво отказная руна
+                // водила бы спутника к кузнице раз в минуту вечно. Счётчик
+                // отдельный от попыток — они про «каст ушёл и не сработал», —
+                // а вот СНЯТИЕ переиспользует уже готовый предел, чтобы не
+                // заводить второй механизм с той же судьбой.
+                //
+                // Десять отказов при минутном откате — это около десяти минут
+                // попыток. Последний код остаётся в CastRefusal для разбора.
+                if (++c.CastRefused[rk] >= 10)
+                {
+                    c.CastTried[rk] = 3;        // тем же путём, что и бесплодные касты
+                    _focusPairDead.insert(rk);  // и для всего состава тоже
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation КУЗНЯ {}: заклинание {} отказано десять раз подряд "
+                        "(последняя причина {}) — снимаю его",
+                        self->GetName(), spellId, uint32(probe));
+                }
+                GatherLeaveCore(c, self, 60000, true);
+                return "ядро отказало";
+            }
+            uint64 const okKey = PairKey(spellId, c.GatherCastCreature);
+            c.CastRefusal.erase(okKey);     // прошло — прежний отказ больше не факт
+            c.CastRefused.erase(okKey);     // и череда отказов прервалась
+            int32 const had = ObjectiveCount(self, c.GatherCastQuest, c.GatherCastCreature);
+            act.CastSpellOnItem(spellId, weapon->GetGUID());   // TARGET_FLAG_ITEM — дверь
+            c.CraftSpell = spellId;
+            c.CraftObjQuest = c.GatherCastQuest;
+            c.CraftObjCreature = c.GatherCastCreature;
+            c.CraftObjBefore = had;
+            c.CraftWaitMs = 15000;      // каст, скрипт ядра и его зачёт
+            c.CraftSpawn = c.GatherSpawnId;
+            c.GatherCastSpell = 0;      // взведено было на эту точку и отработало
+            c.GatherCastQuest = 0;
+            c.GatherCastCreature = 0;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation КУЗНЯ {}: произнёс {} (фокус {}) на {} у точки {}, "
+                "цель {}/{} была {} — жду 15 с",
+                self->GetName(), spellId, si->RequiresSpellFocus,
+                weapon->GetEntry(), c.GatherSpawnId,
+                c.CraftObjQuest, c.CraftObjCreature, had);
+            GatherLeaveCore(c, self, 60000, true);
+            return "произнёс у фокуса";
+        }
+        uint32 const useEntry = c.GatherUseItem;
+        Item* blank = nullptr;
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !blank; ++i)
+            if (Item* it = self->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                if (it->GetEntry() == useEntry)
+                    blank = it;
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !blank; ++b)
+            if (Bag* bag = self->GetBagByPos(b))
+                for (uint32 j = 0; j < bag->GetBagSize() && !blank; ++j)
+                    if (Item* it = bag->GetItemByPos(j))
+                        if (it->GetEntry() == useEntry)
+                            blank = it;
+        uint32 const spellId = _craftSpellOfItem.count(useEntry) ? _craftSpellOfItem.at(useEntry) : 0;
+        SpellInfo const* si = spellId ? sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE) : nullptr;
+        if (!blank || !si)
+        {
+            GatherLeaveCore(c, self, 0, true);
+            return "заготовки или заклинания нет";
+        }
+        // ОЧЕРЕДЬ И ОТКАТ СПРАШИВАЕМ ДО ОТПРАВКИ — тем же вопросом, что и бой.
+        if (!self->CanRequestSpellCast(si, self)
+            || self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms)
+            return nullptr;                 // ещё не время, вернёмся тем же тактом
+        std::vector<std::pair<uint32, int32>> const snapBefore = QuestSnapshot(self);
+        // СЧИТАЕМ ДО ОТПРАВКИ: обработчик может истратить предмет синхронно, и
+        // тогда счёт «после» уже уменьшен, а признак «истрачена» стал бы ложным
+        // (Кодекс, задача 101).
+        uint32 const hadBefore = self->GetItemCount(useEntry, false);
+        uint8 const blankBag = blank->GetBagSlot();
+        uint8 const blankSlot = blank->GetSlot();
+        ObjectGuid const blankGuid = blank->GetGUID();
+        blank = nullptr;                            // обработчик мог его уничтожить
+        act.UseItem(blankBag, blankSlot, blankGuid, spellId,
+                    Constellation::Ai::ClientAct::UseItemTarget());  // на себя, у фокуса
+        // СУДИМ НЕ ЗДЕСЬ. Ставим окно ожидания и вернёмся к приговору, когда
+        // очередь ядра и вся цепочка успеют отработать.
+        c.CraftItem = useEntry;
+        c.CraftSnap = snapBefore;
+        c.CraftHadBefore = hadBefore;
+        c.CraftWaitMs = 15000;      // ВЫБРАННОЕ число: каст, аура и её триггер
+        TC_LOG_INFO("server.worldserver",
+            "Constellation КУЗНЯ {}: применил {} (закл. {}, фокус {}) у точки {} — жду 15 с и сверю цели",
+            self->GetName(), useEntry, spellId, si->RequiresSpellFocus, c.GatherSpawnId);
+        // ЗАХОД СЧИТАЕМ СРАЗУ, А ПРИ УДАЧЕ ПРИГОВОР ЕГО СНИМЕТ: иначе фокус, у
+        // которого применение никогда не срабатывает, оставался бы вечным.
+        c.CraftSpawn = c.GatherSpawnId;
+        GatherLeaveCore(c, self, 60000, true);
+        return "применил у фокуса";
+    }
+
+    char const* GatherOpenCore(Companion& c, Player* self, GameObject* go,
+                               Constellation::Ai::ClientAct& act, Constellation::Ai::MoveState& move)
+    {
+        // ОТКРЫВАЕМ ТЕМ ЖЕ ОПКОДОМ, КАКИМ ЭТО ДЕЛАЕТ КЛИЕНТ ПО КЛИКУ.
+        // Пакет несёт ровно один GUID (GameObjectPackets.h), обработчик зовёт
+        // GetGameObjectIfCanInteractWith и затем obj->Use(player).
+        std::string const name = go->GetName();
+        uint32 const entry = go->GetEntry();
+
+        // ВОЗОБНОВЛЕНИЕ ПОСЛЕ КАСТА ЗАМКА — ДО ВОРОТ ДОСТУПНОСТИ, И ЭТО СУЩЕСТВЕННО.
+        //
+        // Открытая дверь перестаёт быть «нашей» по IsLootAllowedFor и может выпасть из
+        // ActivateToQuest, поэтому проверять их на возврате нельзя: спутник ушёл бы с
+        // отговоркой «добыча не наша», потеряв вместе с ней и исход собственного
+        // каста, и точку.
+        // ЧУЖОЙ КАСТ НА ЭТОЙ ТОЧКЕ — ЭТО ЗАНЯТОСТЬ, А НЕ ИСХОД.
+        //
+        // Держатель резерва имеет право продолжить; всякий другой уходит, не тратя
+        // точку. Просроченный резерв снимается на месте: держатель мог погибнуть.
+        if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end())
+        {
+            // ЧУЖОЙ РЕЗЕРВ НЕ СНИМАЕТСЯ ПО ВОЗРАСТУ (Кодекс, задачи 145 и 146).
+            //
+            // Сначала он снимался через пятнадцать секунд, потом через тридцать, и
+            // каждый раз оставался один и тот же вопрос: доказано ли, что к этому
+            // мгновению чужой каст кончился. Доказать это можно было только
+            // рассуждением о том, кто когда тикает и что делает диспетчер поведения, —
+            // то есть выводом, а не проверкой, и Кодекс справедливо отказывался его
+            // принимать четыре прохода подряд. Поэтому возраста здесь больше нет:
+            // резерв снимает ТОЛЬКО владелец, и только теми путями, которые сперва
+            // гасят своё заклинание. Инвариант «двое не читают одну точку» виден в
+            // коде целиком.
+            //
+            // НО «НИКОГДА» ОБОРАЧИВАЛОСЬ НАКОПЛЕНИЕМ: каждый спутник, исчезнувший в
+            // чтении, забирал ещё одну точку навсегда, и в пределе отряд терял их все
+            // вместе с возможностью закрыть квест. Отпускаем такой резерв по условию,
+            // которое ВИДНО, а не выводится: владельца нет среди спутников модуля.
+            // Кого модуль не ведёт, тот и не кастует — рассуждать про диспетчер
+            // поведения и снятие юнита с карты для этого не нужно.
+            bool ownerGone = true;
+            for (Companion const& other : _companions)
+                if (other.Guid.GetCounter() == hold->second.first)
+                {
+                    ownerGone = false;
+                    break;
+                }
+            if (ownerGone)
+            {
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: резерв на {} ({}) остался от спутника, которого больше нет — снимаю",
+                    self->GetName(), name, entry);
+                _lockCastHold.erase(hold);
+            }
+            else if (hold->second.first != self->GetGUID().GetCounter())
+            {
+                // И НИЧЕГО НЕ СПИСЫВАЕМ. Здесь стоял счёт занятости, а GatherLeave
+                // сверху добавлял холостой заход, и повторные встречи у одной двери
+                // откладывали её, хотя спутник не сделал по ней НИ ОДНОЙ собственной
+                // попытки. Соседство напарника — свойство трафика, а не двери.
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: у {} ({}) сейчас читает замок другой спутник — не мешаю",
+                    self->GetName(), name, entry);
+                GatherLeaveCore(c, self, 5000, false);
+                return "замок: точку читает другой";
+            }
+        }
+
+        bool resuming = false;
+        bool usedLockCast = false;
+        uint32 spaceBefore = 0;
+        bool wasReady = false;
+        std::vector<std::pair<uint32, int32>> snapBefore;
+        if (c.LockCastSpawn == c.GatherSpawnId)
+        {
+            // СРОК ПРОВЕРЯЕТСЯ ВСЕГДА, А НЕ ТОЛЬКО ПОКА ИДЁТ КАСТ (Кодекс, задача 138).
+            // Проверка стояла внутри ветки «ещё читаем», поэтому просроченный снимок,
+            // доживший до возврата уже без каста, принимался безусловно и мерил мир
+            // мерой пятнадцатиминутной давности.
+            bool const expired = GameTime::GetGameTimeMS() - c.LockCastStartMs >= 15000;
+            if (expired || self->IsNonMeleeSpellCast(false))
+            {
+                // Ещё читаем и срок не вышел — стоим и ничего не судим.
+                if (!expired)
+                {
+                    // ОТМЕТКА РЕЗЕРВА ОСВЕЖАЕТСЯ, ПОКА МЫ ЖДЁМ. Возраст резерва никто
+                    // больше не читает — ни код, ни журнал (Кодекс, задача 147, [P2]:
+                    // прежний комментарий обещал видимость в журнале, которой нет).
+                    // Освежение оставлено как дешёвая отметка живого владельца на
+                    // случай, если возраст снова кому-то понадобится.
+                    if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end()
+                        && hold->second.first == self->GetGUID().GetCounter())
+                        hold->second.second = GameTime::GetGameTimeMS();
+                    return nullptr;
+                }
+                // Срок вышел — это не исход, а тупик. Точка цела, засчитываем
+                // занятость и уходим.
+                // СНАЧАЛА ОТМЕНЯЕМ СВОЙ КАСТ, ПОТОМ ОТПУСКАЕМ ТОЧКУ (Кодекс, 142).
+                //
+                // Тайм-аут освобождал резерв, а заклинание при этом продолжало
+                // читаться, и второй спутник мог начать поверх живого первого. Отмена
+                // делает пересечение невозможным по построению, а не по расчёту
+                // времени: после неё живого каста на этой точке просто нет.
+                //
+                // Отменяем так же, как клиент по Escape: CMSG_CANCEL_CAST через
+                // настоящий обработчик сессии, с тем же идентификатором каста, что
+                // отправляли. Обработчик сам проверит, что читать ещё есть что
+                // (SpellHandler.cpp:268).
+                if (c.LockCastSpellId)
+                {
+                    act.CancelCast(c.LockCastSpellId, c.LockCastId);
+                    c.LockCastSpellId = 0;
+                }
+                // РЕЗЕРВ СНИМАЕМ ЗДЕСЬ ЖЕ, А НЕ НАДЕЯСЬ НА GatherLeave (Кодекс, 141).
+                //
+                // Обнуление LockCastSpawn строкой ниже гасит и проверку внутри
+                // GatherLeave, поэтому резерв висел бы до собственного срока — и
+                // обещание «владелец всегда отпускает первым» на этом пути было
+                // неправдой. Когда владелец отпускает на ВСЕХ своих путях, у истечения
+                // остаётся единственный смысл: владелец исчез, а с ним исчез и каст,
+                // и пересечься уже не с чем.
+                if (auto hold = _lockCastHold.find(c.GatherSpawnId); hold != _lockCastHold.end()
+                    && hold->second.first == self->GetGUID().GetCounter())
+                    _lockCastHold.erase(hold);
+                c.LockCastSpawn = 0;
+                c.LockCastSnap.clear();
+                ++c.GooberIdle[c.GatherSpawnId];
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: ожидание каста замка у {} ({}) вышло за срок — точка цела",
+                    self->GetName(), name, entry);
+                GatherLeaveCore(c, self, 30000, true);
+                return "замок: срок ожидания вышел";
+            }
+            _lockCastHold.erase(c.GatherSpawnId);
+            c.LockCastSpellId = 0;
+            c.LockCastId.Clear();
+            resuming = true;
+            usedLockCast = true;
+            spaceBefore = c.LockCastSpace;
+            wasReady = c.LockCastReady;
+            snapBefore = std::move(c.LockCastSnap);
+            c.LockCastSnap.clear();
+            c.LockCastSpawn = 0;
+        }
+
+        // ДОСТУПНОСТЬ СУНДУКА ЗАВИСИТ ОТ САМОГО ИГРОКА, И ЭТО НАДО СПРОСИТЬ.
+        //
+        // Кодекс называл это среди того, чего строка в таблице не знает: для
+        // сундуков и точек сбора ядро проверяет квестовое состояние игрока через
+        // GameObject::ActivateToQuest, и без этого добыча для него не создаётся
+        // вовсе. Замер на боевом после переделки: 106 заходов, из них НИ ОДНОГО
+        // с добычей — «открыл, но ничего не легло». Проверки не было.
+        //
+        // Здесь же — права на добычу: IsLootAllowedFor знает про уже опустошённое,
+        // разрешённых собирателей, личную добычу и список захвативших.
+        if (!resuming && !go->ActivateToQuest(self))
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: {} ({}) для меня не активен по квесту",
+                self->GetName(), name, entry);
+            GatherLeaveCore(c, self, 300000, true);
+            return "объект не мой по квесту";
+        }
+        if (!resuming && !go->IsLootAllowedFor(self))
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: {} ({}) уже занят или обобран другим",
+                self->GetName(), name, entry);
+            GatherLeaveCore(c, self, 120000, true);
+            return "добыча не наша";
+        }
+        if (!resuming)
+        {
+            spaceBefore = FreeBagSpace(self);
+            // СОСТОЯНИЕ ОБЩЕГО ОБЪЕКТА ДО ПРИМЕНЕНИЯ: не готов — значит его только что
+            // использовал другой, и наш отказ ничего не говорит о самом объекте.
+            wasReady = go->getLootState() == GO_READY;
+            if (c.GatherIsGoober)
+                snapBefore = QuestSnapshot(self);
+        }
+        // КЛИК ПО ЗАПЕРТОМУ ОБЪЕКТУ — ЭТО КАСТ, А НЕ ПАКЕТ «ИСПОЛЬЗОВАТЬ»
+        // (оператор, 2026-09-05: «боты действуют как люди»; замер того же дня).
+        //
+        // Дверь квеста 14098 несёт замок (goober.open = 1944). Живой клиент по клику
+        // такой объект НЕ «использует»: он берёт заклинание, которым объект
+        // открывается, и кастует его — а уже `Spell::EffectOpenLock` вызывает
+        // `Use(player, true)`. Именно этот каст и запускает всё остальное: у двери
+        // это 67869 «Стук», чей сценарий (gilneas_chapter_1.cpp) случайно призывает
+        // либо жителя, дающего зачёт существа 35830, либо воргена.
+        //
+        // Спутники слали голый CMSG_GAME_OBJ_USE. Дверь при этом открывалась и
+        // засчитывала САМУ СЕБЯ (KillCreditGO по entry), но заклинание не звучало
+        // никогда — отсюда замер круга 66: 102 клика по одиннадцати разным дверям,
+        // ноль жителей, ноль воргенов, ноль зачёта. Оператор закрыл этот квест
+        // руками, и это было прямым опровержением вывода «дверь ничего не делает».
+        //
+        // НОМЕР ЗАКЛИНАНИЯ НЕ ПОДСТАВЛЯЕМ — СПРАШИВАЕМ У ЯДРА.
+        // `GameObject::GetSpellForLock` (GameObject.cpp:4687) читает Lock.db2 и
+        // возвращает то заклинание, которое открывает ИМЕННО этот объект: для
+        // LOCK_KEY_SPELL это прямо `Index[i]`, для LOCK_KEY_SKILL — известное игроку
+        // заклинание с нужным SPELL_EFFECT_OPEN_LOCK. Поэтому правка чинит не одну
+        // дверь, а весь класс запертых объектов, и данные Lock.db2 читать не нужно.
+        SpellInfo const* lockSpell = resuming ? nullptr : go->GetSpellForLock(self);
+        // ЧИТАЕМОЕ ЗАКЛИНАНИЕ БОЛЬШЕ НЕ ОТВЕРГАЕТСЯ, А ДОЖИДАЕТСЯ (замер круга 67).
+        //
+        // Прошлый круг исключал не мгновенные, чтобы не судить исход раньше времени,
+        // и замер показал цену этого решения: у двери 195327 ядро возвращает 67869
+        // «Стук» — то самое заклинание, что призывает жителя или воргена, — и все 153
+        // находки за пятнадцать минут были отвергнуты именно этим ограничением.
+        // Отвергнут был ровно нужный случай. Теперь он обслуживается стадией ожидания
+        // выше: спутник стоит на точке до конца каста и судит по сохранённым снимкам.
+        // И ТОЛЬКО ТАМ, ГДЕ ПРИМЕНЕНИЕ БУДЕТ ДОКАЗУЕМО (Кодекс, задача 136).
+        //
+        // Кастовать имеет смысл лишь при двух условиях, и оба проверяются здесь, до
+        // отправки. Иначе — прежний пакет использования и прежняя мерка, то есть в
+        // точности то поведение, что было до этого круга; хуже стать не может.
+        //
+        // 1. НЕ MULTI-INTERACT. У такого объекта ядро не трогает состояние добычи, а
+        //    гасит объект персонально или переводит состояние для одного игрока —
+        //    наблюдаемого следа не остаётся вовсе. Кодекс показал, чем это кончается:
+        //    `EffectOpenLock` может выйти без применения (иммунитет, отказ
+        //    `CanOpenLock`), а модуль по одной готовности до отправки списал бы
+        //    нетронутую точку. Доказать нечем — значит не касту.
+        // 2. ДВИЖЕТ СОБОЙ САМ СПУТНИК. Обработчик выбирает исполнителя через
+        //    `GetUnitBeingMoved()` (SpellHandler.cpp:242): если спутник управляет
+        //    существом, проверенный откат ИГРОКА ничего не говорит об откате того
+        //    существа, и каст снова может уйти в очередь.
+        if (lockSpell && (multiInteractGoober(go) || self->GetUnitBeingMoved() != self))
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: у {} ({}) применение недоказуемо — открываю пакетом",
+                self->GetName(), name, entry);
+            lockSpell = nullptr;
+        }
+        if (resuming)
+        {
+            // Уже применили в прошлом заходе: слать нечего, идём прямо к учёту.
+        }
+        else if (lockSpell)
+        {
+            // ШЛЁМ ТОЛЬКО ТО, ЧТО ИСПОЛНИТСЯ ПРЯМО СЕЙЧАС (Кодекс, задачи 133 и 135).
+            //
+            // `CanRequestSpellCast` — не тот порог. Он ПУСКАЕТ В ОЧЕРЕДЬ и при
+            // непустом откате, лишь бы остаток укладывался в окно очереди
+            // (Player.cpp:30936, SPELL_QUEUE_TIME_WINDOW), а исполнение тогда ждёт
+            // конца отката. Обработчик при этом вернётся раньше, чем объект будет
+            // применён, и весь учёт вокруг — добыча, снимок квестов, трата точки —
+            // посчитается по ещё не наступившему исходу.
+            //
+            // Поэтому требуем строго больше: откат уже вышел И ничего не читается.
+            // Тогда `RequestSpellCast` исполняет запрос немедленно, и немедленный
+            // учёт становится верным. Иначе уходим ни с чем — это то же «объект
+            // занят», только занят наш собственный спутник.
+            if (self->GetSpellHistory()->GetRemainingGlobalCooldown(lockSpell) > 0ms
+                || self->IsNonMeleeSpellCast(false)
+                || !self->CanRequestSpellCast(lockSpell, self))
+            {
+                ++c.GooberIdle[c.GatherSpawnId];
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: {} ({}) заперт, но каст сейчас не примут — вернусь",
+                    self->GetName(), name, entry);
+                GatherLeaveCore(c, self, 5000, true);
+                return "замок: каст не примут сейчас";
+            }
+            // ЦЕЛЬ-ОБЪЕКТ КЛАДЁТСЯ В ТО ЖЕ ПОЛЕ, что и цель-существо: ядро пишет и
+            // читает его по флагу (Spell.cpp:147).
+            // ЧИТАЕМОЕ ПРОИЗНОСИМ СТОЯ — то же правило, что и у боевых заклинаний:
+            // ядро отказывает движущемуся, и отказ выглядел бы как «дверь молчит».
+            ObjectGuid castId;
+            if (lockSpell->CalcCastTime() > 0 && self->isMoving())
+            {
+                act.StopMoving();
+                move.Moving = false;
+            }
+            act.CastSpellAtObject(lockSpell->Id, go->GetGUID(), &castId);  // TARGET_FLAG_GAMEOBJECT
+            usedLockCast = true;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: {} ({}) заперт — открываю заклинанием {} «{}», как клиент",
+                self->GetName(), name, entry, lockSpell->Id,
+                lockSpell->SpellName ? lockSpell->SpellName->Str[LOCALE_ruRU] : "?");
+
+            // ЧИТАЕТСЯ — ЗНАЧИТ ЖДЁМ ЗДЕСЬ ЖЕ, НЕ УХОДЯ И НЕ СУДЯ.
+            //
+            // Уход через GatherLeave обнулил бы точку и увёл спутника, а снимки
+            // пропали бы вместе с ним. Остаёмся на месте, сохранив ровно то, чем
+            // будем мерить исход, и вернёмся сюда следующим тактом.
+            if (self->IsNonMeleeSpellCast(false))
+            {
+                _lockCastHold[c.GatherSpawnId] = { self->GetGUID().GetCounter(),
+                                                    GameTime::GetGameTimeMS() };
+                c.LockCastSpawn = c.GatherSpawnId;
+                c.LockCastSpace = spaceBefore;
+                c.LockCastReady = wasReady;
+                c.LockCastSnap = snapBefore;
+                c.LockCastStartMs = GameTime::GetGameTimeMS();
+                c.LockCastSpellId = lockSpell->Id;
+                c.LockCastId = castId;
+                return nullptr;
+            }
+        }
+        else
+        {
+            act.UseGameObject(go->GetGUID());
+            // ВОТ ЗДЕСЬ ПОПЫТКА И СОСТОЯЛАСЬ: объект использован, а не «мы вышли».
+            // У КЛЕТКИ НЕТ ПРИЗНАКА, КОТОРЫЙ МОЖНО СНЯТЬ ЗДЕСЬ, И ПОЭТОМУ НЕТ ОТСТАВКИ.
+            //
+            // Замер круга 78: три тюрьмы отставлены ДЛЯ ВСЕГО СОСТАВА по приговору
+            // «квесты не сдвинулись» — и четверо оставшихся лишились ровно тех
+            // клеток, которые им нужны. Признак был неверный: клетка квест не
+            // двигает, она выпускает того, кто даёт зачёт при убийстве
+            // (29520.KillCredit1 = 29519).
+            //
+            // Обзор предложил считать, не появился ли рядом засчитываемый за нашу
+            // цель. Я это написал, а потом прочитал ядро и выбросил:
+            // npc_unworthy_initiateAI::EventStart (chapter1.cpp:175-188) ничего не
+            // освобождает, он ставит wait_timer = 5000 и меняет фазу. Уязвимым
+            // послушник становится в UpdateAI: PHASE_TO_EQUIP через пять секунд шлёт
+            // его к якорю, PHASE_TO_ATTACK ещё по таймеру делает SetImmuneToPC(false)
+            // и AttackStart. Десяток секунд, и спутник к тому времени уже ушёл.
+            //
+            // Значит внутри захода наблюдать нечего и никакой срок этого не
+            // исправит. Вывод — убрать механизм, а не чинить его: предел на
+            // повторные походы уже есть и он правильный — восемь холостых заходов
+            // на ТОЧКУ у этого спутника, и отбор клетки его спрашивает. Общая
+            // отставка была нужна рунам, где приговор наблюдаем; здесь она только
+            // убивала работающие клетки.
+            if (c.FreeGoFor && c.FreeGoSpawnUsed == c.GatherSpawnId)
+            {
+                // ПРЕДЕЛ ЛИЧНЫЙ, И ЭТО ТРЕТЬЯ РЕДАКЦИЯ ЭТОГО МЕСТА.
+                //
+                // Сначала попытка считалась при ВЫХОДЕ — три долгих похода убивали
+                // пару, и рабочие клетки умирали для всего состава. Потом я убрал
+                // общую отставку вовсе, сказав, что предел даёт счёт холостых
+                // заходов. Проверка это опровергла: применение клетки уходит через
+                // GatherLeave(..., !success, "собрал") с success = true, значит
+                // fruitless = false и GatherEmpty не растёт. Предела не было.
+                //
+                // Середина: считаем ЗДЕСЬ, по факту применения, и держим счёт
+                // ЛИЧНЫМ. Три применения одной клетки ради одной цели — и этот
+                // спутник идёт к другой; клеток двадцать одна. Общей отставки нет
+                // и быть не может: судить о клетке внутри захода нечем, потому что
+                // EventStart (chapter1.cpp:175) только взводит таймер на пять
+                // секунд, а освобождение приходит много позже, из UpdateAI.
+                uint64 const fk = PairKey(c.FreeGoEntry, c.FreeGoFor);
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation КЛЕТКА {}: применил {} ради {} (раз {} из 3) — освобождение"
+                    " придёт через ядро, здесь его не увидеть",
+                    self->GetName(), c.FreeGoEntry, c.FreeGoFor,
+                    uint32(++c.FreeTried[fk]));
+                c.FreeGoFor = 0;
+                c.FreeGoEntry = 0;
+                c.FreeGoSpawnUsed = 0;
+            }
+        }
+
+        // ПРИМЕНЕНИЕ ДОКАЗЫВАЕТ САМ ОБЪЕКТ, А НЕ ОТКАТ У СПУТНИКА (Кодекс, задача 134).
+        //
+        // Прежний признак «пошёл общий откат» имел ложные отрицания: мгновенное
+        // заклинание без отката оставляло оба следа пустыми, и состоявшееся открытие
+        // читалось как отказ. Спрашиваем то, что меняет САМ объект: `GameObject::Use`
+        // на гуубере выставляет GO_FLAG_IN_USE и переводит состояние добычи в
+        // GO_ACTIVATED (GameObject.cpp, ветка без AllowMultiInteract). Значит уход
+        // состояния из GO_READY и есть прямое доказательство, что применение прошло.
+        //
+        // И ЭТО ИМЕННО ПЕРЕХОД, А НЕ ЗНАЧЕНИЕ (Кодекс, задача 135, [P1]). Проверять
+        // одно лишь «состояние не GO_READY» нельзя: объект мог быть открыт кем-то
+        // раньше, наш каст при этом отклонён, а выражение всё равно сказало бы
+        // «применено» и списало нетронутую точку. `wasReady` — снимок ДО отправки,
+        // поэтому доказательством служит пара «был готов и перестал».
+        bool const stateMoved = wasReady && go->getLootState() != GO_READY;
+        // НО ЭТОТ ПРИЗНАК ГОДИТСЯ НЕ ДЛЯ ВСЯКОГО ГУУБЕРА. При AllowMultiInteract ядро
+        // идёт другой веткой: гасит объект персонально для игрока либо переводит его
+        // состояние для него одного — и состояние ДОБЫЧИ не трогает вовсе. Замер по
+        // базе: таких среди квестовых гууберов 319 из 845, то есть больше трети.
+        // Требовать от них ухода из GO_READY значило бы трижды счесть отказом
+        // работающую точку и отложить её — ровно та ошибка, которую этот круг снимает.
+        // Для них остаёмся на прежней мерке: готовность объекта до отправки.
+        // Прежний путь судим прежней меркой: там пакет использования, и готовность
+        // до отправки была единственным, что о нём известно. Новый путь берётся
+        // только там, где переход состояния наблюдаем, — это обеспечено выше.
+        bool const interacted = usedLockCast ? stateMoved : wasReady;
+
+        // Считаем ЛЁГШЕЕ, а не запрошенное: предмет, ушедший в имеющуюся стопку,
+        // места не занимает, и по свободным ячейкам удачный сбор выглядел бы пустым.
+        // ЧАСТЬ СУНДУКОВ КЛАДЁТ ДОБЫЧУ СРАЗУ, БЕЗ ОКНА (Кодекс).
+        //
+        // При флаге chestPushLoot ядро складывает предметы прямо внутри Use, и
+        // окна добычи не появляется вовсе. Прежний счёт считал такой заход
+        // неудачей — вид пуст, значит «ничего не легло», — и ставил объекту
+        // отсрочку, хотя предмет реально лежал в сумке. Поэтому меряем по месту
+        // в сумках вокруг самого Use, а не только по окну.
+        uint32 const landed = self->GetAELootView().empty()
+            ? (spaceBefore > FreeBagSpace(self) ? spaceBefore - FreeBagSpace(self) : 0u)
+            : TakeOpenLoot(c, self, go->GetGUID(), name, entry);
+        // УСПЕХ — ЭТО ДОБЫЧА ИЛИ СДВИГ ЦЕЛЕЙ, И НИЧТО ИНОЕ. Объединённый выход раньше
+        // объявлял успехом любой заход, из-за чего предел не действовал ровно там, где
+        // он и был нужен (Кодекс, задача 104).
+        bool success = landed > 0;
+        if (landed)
+        {
+            ++c.Gathered;
+            c.GatherEmpty.erase(c.GatherSpawnId);   // взяли — точка снова хорошая
+            // КВЕСТОВАЯ ТОЧКА ТРАТИТСЯ И ЗДЕСЬ, БЕЗ ОГЛЯДКИ НА ГОТОВНОСТЬ
+            // (Кодекс, задачи 130 и 131).
+            //
+            // Сначала правило одноразовости стояло только в ветке «добычи не было», а
+            // добыча перехватывает выход раньше неё: гуубер, отдающий предмет без
+            // сдвига целей, оставался доступным навсегда, и очистка GatherEmpty строкой
+            // выше снимала последний предел. Первая правка добавила сюда отметку, но
+            // под условием `wasReady` — и Кодекс показал, что дыра осталась: при
+            // `landed > 0 && !wasReady` отметка пропускается, до счётчика занятости
+            // исполнение не доходит, и возвраты снова ничем не ограничены.
+            //
+            // Условие снято. `wasReady` — это снимок `getLootState() == GO_READY`,
+            // взятый ДО применения, и он отвечает на вопрос «не занял ли объект
+            // кто-то раньше». Но добыча, которая легла в сумку, отвечает на более
+            // сильный вопрос: применение СОСТОЯЛОСЬ. Спорить с этим снимком нечем,
+            // поэтому точка тратится.
+            //
+            // Жилы и травы сюда не попадают: GatherIsGoober ставится только для точек
+            // из квестового указателя.
+            if (c.GatherIsGoober)
+                c.GooberDone.insert(c.GatherSpawnId);
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: обобрал {} ({}), предметов легло {}{}; всего объектов {}",
+                self->GetName(), name, entry, landed,
+                c.GatherIsGoober ? "; точка отработана" : "",
+                c.Gathered);
+        }
+        else
+        {
+            // ОБЪЕКТ-ЗАДАЧА СУДИТСЯ ПО СДВИГУ ЦЕЛЕЙ, А НЕ ПО ДОБЫЧЕ: он её и не даёт.
+            // Сдвинул — своё отработал, больше не ходим. Не сдвинул — это дверь,
+            // рычаг или реквизит, привязанный к квесту: вернёмся, только если мир
+            // вокруг сам изменится (Кодекс, задача 90).
+            if (c.GatherIsGoober && QuestSnapshot(self) != snapBefore)
+            {
+                success = true;                 // цели сдвинулись — заход не холостой
+                c.GooberDone.insert(c.GatherSpawnId);
+                c.GooberIdle.erase(c.GatherSpawnId);
+                c.GatherEmpty.erase(c.GatherSpawnId);
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: применил {} ({}) — состояние квестов изменилось, больше не хожу",
+                    self->GetName(), name, entry);
+            }
+            else if (c.GatherIsGoober)
+            {
+                // ОДИН КЛИК НА ТОЧКУ, ДАЛЬШЕ СЛЕДУЮЩАЯ (оператор, 2026-09-05: «не
+                // долбить дверь, а по разу кликать двери по порядку… до тех пор, пока
+                // не будет спасено 3 жителя»; «они ОДНОРАЗОВЫЕ для каждого персонажа»).
+                //
+                // «КВЕСТЫ НЕ СДВИНУЛИСЬ» ЗДЕСЬ НЕ УЛИКА, А ПОЛОВИНА ИСХОДОВ. Дверь
+                // квеста 14098 — лотерея: заклинание 67869 «Стук»
+                // (gilneas_chapter_1.cpp, spell_gilneas_knocking) случайным образом
+                // выбирает между двумя своими эффектами, и выбегает либо мирный житель,
+                // чей сценарий даёт зачёт существа 35830, либо ворген, не дающий
+                // ничего. Отсечка круга 65 считала такие исходы уликой и выключала вид
+                // после шести — то есть обрывала обход на шестой двери из четырнадцати.
+                // Правильный ответ на «не сдвинулось» ровно один: идти к следующей.
+                //
+                // Обход кончается сам: точек у вида конечное число, каждая тратится
+                // одним готовым кликом. Для двери 195327 это четырнадцать кликов на
+                // спутника вместо девяноста ударов в одну.
+                //
+                // ЗАНЯТЫЙ ОБЪЕКТ ТОЧКУ НЕ ТРАТИТ: клика не было. От вечного возврата к
+                // вечно занятой точке защищает GooberIdle (три захода) и GatherEmpty
+                // (восемь холостых) — обе отсечки по ТОЧКЕ, а не по виду.
+                if (interacted)
+                    c.GooberDone.insert(c.GatherSpawnId);
+                else
+                    ++c.GooberIdle[c.GatherSpawnId];
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: применил {} ({}) — квесты не сдвинулись{}, холостой заход {} из 8",
+                    self->GetName(), name, entry,
+                    interacted ? "; точка отработана, иду к следующей"
+                               : " (применение не состоялось — точка цела)",
+                    uint32(c.GatherEmpty[c.GatherSpawnId] + 1));
+            }
+            else
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation СБОР {}: открыл {} ({}), но ничего не легло",
+                    self->GetName(), name, entry);
+        }
+        GatherLeaveCore(c, self, landed ? 60000 : 120000, !success);
+        return "собрал";
+    }
+
+    // ПРИШЛИ, А ОБЪЕКТА НЕТ — тоже общее: в пуле живёт один член из многих, событие может быть
+    // выключено, а взятый объект возрождается по своему сроку.
+    char const* GatherArrivedEmptyCore(Companion& c, Player* self)
+    {
+        TC_LOG_INFO("server.worldserver",
+            "Constellation СБОР {}: пришёл к точке {} (вид {}), а объекта там нет — холостой заход {} из 8",
+            self->GetName(), c.GatherSpawnId, c.GatherEntry, uint32(c.GatherEmpty[c.GatherSpawnId] + 1));
+        GatherLeaveCore(c, self, 120000, true);
+        return "объекта на месте нет";
+    }
+
     void GatherLeave(Companion& c, Player* self, uint32 backoffMs, bool fruitless, char const* why)
+    {
+        GatherLeaveCore(c, self, backoffMs, fruitless);
+        Switch(c, self, Behavior::Idle, why);
+    }
+
+    // Всё, что «уйти с точки» делает с памятью — без перехода. Отменяет свой каст замка и
+    // снимает резерв (владелец отпускает первым — на всех путях).
+    void GatherLeaveCore(Companion& c, Player* self, uint32 backoffMs, bool fruitless)
     {
         if (c.GatherSpawnId)
         {
@@ -5925,11 +5957,8 @@ public:
             // кастом ни на одном выходе.
             if (c.LockCastSpellId)
             {
-                WorldPacket rawCancel(CMSG_CANCEL_CAST);
-                WorldPackets::Spells::CancelCast cancel(std::move(rawCancel));
-                cancel.SpellID = c.LockCastSpellId;
-                cancel.CastID = c.LockCastId;
-                c.Session->HandleCancelCastOpcode(cancel);
+                Constellation::Ai::ClientAct act(self, c.Session);
+                act.CancelCast(c.LockCastSpellId, c.LockCastId);
             }
             if (auto hold = _lockCastHold.find(c.LockCastSpawn); hold != _lockCastHold.end()
                 && hold->second.first == self->GetGUID().GetCounter())
@@ -5942,7 +5971,6 @@ public:
         c.GatherSpawnId = 0;
         c.GatherEntry = 0;              // вместе с точкой, иначе отказ припишется прошлому виду
         c.GatherUseItem = 0;
-        Switch(c, self, Behavior::Idle, why);
     }
 
     // СКОЛЬКО МЕСТА РЕАЛЬНО ЕСТЬ ПОД ДОБЫЧУ.
@@ -14472,6 +14500,78 @@ namespace Constellation::Ai
         return Constellation::Manager::Instance()->TradeAtCore(self, v, mem, send);
     }
 
+    // СБОР — переходники к телам над слотом спутника. Слот ищется по игроку; без слота
+    // (спутник снят) — «уйти» с причиной, чтобы действие сняло ставку.
+    bool GatherSpotFor(Player* self, GatherSpot* out)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        if (!c || !m->FindGatherCandidate(*c, self))
+            return false;
+        c->GatherMs = 0;                                     // как `Idle`, `:3316-3317`
+        c->GatherDist = self->GetExactDist(c->GatherPos);
+        out->SpawnId = c->GatherSpawnId;
+        out->Entry   = c->GatherEntry;
+        out->Where   = c->GatherPos;
+        out->Focus   = c->GatherUseItem || c->GatherCastSpell;
+        return true;
+    }
+
+    uint32 GatherSpawnFor(Player* self)
+    {
+        Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self);
+        return c ? c->GatherSpawnId : 0;
+    }
+
+    char const* GatherFocusFor(Player* self, ClientAct& act, MoveState& move)
+    {
+        Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self);
+        return c ? Constellation::Manager::Instance()->GatherFocusCore(*c, self, act, move) : "спутника нет";
+    }
+
+    char const* GatherOpenFor(Player* self, uint32 spawnId, ClientAct& act, MoveState& move)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        if (!c)
+            return "спутника нет";
+        if (c->GatherSpawnId != spawnId)
+            return "слот настроен на другую точку";
+        GameObject* go = self->GetMap()->GetGameObjectBySpawnId(spawnId);
+        if (!go || !go->isSpawned() || !self->GetGameObjectIfCanInteractWith(go->GetGUID()))
+            return m->GatherArrivedEmptyCore(*c, self);
+        return m->GatherOpenCore(*c, self, go, act, move);
+    }
+
+    char const* GatherArrivedEmptyFor(Player* self)
+    {
+        Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self);
+        return c ? Constellation::Manager::Instance()->GatherArrivedEmptyCore(*c, self) : "спутника нет";
+    }
+
+    void GatherUnreachableFor(Player* self, uint32 backoffMs)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        if (Constellation::Companion* c = m->FindByPlayer(self))
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation СБОР {}: до точки {} (вид {}) не дойти — беру другую",
+                self->GetName(), c->GatherSpawnId, c->GatherEntry);
+            m->GatherLeaveCore(*c, self, backoffMs, true);
+        }
+    }
+
+    // Ставку сняли на полпути (бой, отдых, смерть): лестница из `Gathering` уходит только через
+    // `GatherLeave`, и слот никогда не остаётся с висящим кастом замка и чужим резервом. Здесь
+    // то же — без отсрочки и без холостого захода: точка не виновата.
+    void GatherCancelFor(Player* self)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        if (Constellation::Companion* c = m->FindByPlayer(self))
+            if (c->GatherSpawnId)
+                m->GatherLeaveCore(*c, self, 0, false);
+    }
+
     bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send)
     {
         return Constellation::Manager::Instance()->TurnInCore(self, ender, questId, send);
@@ -14552,6 +14652,7 @@ namespace Constellation::Ai
         t.RestMaxMs       = Constellation::Cfg().RestMaxMs;
         t.MaxQuests       = Constellation::Cfg().MaxQuests;
         t.Vending         = Constellation::Cfg().Vending;
+        t.Quests          = Constellation::Cfg().Quests;
         return t;
     }
 }
