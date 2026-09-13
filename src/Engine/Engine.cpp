@@ -766,6 +766,29 @@ namespace Constellation::Ai
         }
     }
 
+    namespace
+    {
+        inline constexpr uint32 TRIGGER_RESEND_MS = 60000;      // лестница: TriggerSentMs = 60000
+        bool TriggerSentByEngine(void const* u, uint32 id)
+        {
+            return EngineRemembers(u, BackoffKind::TriggerSent, Subject::OfSpawn(id));
+        }
+        void TriggerNoteByEngine(void* u, uint32 id)
+        {
+            Defer(*static_cast<Ctx*>(u), BackoffKind::TriggerSent, Subject::OfSpawn(id), 0, TRIGGER_RESEND_MS);
+        }
+        void DoorTrigger(void* u, int32 id) { static_cast<ClientAct*>(u)->EnterAreaTrigger(id); }
+    }
+
+    void TouchTriggersThroughDoor(Ctx& ctx)
+    {
+        if (!ctx.St)
+            return;
+        TriggerMemory mem;
+        mem.SentRecently = &TriggerSentByEngine; mem.NoteSent = &TriggerNoteByEngine; mem.User = &ctx;
+        ctx.World.TouchTriggers(mem, &DoorTrigger, &ctx.Act);
+    }
+
     bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId)
     {
         TurnInSender send;
@@ -1252,6 +1275,14 @@ namespace Constellation::Ai
             // §10 — В ТЕНИ ИСПОЛНЕНИЯ НЕТ. Считаем его удавшимся: иначе ветка альтернатив
             // разошлась бы с настоящей на первом же отказе, и сравнивать было бы нечего.
             attempted = true;
+            // ЗОНЫ ОСМОТРА — ПЕРЕД КАЖДЫМ ЖИВЫМ ИСПОЛНЕНИЕМ, а не внутри одного действия: цель-
+            // триггер закрывается пакетом «вошёл», куда бы спутник ни шёл — за целью, к принимающему,
+            // к квестодателю по карте (Кодекс: три действия двигают, одно трогало бы). Лестница
+            // трогает зоны каждый такт `Idle` и `Travelling`; в тени ход не берётся, и её такт
+            // `Idle` идёт после шва — значит там она сама. Повтор в ту же зону режет отсрочка
+            // на минуту (`TriggerSent`).
+            if (run != Run::Shadow)
+                TouchTriggersThroughDoor(ctx);
             bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
             if (ran)
             {

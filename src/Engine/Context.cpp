@@ -512,6 +512,12 @@ namespace Constellation::Ai
         return TalkEngageFor(_self, c, plan, st, mem, send, sliceMs);
     }
 
+    void WorldView::TouchTriggers(TriggerMemory const& mem, TriggerSendFn send, void* sendUser) const
+    {
+        if (_self)
+            TouchAreaTriggersFor(_self, mem, send, sendUser);
+    }
+
     bool WorldView::TurnInAt(ObjectGuid ender, uint32 questId, TurnInSender const& send) const
     {
         return _self && TurnInFor(_self, ender, questId, send);

@@ -485,6 +485,8 @@ namespace Constellation::Ai
     TalkOutcome TalkThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
     // Сдача через дверь: три пакета лестницы над `ctx.Act`; истина — ответ ядра «награждён».
     bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId);
+    // Зоны осмотра через дверь: память — таблица отсрочек (`TriggerSent`, минута), пакет — `ctx.Act`.
+    void TouchTriggersThroughDoor(Ctx& ctx);
     bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
     void RegisterTalkActions(Engine& engine);
 

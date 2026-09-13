@@ -9736,7 +9736,9 @@ public:
 
     // ВОЙТИ В ЗОНУ ОСМОТРА — ЭТО ПАКЕТ, А НЕ ФАКТ. Ядро проверит IsInAreaTrigger само и
     // откажет, если мы снаружи; повторно в ту же зону не шлём минуту.
-    void TouchAreaTriggers(Companion& c, Player* self) const
+    // ТЕЛО — одно на лестницу и на движок; память «слал минуту назад» и отправка — у вызывающего.
+    void TouchAreaTriggersCore(Player* self, Constellation::Ai::TriggerMemory const& mem,
+                               Constellation::Ai::TriggerSendFn send, void* sendUser) const
     {
         if (_questTriggers.empty() || !self->IsAlive() || self->GetOutdoorPvP())
             return;                     // в PvP-зоне пакет зоны идёт в её обработчик — не наш случай
@@ -9759,17 +9761,12 @@ public:
                 continue;
             for (AreaTriggerEntry const* at : it->second)
             {
-                if (at->ContinentID != self->GetMapId() || c.TriggerSentMs.count(at->ID))
+                if (at->ContinentID != self->GetMapId() || mem.SentRecently(mem.User, at->ID))
                     continue;
                 if (!self->IsInAreaTrigger(at))
                     continue;
-                c.TriggerSentMs[at->ID] = 60000;
-                WorldPacket raw(CMSG_AREA_TRIGGER);
-                WorldPackets::AreaTrigger::AreaTrigger pkt(std::move(raw));
-                pkt.AreaTriggerID = int32(at->ID);
-                pkt.Entered = true;
-                pkt.FromClient = true;
-                c.Session->HandleAreaTriggerOpcode(pkt);
+                mem.NoteSent(mem.User, at->ID);
+                send(sendUser, int32(at->ID));
                 bool done = true;
                 for (QuestObjective const& obj : q->GetObjectives())
                     if (obj.Type == QUEST_OBJECTIVE_AREATRIGGER && self->GetQuestObjectiveData(obj) < 1)
@@ -9779,6 +9776,26 @@ public:
                     self->GetName(), at->ID, qid, q->GetLogTitle(), done ? "зачёт" : "без зачёта");
             }
         }
+    }
+
+    static bool TriggerSentFor(void const* u, uint32 id) { return static_cast<Companion const*>(u)->TriggerSentMs.count(id) != 0; }
+    static void TriggerNoteFor(void* u, uint32 id)       { static_cast<Companion*>(u)->TriggerSentMs[id] = 60000; }
+    static void TriggerSendFor(void* u, int32 id)
+    {
+        WorldPacket raw(CMSG_AREA_TRIGGER);
+        WorldPackets::AreaTrigger::AreaTrigger pkt(std::move(raw));
+        pkt.AreaTriggerID = id;
+        pkt.Entered = true;
+        pkt.FromClient = true;
+        static_cast<Companion*>(u)->Session->HandleAreaTriggerOpcode(pkt);
+    }
+
+    // Обёртка лестницы, подпись прежняя (`Idle` и `Travelling` зовут её каждый такт).
+    void TouchAreaTriggers(Companion& c, Player* self) const
+    {
+        Constellation::Ai::TriggerMemory mem;
+        mem.SentRecently = &TriggerSentFor; mem.NoteSent = &TriggerNoteFor; mem.User = &c;
+        TouchAreaTriggersCore(self, mem, &TriggerSendFor, &c);
     }
 
     // БЛИЖАЙШИЙ ТОРГОВЕЦ ПО КАРТЕ, умеющий нужное и не враждебный по своей фракции.
@@ -14318,6 +14335,11 @@ namespace Constellation::Ai
     bool TalkArrivedFor(Player* self, Creature* who, TalkPlan const& plan)
     {
         return Constellation::Manager::TalkArrivedCore(self, who, plan);
+    }
+
+    void TouchAreaTriggersFor(Player* self, TriggerMemory const& mem, TriggerSendFn send, void* sendUser)
+    {
+        Constellation::Manager::Instance()->TouchAreaTriggersCore(self, mem, send, sendUser);
     }
 
     bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send)

@@ -491,6 +491,16 @@ namespace Constellation::Ai
         void* User = nullptr;
     };
 
+    // ЗОНЫ ОСМОТРА — ОДНО ТЕЛО (`Constellation.cpp` `TouchAreaTriggers`): для незакрытых целей-триггеров
+    // журнала — «мы внутри?» у ядра, пакет через отправителя, минуту не повторять — память механизма.
+    struct TriggerMemory
+    {
+        bool (*SentRecently)(void const* user, uint32 triggerId) = nullptr;
+        void (*NoteSent)(void* user, uint32 triggerId) = nullptr;
+        void* User = nullptr;
+    };
+    using TriggerSendFn = void (*)(void* user, int32 triggerId);
+
     enum class TalkOutcome : uint8
     {
         Waiting, Sent,
@@ -820,6 +830,8 @@ namespace Constellation::Ai
                                  TalkMemory const& mem, TalkSender const& send, uint32 sliceMs) const;
         bool TalkRefuseAt(ObjectGuid who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem) const;
         friend bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId);
+        friend void TouchTriggersThroughDoor(Ctx& ctx);
+        void TouchTriggers(TriggerMemory const& mem, TriggerSendFn send, void* sendUser) const;
         bool TurnInAt(ObjectGuid ender, uint32 questId, TurnInSender const& send) const;
 
         // ХРАНИТСЯ ИЗМЕНЯЕМЫМ, И ЭТО НЕ ПОСЛАБЛЕНИЕ ПРАВИЛА, А ОНО САМО. Заголовок выше
@@ -926,6 +938,8 @@ namespace Constellation::Ai
     char const* TalkRefusedFor(Player* self, Creature* who, TalkPlan const& plan, TalkState& st, TalkMemory const& mem);
 
     bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send);
+
+    void TouchAreaTriggersFor(Player* self, TriggerMemory const& mem, TriggerSendFn send, void* sendUser);
 
     // §6′ — what an action receives. One timestamp for the whole tick so two values cannot
     // disagree about "now"; one read facade; one write door; nothing else.
