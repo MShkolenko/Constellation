@@ -721,6 +721,15 @@ public:
         uint64 Dealt = 0;               // и на сколько всего
         uint32 Hits = 0;                // сколько раз попали по нам
         uint64 Taken = 0;
+        // ПОСЛЕДНИЙ УДАР ПО НАМ — прибор к строке гибели (2026-09-13). Замер часа 20:29-21:43:
+        // Rowena погибла 26 раз на одном пятачке зоны 46 «рядом враждебных 0 — никого, без
+        // воды, до земли 3-9» — ни существа, ни жидкости; кто бьёт — строка не знала. Среда
+        // (лава, падение) приходит через `EnvironmentalDamage` -> `DealDamage(this, this)`, то
+        // есть нападающий = сам; это и печатаем как «среда».
+        uint32     LastHitEntry = 0;
+        uint32     LastHitDamage = 0;
+        uint32     LastHitMs = 0;
+        std::string LastHitName;
         uint32 Kills = 0;               // АТРИБУЦИЯ ЯДРА: OnCreatureKill(мы, кто-то)
         ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
     };
@@ -790,6 +799,12 @@ public:
             {
                 ++it->second.Hits;
                 it->second.Taken += damage;
+                it->second.LastHitEntry = attacker ? attacker->GetEntry() : 0;
+                it->second.LastHitDamage = damage;
+                it->second.LastHitMs = GameTime::GetGameTimeMS();
+                it->second.LastHitName = !attacker ? std::string("никто")
+                                       : attacker == victim ? std::string("среда")
+                                       : attacker->GetName();
             }
         }
     }
@@ -2643,14 +2658,21 @@ public:
                     char const* water = (liq & LIQUID_MAP_UNDER_WATER) ? "под водой"
                                       : (liq & LIQUID_MAP_IN_WATER)    ? "в воде"
                                       : (liq & LIQUID_MAP_ABOVE_WATER) ? "над водой" : "без воды";
+                    // ПОСЛЕДНИЙ УДАР — из книги ударов, а не догадка по соседям (см. `Blows`).
+                    Blows const blows = BlowsOf(self->GetGUID());
+                    std::string const lastHit = blows.LastHitMs
+                        ? Trinity::StringFormat("последний удар: {} ({}) на {} за {} с до смерти",
+                              blows.LastHitName, blows.LastHitEntry, blows.LastHitDamage,
+                              getMSTimeDiff(blows.LastHitMs, nowMs) / 1000)
+                        : std::string("ударов по нам не записано");
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ГИБЕЛЬ {} (ур {}): зона {}, место {:.0f} {:.0f} {:.0f}, "
-                        "цель модуля {}, {}, {}, гибелей в окне {}, рядом враждебных {} — {}",
+                        "цель модуля {}, {}, {}, гибелей в окне {}, рядом враждебных {} — {}; {}",
                         self->GetName(), uint32(self->GetLevel()), self->GetZoneId(),
                         self->GetPositionX(), self->GetPositionY(), self->GetPositionZ(),
                         foe, water, under,
                         uint32(c.DeathAt.size()), uint32(hostiles.size()),
-                        who.empty() ? std::string("никого") : who);
+                        who.empty() ? std::string("никого") : who, lastHit);
                 }
                 while (!c.DeathAt.empty() && getMSTimeDiff(c.DeathAt.front(), nowMs) > 600000)
                     c.DeathAt.pop_front();      // скользящее окно в десять минут
