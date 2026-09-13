@@ -99,10 +99,9 @@ namespace
     // возрождается с тем же GUID). Победа докладывается в память опасности и лутится — со своего
     // убийства и только с него.
     //
-    // ЧТО ЗДЕСЬ ЕЩЁ НЕ ПОРТИРОВАНО, НАЗВАНО: отвод (кайт) для дальников по маршруту мовера спиной
-    // — следующим коммитом того же переноса, до включения `Combat` вживую; и дистанция
-    // вступления для дальников (`EngageRangeAgainst`) читается, но сегодня равна нулю у всех:
-    // умения выключены (`Cfg().Abilities`), и лестница тоже дерётся вплотную.
+    // Отвод (кайт) для дальников — портирован (`Engage`); дистанция вступления
+    // (`EngageRangeAgainst`) — настоящая: `Constellation.Abilities = 1` на реалме, и удержание
+    // держит её же (первая редакция этого комментария говорила «умения выключены» — устарело).
     class KillObjectiveAction final : public Action
     {
     public:
@@ -209,15 +208,30 @@ namespace
                 return End(ctx, f, "бью, а следа нет — не наша цель", /*ban=*/true);
 
             // ---- УДЕРЖАНИЕ: догнать или стоять лицом ---------------------------------------
-            if (!ctx.World.InMeleeRange(victim))
+            //
+            // ДАЛЬНИЙ ДЕРЖИТ ДИСТАНЦИЮ ВСТУПЛЕНИЯ, А НЕ ДОСЯГАЕМОСТЬ УДАРА. Первая редакция
+            // требовала здесь `InMeleeRange` от всех: чернокнижник вступал с дальности заклинания
+            // (`Engage`, `stopAt = EngageRange`), а следующим тактом шёл вплотную — шаг рвал каст,
+            // сторож дороги считал «без приближения», и бой кончался «до цели в бою не дойти»
+            // с запретом на цель (живой час 2026-09-13: у чернокнижника 9 таких и 6 «добили не
+            // мы» на 3 победы, у жреца 5 и 13; воин, монах, паладин — вплотную — в порядке).
+            // Порог — тот же, что у вступления; и ДАЛЬНОБОЙНЫЙ ЧИТАЕТ СТОЯ (лестница, `:4081`):
+            // идёт каст — стоим и не мешаем себе, ядро само скажет, идёт ли он.
+            bool const ranged = f.EngageRange > 0.0f;
+            bool const held = ranged ? ctx.World.CloseEnough(victim, f.EngageRange)
+                                     : ctx.World.InMeleeRange(victim);
+            if (!held && ranged && ctx.World.IsCasting())
+                ctx.Act.StopMoving();
+            else if (!held)
             {
                 std::optional<Position> const where = ctx.World.WhereIs(victim);
                 std::optional<float> const d = ctx.World.DistanceTo(victim);
                 if (!where || !d)
                     return Outcome(ctx, f, victim);     // исчез между проверками — разобрать исход
                 float const dt = ctx.Act.SliceSeconds();
-                bool const going = WalkTowards(ctx, *where, MELEE_STOP_YARDS, dt);
-                bool const stalled = !going && *d > MELEE_STOP_YARDS;
+                float const stopAt = ranged ? f.EngageRange : MELEE_STOP_YARDS;
+                bool const going = WalkTowards(ctx, *where, stopAt, dt);
+                bool const stalled = !going && *d > stopAt;
                 if (AdvanceWalk(ctx, bid.About, *d, uint32(dt * 1000.0f), stalled) != WalkVerdict::Going)
                     return End(ctx, f, "до цели в бою не дойти", /*ban=*/true);
             }
@@ -407,7 +421,7 @@ namespace
                     return false;
                 float const dt = ctx.Act.SliceSeconds();
                 // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
-                // включённых умениях, иначе четыре ярда. Сегодня умения выключены — ноль у всех.
+                // включённых умениях (`Constellation.Abilities = 1` на реалме), иначе четыре ярда.
                 float const stopAt = f.EngageRange > 0.0f ? f.EngageRange : MELEE_STOP_YARDS;
                 bool const going = WalkTowards(ctx, *where, stopAt, dt);
                 // «ДОШЁЛ» — НЕ «ЗАСТРЯЛ»: приход решает ядро, а между его меркой и порогом
