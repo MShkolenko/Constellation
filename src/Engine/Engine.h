@@ -201,6 +201,11 @@ namespace Constellation::Ai
         bool RestHeld = false;
 
         TalkState Talk;
+
+        // ТОРГОВЕЦ — счётчики визитов (лестница: VendPoor/VendSold/VendEarned/VendRepaired).
+        uint32 VendPoor = 0, VendSold = 0, VendRepaired = 0;
+        uint64 VendEarned = 0;
+        uint32 VendorMapScanAtMs = 0;    // обзор у точки по карте — раз в две секунды (лестница: VendorScanMs)
         uint32    TalkPauseSetMs = 0;   // пауза — «когда поставлена + сколько», а не «до когда»:
         uint32    TalkPauseMs = 0;      // разность uint32 переживает переполнение часов, сумма — нет (Кодекс)
         uint32    Talked = 0;
@@ -487,8 +492,12 @@ namespace Constellation::Ai
     bool TurnInThroughDoor(Ctx& ctx, ObjectGuid ender, uint32 questId);
     // Зоны осмотра через дверь: память — таблица отсрочек (`TriggerSent`, минута), пакет — `ctx.Act`.
     void TouchTriggersThroughDoor(Ctx& ctx);
+    // Торговец: память над таблицей отсрочек, три двери; прилавок — общее тело.
+    VendorMemory VendorMemoryByEngine(Ctx& ctx);
+    bool TradeThroughDoor(Ctx& ctx, ObjectGuid vendor);
     bool TalkRefuseThroughDoor(Ctx& ctx, ObjectGuid who, TalkPlan const& plan, TalkState& st);
     void RegisterTalkActions(Engine& engine);
+    void RegisterVendorActions(Engine& engine);
 
     // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
     // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,

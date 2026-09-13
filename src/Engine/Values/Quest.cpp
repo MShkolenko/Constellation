@@ -181,6 +181,34 @@ namespace
         }
     };
 
+    // К ТОРГОВЦУ — нужда и адресат (`VendorNeedCore`), раз в пять секунд, как `VendScanMs` у лестницы.
+    // Пауза походам (`VendorPause`) — здесь же: под ней значение пустое, и ставки нет.
+    inline constexpr uint32 VENDOR_SCAN_MS = 5000;
+
+    class VendorTripValue final : public Value<VendorNeed>
+    {
+    public:
+        VendorTripValue() : Value(ValueId::VendorTrip, VENDOR_SCAN_MS) { }
+
+    protected:
+        void Calculate(Ctx& ctx, VendorNeed& out) const override
+        {
+            out = VendorNeed();
+            if (!ctx.St || !Tuning().Vending)
+                return;
+            BackoffKey pause;
+            pause.Kind = BackoffKind::VendorPause; pause.About = Subject();
+            if (Engine::Deferred(*ctx.St, pause, ctx.NowMs))
+                return;
+            VendorNeed need;
+            if (ctx.World.VendorNeed(VendorMemoryByEngine(ctx), &need))
+                out = need;
+            else if (need.Reason != VendorNeed::None)
+                // повод был, а идти не к кому — пять минут молчим, как лестница (`:3254`)
+                Defer(ctx, BackoffKind::VendorPause, Subject(), 0, 300000 + (ctx.World.Guid().GetCounter() % 61) * 1000);
+        }
+    };
+
     class GiversByIndexValue final : public Value<GiverIndexList>
     {
     public:
@@ -212,5 +240,6 @@ namespace Constellation::Ai
         engine.RegisterValue<ValueId::GiverToSeek>(std::make_unique<GiverToSeekValue>());
         engine.RegisterValue<ValueId::ObjectiveSpot>(std::make_unique<ObjectiveSpotValue>());
         engine.RegisterValue<ValueId::UnmetObjectives>(std::make_unique<UnmetObjectivesValue>());
+        engine.RegisterValue<ValueId::VendorTrip>(std::make_unique<VendorTripValue>());
     }
 }

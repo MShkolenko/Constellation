@@ -93,7 +93,8 @@ namespace Constellation::Ai
     X(GiverToSeek,      "куда идти за квестом",  SeekTarget)                    \
     X(Objectives,       "цели задания вокруг",   ObjectiveScan)                  \
     X(ObjectiveSpot,    "куда идти за целью",    TravelSpot)                    \
-    X(UnmetObjectives,  "незакрытых целей",      uint32)
+    X(UnmetObjectives,  "незакрытых целей",      uint32)                       \
+    X(VendorTrip,       "к торговцу",            VendorNeed)
 
     enum class ValueId : uint8
     {
@@ -292,6 +293,11 @@ namespace Constellation::Ai
     X(TalkRetry,        "с этой особью — позже")                                             \
     /* ЗОНА ОСМОТРА — пакет послан, минуту не повторять (лестница: TriggerSentMs).             */ \
     X(TriggerSent,      "зона осмотра — уже слал")                                           \
+    /* ТОРГОВЕЦ: предмет, который ядро отказалось купить (10 мин); вид, отказавший во всём     */ \
+    /* (10 мин); пауза походам после визита (минута + разброс) или «не к кому» (пять минут). */ \
+    X(SellRefused,      "предмет не покупают")                                               \
+    X(VendorNoSell,     "торговец не продавец")                                              \
+    X(VendorPause,      "к торговцу — позже")                                                \
     X(FreeUseDone,      "этой клеткой ради этого пленника — всё")                         \
     X(ApproachesDone,   "заходы к точке исчерпаны")                                       \
     X(CombatUnreachable, "до цели боя не добраться")                                  \

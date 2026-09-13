@@ -305,6 +305,45 @@ namespace Constellation::Ai
         return creature && creature->IsAlive() && _self->CanInteractWithQuestGiver(creature);
     }
 
+    bool WorldView::CanInteractWithNpc(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        return _self->GetNPCIfCanInteractWith(unit, UNIT_NPC_FLAG_NONE, UNIT_NPC_FLAG_2_NONE) != nullptr;
+    }
+
+    std::optional<ObjectGuid> WorldView::NearestCreatureOfEntry(uint32 entry, float searchDist) const
+    {
+        if (!_self || !entry || searchDist <= 0.0f)
+            return std::nullopt;
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(_self, searchDist);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(_self, around, check);
+        Cell::VisitGridObjects(_self, searcher, searchDist);
+        Creature* best = nullptr; float bestD = searchDist + 1.0f;
+        for (Creature* cr : around)
+        {
+            if (cr->GetEntry() != entry || !cr->IsAlive())
+                continue;
+            float const d = _self->GetExactDist(cr);
+            if (d < bestD)
+                { bestD = d; best = cr; }
+        }
+        if (!best)
+            return std::nullopt;
+        return best->GetGUID();
+    }
+
+    bool WorldView::VendorNeed(VendorMemory const& mem, struct VendorNeed* out) const
+    {
+        return _self && out && VendorNeedFor(_self, mem, out);
+    }
+
+    bool WorldView::TradeAt(ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send) const
+    {
+        return _self && TradeAtFor(_self, vendor, mem, send);
+    }
+
     bool WorldView::InMeleeRange(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

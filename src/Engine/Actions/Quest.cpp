@@ -630,6 +630,19 @@ namespace
                 for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
                     sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
 
+            // К ТОРГОВЦУ — ТАМ ЖЕ, ГДЕ У ЛЕСТНИЦЫ: после сдачи и отдыха, ПЕРЕД боем, взятием и походами
+            // (`Idle`, `:3221` против `:3258`). Сломанный или с полными сумками — REL_HIGH: у него
+            // и боя-то нет (обход со сломанным не даёт целей); хлам и «мимоходом» — REL_NORMAL.
+            VendorNeed const& v = Val<ValueId::VendorTrip>(ctx);
+            if (v.Reason != VendorNeed::None)
+            {
+                float const rel = (v.Reason == VendorNeed::Helpless || v.Reason == VendorNeed::Stuffed) ? REL_HIGH : REL_NORMAL;
+                if (v.ByMap)
+                    sink.Add(ActionId::VisitVendor, rel, Subject::OfSpecies(v.MapEntry));
+                else
+                    sink.Add(ActionId::VisitVendor, rel, Subject::OfUnit(v.Near));
+            }
+
             // ПОХОД ПО КАРТЕ — САМОЕ НИЖНЕЕ, ЧТО МОЖНО ДЕЛАТЬ ПО КВЕСТАМ, и у лестницы он ровно
             // там же: последняя ветка `Idle`, куда доходит тот, у кого нет ни готового к сдаче,
             // ни цели, ни собеседника. REL_BACKGROUND значит «когда больше нечем заняться»; всё

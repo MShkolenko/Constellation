@@ -842,6 +842,7 @@ public:
         Constellation::Ai::RegisterFightActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::RegisterQuestActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterTalkActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterVendorActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -14550,6 +14551,7 @@ namespace Constellation::Ai
         t.WalkCapMs       = Constellation::Cfg().WalkCapMs;
         t.RestMaxMs       = Constellation::Cfg().RestMaxMs;
         t.MaxQuests       = Constellation::Cfg().MaxQuests;
+        t.Vending         = Constellation::Cfg().Vending;
         return t;
     }
 }

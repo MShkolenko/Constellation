@@ -780,6 +780,40 @@ namespace Constellation::Ai
         void DoorTrigger(void* u, int32 id) { static_cast<ClientAct*>(u)->EnterAreaTrigger(id); }
     }
 
+    namespace
+    {
+        inline constexpr uint32 VENDOR_MEMORY_MS = 600000;      // лестница: 600000 на оба вида памяти
+        bool VendSellRefusedByEngine(void const* u, ObjectGuid g) { return EngineRemembers(u, BackoffKind::SellRefused, Subject::OfUnit(g)); }
+        bool VendNoSellByEngine(void const* u, uint32 e)          { return EngineRemembers(u, BackoffKind::VendorNoSell, Subject::OfSpecies(e)); }
+        void VendNoteSellRefusedByEngine(void* u, ObjectGuid g)   { Defer(*static_cast<Ctx*>(u), BackoffKind::SellRefused, Subject::OfUnit(g), 0, VENDOR_MEMORY_MS); }
+        void VendNoteNoSellByEngine(void* u, uint32 e)            { Defer(*static_cast<Ctx*>(u), BackoffKind::VendorNoSell, Subject::OfSpecies(e), 0, VENDOR_MEMORY_MS); }
+        void VendNotePoorByEngine(void* u)                        { ++static_cast<Ctx*>(u)->St->VendPoor; }
+        void VendNoteSoldByEngine(void* u, uint32 sold, uint64 earned) { Ctx* c = static_cast<Ctx*>(u); c->St->VendSold += sold; c->St->VendEarned += earned; }
+        void VendNoteRepairedByEngine(void* u)                    { ++static_cast<Ctx*>(u)->St->VendRepaired; }
+        void DoorVendList(void* u, ObjectGuid v)                  { static_cast<ClientAct*>(u)->ListInventory(v); }
+        void DoorVendSell(void* u, ObjectGuid v, ObjectGuid item, uint32 n) { static_cast<ClientAct*>(u)->SellItem(v, item, n); }
+        void DoorVendRepair(void* u, ObjectGuid v)                { static_cast<ClientAct*>(u)->RepairAll(v); }
+    }
+
+    VendorMemory VendorMemoryByEngine(Ctx& ctx)
+    {
+        VendorMemory m;
+        m.SellRefused = &VendSellRefusedByEngine; m.NoSell = &VendNoSellByEngine;
+        m.NoteSellRefused = &VendNoteSellRefusedByEngine; m.NoteNoSell = &VendNoteNoSellByEngine;
+        m.NotePoor = &VendNotePoorByEngine; m.NoteSold = &VendNoteSoldByEngine; m.NoteRepaired = &VendNoteRepairedByEngine;
+        m.User = &ctx;
+        return m;
+    }
+
+    bool TradeThroughDoor(Ctx& ctx, ObjectGuid vendor)
+    {
+        if (!ctx.St)
+            return false;
+        VendorSender send;
+        send.ListInventory = &DoorVendList; send.Sell = &DoorVendSell; send.Repair = &DoorVendRepair; send.User = &ctx.Act;
+        return ctx.World.TradeAt(vendor, VendorMemoryByEngine(ctx), send);
+    }
+
     void TouchTriggersThroughDoor(Ctx& ctx)
     {
         if (!ctx.St)

@@ -836,6 +836,14 @@ namespace Constellation::Ai
         // пространстве 10.7, ядру нужно 5. Поэтому «достаточно ли близко» отвечает
         // `CanInteractWithQuestGiver`, а этот радиус лишь ограничивает обход сетки.
         std::optional<ObjectGuid> NearestQuestGiverOfEntry(uint32 entry, float searchDist) const;
+        // Торговец: «можно ли уже торговать» — тот же вопрос ядра, что задаёт обработчик прилавка
+        // (`GetNPCIfCanInteractWith` без флагов); и ближайший живой вид в радиусе — для прихода по карте.
+        bool CanInteractWithNpc(ObjectGuid unit) const;
+        std::optional<ObjectGuid> NearestCreatureOfEntry(uint32 entry, float searchDist) const;
+        // Нужда в торговце и прилавок — общие тела (см. `VendorMemory`).
+        bool VendorNeed(VendorMemory const& mem, struct VendorNeed* out) const;
+        friend bool TradeThroughDoor(Ctx& ctx, ObjectGuid vendor);
+        bool TradeAt(ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send) const;
 
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
@@ -918,6 +926,7 @@ namespace Constellation::Ai
         // Потолок журнала МОДУЛЯ, ниже потолка ядра (`Constellation.MaxQuests`, по умолчанию 10):
         // лестница не берёт квесты, когда занято столько слотов (`QuestTick`, `:7290`).
         uint32 MaxQuests      = 10;
+        bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
     };
     EngineTuning Tuning();
 
