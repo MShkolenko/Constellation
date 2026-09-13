@@ -845,6 +845,7 @@ public:
         Constellation::Ai::RegisterVendorActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterGatherActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterFleeActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterAirActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -3111,8 +3112,9 @@ public:
                 {
                     TouchAreaTriggers(c, self);
                     ReconcileLateCredit(c, self);   // поздний рост счётчика — до любого нового «бесплодно»
-                    LearnTaxiNode(c, self);         // мимо полётного мастера не проходим молча
-                    BindAtInn(c, self);             // и мимо трактирщика тоже: камень должен вести сюда
+                    Constellation::Ai::ClientAct doors(self, c.Session);
+                    LearnTaxiNode(c, self, doors);  // мимо полётного мастера не проходим молча
+                    BindAtInn(c, self, doors);      // и мимо трактирщика тоже: камень должен вести сюда
                 }
 
                 // ВЫПОЛНЕННОЕ СДАЁМ ПЕРВЫМ ДЕЛОМ: висящий в журнале готовый квест
@@ -3652,26 +3654,13 @@ public:
                         return;
                     }
                     // пришли на точку — ищем его вживую
-                    std::list<Creature*> near;
-                    Trinity::AnyUnitInObjectRangeCheck check(self, 30.0f);
-                    Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
-                    Cell::VisitGridObjects(self, searcher, 30.0f);
-                    float best = 100000.0f;
-                    for (Creature* cr : near)
-                        if (cr->IsAlive() && cr->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER)
-                            && cr->GetEntry() == c.FlightMasterEntry)   // ТОТ ЖЕ, для кого считали (Кодекс)
-                        {
-                            float const dd = self->GetExactDist(cr);
-                            if (dd < best)
-                                { best = dd; master = cr; }
-                        }
+                    // ПОДНЯТО (`FindFlightMasterCore`): тот же вид, для кого считали, в 30 ярдах.
+                    master = FindFlightMasterCore(c, self);
                     if (!master)
                     {
-                        c.FlightCooldownMs = 600000;
                         Switch(c, self, Behavior::Idle, "полётного мастера на точке нет");
                         return;
                     }
-                    c.FlightMaster = master->GetGUID();
                 }
 
                 // ЯДРО РЕШАЕТ, ДОСТАТОЧНО ЛИ БЛИЗКО — тем же вопросом, что задаёт обработчик.
@@ -3695,67 +3684,9 @@ public:
                 // УЗЕЛ ВЫВОДИМ ЗАНОВО, ИЗ ЖИВОЙ ПОЗИЦИИ (Кодекс). Обработчик берёт его от того, кто
                 // стоит перед нами, а план считал по строке таблицы: мастер мог сдвинуться, а
                 // рядом стоять другой. Разошлось — перепроверяем маршрут, и только потом летим.
-                uint32 const liveFrom = sObjectMgr->GetNearestTaxiNode(master->GetPositionX(), master->GetPositionY(),
-                                                                       master->GetPositionZ(), master->GetMapId(), self->GetTeam());
-                if (!liveFrom || !self->m_taxi.IsTaximaskNodeKnown(liveFrom))
-                {
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПОЛЁТ {}: у живого мастера узел {} (ждали {}) — не наш, не лечу",
-                        self->GetName(), liveFrom, c.FlightFromNode);
-                    c.FlightCooldownMs = 600000;
-                    Switch(c, self, Behavior::Idle, "узел мастера не наш");
-                    return;
-                }
-                if (liveFrom != c.FlightFromNode)
-                {
-                    std::vector<uint32> again;
-                    TaxiNodesEntry const* from = sTaxiNodesStore.LookupEntry(liveFrom);
-                    TaxiNodesEntry const* to = sTaxiNodesStore.LookupEntry(c.FlightNode);
-                    if (!from || !to || TaxiPathGraph::GetCompleteNodeRoute(from, to, self, again) < 2)
-                    {
-                        TC_LOG_INFO("server.worldserver",
-                            "Constellation ПОЛЁТ {}: живой узел {} не тот, что в плане ({}), и маршрута к {} от него нет",
-                            self->GetName(), liveFrom, c.FlightFromNode, c.FlightNode);
-                        c.FlightCooldownMs = 600000;
-                        Switch(c, self, Behavior::Idle, "маршрута от живого узла нет");
-                        return;
-                    }
-                    c.FlightFromNode = liveFrom;
-                }
-
-                // НАЗЕМНОЕ ДВИЖЕНИЕ КОНЧАЕТСЯ ЗДЕСЬ (Кодекс): после взлёта любой наш пакет
-                // движения спорил бы с маршрутом, который ведёт ядро.
-                StopMoving(c, self);
-                c.Move.Waypoints.clear();
-                c.Move.WaypointIndex = 0;
-                c.Move.Moving = false;
-
-                // ТОТ ЖЕ ПАКЕТ, ЧТО ШЛЁТ КЛИЕНТ. Свой узел ядро выведет из позиции мастера само.
-                WorldPacket raw(CMSG_ACTIVATE_TAXI);
-                WorldPackets::Taxi::ActivateTaxi taxi(std::move(raw));
-                taxi.Vendor = c.FlightMaster;
-                taxi.Node = c.FlightNode;
-                uint64 const moneyWas = self->GetMoney();
-                c.Session->HandleActivateTaxiOpcode(taxi);
-
-                // УСПЕХ — СОСТОЯНИЕ, А НЕ ОТПРАВКА: сокета нет, ответа не будет.
-                if (self->IsInFlight())
-                {
-                    ++_flights;
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ПОЛЁТ {}: полетел к узлу {}, заплатил {} мед., экономия пешком {:.0f} ярдов; всего перелётов {}",
-                        self->GetName(), c.FlightNode, uint32(moneyWas - self->GetMoney()),
-                        c.FlightSavedYards, _flights);
-                    c.FlightCooldownMs = 60000;
-                    Switch(c, self, Behavior::Idle, "лечу");
-                    return;
-                }
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation ПОЛЁТ {}: ядро не отправило к узлу {} (денег {}, узел наш {})",
-                    self->GetName(), c.FlightNode, moneyWas,
-                    self->m_taxi.IsTaximaskNodeKnown(c.FlightNode) ? 1 : 0);
-                c.FlightCooldownMs = 600000;
-                Switch(c, self, Behavior::Idle, "улететь не вышло");
+                // ПОДНЯТО (`TakeFlightCore`): живой узел, маршрут от него, оплата, взлёт.
+                Constellation::Ai::ClientAct act(self, c.Session);
+                Switch(c, self, Behavior::Idle, TakeFlightCore(c, self, master, act, c.Move));
                 return;
             }
 
@@ -10181,7 +10112,7 @@ public:
     // Опкод тот же, что шлёт клиент по кнопке «сделать эту таверну домом»; ядро само проверит,
     // что перед нами трактирщик и что мы достаточно близко, а домашнюю точку поставит по нашему
     // месту (SendBindPoint -> заклинание 3286 -> Spell::EffectBind).
-    void BindAtInn(Companion& c, Player* self)
+    void BindAtInn(Companion& c, Player* self, Constellation::Ai::ClientAct& act)
     {
         if (c.InnScanMs)
             return;
@@ -10206,10 +10137,7 @@ public:
             if (!self->GetNPCIfCanInteractWith(cr->GetGUID(), UNIT_NPC_FLAG_INNKEEPER, UNIT_NPC_FLAG_2_NONE))
                 continue;
             WorldLocation const was = self->m_homebind;
-            WorldPacket raw(CMSG_BINDER_ACTIVATE);
-            WorldPackets::NPC::Hello bind(std::move(raw));
-            bind.Unit = cr->GetGUID();
-            c.Session->HandleBinderActivateOpcode(bind);
+            act.BinderActivate(cr->GetGUID());
             // УСПЕХ — ПО ТОМУ, ЧТО ТОЧКА ДЕЙСТВИТЕЛЬНО ДРУГАЯ: карта или координаты (Кодекс).
             // «Стало ближе» — не то же самое и могло бы соврать.
             bool const bound = self->m_homebind.GetMapId() != was.GetMapId()
@@ -10231,7 +10159,10 @@ public:
     // Уходим камнем, если до цели далеко, а от домашней точки до неё близко: тогда «камень плюс
     // короткая дорога» короче длинной. Ядро проверит откат и бой само; судим по состоянию —
     // перенесло нас или нет.
-    bool HearthTowards(Companion& c, Player* self, Position const& target)
+    // КАМЕНЬ — ДВА ТЕЛА НА ОБА МЕХАНИЗМА (2026-09-13): «стоит ли» (чистая выкладка над слотом:
+    // откат, бой, полёт, дом на этой карте, экономия) и «читаю» (дверь; откаты в слот — их читает
+    // страховка такта `:2690`, поэтому они остаются в `Companion`).
+    bool HearthWorthCore(Companion& c, Player* self, Position const& target, float* walkAllOut, float* fromHomeOut) const
     {
         if (c.HearthCooldownMs || self->IsInCombat() || self->IsInFlight())
             return false;
@@ -10243,6 +10174,14 @@ public:
         if (walkAll < Cfg().FlyIfFartherThan || fromHome > walkAll * 0.5f
             || walkAll - fromHome < Cfg().FlyIfSaves)
             return false;
+        if (walkAllOut) *walkAllOut = walkAll;
+        if (fromHomeOut) *fromHomeOut = fromHome;
+        return true;
+    }
+
+    bool HearthCastCore(Companion& c, Player* self, float walkAll, float fromHome,
+                        Constellation::Ai::ClientAct& act, Constellation::Ai::MoveState& move)
+    {
         Item* stone = self->GetItemByEntry(6948);
         if (!stone)
             return false;
@@ -10250,21 +10189,16 @@ public:
         if (!si || !self->GetSpellHistory()->IsReady(si, stone->GetEntry())
             || self->IsNonMeleeSpellCast(false))
             return false;
-        WorldPacket raw(CMSG_USE_ITEM);
-        WorldPackets::Spells::UseItem use(std::move(raw));
-        use.PackSlot = stone->GetBagSlot();
-        use.Slot = stone->GetSlot();
-        use.CastItem = stone->GetGUID();
-        use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL, self->GetMapId(),
-            8690, self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-        use.Cast.SpellID = 8690;
-        use.Cast.Target.Flags = TARGET_FLAG_NONE;
+        uint8 const stoneBag = stone->GetBagSlot();
+        uint8 const stoneSlot = stone->GetSlot();
+        ObjectGuid const stoneGuid = stone->GetGUID();
         // ГАСИМ ДОРОГУ ДО ОТПРАВКИ: движение оборвало бы собственный перенос.
-        StopMoving(c, self);
-        c.Move.Waypoints.clear();
-        c.Move.WaypointIndex = 0;
-        c.Move.Moving = false;
-        c.Session->HandleUseItemOpcode(use);
+        if (self->isMoving())
+            act.StopMoving();
+        move.Waypoints.clear();
+        move.WaypointIndex = 0;
+        move.Moving = false;
+        act.UseItem(stoneBag, stoneSlot, stoneGuid, 8690, Constellation::Ai::ClientAct::UseItemTarget());
 
         // ПАУЗУ СТАВИМ, ТОЛЬКО ЕСЛИ КАСТ ДЕЙСТВИТЕЛЬНО НАЧАЛСЯ (Кодекс): иначе мы бы честно
         // простояли десять секунд после отказа ядра.
@@ -10276,6 +10210,127 @@ public:
             self->GetName(), walkAll, fromHome,
             casting ? "читаю камень" : "ядро каст не начало");
         return casting;
+    }
+
+    // ПОЛЁТ — ОДНО ТЕЛО НА ОБА МЕХАНИЗМА (2026-09-13). План (`PlanFlight`) и его память —
+    // `FlightMaster*`, `FlightNode`, `FlightCooldownMs` — в слоте; страховка `IsInFlight` стоит в
+    // такте до шва (`:2683`), поэтому в полёте не тикает ни один механизм. Уход из режима —
+    // причина строкой; `FlightNode = 0` снимает план, и движок перестаёт ставить полёт.
+    Creature* FindFlightMasterCore(Companion& c, Player* self)
+    {
+        std::list<Creature*> near;
+        Trinity::AnyUnitInObjectRangeCheck check(self, 30.0f);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+        Cell::VisitGridObjects(self, searcher, 30.0f);
+        Creature* master = nullptr;
+        float best = 100000.0f;
+        for (Creature* cr : near)
+            if (cr->IsAlive() && cr->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER)
+                && cr->GetEntry() == c.FlightMasterEntry)   // ТОТ ЖЕ, для кого считали (Кодекс)
+            {
+                float const dd = self->GetExactDist(cr);
+                if (dd < best)
+                    { best = dd; master = cr; }
+            }
+        if (!master)
+
+        {
+            c.FlightCooldownMs = 600000;
+            c.FlightNode = 0;                       // план снят — движок читает это как «плана нет»
+            c.FlightMaster.Clear();                 // и мастер вместе с ним (Кодекс, п. 7)
+            return nullptr;
+
+        }
+
+        c.FlightMaster = master->GetGUID();
+
+        return master;
+    }
+
+    char const* TakeFlightCore(Companion& c, Player* self, Creature* master,
+                               Constellation::Ai::ClientAct& act, Constellation::Ai::MoveState& move)
+    {
+        uint32 const liveFrom = sObjectMgr->GetNearestTaxiNode(master->GetPositionX(), master->GetPositionY(),
+                                                               master->GetPositionZ(), master->GetMapId(), self->GetTeam());
+        if (!liveFrom || !self->m_taxi.IsTaximaskNodeKnown(liveFrom))
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПОЛЁТ {}: у живого мастера узел {} (ждали {}) — не наш, не лечу",
+                self->GetName(), liveFrom, c.FlightFromNode);
+            c.FlightCooldownMs = 600000;
+
+            c.FlightNode = 0;
+
+            return "узел мастера не наш";
+        }
+        if (liveFrom != c.FlightFromNode)
+        {
+            std::vector<uint32> again;
+            TaxiNodesEntry const* from = sTaxiNodesStore.LookupEntry(liveFrom);
+            TaxiNodesEntry const* to = sTaxiNodesStore.LookupEntry(c.FlightNode);
+            if (!from || !to || TaxiPathGraph::GetCompleteNodeRoute(from, to, self, again) < 2)
+            {
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПОЛЁТ {}: живой узел {} не тот, что в плане ({}), и маршрута к {} от него нет",
+                    self->GetName(), liveFrom, c.FlightFromNode, c.FlightNode);
+                c.FlightCooldownMs = 600000;
+
+                c.FlightNode = 0;
+
+                return "маршрута от живого узла нет";
+            }
+            c.FlightFromNode = liveFrom;
+        }
+
+        // НАЗЕМНОЕ ДВИЖЕНИЕ КОНЧАЕТСЯ ЗДЕСЬ (Кодекс): после взлёта любой наш пакет
+        // движения спорил бы с маршрутом, который ведёт ядро.
+        if (self->isMoving())
+
+            act.StopMoving();
+
+        move.Waypoints.clear();
+
+        move.WaypointIndex = 0;
+
+        move.Moving = false;
+
+        // ТОТ ЖЕ ПАКЕТ, ЧТО ШЛЁТ КЛИЕНТ. Свой узел ядро выведет из позиции мастера само.
+        uint64 const moneyWas = self->GetMoney();
+
+        act.ActivateTaxi(c.FlightMaster, c.FlightNode);
+
+        // УСПЕХ — СОСТОЯНИЕ, А НЕ ОТПРАВКА: сокета нет, ответа не будет.
+        if (self->IsInFlight())
+        {
+            ++_flights;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПОЛЁТ {}: полетел к узлу {}, заплатил {} мед., экономия пешком {:.0f} ярдов; всего перелётов {}",
+                self->GetName(), c.FlightNode, uint32(moneyWas - self->GetMoney()),
+                c.FlightSavedYards, _flights);
+            c.FlightCooldownMs = 60000;
+
+            c.FlightNode = 0;
+
+            return "лечу";
+        }
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПОЛЁТ {}: ядро не отправило к узлу {} (денег {}, узел наш {})",
+            self->GetName(), c.FlightNode, moneyWas,
+            self->m_taxi.IsTaximaskNodeKnown(c.FlightNode) ? 1 : 0);
+        c.FlightCooldownMs = 600000;
+
+        c.FlightNode = 0;
+
+        return "улететь не вышло";
+    }
+
+    bool HearthTowards(Companion& c, Player* self, Position const& target)
+    {
+        float walkAll = 0.0f, fromHome = 0.0f;
+        if (!HearthWorthCore(c, self, target, &walkAll, &fromHome))
+            return false;
+        Constellation::Ai::ClientAct act(self, c.Session);
+        return HearthCastCore(c, self, walkAll, fromHome, act, c.Move);
     }
 
     // УЗНАТЬ ПОЛЁТНУЮ ТОЧКУ У МАСТЕРА, МИМО КОТОРОГО ПРОХОДИМ.
@@ -10295,7 +10350,7 @@ public:
     //
     // Дёшево: обзор раз в тридцать секунд и только когда спутник свободен, и только если ядро
     // уже разрешает с мастером говорить (тот же вопрос, что задаёт обработчик такси).
-    void LearnTaxiNode(Companion& c, Player* self)
+    void LearnTaxiNode(Companion& c, Player* self, Constellation::Ai::ClientAct& act)
     {
         if (c.TaxiScanMs)
             return;
@@ -10324,10 +10379,7 @@ public:
             // беседы нет, и пункт «узнать точку» искать негде — отсюда семь «нет пункта» и ноль
             // узнанных на замере. Клиент для этого шлёт CMSG_ENABLE_TAXI_NODE, а обработчик сам
             // проверяет, что перед нами полётный мастер, и зовёт SendLearnNewTaxiNode.
-            WorldPacket raw(CMSG_ENABLE_TAXI_NODE);
-            WorldPackets::Taxi::EnableTaxiNode enable(std::move(raw));
-            enable.Unit = cr->GetGUID();
-            c.Session->HandleEnableTaxiNodeOpcode(enable);
+            act.EnableTaxiNode(cr->GetGUID());
 
             bool got = self->m_taxi.IsTaximaskNodeKnown(node);
             std::string why;
@@ -14582,6 +14634,95 @@ namespace Constellation::Ai
                 m->GatherLeaveCore(*c, self, 0, false);
     }
 
+    // ПОЛЁТ, КАМЕНЬ, ПРИВЯЗКА — переходники к телам над слотом.
+    bool HearthWorthFor(Player* self, Position const& target)
+    {
+        Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self);
+        return c && Constellation::Manager::Instance()->HearthWorthCore(*c, self, target, nullptr, nullptr);
+    }
+
+    bool HearthCastFor(Player* self, Position const& target, ClientAct& act, MoveState& move)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        float walkAll = 0.0f, fromHome = 0.0f;
+        if (!c || !m->HearthWorthCore(*c, self, target, &walkAll, &fromHome))
+            return false;
+        return m->HearthCastCore(*c, self, walkAll, fromHome, act, move);
+    }
+
+    bool PlanFlightFor(Player* self, Position const& target, FlightPlan* out)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        if (!c)
+            return false;
+        if (!c->FlightNode && !m->PlanFlight(*c, self, target))
+            return false;
+        out->MasterEntry = c->FlightMasterEntry;
+        out->MasterWhere = c->FlightMasterPos;
+        out->Node = c->FlightNode;
+        return c->FlightNode != 0;
+    }
+
+    bool FlightPlannedFor(Player* self, FlightPlan* out)
+    {
+        Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self);
+        if (!c || !c->FlightNode)
+            return false;
+        if (out)
+        {
+            out->MasterEntry = c->FlightMasterEntry;
+            out->MasterWhere = c->FlightMasterPos;
+            out->Node = c->FlightNode;
+        }
+        return true;
+    }
+
+    std::optional<ObjectGuid> FlightMasterAtFor(Player* self)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        if (!c)
+            return std::nullopt;
+        Creature* master = m->FindFlightMasterCore(*c, self);
+        return master ? std::optional<ObjectGuid>(master->GetGUID()) : std::nullopt;
+    }
+
+    char const* TakeFlightFor(Player* self, ObjectGuid master, ClientAct& act, MoveState& move)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        Creature* who = ObjectAccessor::GetCreature(*self, master);
+        if (!c || !who)
+            return "спутника или мастера нет";
+        return m->TakeFlightCore(*c, self, who, act, move);
+    }
+
+    void FlightAbortFor(Player* self, uint32 cooldownMs)
+    {
+        if (Constellation::Companion* c = Constellation::Manager::Instance()->FindByPlayer(self))
+        {
+            c->FlightCooldownMs = cooldownMs;
+            c->FlightNode = 0;
+            c->FlightMaster.Clear();
+        }
+    }
+
+    void LearnTaxiNodeFor(Player* self, ClientAct& act)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        if (Constellation::Companion* c = m->FindByPlayer(self))
+            m->LearnTaxiNode(*c, self, act);
+    }
+
+    void BindAtInnFor(Player* self, ClientAct& act)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        if (Constellation::Companion* c = m->FindByPlayer(self))
+            m->BindAtInn(*c, self, act);
+    }
+
     uint32 BrokenGearFor(Player* self)
     {
         return Constellation::Manager::Instance()->BrokenCount(self);
@@ -14674,6 +14815,7 @@ namespace Constellation::Ai
         t.MaxQuests       = Constellation::Cfg().MaxQuests;
         t.Vending         = Constellation::Cfg().Vending;
         t.Quests          = Constellation::Cfg().Quests;
+        t.Flying          = Constellation::Cfg().Flying;
         return t;
     }
 }

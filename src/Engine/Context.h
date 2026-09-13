@@ -561,6 +561,24 @@ namespace Constellation::Ai
     void GatherUnreachableFor(Player* self, uint32 backoffMs);    // дорога не вышла — как `GatherLeave`
     void GatherCancelFor(Player* self);                           // ставку сняли на полпути: отпустить точку
 
+    // ПОЛЁТ И КАМЕНЬ (2026-09-13): план полёта живёт в слоте (`FlightMaster*`, `FlightNode`,
+    // `FlightCooldownMs`), откаты камня — тоже (их читает страховка такта `:2690`).
+    struct FlightPlan
+    {
+        uint32   MasterEntry = 0;
+        Position MasterWhere;
+        uint32   Node = 0;
+    };
+    bool HearthWorthFor(Player* self, Position const& target);
+    bool HearthCastFor(Player* self, Position const& target, ClientAct& act, MoveState& move);
+    bool PlanFlightFor(Player* self, Position const& target, FlightPlan* out);   // считает и кладёт в слот
+    bool FlightPlannedFor(Player* self, FlightPlan* out);
+    std::optional<ObjectGuid> FlightMasterAtFor(Player* self);            // тот же вид в 30 ярдах
+    char const* TakeFlightFor(Player* self, ObjectGuid master, ClientAct& act, MoveState& move);
+    void FlightAbortFor(Player* self, uint32 cooldownMs);
+    void LearnTaxiNodeFor(Player* self, ClientAct& act);                    // сервисы Idle (`:3114-3115`)
+    void BindAtInnFor(Player* self, ClientAct& act);
+
     // ОТХОД (2026-09-13): сломанных вещей на теле (`BrokenCount`) и точка отхода от нападающего
     // (`FleePointCore`) — те же тела, что у `Idle` лестницы.
     uint32 BrokenGearFor(Player* self);
@@ -701,6 +719,7 @@ namespace Constellation::Ai
         bool  IsInWater() const;
         float HealthPct() const;
         bool  HasAttackers() const;
+        bool  IsInFlight() const;                    // на такси — движение слать нельзя
         // Ближайший нападающий (`:3010-3019`): по списку, а без него — `getAttackerForHelper`.
         std::optional<ObjectGuid> NearestAttacker() const;
         // Сломанных вещей на теле; ноль — драться есть чем.
@@ -885,6 +904,17 @@ namespace Constellation::Ai
         char const* GatherArrivedEmpty() const;
         void GatherUnreachable(uint32 backoffMs) const;
         void GatherCancel() const;
+        // Полёт и камень — общие тела над слотом (см. `FlightPlan`).
+        bool HearthWorth(Position const& target) const;
+        bool HearthCast(Position const& target, ClientAct& act, MoveState& move) const;
+        bool PlanFlight(Position const& target, FlightPlan* out) const;
+        bool FlightPlanned(FlightPlan* out) const;
+        std::optional<ObjectGuid> FlightMasterAt() const;
+        bool CanInteractWithFlightMaster(ObjectGuid unit) const;   // `GetNPCIfCanInteractWith` с флагом мастера
+        char const* TakeFlight(ObjectGuid master, ClientAct& act, MoveState& move) const;
+        void FlightAbort(uint32 cooldownMs) const;
+        void LearnTaxiNode(ClientAct& act) const;                   // сервисы Idle (`:3114-3115`)
+        void BindAtInn(ClientAct& act) const;
 
         // NOT HERE, and not by omission:
         //   Player const* / Player& — see the header comment; this is the whole point.
@@ -969,6 +999,7 @@ namespace Constellation::Ai
         uint32 MaxQuests      = 10;
         bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
         bool   Quests         = true;     // `Constellation.Quests`: сбор и квесты разрешены (`Idle`, `:3314`)
+        bool   Flying         = true;     // `Constellation.Flying`: полёты и камень разрешены
     };
     EngineTuning Tuning();
 

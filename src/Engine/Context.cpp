@@ -98,6 +98,11 @@ namespace Constellation::Ai
         return _self && !_self->getAttackers().empty();
     }
 
+    bool WorldView::IsInFlight() const
+    {
+        return _self && _self->IsInFlight();
+    }
+
     std::optional<ObjectGuid> WorldView::NearestAttacker() const
     {
         if (!_self)
@@ -411,6 +416,61 @@ namespace Constellation::Ai
     {
         if (_self)
             GatherCancelFor(_self);
+    }
+
+    bool WorldView::HearthWorth(Position const& target) const
+    {
+        return _self && HearthWorthFor(_self, target);
+    }
+
+    bool WorldView::HearthCast(Position const& target, ClientAct& act, MoveState& move) const
+    {
+        return _self && HearthCastFor(_self, target, act, move);
+    }
+
+    bool WorldView::PlanFlight(Position const& target, FlightPlan* out) const
+    {
+        return _self && out && PlanFlightFor(_self, target, out);
+    }
+
+    bool WorldView::FlightPlanned(FlightPlan* out) const
+    {
+        return _self && FlightPlannedFor(_self, out);
+    }
+
+    std::optional<ObjectGuid> WorldView::FlightMasterAt() const
+    {
+        return _self ? FlightMasterAtFor(_self) : std::nullopt;
+    }
+
+    bool WorldView::CanInteractWithFlightMaster(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        return _self->GetNPCIfCanInteractWith(unit, UNIT_NPC_FLAG_FLIGHTMASTER, UNIT_NPC_FLAG_2_NONE) != nullptr;
+    }
+
+    char const* WorldView::TakeFlight(ObjectGuid master, ClientAct& act, MoveState& move) const
+    {
+        return _self ? TakeFlightFor(_self, master, act, move) : "спутника нет";
+    }
+
+    void WorldView::FlightAbort(uint32 cooldownMs) const
+    {
+        if (_self)
+            FlightAbortFor(_self, cooldownMs);
+    }
+
+    void WorldView::LearnTaxiNode(ClientAct& act) const
+    {
+        if (_self)
+            LearnTaxiNodeFor(_self, act);
+    }
+
+    void WorldView::BindAtInn(ClientAct& act) const
+    {
+        if (_self)
+            BindAtInnFor(_self, act);
     }
 
     bool WorldView::TradeAt(ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send) const

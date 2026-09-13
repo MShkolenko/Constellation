@@ -123,6 +123,14 @@ namespace Constellation::Ai
         };
         FleeState Flee;
 
+        // ЦЕЛЬ КАМНЯ: позиционного предмета у ставки нет, предпосылка дороги кладёт её сюда.
+        Position HearthTarget;
+        bool     HearthTargetSet = false;
+        // ДЛЯ КАКОЙ ДОРОГИ СЧИТАН ПЛАН ПОЛЁТА. У лестницы план потребляется тем же тактом
+        // (`Switch(TakingFlight)`); здесь он лежит в слоте, и дорога может исчезнуть раньше —
+        // чужой план другой дороге не достаётся.
+        Subject  FlightRoad;
+
         // §31 — И САМО СОСТОЯНИЕ ДВИГАТЕЛЯ. `Walk` выше — прогресс уровня ДЕЙСТВИЯ: приближаемся
         // ли к цели. `Move` — внутренности ходьбы: маршрут ядра и место в нём, отступы вбок,
         // отсрочка построителя, примерзание. Два разных яруса, и путать их дорого: один отвечает
@@ -512,6 +520,9 @@ namespace Constellation::Ai
     void RegisterVendorActions(Engine& engine);
     void RegisterGatherActions(Engine& engine);
     void RegisterFleeActions(Engine& engine);
+    void RegisterAirActions(Engine& engine);
+    // Предпосылка дороги: камень (если разрешён для этой дороги) или полёт — см. `Air.cpp`.
+    void AirPrerequisites(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth, BidSink& sink);
 
     // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
     // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,

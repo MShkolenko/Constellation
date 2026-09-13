@@ -209,6 +209,17 @@ namespace
             return relevance;
         }
 
+        // КАМЕНЬ ИЛИ ПОЛЁТ К СДАЧЕ (`:3129-3137`) — предпосылка дороги, только когда ender не в обзоре.
+        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
+        {
+            if (!ctx.St || bid.About.What() != Subject::Kind::Quest)
+                return;
+            for (TurnInCandidate const& t : Val<ValueId::CompletedTurnIns>(ctx))
+                if (t.QuestId == bid.About.Id() && t.EnderEntry
+                    && !ctx.World.NearestQuestGiverOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
+                    AirPrerequisites(ctx, bid, Subject::OfSpecies(t.EnderEntry), t.Where, true, sink);
+        }
+
         bool Execute(Ctx& ctx, Bid const& bid) override
         {
             if (bid.About.What() != Subject::Kind::Quest)
@@ -476,6 +487,15 @@ namespace
             return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
         }
 
+        // ПОЛЁТ К КВЕСТОДАТЕЛЮ (`:3361-3364`) — без камня, как у лестницы.
+        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
+        {
+            SeekTarget const& t = Val<ValueId::GiverToSeek>(ctx);
+            if (ctx.St && t.Found && uint32(t.SpawnId) == bid.About.Id()
+                && ctx.World.DistanceTo2d(t.Where) > SEEK_ARRIVED_YARDS)
+                AirPrerequisites(ctx, bid, bid.About, t.Where, false, sink);
+        }
+
         bool Execute(Ctx& ctx, Bid const& bid) override
         {
             if (!ctx.St)
@@ -547,6 +567,15 @@ namespace
             if (!t.Worth || t.QuestId != bid.About.Id())
                 return relevance;
             return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
+        }
+
+        // КАМЕНЬ ИЛИ ПОЛЁТ К МЕСТУ ЗАДАНИЯ (`:3320-3326`).
+        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
+        {
+            TravelSpot const& t = Val<ValueId::ObjectiveSpot>(ctx);
+            if (ctx.St && t.Worth && t.QuestId == bid.About.Id()
+                && ctx.World.DistanceTo2d(t.Where) > t.Stop + TRAVEL_ARRIVED_SLACK)
+                AirPrerequisites(ctx, bid, bid.About, t.Where, true, sink);
         }
 
         bool Execute(Ctx& ctx, Bid const& bid) override

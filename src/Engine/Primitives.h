@@ -46,6 +46,8 @@ namespace Constellation::Ai
     X(OpenCageForTarget,  "открыть клетку цели")                            \
     X(TalkToTarget,       "поговорить, а не драться")                       \
     X(GatherObjective,    "нужное лежит на земле")                          \
+    X(UseHearthstone,     "камень уносит домой")                            \
+    X(TakeFlight,         "лечу")                                           \
     X(TravelToObjective,  "идти за целью задания")                          \
     X(TakeQuestNearby,    "взять квест рядом")                              \
     X(SeekGiverByMap,     "идти к квестодателю по карте")                    \

@@ -814,6 +814,17 @@ namespace Constellation::Ai
         return ctx.World.TradeAt(vendor, VendorMemoryByEngine(ctx), send);
     }
 
+    // СЕРВИСЫ IDLE, КОТОРЫХ ДВИЖОК-ХОЗЯИН НЕ ДОСТИГАЕТ (`:3114-3115`): мимо полётного мастера и
+    // трактирщика не проходим молча. Частота — в слоте (`TaxiScanMs`, `InnScanMs`); тела —
+    // лестницы, дверь — движка.
+    void LearnTaxiAndBindThroughDoor(Ctx& ctx)
+    {
+        if (!ctx.St)
+            return;
+        ctx.World.LearnTaxiNode(ctx.Act);
+        ctx.World.BindAtInn(ctx.Act);
+    }
+
     void TouchTriggersThroughDoor(Ctx& ctx)
     {
         if (!ctx.St)
@@ -1316,7 +1327,10 @@ namespace Constellation::Ai
             // `Idle` идёт после шва — значит там она сама. Повтор в ту же зону режет отсрочка
             // на минуту (`TriggerSent`).
             if (run != Run::Shadow)
+            {
                 TouchTriggersThroughDoor(ctx);
+                LearnTaxiAndBindThroughDoor(ctx);
+            }
             bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
             if (ran)
             {
