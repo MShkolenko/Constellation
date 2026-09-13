@@ -3201,56 +3201,43 @@ public:
                     // оружие, а про «чинить нечего» — ремонт не заполняет пустой слот. Условие
                     // считает именно СЛОМАННОЕ, поэтому спутник с пустой рукой и целым прочим
                     // снаряжением к ремонтнику по-прежнему не пойдёт.
-                    bool const helpless = BrokenCount(self) > 0;
-                    bool const stuffed = FreeBagSpace(self) <= 2;
-                    bool const worn = DamagedCount(self) > 0;
-                    // ХЛАМ — ТРЕТИЙ ПОВОД. Два замера подряд: походов ноль, потому что до «сумки
-                    // почти полны» состав не доходит, а правило продажи так и не срабатывает.
-                    // Шесть и больше стопок, которые правило продало бы, — идём продавать.
-                    uint32 const sellable = (!stuffed && !helpless) ? SellableCount(c, self) : 0;
-                    bool const clutter = sellable >= 6;                                  // продавец в обзоре
-                    bool const clutterFar = sellable >= std::max<uint32>(12, BagCapacity(self) / 4);   // поход по карте
-
-                    // МИМОХОДОМ: изношен, но дееспособен — только если торговец уже рядом.
-                    // Двадцать ярдов это «прохожу мимо», а не «схожу-ка я за тридцать».
-                    bool passingBy = false;
-                    if (worn && !helpless && !stuffed)
-                        if (Creature* near = FindVendorNear(c, self, false, true))
-                            passingBy = self->IsWithinDistInMap(near, 20.0f);
-
-                    if (helpless || stuffed || clutter || passingBy)
+                    // ЗАЧЕМ И К КОМУ — ПОДНЯТО (`VendorNeedCore`): та же выкладка, что стояла здесь.
+                    // Правило «в обзоре никого, а идти незачем» (потёртость, малый хлам) — внутри.
+                    using Constellation::Ai::VendorNeed;
+                    VendorNeed need;
+                    bool const worthIt = VendorNeedCore(self, VendorMemoryOf(c), &need);
+                    bool const helpless = need.Reason == VendorNeed::Helpless;
+                    bool const stuffed  = need.Reason == VendorNeed::Stuffed;
+                    bool const clutter  = need.Reason == VendorNeed::Clutter;
+                    if (worthIt && !need.ByMap)
                     {
-                        // ИЩЕМ ТОГО, КТО УМЕЕТ НУЖНОЕ. Полные сумки требуют продавца,
-                        // поломка — ремонтника; идти к тому, кто не умеет, значит вернуться
-                        // ни с чем и повторить через минуту (Кодекс).
-                        if (Creature* vendor = FindVendorNear(c, self, stuffed || clutter, helpless || passingBy))
-                        {
-                            c.VendorGuid = vendor->GetGUID();
-                            Switch(c, self, Behavior::Vending,
-                                helpless ? "бить нечем, иду чиниться"
-                                         : stuffed ? "сумки полны, иду продавать"
-                                                   : clutter ? "хлам в сумках, иду продавать"
-                                                             : "торговец рядом, чинюсь мимоходом");
-                            return;
-                        }
-                        // НИКОГО В ОБЗОРЕ — ИДЁМ ПО КАРТЕ, если поход того стоит: ради
-                        // сломанного оружия или полных сумок, не ради потёртости. Пятеро
-                        // людей стояли так часами: сломаны, ремонтник за 150-300 ярдов.
-                        if ((helpless || stuffed || clutterFar) && FindMenderByMap(c, self, stuffed || clutterFar, helpless, &c.VendorEntry, &c.VendorPos))
-                        {
-                            c.VendorGuid.Clear();
-                            c.VendorScanMs = 0;
-                            c.VendorDist = self->GetExactDist2d(c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY());
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation ТОРГ {}: в обзоре никого — иду к {} за {:.0f} ярдов ({})",
-                                self->GetName(), c.VendorEntry, c.VendorDist, helpless ? "чиниться" : "продавать");
-                            Switch(c, self, Behavior::Vending,
-                                helpless ? "бить нечем, иду чиниться по карте"
-                                         : stuffed ? "сумки полны, иду продавать по карте"
-                                                   : "хлам в сумках, иду продавать по карте");
-                            return;
-                        }
-                        // и по карте никого: считаем и молчим пять минут
+                        c.VendorGuid = need.Near;
+                        Switch(c, self, Behavior::Vending,
+                            helpless ? "бить нечем, иду чиниться"
+                                     : stuffed ? "сумки полны, иду продавать"
+                                               : clutter ? "хлам в сумках, иду продавать"
+                                                         : "торговец рядом, чинюсь мимоходом");
+                        return;
+                    }
+                    if (worthIt)
+                    {
+                        c.VendorEntry = need.MapEntry;
+                        c.VendorPos = need.MapWhere;
+                        c.VendorGuid.Clear();
+                        c.VendorScanMs = 0;
+                        c.VendorDist = self->GetExactDist2d(c.VendorPos.GetPositionX(), c.VendorPos.GetPositionY());
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ТОРГ {}: в обзоре никого — иду к {} за {:.0f} ярдов ({})",
+                            self->GetName(), c.VendorEntry, c.VendorDist, helpless ? "чиниться" : "продавать");
+                        Switch(c, self, Behavior::Vending,
+                            helpless ? "бить нечем, иду чиниться по карте"
+                                     : stuffed ? "сумки полны, иду продавать по карте"
+                                               : "хлам в сумках, иду продавать по карте");
+                        return;
+                    }
+                    // ПОВОД БЫЛ, А ИДТИ НЕ К КОМУ: ни в обзоре, ни по карте — считаем и молчим пять минут.
+                    if (need.Reason != VendorNeed::None)
+                    {
                         ++c.VendNoVendor;
                         c.VendCooldownMs = 300000 + (c.Guid.GetCounter() % 61) * 1000;
                     }
@@ -3603,16 +3590,8 @@ public:
 
                 // ДОШЛИ. Открываем прилавок тем же пакетом, что шлёт клиент; обработчик
                 // сам перепроверит флаг продавца через GetNPCIfCanInteractWith.
-                bool poorBefore = c.VendPoor;
-                if (vendor->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
-                {
-                    WorldPacket raw(CMSG_LIST_INVENTORY);
-                    WorldPackets::NPC::Hello list(std::move(raw));
-                    list.Unit = c.VendorGuid;
-                    c.Session->HandleListInventoryOpcode(list);
-                    SellJunkTo(c, self, vendor);
-                }
-                RepairAt(c, self, vendor);
+                // ПРИЛАВОК — ПОДНЯТ (`TradeAtCore`): продать, починить, страховка от безденежья.
+                TradeAtCore(self, vendor, VendorMemoryOf(c), VendorSenderOf(c));
 
                 // РАЗБРОС, ЧТОБЫ НЕ ХОДИТЬ СТРОЕМ. Кодекс: одинаковые пороги и одинаковые
                 // таймеры у 122 спутников дают синхронную толпу у одного NPC — и человеку
@@ -3640,14 +3619,6 @@ public:
                 // которого спутник не падает. Цена названа вслух: это отступление от
                 // «только клиентскими опкодами», и оно сознательное. Альтернатива —
                 // спутник, навсегда выбывший из игры.
-                bool const stillPoor = c.VendPoor > poorBefore;
-                if (stillPoor && BrokenCount(self))
-                {
-                    uint32 const fixed = RepairIfBroken(self, "страховка: денег нет", /*operatorAsked=*/true);
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation ТОРГ {}: на ремонт не хватило — починил даром {} вещей, "
-                        "иначе он выбывает навсегда", self->GetName(), fixed);
-                }
                 c.VendCooldownMs = 60000 + (c.Guid.GetCounter() % 47) * 1000;
                 c.VendorGuid.Clear();
                 Switch(c, self, Behavior::Idle, "торговля закончена");
@@ -6007,7 +5978,7 @@ public:
     // needSell/needRepair — ЗАЧЕМ идём. Кодекс: без этого бот с полными сумками мог уйти
     // к ремонтнику, ничего не продать, поставить минутный таймер и вернуться — и так по
     // кругу вечно. Услуга, за которой идём, теперь обязательна, а вторая — приятный бонус.
-    Creature* FindVendorNear(Companion const& c, Player* self, bool needSell, bool needRepair) const
+    Creature* FindVendorNearCore(Player* self, Constellation::Ai::VendorMemory const& mem, bool needSell, bool needRepair) const
     {
         Creature* both = nullptr; float bothDist = 100000.0f;
         Creature* any = nullptr;  float anyDist = 100000.0f;
@@ -6024,7 +5995,7 @@ public:
             // ГОДИТСЯ, ТОЛЬКО ЕСЛИ УМЕЕТ ТО, ЗАЧЕМ ИДЁМ.
             if (needSell && !sells)
                 continue;
-            if (needSell && c.VendorNoSell.count(cr->GetEntry()))
+            if (needSell && mem.NoSell(mem.User, cr->GetEntry()))
                 continue;                           // недавно отказал во всём — не продавец
             if (needRepair && !fixes)
                 continue;
@@ -6039,6 +6010,61 @@ public:
                 { anyDist = d; any = cr; }
         }
         return both ? both : any;
+    }
+
+    // ПАМЯТЬ ЛЕСТНИЦЫ — те же контейнеры и счётчики спутника, что стояли в этих телах.
+    static bool VendSellRefusedFor(void const* u, ObjectGuid g) { return static_cast<Companion const*>(u)->SellRefused.count(g) != 0; }
+    static bool VendNoSellFor(void const* u, uint32 e)          { return static_cast<Companion const*>(u)->VendorNoSell.count(e) != 0; }
+    static void VendNoteSellRefusedFor(void* u, ObjectGuid g)   { static_cast<Companion*>(u)->SellRefused[g] = 600000; }
+    static void VendNoteNoSellFor(void* u, uint32 e)            { static_cast<Companion*>(u)->VendorNoSell[e] = 600000; }
+    static void VendNotePoorFor(void* u)                        { ++static_cast<Companion*>(u)->VendPoor; }
+    static void VendNoteSoldFor(void* u, uint32 sold, uint64 earned) { Companion* c = static_cast<Companion*>(u); c->VendSold += sold; c->VendEarned += earned; }
+    static void VendNoteRepairedFor(void* u)                    { ++static_cast<Companion*>(u)->VendRepaired; }
+    static Constellation::Ai::VendorMemory VendorMemoryOf(Companion& c)
+    {
+        Constellation::Ai::VendorMemory m;
+        m.SellRefused = &VendSellRefusedFor; m.NoSell = &VendNoSellFor;
+        m.NoteSellRefused = &VendNoteSellRefusedFor; m.NoteNoSell = &VendNoteNoSellFor;
+        m.NotePoor = &VendNotePoorFor; m.NoteSold = &VendNoteSoldFor; m.NoteRepaired = &VendNoteRepairedFor;
+        m.User = &c;
+        return m;
+    }
+    static void VendListFor(void* u, ObjectGuid vendor)
+    {
+        WorldPacket raw(CMSG_LIST_INVENTORY);
+        WorldPackets::NPC::Hello list(std::move(raw));
+        list.Unit = vendor;
+        static_cast<Companion*>(u)->Session->HandleListInventoryOpcode(list);
+    }
+    static void VendSellFor(void* u, ObjectGuid vendor, ObjectGuid item, uint32 amount)
+    {
+        WorldPacket raw(CMSG_SELL_ITEM);
+        WorldPackets::Item::SellItem sell(std::move(raw));
+        sell.VendorGUID = vendor;
+        sell.ItemGUID = item;
+        sell.Amount = amount;
+        static_cast<Companion*>(u)->Session->HandleSellItemOpcode(sell);
+    }
+    static void VendRepairFor(void* u, ObjectGuid vendor)
+    {
+        WorldPacket raw(CMSG_REPAIR_ITEM);
+        WorldPackets::Item::RepairItem fix(std::move(raw));
+        fix.NpcGUID = vendor;
+        fix.ItemGUID = ObjectGuid::Empty;   // пусто = «починить всё»
+        fix.UseGuildBank = false;
+        static_cast<Companion*>(u)->Session->HandleRepairItemOpcode(fix);
+    }
+    static Constellation::Ai::VendorSender VendorSenderOf(Companion& c)
+    {
+        Constellation::Ai::VendorSender s;
+        s.ListInventory = &VendListFor; s.Sell = &VendSellFor; s.Repair = &VendRepairFor; s.User = &c;
+        return s;
+    }
+
+    // Обёртки лестницы — подписи прежние.
+    Creature* FindVendorNear(Companion const& c, Player* self, bool needSell, bool needRepair) const
+    {
+        return FindVendorNearCore(self, VendorMemoryOf(const_cast<Companion&>(c)), needSell, needRepair);
     }
 
     // ПРОДАТЬ ХЛАМ — ПО ОДНОМУ ПРЕДМЕТУ, ПОТОМУ ЧТО ПАЧКОЙ ЭТА СБОРКА НЕ УМЕЕТ.
@@ -6306,14 +6332,14 @@ public:
     }
 
     // СКОЛЬКО СТОПОК ПРАВИЛО ПРОДАЛО БЫ — повод идти к торговцу, не дожидаясь полных сумок.
-    uint32 SellableCount(Companion const& c, Player* self) const
+    uint32 SellableCountCore(Player* self, Constellation::Ai::VendorMemory const& mem) const
     {
         uint32 count = 0;
         std::set<ObjectGuid> const keepBags = BagsToKeep(self);
         auto look = [&](Item* it)
         {
             if (it && !it->IsEquipped() && it->GetTemplate()
-                && !c.SellRefused.count(it->GetGUID())     // ядро уже отказало — не повод для похода
+                && !mem.SellRefused(mem.User, it->GetGUID())     // ядро уже отказало — не повод для похода
                 && ClassifyForSale(self, it, keepBags) == SellVerdict::Sell)
                 ++count;
         };
@@ -6326,6 +6352,11 @@ public:
         return count;
     }
 
+    uint32 SellableCount(Companion const& c, Player* self) const
+    {
+        return SellableCountCore(self, VendorMemoryOf(const_cast<Companion&>(c)));
+    }
+
     uint32 BagCapacity(Player* self) const
     {
         uint32 cap = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
@@ -6335,7 +6366,8 @@ public:
         return cap;
     }
 
-    uint32 SellJunkTo(Companion& c, Player* self, Creature* vendor)
+    uint32 SellJunkToCore(Player* self, Creature* vendor, Constellation::Ai::VendorMemory const& mem,
+                          Constellation::Ai::VendorSender const& send) const
     {
         std::vector<Item*> junk;
         uint32 seenStacks = 0, seenPieces = 0, keptQuest = 0, keptStart = 0, keptStone = 0,
@@ -6352,7 +6384,7 @@ public:
                 return;
             ++seenStacks;
             seenPieces += it->GetCount();
-            if (c.SellRefused.count(it->GetGUID()))
+            if (mem.SellRefused(mem.User, it->GetGUID()))
                 { ++skippedRefused; return; }       // недавно отказано — не повторяем
             switch (ClassifyForSale(self, it, keepBags))
             {
@@ -6383,16 +6415,11 @@ public:
             // отвергнутый предмет записывался проданным, и журнал мог сказать «продал 3,
             // выручил 0». Спрашиваем ядро, лежит ли предмет ещё у нас.
             ObjectGuid const itemGuid = it->GetGUID();
-            WorldPacket raw(CMSG_SELL_ITEM);
-            WorldPackets::Item::SellItem sell(std::move(raw));
-            sell.VendorGUID = vendor->GetGUID();
-            sell.ItemGUID = itemGuid;
-            sell.Amount = it->GetCount();
-            c.Session->HandleSellItemOpcode(sell);
+            send.Sell(send.User, vendor->GetGUID(), itemGuid, it->GetCount());
             if (self->GetItemByGuid(itemGuid))
             {
                 ++refused;              // остался у нас — значит не продан
-                c.SellRefused[itemGuid] = 600000;   // десять минут не считать его поводом (Кодекс)
+                mem.NoteSellRefused(mem.User, itemGuid);   // десять минут не считать его поводом (Кодекс)
             }
             else
                 ++sold;
@@ -6400,10 +6427,9 @@ public:
         // ОТКАЗАЛ ВО ВСЁМ — этот торговец десять минут не продавец: без выкупа или не берёт
         // такое; иначе поход к нему повторялся бы по кругу
         if (!junk.empty() && sold == 0)
-            c.VendorNoSell[vendor->GetEntry()] = 600000;
+            mem.NoteNoSell(mem.User, vendor->GetEntry());
         uint64 const earned = self->GetMoney() > before ? self->GetMoney() - before : 0;
-        c.VendSold += sold;
-        c.VendEarned += earned;
+        mem.NoteSold(mem.User, sold, earned);
         // ОДНА СТРОКА НА ВИЗИТ, ВКЛЮЧАЯ ПУСТОЙ: что просмотрено, что продано, что и почему
         // оставлено. Без неё «ноль продаж» неотличим от «продавать было нечего».
         TC_LOG_INFO("server.worldserver",
@@ -6415,6 +6441,11 @@ public:
         return sold;
     }
 
+    uint32 SellJunkTo(Companion& c, Player* self, Creature* vendor)
+    {
+        return SellJunkToCore(self, vendor, VendorMemoryOf(c), VendorSenderOf(c));
+    }
+
     // ПОЧИНИТЬСЯ — ПАКЕТОМ, А НЕ ПРЯМЫМ ВЫЗОВОМ.
     //
     // Пустой ItemGUID означает «починить всё», ровно как кнопка клиента. Обработчик сам
@@ -6424,7 +6455,8 @@ public:
     // ДЕНЕГ НЕ ХВАТИЛО — ЯДРО МОЛЧА НЕ ЧИНИТ НИЧЕГО (Кодекс: считает полную стоимость и
     // выходит). Поэтому сверяем прочность до и после и пишем, если ничего не изменилось:
     // иначе «починился» было бы утверждением, а не фактом.
-    bool RepairAt(Companion& c, Player* self, Creature* vendor)
+    bool RepairAtCore(Player* self, Creature* vendor, Constellation::Ai::VendorMemory const& mem,
+                      Constellation::Ai::VendorSender const& send) const
     {
         if (!vendor->HasNpcFlag(UNIT_NPC_FLAG_REPAIR))
             return false;
@@ -6443,12 +6475,7 @@ public:
         uint32 const damagedBefore = DamagedCount(self);
         uint64 const moneyBefore = self->GetMoney();
 
-        WorldPacket raw(CMSG_REPAIR_ITEM);
-        WorldPackets::Item::RepairItem fix(std::move(raw));
-        fix.NpcGUID = vendor->GetGUID();
-        fix.ItemGUID = ObjectGuid::Empty;   // пусто = «починить всё»
-        fix.UseGuildBank = false;
-        c.Session->HandleRepairItemOpcode(fix);
+        send.Repair(send.User, vendor->GetGUID());
 
         uint32 const brokenAfter = BrokenCount(self);
         uint32 const damagedAfter = DamagedCount(self);
@@ -6459,7 +6486,7 @@ public:
         bool const better = brokenAfter < brokenBefore || damagedAfter < damagedBefore;
         if (!better)
         {
-            ++c.VendPoor;
+            mem.NotePoor(mem.User);
             TC_LOG_INFO("server.worldserver",
                 "Constellation ТОРГ {}: ремонт НЕ прошёл у {} ({}) — сломано {}, изношено {}, "
                 "денег {}, списано {}; ядро чинит всё или ничего",
@@ -6467,13 +6494,47 @@ public:
                 brokenBefore, damagedBefore, moneyBefore, spent);
             return false;
         }
-        ++c.VendRepaired;
+        mem.NoteRepaired(mem.User);
         TC_LOG_INFO("server.worldserver",
             "Constellation ТОРГ {}: починился у {} ({}) за {} медяков; сломано {} -> {}, "
             "изношено {} -> {}",
             self->GetName(), vendor->GetName(), vendor->GetEntry(), spent,
             brokenBefore, brokenAfter, damagedBefore, damagedAfter);
         return true;
+    }
+
+    bool RepairAt(Companion& c, Player* self, Creature* vendor)
+    {
+        return RepairAtCore(self, vendor, VendorMemoryOf(c), VendorSenderOf(c));
+    }
+
+    // ПРИЛАВОК ОТКРЫТ — тело из `Vending` (`:3604-3650`): продать, починить, страховка от тупика.
+    // Кулдаун и выход — у вызывающего: это память механизма.
+    bool TradeAtCore(Player* self, Creature* vendor, Constellation::Ai::VendorMemory const& mem,
+                     Constellation::Ai::VendorSender const& send) const
+    {
+        if (vendor->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
+        {
+            send.ListInventory(send.User, vendor->GetGUID());
+            SellJunkToCore(self, vendor, mem, send);
+        }
+        bool const repaired = RepairAtCore(self, vendor, mem, send);
+        // НЕ ХВАТИЛО ДЕНЕГ — ЧИНИМ ДАРОМ. Страховка от тупика, а не поблажка (см. разбор ниже
+        // в `Vending`): сломанным оружием не заработать на ремонт.
+        //
+        // «Не хватило» — ЭТОГО визита: ремонтник есть, а починка не прошла. Лестница считала это
+        // через `bool poorBefore = c.VendPoor` — усечение до bool делало «беден» любого, кто
+        // беднел хоть раз, и даровой ремонт шёл дальше при любом сломанном, даже у торговца без
+        // ремонта (Кодекс, подъём торговца). Здесь названо и исправлено: страховка — по факту отказа.
+        bool const stillPoor = !repaired && vendor->HasNpcFlag(UNIT_NPC_FLAG_REPAIR);
+        if (stillPoor && BrokenCount(self))
+        {
+            uint32 const fixed = RepairIfBroken(self, "страховка: денег нет", /*operatorAsked=*/true);
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ТОРГ {}: на ремонт не хватило — починил даром {} вещей, "
+                "иначе он выбывает навсегда", self->GetName(), fixed);
+        }
+        return repaired || !stillPoor;
     }
 
     // ОБОБРАТЬ ТРУП — ЧЕТЫРЬМЯ ПАКЕТАМИ, В ТОМ ЖЕ ПОРЯДКЕ, ЧТО ШЛЁТ КЛИЕНТ.
@@ -11315,7 +11376,7 @@ public:
         return true;
     }
 
-    bool FindMenderByMap(Companion const& c, Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
+    bool FindMenderByMapCore(Player* self, Constellation::Ai::VendorMemory const& mem, bool needSell, bool needRepair, uint32* entry, Position* pos) const
     {
         auto it = _menders.find(self->GetMapId());
         if (it == _menders.end())
@@ -11347,7 +11408,7 @@ public:
         {
             if ((needSell && !m.Sells) || (needRepair && !m.Fixes))
                 continue;
-            if (needSell && c.VendorNoSell.count(m.Entry))
+            if (needSell && mem.NoSell(mem.User, m.Entry))
                 continue;                           // недавно отказал во всём — не продавец
             if (mine)
                 if (FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(m.Faction))
@@ -11365,6 +11426,50 @@ public:
         *entry = best->Entry;
         *pos = best->Where;
         return true;
+    }
+
+    bool FindMenderByMap(Companion const& c, Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
+    {
+        return FindMenderByMapCore(self, VendorMemoryOf(const_cast<Companion&>(c)), needSell, needRepair, entry, pos);
+    }
+
+    // ЗАЧЕМ ИДТИ К ТОРГОВЦУ — отбор из `Idle` (`:3204-3252`), без записей в спутника.
+    bool VendorNeedCore(Player* self, Constellation::Ai::VendorMemory const& mem, Constellation::Ai::VendorNeed* out) const
+    {
+        using Constellation::Ai::VendorNeed;
+        *out = VendorNeed();
+        bool const helpless = BrokenCount(self) > 0;
+        bool const stuffed = FreeBagSpace(self) <= 2;
+        bool const worn = DamagedCount(self) > 0;
+        uint32 const sellable = (!stuffed && !helpless) ? SellableCountCore(self, mem) : 0;
+        bool const clutter = sellable >= 6;                                  // продавец в обзоре
+        bool const clutterFar = sellable >= std::max<uint32>(12, BagCapacity(self) / 4);   // поход по карте
+        bool passingBy = false;
+        if (worn && !helpless && !stuffed)
+            if (Creature* near = FindVendorNearCore(self, mem, false, true))
+                passingBy = self->IsWithinDistInMap(near, 20.0f);
+        if (!(helpless || stuffed || clutter || passingBy))
+            return false;
+        out->Reason = helpless ? VendorNeed::Helpless : stuffed ? VendorNeed::Stuffed
+                    : clutter ? VendorNeed::Clutter : VendorNeed::PassingBy;
+        out->NeedSell = stuffed || clutter;
+        out->NeedRepair = helpless || passingBy;
+        if (Creature* vendor = FindVendorNearCore(self, mem, out->NeedSell, out->NeedRepair))
+        {
+            out->Near = vendor->GetGUID();
+            return true;
+        }
+        if ((helpless || stuffed || clutterFar)
+            && FindMenderByMapCore(self, mem, stuffed || clutterFar, helpless, &out->MapEntry, &out->MapWhere))
+        {
+            out->ByMap = true;
+            out->NeedSell = stuffed || clutterFar;
+            return true;
+        }
+        // ПОВОД БЫЛ, А ИДТИ НЕ К КОМУ: `Reason` остаётся — по нему вызывающий ставит свою
+        // пятиминутную паузу; повода не было — `Reason == None` и паузы нет (лестница входила в
+        // блок только по поводу).
+        return false;
     }
 
     // СВЕТОФОР ЗАДАНИЯ — ТОТ ЖЕ, ЧТО ВИДИТ ИГРОК В ЖУРНАЛЕ.
@@ -14351,6 +14456,19 @@ namespace Constellation::Ai
     void TouchAreaTriggersFor(Player* self, TriggerMemory const& mem, TriggerSendFn send, void* sendUser)
     {
         Constellation::Manager::Instance()->TouchAreaTriggersCore(self, mem, send, sendUser);
+    }
+
+    bool VendorNeedFor(Player* self, VendorMemory const& mem, VendorNeed* out)
+    {
+        return Constellation::Manager::Instance()->VendorNeedCore(self, mem, out);
+    }
+
+    bool TradeAtFor(Player* self, ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send)
+    {
+        Creature* v = ObjectAccessor::GetCreature(*self, vendor);
+        if (!v)
+            return false;
+        return Constellation::Manager::Instance()->TradeAtCore(self, v, mem, send);
     }
 
     bool TurnInFor(Player* self, ObjectGuid ender, uint32 questId, TurnInSender const& send)

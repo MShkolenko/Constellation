@@ -501,6 +501,46 @@ namespace Constellation::Ai
     };
     using TriggerSendFn = void (*)(void* user, int32 triggerId);
 
+    // ---------------------------------------------------------------------------------------
+    // ТОРГОВЕЦ — ОДНО ТЕЛО НА ДВА МЕХАНИЗМА (`Constellation.cpp`: Idle `:3204-3256`, Vending
+    // `:3604-3653`, `FindVendorNear`, `SellableCount`, `FindMenderByMap`, `SellJunkTo`, `RepairAt`).
+    // Память механизма: отказанные предметы (10 мин), торговцы-«не продавцы» (10 мин), счётчики.
+    // Отправитель: три двери — прилавок, продажа, починка. Даровой ремонт при безденежье —
+    // сознательное отступление от «только пакетами», остаётся в теле (`RepairIfBroken`).
+    // ---------------------------------------------------------------------------------------
+    struct VendorMemory
+    {
+        bool (*SellRefused)(void const* user, ObjectGuid item) = nullptr;
+        bool (*NoSell)(void const* user, uint32 vendorEntry) = nullptr;
+        void (*NoteSellRefused)(void* user, ObjectGuid item) = nullptr;     // 10 мин
+        void (*NoteNoSell)(void* user, uint32 vendorEntry) = nullptr;       // 10 мин
+        void (*NotePoor)(void* user) = nullptr;
+        void (*NoteSold)(void* user, uint32 sold, uint64 earned) = nullptr;
+        void (*NoteRepaired)(void* user) = nullptr;
+        void* User = nullptr;
+    };
+    struct VendorSender
+    {
+        void (*ListInventory)(void* user, ObjectGuid vendor) = nullptr;
+        void (*Sell)(void* user, ObjectGuid vendor, ObjectGuid item, uint32 amount) = nullptr;
+        void (*Repair)(void* user, ObjectGuid vendor) = nullptr;
+        void* User = nullptr;
+    };
+    // ЗАЧЕМ ИДТИ — ответ отбора `Idle`: сломан / сумки полны / хлам / мимоходом; кто в обзоре, а
+    // если никого — куда по карте (только ради сломанного, полных сумок или большого хлама).
+    struct VendorNeed
+    {
+        enum Why : uint8 { None, Helpless, Stuffed, Clutter, PassingBy } Reason = None;
+        bool       NeedSell = false, NeedRepair = false;
+        ObjectGuid Near;                // торговец в обзоре (100 ярдов), годный под нужду
+        uint32     MapEntry = 0;        // …или вид по карте
+        Position   MapWhere;
+        bool       ByMap = false;
+    };
+    bool VendorNeedFor(Player* self, VendorMemory const& mem, VendorNeed* out);   // false = идти незачем
+    // Прилавок открыт: продать, починить, страховка; true = хоть что-то вышло или чинить было нечего.
+    bool TradeAtFor(Player* self, ObjectGuid vendor, VendorMemory const& mem, VendorSender const& send);
+
     enum class TalkOutcome : uint8
     {
         Waiting, Sent,
