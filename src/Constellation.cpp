@@ -2995,6 +2995,25 @@ public:
                     if (Constellation::Ai::Engine::Instance().Tick(c.Engine, ctx, c.ModeEpoch)
                         != Constellation::Ai::Engine::TickResult::Idle)
                         return;
+
+                    // ДВИЖОК-ХОЗЯИН ПУСТ — IDLE ЛЕСТНИЦЫ ДАЛЬШЕ НЕ ВЫБИРАЕТ (2026-09-13, замер
+                    // 20:29-21:06). Провал в её отбор вёл спутника МИМО отказов движка: поход
+                    // отвергнут как смертельный / квест стоил гибелей — а лестничный `Travelling`
+                    // вёл его в Пылающие степи снова и снова (Emrick: четыре гибели в зоне 46 под
+                    // `FSM … иду к месту задания`, без единого решения движка). Все выборы Idle
+                    // перенесены (сдача, взятие, торговец, бой, клетка, разговор, сбор, поход, поиск,
+                    // отход, камень/полёт); сервисы — в такте движка; поздний зачёт сверяется в
+                    // `TalkEngageCore`. Остаётся то, чего у движка нет: следование за хозяином.
+                    {
+                        Position owner;
+                        if (Cfg().Follow && !c.FollowCooldownMs && FollowTargetPos(c, self, &owner)
+                            && self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY()) <= Cfg().FollowMaxRange)
+                        {
+                            c.LastDist = self->GetExactDist2d(owner.GetPositionX(), owner.GetPositionY());
+                            Switch(c, self, Behavior::FollowingOwner, "есть за кем идти");
+                        }
+                        return;
+                    }
                 }
 
                 // В БОЮ, А ДРАТЬСЯ НЕЧЕМ — ОТХОДИМ, А НЕ СТОИМ.
