@@ -903,16 +903,36 @@ namespace Constellation::Ai
         // НОВАЯ ЦЕЛЬ — НОВАЯ ДОРОГА. Перезапуск здесь, а не у вызывающего: забытый перезапуск
         // означал бы, что счётчик застревания пришёл из прошлого пути и оборвал бы новый.
         if (!(w.Toward == toward))
+        {
             w.Restart(toward, ctx.NowMs);
+            w.LastWaypoint = ctx.St->Move.WaypointIndex;   // база — текущий индекс, не ноль: чужой путь не прогресс (Кодекс)
+        }
 
         // ПРИБЛИЖЕНИЕ — С ЗАПАСОМ. Правило и число у лестницы (`Constellation.cpp:3375`).
         // Первый замер прогрессом не считается и не наказывается: сравнивать ещё не с чем.
+        // ВПЕРЁД ПО ПУТИ — ПРОГРЕСС, ДАЖЕ ЕСЛИ ПО ПРЯМОЙ ДАЛЬШЕ (см. `WalkProgress::LastWaypoint`).
+        // ДРОЖЬ ПУТИ (0 -> 1 -> 0 -> 1) — НЕ ПРОГРЕСС: после отката индекса первый рост лишь снимает
+        // отметку отката, и только следующий рост без отката обнуляет счёт (Кодекс, третий проход).
+        size_t const wp = ctx.St->Move.WaypointIndex;
+        bool alongPath = false;
+        if (wp < w.LastWaypoint)
+            w.Regressed = true;
+        else if (wp > w.LastWaypoint)
+        {
+            if (w.Regressed)
+                w.Regressed = false;
+            else
+                alongPath = true;
+        }
+        w.LastWaypoint = wp;
         if (!w.Measured || dist < w.Best - WALK_PROGRESS_YARDS)
         {
             w.Measured = true;
             w.Best     = dist;
             w.StuckMs  = 0;
         }
+        else if (alongPath)
+            w.StuckMs  = 0;
         else
             w.StuckMs += sliceMs;
 
