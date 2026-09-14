@@ -438,8 +438,7 @@ namespace Constellation::Ai
         return 0;
     }
 
-    void Engine::LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance,
-                           Run run) const
+    void Engine::LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const
     {
         // §5 — every decision says why. An engine whose choice cannot be read back is worse than
         // the `if` chain it replaces, because at least a chain can be read top to bottom.
@@ -459,7 +458,7 @@ namespace Constellation::Ai
         TC_LOG_INFO("server.worldserver",
             "Constellation {} {}: «{}» {:.2f} (было «{}», у лестницы «{}») (эпоха {}, в очереди {},"
             " сброшено {}, подавлено {}, шаг отвергнут {})",
-            run == Run::Shadow ? "ТЕНЬ" : "РЕШЕНИЕ",
+            "РЕШЕНИЕ",
             ctx.World.Name(), chosen.Name(), relevance, NameOf(st.Running),
             ctx.Peer ? ctx.Peer : "?",
             st.AssignmentEpoch, st.Queue.size(), st.BidsDropped, st.BidsSuppressed,
@@ -1110,7 +1109,7 @@ namespace Constellation::Ai
         return r;
     }
 
-    Engine::TickResult Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run)
+    Engine::TickResult Engine::Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch)
     {
         if (!_ready)
             return TickResult::Idle;   // до счёта: движка ещё нет
@@ -1165,10 +1164,7 @@ namespace Constellation::Ai
         st.HasTicked  = true;
         st.LastTickMs = ctx.NowMs;
 
-        if (run == Run::Decide)
-        {
-            ctx.Act.ResetTick(slice, &st.StepsRefused);
-        }
+        ctx.Act.ResetTick(slice, &st.StepsRefused);
 
         // ЗАНЯТОСТЬ — РАЗ В МИНУТУ И ПО СПУТНИКУ. За минуту набирается порядка двухсот сорока
         // тактов, чего довольно для доли; восемь строк в минуту не топят журнал, который однажды
@@ -1189,7 +1185,7 @@ namespace Constellation::Ai
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЗАНЯТОСТЬ {} {}: тактов {}, провёл {}, взялся {}, нечего {},"
                     " в очереди {}, сброшено всего {}, слито за минуту {}",
-                    run == Run::Shadow ? "ТЕНЬ" : "ШОВ", ctx.World.Name(),
+                    "ШОВ", ctx.World.Name(),
                     total, st.TicksCommitted, st.TicksAttempted, st.TicksIdle,
                     st.Queue.size(), st.BidsDropped, st.BidsMerged);
             st.TicksIdle = st.TicksAttempted = st.TicksCommitted = 0;
@@ -1353,12 +1349,9 @@ namespace Constellation::Ai
             // трогает зоны каждый такт `Idle` и `Travelling`; в тени ход не берётся, и её такт
             // `Idle` идёт после шва — значит там она сама. Повтор в ту же зону режет отсрочка
             // на минуту (`TriggerSent`).
-            if (run != Run::Shadow)
-            {
-                TouchTriggersThroughDoor(ctx);
-                LearnTaxiAndBindThroughDoor(ctx);
-            }
-            bool const ran = (run == Run::Shadow) ? true : action->Execute(ctx, bid);
+            TouchTriggersThroughDoor(ctx);
+            LearnTaxiAndBindThroughDoor(ctx);
+            bool const ran = action->Execute(ctx, bid);
             if (ran)
             {
                 // §14 — УСПЕХ СНИМАЕТ ЗАПРЕТ, иначе он переживёт то изменение мира, которое
@@ -1374,7 +1367,7 @@ namespace Constellation::Ai
                 // `SeekGiverByMap` носил это с первого дня (`Actions/Quest.cpp:446`), и тень
                 // показать не могла: там `Execute` не зовётся. Найдено 2026-09-12 при переносе
                 // `TravelToObjective`, чей приход — та же пара.
-                if (run != Run::Shadow && suppress.Kind != BackoffKind::None
+                if (suppress.Kind != BackoffKind::None
                     && !Deferred(st, suppress, now))
                     Allow(st, suppress);
 
@@ -1383,7 +1376,7 @@ namespace Constellation::Ai
                 if (bid.Action != st.Running)
                     ++st.AssignmentEpoch;
 
-                LogChoice(st, ctx, *action, rel, run);
+                LogChoice(st, ctx, *action, rel);
                 st.Scratch.clear();
                 BidSink sink(st.Scratch, st.BidsDropped);
                 action->Continuers(ctx, bid, sink);

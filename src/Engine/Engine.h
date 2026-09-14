@@ -369,7 +369,6 @@ namespace Constellation::Ai
         // return is unknowable without running it, so the shadow treats execution as successful —
         // otherwise the alternative and prerequisite branches would diverge from the real ones at
         // the first failure and there would be nothing left to compare.
-        enum class Run : uint8 { Decide, Shadow };
 
         // §4.1 — one tick. `modeEpoch` is the module's counter of mode changes for this
         // companion; if it moved since we last ticked, somebody else put us here and every bit
@@ -392,7 +391,7 @@ namespace Constellation::Ai
             Committed,  // ровно одно действие проведено через дверь
         };
 
-        TickResult Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch, Run run = Run::Decide);
+        TickResult Tick(EngineState& st, Ctx& ctx, uint32 modeEpoch);
 
     private:
         // СЧЁТ В ОДНОЙ ТОЧКЕ. Возвратов у такта три, и три отдельных инкремента разошлись бы на
@@ -460,8 +459,7 @@ namespace Constellation::Ai
         size_t Choose(EngineState& st, Ctx& ctx, uint32 nowMs, float& outScore) const;
         // Нешаблонная половина регистрации: шаблон выше только связывает тип с именем.
         void RegisterValueBase(ValueId id, std::unique_ptr<ValueBase> value);
-        void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance,
-                        Run run) const;
+        void  LogChoice(EngineState& st, Ctx& ctx, Action const& chosen, float relevance) const;
 
         std::vector<std::unique_ptr<Action>>     _actions;      // indexed by ActionId
         // ОДИН ВЕКТОР, А НЕ ДВА ПАРАЛЛЕЛЬНЫХ. Раньше объект и маска владельца лежали в разных
