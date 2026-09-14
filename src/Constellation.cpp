@@ -2640,12 +2640,18 @@ public:
                     // ударить, а прилететь могло от второго моба или от обрыва. Кто именно бил и
                     // чем кончилось, говорит соседняя строка БОЙ — она ведётся по ходу боя, а не
                     // осмотром после смерти, и потому знает то, чего осмотр знать не может.
+                    // ЦЕЛЬ — ТОГО МЕХАНИЗМА, КОТОРЫЙ ВЁЛ БОЙ (2026-09-14): под движком-хозяином цель
+                    // лежит в `c.Engine.Fight.Victim`, а `c.TargetGuid` пуст — и 258 гибелей за девять
+                    // часов вышли «цели не было», разделить «погиб в своём бою» и «застигнут в пути»
+                    // было нечем.
+                    ObjectGuid const foeGuid = !c.Engine.Fight.Victim.IsEmpty() ? c.Engine.Fight.Victim : c.TargetGuid;
+                    char const* const foeBy = !c.Engine.Fight.Victim.IsEmpty() ? "движок" : "лестница";
                     std::string foe = "цели не было";
-                    if (Creature* t = ObjectAccessor::GetCreature(*self, c.TargetGuid))
-                        foe = Trinity::StringFormat("{} ({}, {:.0f} ярд, у него {:.0f}%)",
-                            t->GetName(), t->GetEntry(), self->GetExactDist(t), t->GetHealthPct());
-                    else if (!c.TargetGuid.IsEmpty())
-                        foe = "цель уже недоступна";
+                    if (Creature* t = ObjectAccessor::GetCreature(*self, foeGuid))
+                        foe = Trinity::StringFormat("{} ({}, {:.0f} ярд, у него {:.0f}%, вёл {})",
+                            t->GetName(), t->GetEntry(), self->GetExactDist(t), t->GetHealthPct(), foeBy);
+                    else if (!foeGuid.IsEmpty())
+                        foe = Trinity::StringFormat("цель уже недоступна (вёл {})", foeBy);
 
                     // ОКРУЖЕНИЕ ТРУПА — именно окружение, а не причина урона (Кодекс).
                     // Землю ищем от своего Z с запасом: трассировка от MAX_HEIGHT цепляет мост
