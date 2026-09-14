@@ -23,6 +23,12 @@ namespace
     inline constexpr float  MASTER_STOP_YARDS    = 15.0f;
     inline constexpr float  MASTER_TALK_YARDS    = 5.0f;
     inline constexpr uint32 FLIGHT_FAIL_MS       = 600000;
+    // ПЛАН ПРИНАДЛЕЖИТ СВОЕЙ ДОРОГЕ ЭТИ СЕКУНДЫ (замер 2026-09-14 04:13-04:31: 274 плана, ноль
+    // взлётов). Две дороги — сдача (`OfSpecies`) и поход (`OfQuest`) — в одном такте обе
+    // спрашивают предпосылку; каждая видела чужой план, снимала его и строила свой: маршруты
+    // графа пятнадцать раз в минуту, и ни один `TakeFlight` не доживал до выбора. Чужой свежий
+    // план не трогаем; несвежий (его дорога не вернулась) — снимаем без отката, как и было.
+    inline constexpr uint32 FLIGHT_PLAN_HOLD_MS  = 5000;
 
     // КАМЕНЬ. Ставится предпосылкой дороги, когда «стоит»: дом на этой карте, цель дальше
     // FlyIfFartherThan, от дома до неё меньше половины пути и экономия не меньше FlyIfSaves.
@@ -81,6 +87,7 @@ namespace
             FlightPlan plan;
             if (!ctx.World.FlightPlanned(&plan) || plan.MasterEntry != bid.About.Id())
                 return false;
+            ctx.St->FlightRoadMs = ctx.NowMs;       // план исполняется — аренда живая
             float const dt = ctx.Act.SliceSeconds();
             uint32 const sliceMs = uint32(dt * 1000.0f);
             float const d = ctx.World.DistanceTo2d(plan.MasterWhere);
@@ -153,10 +160,14 @@ namespace Constellation::Ai
         {
             if (ctx.St->FlightRoad == road)
             {
+                // Аренду продлевает ИСПОЛНЕНИЕ `TakeFlight`, не ставка (Кодекс): ставка, которую
+                // никогда не выбирают, иначе держала бы план вечно.
                 sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
                 return;
             }
-            ctx.World.FlightAbort(0);               // план другой дороги — снять без отката, считать заново
+            if (ctx.NowMs - ctx.St->FlightRoadMs < FLIGHT_PLAN_HOLD_MS)
+                return;                             // чужой, но свежий — не перехватываем
+            ctx.World.FlightAbort(0);               // чужой и брошенный — снять без отката, считать заново
         }
         // НАЧАЛО ДОРОГИ — ЭТО «ДОРОГА СЕЙЧАС НЕ ИДЁТ», а не «к этой цели ещё не ходили»:
         // `Walk.Toward` — исторический след, он переживает бой и не даёт переспросить план при
@@ -175,6 +186,7 @@ namespace Constellation::Ai
         if (ctx.World.PlanFlight(target, &plan))
         {
             ctx.St->FlightRoad = road;
+            ctx.St->FlightRoadMs = ctx.NowMs;
             sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
         }
     }
