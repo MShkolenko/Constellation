@@ -539,7 +539,7 @@ namespace Constellation::Ai
     // если никого — куда по карте (только ради сломанного, полных сумок или большого хлама).
     struct VendorNeed
     {
-        enum Why : uint8 { None, Helpless, Stuffed, Clutter, PassingBy } Reason = None;
+        enum Why : uint8 { None, Helpless, Stuffed, Clutter, PassingBy, Operator } Reason = None;
         bool       NeedSell = false, NeedRepair = false;
         ObjectGuid Near;                // торговец в обзоре (100 ярдов), годный под нужду
         uint32     MapEntry = 0;        // …или вид по карте

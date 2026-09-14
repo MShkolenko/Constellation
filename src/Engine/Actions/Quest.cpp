@@ -676,7 +676,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             VendorNeed const& v = Val<ValueId::VendorTrip>(ctx);
             if (v.Reason != VendorNeed::None)
             {
-                float const rel = (v.Reason == VendorNeed::Helpless || v.Reason == VendorNeed::Stuffed) ? REL_HIGH : REL_NORMAL;
+                float const rel = (v.Reason == VendorNeed::Helpless || v.Reason == VendorNeed::Stuffed || v.Reason == VendorNeed::Operator) ? REL_HIGH : REL_NORMAL;
                 if (v.ByMap)
                     sink.Add(ActionId::VisitVendor, rel, Subject::OfSpecies(v.MapEntry));
                 else

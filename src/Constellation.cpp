@@ -611,6 +611,7 @@ struct Companion
     bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
+    mutable bool VendorAskedByOperator = false; // команда `vend` — идти к торговцу, нужды не требуя; снимает прилавок (const тело)
 };
 
 class Manager
@@ -1046,9 +1047,11 @@ public:
             Creature* vendor = FindVendorNear(c, self, false, false);
             if (!vendor)
                 { ++nobody; continue; }
-            c.VendorGuid = vendor->GetGUID();
+            // КОМАНДА — ОТМЕТКА В СЛОТЕ, А НЕ РЕЖИМ (2026-09-14, шаг 3 удаления лестницы): её
+            // читает `VendorNeedCore` как причину похода (`VendorNeed::Operator`), и движок сам идёт
+            // к торговцу (`VisitVendor`, REL_HIGH). Снимается телом прилавка по факту визита.
+            c.VendorAskedByOperator = true;
             c.VendCooldownMs = 0;
-            Switch(c, self, Behavior::Vending, "команда оператора");
             ++sent;
         }
         handler->PSendSysMessage(
@@ -6503,6 +6506,9 @@ public:
     bool TradeAtCore(Player* self, Creature* vendor, Constellation::Ai::VendorMemory const& mem,
                      Constellation::Ai::VendorSender const& send) const
     {
+        for (Companion const& other : _companions)
+            if (other.Session && other.Session->GetPlayer() == self)
+                { other.VendorAskedByOperator = false; break; }     // команда исполнена — прилавок открыт
         if (vendor->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
         {
             send.ListInventory(send.User, vendor->GetGUID());
@@ -11595,12 +11601,18 @@ public:
         if (worn && !helpless && !stuffed)
             if (Creature* near = FindVendorNearCore(self, mem, false, true))
                 passingBy = self->IsWithinDistInMap(near, 20.0f);
-        if (!(helpless || stuffed || clutter || passingBy))
+        // КОМАНДА ОПЕРАТОРА — повод и без нужды: обе услуги, ближайший торговец в обзоре.
+        Companion const* me = nullptr;
+        for (Companion const& other : _companions)
+            if (other.Session && other.Session->GetPlayer() == self)
+                { me = &other; break; }
+        bool const asked = me && me->VendorAskedByOperator;
+        if (!(helpless || stuffed || clutter || passingBy || asked))
             return false;
         out->Reason = helpless ? VendorNeed::Helpless : stuffed ? VendorNeed::Stuffed
-                    : clutter ? VendorNeed::Clutter : VendorNeed::PassingBy;
-        out->NeedSell = stuffed || clutter;
-        out->NeedRepair = helpless || passingBy;
+                    : clutter ? VendorNeed::Clutter : passingBy ? VendorNeed::PassingBy : VendorNeed::Operator;
+        out->NeedSell = stuffed || clutter || asked;
+        out->NeedRepair = helpless || passingBy;    // по команде ищем ЛЮБОГО продавца (как сама команда); чинит прилавок, если умеет
         if (Creature* vendor = FindVendorNearCore(self, mem, out->NeedSell, out->NeedRepair))
         {
             out->Near = vendor->GetGUID();
