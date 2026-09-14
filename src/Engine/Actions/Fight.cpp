@@ -121,6 +121,12 @@ namespace
             // (сторож подмены у лестницы ровно про это). Свою цель бой доводит до исхода.
             if (ctx.St->Fight.Engaged && ctx.St->Fight.Victim == victim)
                 return true;
+            // МОЙ НАПАДАЮЩИЙ — МОЯ ЦЕЛЬ, ПОКА ОН БЬЁТ (0026 п. 1а, 2026-09-15): ставка Combat на
+            // него полезна ровно столько, сколько он ближайший из бьющих; вступивший бой держится
+            // выше, как любой другой.
+            if (ctx.World.IsInCombat())
+                if (std::optional<ObjectGuid> const a = ctx.World.NearestAttacker(); a && *a == victim)
+                    return true;
             return Val<ValueId::Objectives>(ctx).Fight == victim;
         }
 
@@ -769,6 +775,23 @@ namespace
                 sink.Add(ActionId::KillObjective, REL_HIGH, Subject::OfUnit(ctx.St->Fight.Victim));
                 return;
             }
+
+            // НАПАЛИ, А СВОЕГО БОЯ НЕТ — БИТЬ НАПАДАЮЩЕГО (0026 п. 1а, 2026-09-15). Ни у лестницы,
+            // ни у движка такой ставки не было: `Idle` входил в бой только «нашлась цель квеста»
+            // (`ebf54ef^:3295`), а обход берёт в бой только цели задания. Под ударами не-квестового
+            // моба очередь получала `Rest`, чей `Execute` в бою отказывает (`:641`), или квестовую
+            // дорогу прочь — спутник сидел или шёл под ударами. Замер 22:13–00:13: 33 из 72 гибелей
+            // «цели не было»; две трети быстрых гибелей после подъёма — с решением «перевести дух»,
+            // «сдать квест», «идти за целью». Цена REL_MOVE — та же, что у отхода со сломанным:
+            // выше отдыха, который в бою не исполняется, и выше боя из обхода; сломанный — отходит
+            // (Survival ставит на том же уровне и раньше — порядок регистрации), целый — отвечает.
+            // Память опасности здесь не спрашивается: лестничный `Attacking` тоже бил кого бьют.
+            if (ctx.St && ctx.World.IsInCombat() && ctx.World.BrokenGear() == 0)
+                if (std::optional<ObjectGuid> const a = ctx.World.NearestAttacker())
+                {
+                    sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(*a));
+                    return;
+                }
             ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
 
             // ОТДЫХ ПРЕЖДЕ БОЯ — ОТНОШЕНИЕ, А НЕ ЧИСЛО (постановление Мастера 2026-09-12, п. 3).
