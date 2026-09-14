@@ -1,5 +1,5 @@
 /*
- * Constellation — UseHearthstone and TakeFlight: the two ways a road gets shorter. The fourth
+ * Constellation — the air: the hearthstone read at a road's start and TakeFlight. The fourth
  * item ported after the engine became the master (2026-09-13). The bodies are the ladder's
  * (`HearthWorthCore`/`HearthCastCore`, `PlanFlight`, `FindFlightMasterCore`, `TakeFlightCore`)
  * over the companion's slot; the plan is asked by the travelling actions as a PREREQUISITE of
@@ -28,35 +28,6 @@ namespace
     // смене — маршруты графа раз в шесть секунд. Метка ставится ДО попытки, чтобы и неудачный
     // план ждал минуту (Кодекс).
     inline constexpr uint32 FLIGHT_REPLAN_MS     = 60000;
-
-    // КАМЕНЬ. С 2026-09-14 читается прямо из начала дороги (`AirAtRoadStart`); действие оставлено
-    // зарегистрированным, но ставок на него больше нет — снять вместе с `HearthTarget` при уборке.
-    class UseHearthstoneAction final : public Action
-    {
-    public:
-        UseHearthstoneAction() : Action(ActionId::UseHearthstone) { }
-
-        bool Useful(Ctx& ctx, Bid const& bid) override
-        {
-            return ctx.St && ctx.St->HearthTargetSet && ctx.World.HearthWorth(ctx.St->HearthTarget);
-        }
-
-        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
-
-        bool Execute(Ctx& ctx, Bid const& bid) override
-        {
-            if (!ctx.St)
-                return false;
-            // Откат в слоте выставляет само тело: минута, если ядро каст не начало, десять — если
-            // начало. НАЧАТЫЙ КАСТ — «true»: движок фиксирует действие и выходит из такта, как
-            // лестница выходила `return;` (`:3132`); иначе переочередённая дорога сделала бы шаг
-            // тем же тактом и оборвала бы десятисекундное чтение. Следующий такт держит
-            // страховка `HearthCastMs` (`:2690`). Не начатый — «false»: дорога продолжится пешком.
-            bool const casting = ctx.World.HearthCast(ctx.St->HearthTarget, ctx.Act, ctx.St->Move);
-            ctx.St->HearthTargetSet = false;
-            return casting;
-        }
-    };
 
     // ПОЛЁТ. План уже в слоте (`PlanFlight`, спрошен предпосылкой дороги): к точке мастера, у точки
     // — тот же вид, что в плане; подойти; живой узел, маршрут, оплата, взлёт — общее тело.
@@ -139,7 +110,6 @@ namespace Constellation::Ai
 {
     void RegisterAirActions(Engine& engine)
     {
-        engine.Register(std::make_unique<UseHearthstoneAction>());
         engine.Register(std::make_unique<TakeFlightAction>());
     }
 

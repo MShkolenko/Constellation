@@ -1039,7 +1039,7 @@ public:
                 continue;
             // Команда оператора — идём за обеими услугами сразу, но не требуем ни одной:
             // это ручная проверка, а не автоматика, и отказ «никого нет» тут информативнее.
-            Creature* vendor = FindVendorNear(c, self, false, false);
+            Creature* vendor = FindVendorNearCore(self, Constellation::Ai::VendorMemory(), false, false);   // любой продавец в обзоре, память не нужна
             if (!vendor)
                 { ++nobody; continue; }
             // КОМАНДА — ОТМЕТКА В СЛОТЕ, А НЕ РЕЖИМ (2026-09-14, шаг 3 удаления лестницы): её
@@ -1341,11 +1341,6 @@ public:
         m.PathTargetX = tx;                 // цель прежняя: пересчёт пойдёт с нового места
         m.PathTargetY = ty;
         return true;
-    }
-
-    bool Unstick(Companion& c, Player* self, float tx, float ty)
-    {
-        return UnstickCore(c.Move, self, &SendThroughSession, &c, tx, ty);
     }
 
 
@@ -2843,49 +2838,6 @@ public:
             c.EngineMapId = self->GetMapId();
         }
 
-        // ============================== ТЕНЬ ==============================
-        //
-        // Движок выбирает и пишет «ТЕНЬ <имя>: выбрал бы X», а решает по-прежнему лестница
-        // ниже. Никакого `return`: управление уходит в `switch`, как будто тени и нет.
-        //
-        // НЕ ОГРАНИЧЕНА `Owns`, и это намеренно. `Owns` ложно для всех веток и останется
-        // ложно до первого переноса — тень, ограниченная владением, не запустилась бы
-        // никогда, то есть ворота, которыми её объявили, не существовали бы.
-        //
-        // Исполнять она не может ПО ТИПУ, а не по тому, что её никто не зовёт. Дверь
-        // заглушена (`muted`), и это важнее, чем кажется: `Ctx` раздаёт ИЗМЕНЯЕМЫЙ
-        // `ClientAct` всем виртуальным крючкам — включая `Trigger::Check` и `Action::Cancel`,
-        // который зовётся при смене эпохи. «`Execute` не зовётся» — свойство сегодняшнего
-        // кода, а заглушённая дверь — свойство типа (Кодекс, проход по шагу 10).
-
-        // ============================ ШОВ ДВИЖКА ============================
-        //
-        // Один `if`, в одном месте, за флагом. Всё, что выше него — подтверждения
-        // телепорта, счётчики, особые состояния — остаётся вне очереди ставок НАМЕРЕННО:
-        // ставку можно перебить, зарубить множителем, выронить по крышке очереди или
-        // просрочить, а без подтверждения телепорта семафор ядра не снимается и призрак
-        // стоит на месте смерти навсегда (см. :2038).
-        //
-        // `Owns` сегодня ложно для всех веток, а `Seal()` отказывается стать готовым,
-        // пока не зарегистрировано ни одного действия. Значит шов ложится ИНЕРТНЫМ, и
-        // это проверяется, а не обещается.
-        // ДВА ВОРОТА У ОДНОГО ШВА, И ЭТО НЕ ВТОРОЙ ШОВ (постановление Мастера, 2026-09-11, п. 1).
-        //
-        // `Owns(режим)` — ворота ФИНАЛЬНОГО удаления: ветка переехала целиком, её тело стёрто в
-        // том же коммите, движок владеет режимом. Сегодня ложь для всех.
-        //
-        // Ворота ПО НАМЕРЕНИЮ — арбитраж боя. Замер 2026-09-11 (движок вживую, 15 минут) и разбор
-        // Кодекса: шов в `Idle` отдаёт лестнице всё, что не `Idle`, а лестница начинает тот же бой
-        // сама — `Travelling → ApproachingTarget → Attacking` (`:3871`, «цель показалась») — то
-        // есть два контроллера одного намерения, пусть и по очереди. Поэтому в трёх режимах, из
-        // которых у лестницы начинается бой, движок получает ход ПЕРВЫМ с одной стратегией —
-        // `Combat` — и ход уходит лестнице только когда у движка боевой ставки НЕТ (`Idle`-исход;
-        // не «когда `Execute` вернул ложь»: неудавшийся `Execute` мог уже написать в мир —
-        // контракт `Attempted`, 2026-09-10). Это и есть приоритет самой лестницы: она тоже уходит
-        // из похода в тот миг, когда видит цель.
-        //
-        // Маска — ТОЛЬКО бой, и только если бой включён в конфиге: квестовые и отдыхающие ставки
-        // здесь не ставятся, они не отбирают у лестницы её походы и разговоры.
         // ЛЕСТНИЦЫ БОЛЬШЕ НЕТ (2026-09-14, шаг 4 переноса, постановление Мастера 11:05). Здесь стоял
         // `switch (c.Mode)` на двенадцать режимов — 1 800 строк — и шов, по которому движок брал
         // бой в трёх из них, и тень, которая выбирала, не исполняя. Всё поведение теперь — один
@@ -3085,78 +3037,6 @@ public:
                 return true;
         }
         return false;
-    }
-
-    // ПАЛИТРА: ЧТО У ЭТОГО КЛАССА ВООБЩЕ ЕСТЬ, ОДИН РАЗ НА СПУТНИКА.
-    //
-    // Без неё ротацию не спроектировать: нельзя решать, что чем сменять, не видя списка.
-    // Пишем ресурс (его вид и запас) и КАЖДОЕ непассивное заклинание книги — с уровнем,
-    // стоимостью, временем произнесения, пометкой «бьёт/лечит/никак» и причиной, по
-    // которой отбор его не берёт. Именно каждое, включая отвергнутые: дамп, печатающий
-    // только прошедшее через фильтр, уже один раз соврал здесь про пустую книгу мага.
-    void DumpPalette(Companion& c, Player* self)
-    {
-        if (c.PaletteDumped)
-            return;
-        c.PaletteDumped = true;
-
-        Difficulty const diff = self->GetMap()->GetDifficultyID();
-        Powers const pw = self->GetPowerType();
-        TC_LOG_INFO("server.worldserver",
-            "Constellation ПАЛИТРА {} класс {} ур {}: ресурс {} = {}/{}",
-            self->GetName(), uint32(self->GetClass()), uint32(self->GetLevel()),
-            uint32(pw), self->GetPower(pw), self->GetMaxPower(pw));
-
-        // СЫРОЙ, А НЕ ОТФИЛЬТРОВАННЫЙ. Печатаем КАЖДУЮ непассивную запись книги вместе с
-        // причиной, по которой отбор её не берёт. Ровно это правило записано в 0005 после
-        // истории с монахом: удобный вид скрыл настоящую запись, и проверявший честно
-        // подтвердил пустоту. Пусть лучше в журнале будет лишняя строка, чем вывод «у
-        // класса ничего нет», который нечем перепроверить.
-        for (auto const& [id, ps] : self->GetSpellMap())
-        {
-            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
-            if (!si || si->IsPassive())
-                continue;
-
-            bool const hurts = SpellDoes(si, false, diff);
-            bool const heals = !hurts && SpellDoes(si, true, diff);
-            char const* kind = hurts ? "бьёт" : heals ? "лечит" : "никак";
-
-            // ПОЧЕМУ ОТБОР ЭТО НЕ ВОЗЬМЁТ — первая же несданная проверка, в том же порядке.
-            char const* why = "годится";
-            if (!self->HasActiveSpell(id))                           why = "нет-в-книге";
-            else if (!hurts && !heals)                               why = "не-бьёт-не-лечит";
-            else if (hurts && si->IsPositive())                      why = "доброе";
-            else if (hurts && !si->NeedsExplicitUnitTarget())        why = "без-цели";
-            else if (si->IsAffectingArea() || si->IsTargetingArea()) why = "площадь";
-            else if (!si->CanBeUsedInCombat(self))                   why = "нельзя-в-бою";
-            else if (!self->GetSpellHistory()->IsReady(si))          why = "не-готово-в-этот-миг";
-
-            // стоимость: вид ресурса и сколько. Считает ядро, не я.
-            int32 amount = 0; uint32 power = uint32(POWER_MANA);
-            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
-                if (cost.Amount > 0) { amount = cost.Amount; power = uint32(cost.Power); break; }
-
-            // ФОРМА ЗАКЛИНАНИЯ: номер эффекта, а через «>» — что он запускает, если
-            // запускает. Ровно здесь видно разницу, невидимую на экране: у одного
-            // прямой эффект урона, у другого эффект «запусти вот это», и урон уже там.
-            std::string shape;
-            for (SpellEffectInfo const& eff : si->GetEffects())
-            {
-                if (!shape.empty())
-                    shape += ",";
-                shape += std::to_string(uint32(eff.Effect));
-                if (eff.TriggerSpell)
-                    shape += ">" + std::to_string(eff.TriggerSpell);
-                if (eff.ApplyAuraName)
-                    shape += "/аура" + std::to_string(uint32(eff.ApplyAuraName));
-            }
-
-            TC_LOG_INFO("server.worldserver",
-                "Constellation ПАЛИТРА {} класс {}: {} закл {} ур {} цена {}/{} каст {} мс [{}] эфф {}",
-                self->GetName(), uint32(self->GetClass()), kind, id, si->SpellLevel,
-                amount, power, si->CalcCastTime(), why, shape);
-        }
     }
 
     // ТОЧКА, В КОТОРУЮ НАДО ИДТИ, ЧТОБЫ ЗАГОВОРИТЬ — НЕ САМА ЦЕЛЬ.
@@ -4207,61 +4087,6 @@ public:
         return both ? both : any;
     }
 
-    // ПАМЯТЬ ЛЕСТНИЦЫ — те же контейнеры и счётчики спутника, что стояли в этих телах.
-    static bool VendSellRefusedFor(void const* u, ObjectGuid g) { return static_cast<Companion const*>(u)->SellRefused.count(g) != 0; }
-    static bool VendNoSellFor(void const* u, uint32 e)          { return static_cast<Companion const*>(u)->VendorNoSell.count(e) != 0; }
-    static void VendNoteSellRefusedFor(void* u, ObjectGuid g)   { static_cast<Companion*>(u)->SellRefused[g] = 600000; }
-    static void VendNoteNoSellFor(void* u, uint32 e)            { static_cast<Companion*>(u)->VendorNoSell[e] = 600000; }
-    static void VendNotePoorFor(void* u)                        { ++static_cast<Companion*>(u)->VendPoor; }
-    static void VendNoteSoldFor(void* u, uint32 sold, uint64 earned) { Companion* c = static_cast<Companion*>(u); c->VendSold += sold; c->VendEarned += earned; }
-    static void VendNoteRepairedFor(void* u)                    { ++static_cast<Companion*>(u)->VendRepaired; }
-    static Constellation::Ai::VendorMemory VendorMemoryOf(Companion& c)
-    {
-        Constellation::Ai::VendorMemory m;
-        m.SellRefused = &VendSellRefusedFor; m.NoSell = &VendNoSellFor;
-        m.NoteSellRefused = &VendNoteSellRefusedFor; m.NoteNoSell = &VendNoteNoSellFor;
-        m.NotePoor = &VendNotePoorFor; m.NoteSold = &VendNoteSoldFor; m.NoteRepaired = &VendNoteRepairedFor;
-        m.User = &c;
-        return m;
-    }
-    static void VendListFor(void* u, ObjectGuid vendor)
-    {
-        WorldPacket raw(CMSG_LIST_INVENTORY);
-        WorldPackets::NPC::Hello list(std::move(raw));
-        list.Unit = vendor;
-        static_cast<Companion*>(u)->Session->HandleListInventoryOpcode(list);
-    }
-    static void VendSellFor(void* u, ObjectGuid vendor, ObjectGuid item, uint32 amount)
-    {
-        WorldPacket raw(CMSG_SELL_ITEM);
-        WorldPackets::Item::SellItem sell(std::move(raw));
-        sell.VendorGUID = vendor;
-        sell.ItemGUID = item;
-        sell.Amount = amount;
-        static_cast<Companion*>(u)->Session->HandleSellItemOpcode(sell);
-    }
-    static void VendRepairFor(void* u, ObjectGuid vendor)
-    {
-        WorldPacket raw(CMSG_REPAIR_ITEM);
-        WorldPackets::Item::RepairItem fix(std::move(raw));
-        fix.NpcGUID = vendor;
-        fix.ItemGUID = ObjectGuid::Empty;   // пусто = «починить всё»
-        fix.UseGuildBank = false;
-        static_cast<Companion*>(u)->Session->HandleRepairItemOpcode(fix);
-    }
-    static Constellation::Ai::VendorSender VendorSenderOf(Companion& c)
-    {
-        Constellation::Ai::VendorSender s;
-        s.ListInventory = &VendListFor; s.Sell = &VendSellFor; s.Repair = &VendRepairFor; s.User = &c;
-        return s;
-    }
-
-    // Обёртки лестницы — подписи прежние.
-    Creature* FindVendorNear(Companion const& c, Player* self, bool needSell, bool needRepair) const
-    {
-        return FindVendorNearCore(self, VendorMemoryOf(const_cast<Companion&>(c)), needSell, needRepair);
-    }
-
     // ПРОДАТЬ ХЛАМ — ПО ОДНОМУ ПРЕДМЕТУ, ПОТОМУ ЧТО ПАЧКОЙ ЭТА СБОРКА НЕ УМЕЕТ.
     //
     // Кодекс советовал CMSG_SELL_ALL_JUNK_ITEMS: ядро само знает, что серое — это мусор,
@@ -4547,11 +4372,6 @@ public:
         return count;
     }
 
-    uint32 SellableCount(Companion const& c, Player* self) const
-    {
-        return SellableCountCore(self, VendorMemoryOf(const_cast<Companion&>(c)));
-    }
-
     uint32 BagCapacity(Player* self) const
     {
         uint32 cap = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
@@ -4636,11 +4456,6 @@ public:
         return sold;
     }
 
-    uint32 SellJunkTo(Companion& c, Player* self, Creature* vendor)
-    {
-        return SellJunkToCore(self, vendor, VendorMemoryOf(c), VendorSenderOf(c));
-    }
-
     // ПОЧИНИТЬСЯ — ПАКЕТОМ, А НЕ ПРЯМЫМ ВЫЗОВОМ.
     //
     // Пустой ItemGUID означает «починить всё», ровно как кнопка клиента. Обработчик сам
@@ -4698,11 +4513,6 @@ public:
         return true;
     }
 
-    bool RepairAt(Companion& c, Player* self, Creature* vendor)
-    {
-        return RepairAtCore(self, vendor, VendorMemoryOf(c), VendorSenderOf(c));
-    }
-
     // ПРИЛАВОК ОТКРЫТ — тело из `Vending` (`:3604-3650`): продать, починить, страховка от тупика.
     // Кулдаун и выход — у вызывающего: это память механизма.
     bool TradeAtCore(Player* self, Creature* vendor, Constellation::Ai::VendorMemory const& mem,
@@ -4735,36 +4545,8 @@ public:
         return repaired || !stillPoor;
     }
 
-    // ОБОБРАТЬ ТРУП — ЧЕТЫРЬМЯ ПАКЕТАМИ, В ТОМ ЖЕ ПОРЯДКЕ, ЧТО ШЛЁТ КЛИЕНТ.
-    //
-    // Возвращает true, если с этим трупом закончили (успешно или нет) — вызывающий тогда
-    // забывает его. Всё делается за ОДИН заход: спутник после ближнего боя уже стоит
-    // вплотную, а ходьбу к трупу первая версия не умеет и честно считает, сколько раз она
-    // была бы нужна.
-    // ЗАБРАТЬ ИЗ УЖЕ ОТКРЫТОГО ВИДА ДОБЫЧИ.
-    //
-    // Вынесено из LootFromCorpse без единого изменения смысла: труп и объект на земле
-    // отличаются только тем, ЧЕМ вид открывается — CMSG_LOOT_UNIT против CMSG_GAME_OBJ_USE.
-    // Дальше ядро наполняет один и тот же m_AELootView, поэтому деньги, предметы, отчёт и
-    // освобождение вида — общие. Второй такой процедуры заводить нельзя (ступень 2
-    // лестницы: сперва ищем, что уже написано).
-    //
-    // Возвращает, сколько предметов было ЗАПРОШЕНО; сколько реально легло, считает и
-    // печатает сама — по свободному месту до и после, а не по числу запросов.
-    // Возвращает, сколько предметов РЕАЛЬНО ЛЕГЛО (не запрошено): Кодекс верно указал, что
-    // счётчик по запросам называет успехом заход, с которого ничего не взяли.
-    // ---------------------------------------------------------------------------------------
-    // ЛУТ — ОДНО ТЕЛО НА ДВА МЕХАНИЗМА; кто шлёт пакет — параметр.
-    //
-    // Замер 2026-09-11, движок вживую пятнадцать минут: его бой не лутил — предметы заданий не
-    // собирались, квесты не закрывались, — потому что исход боя у лестницы живёт здесь, а
-    // `KillObjective` шёл мимо. Форма подъёма — та же, что у мовера: тело в `...Core`, лестница
-    // держит обёртки с прежними подписями (вызовы в ветках не меняются — `:4919`, `:5592`),
-    // движок получит те же четыре отправки через дверь `ClientAct`. Что брать, сколько влезет и
-    // как считать лёгшее — ПОЛИТИКА, и она одна.
-    //
-    // Четыре отправки лестницы — над сессией спутника, тела дословно из прежних функций.
-    // ---------------------------------------------------------------------------------------
+    // ЛУТ СБОРА ЕЩЁ ИДЁТ ЧЕРЕЗ СЕССИЮ: общее тело `GatherOpenCore` берёт добычу через `TakeOpenLoot`
+    // с этим отправщиком; перевод на дверь `ClientAct` — в backlog после переноса.
     static bool LadderLootOpen(void* user, ObjectGuid unit)
     {
         Companion& c = *static_cast<Companion*>(user);
@@ -4994,12 +4776,6 @@ public:
         return true;
     }
 
-    // Обёртка лестницы: подпись прежняя, вызов в `Attacking` (`:5592`) не тронут.
-    bool LootFromCorpse(Companion& c, Player* self)
-    {
-        return LootFromCorpseCore(self, c.LootTarget, LadderLootSender(c), c.Loot);
-    }
-
     // САМОЛЕЧЕНИЕ: ТОТ ЖЕ ОБХОД КНИГИ, НО ЛЕЧАЩЕЕ И НА СЕБЯ.
     //
     // Порог 35 % — первое защитимое правило (Кодекс), и он же назвал, чем его заменить
@@ -5061,31 +4837,6 @@ public:
     // `Unit.cpp:12307`) и остановка её же мовером перед читаемым заклинанием.
     // ---------------------------------------------------------------------------------------
     struct LadderCastBinding { Companion* C; Player* Self; };
-
-    static bool LadderCastSpell(void* user, uint32 spellId, ObjectGuid target)
-    {
-        LadderCastBinding& b = *static_cast<LadderCastBinding*>(user);
-        WorldPacket raw(CMSG_CAST_SPELL);
-        WorldPackets::Spells::CastSpell cast(std::move(raw));
-        // ИДЕНТИФИКАТОР КАСТА ЛЕПИМ ТАК ЖЕ, КАК ЕГО ЛЕПИТ САМО ЯДРО (Unit.cpp:12307).
-        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
-            b.Self->GetMapId(), spellId, b.Self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-        cast.Cast.SpellID = int32(spellId);
-        cast.Cast.Target.Flags = TARGET_FLAG_UNIT;
-        cast.Cast.Target.Unit = target;
-        // MoveUpdate НЕ ЗАПОЛНЯЕМ: обработчик при нём прогоняет CMSG_MOVE_STOP через
-        // HandleMovementOpcode, а тот ЗАМЕЩАЕТ всё состояние движения — ровно та ловушка,
-        // на которой пришлось разбираться с поворотом к цели.
-        b.C->Session->HandleCastSpellOpcode(cast);
-        return true;
-    }
-
-    static bool LadderCastStop(void* user)
-    {
-        LadderCastBinding& b = *static_cast<LadderCastBinding*>(user);
-        Manager::Instance()->StopMoving(*b.C, b.Self);
-        return true;
-    }
 
     bool CastAtTargetCore(Player* self, Unit* victim,
                           Constellation::Ai::CastSender const& send, Constellation::Ai::CastMemory& m)
@@ -5194,17 +4945,6 @@ public:
                 maxPw ? Trinity::StringFormat("{}%", self->GetPower(pw) * 100 / maxPw) : std::string("нет"));
         }
         return false;
-    }
-
-    // Обёртка лестницы: подпись прежняя, вызов в `Attacking` (`:5697`) не тронут. Прибор
-    // палитры — здесь, первым, как и стоял: приборы остаются лестнице до переезда ветки.
-    bool CastAtTarget(Companion& c, Player* self, Unit* victim)
-    {
-        DumpPalette(c, self);
-        LadderCastBinding bind{ &c, self };
-        Constellation::Ai::CastSender send;
-        send.Cast = &LadderCastSpell; send.Stop = &LadderCastStop; send.User = &bind;
-        return CastAtTargetCore(self, victim, send, c.Cast);
     }
 
     // ЕДИНСТВЕННОЕ МЕСТО, ГДЕ РЕШАЕТСЯ «МОЖНО ЛИ НАМ ДРАТЬСЯ».
@@ -5325,21 +5065,6 @@ public:
                     ++damaged;
             }
         return damaged;
-    }
-
-    // МОГУ ЛИ Я ВООБЩЕ НАНОСИТЬ УРОН — один вопрос вместо «сломан ли» и «изношен ли».
-    //
-    // GetWeaponForAttack(..., useable=true) возвращает nullptr И на сломанном оружии, И на
-    // пустой руке — то есть ровно в обоих случаях, когда бить нечем. Прежние счётчики
-    // пустую руку молча пропускали, и спутник без оружия считался исправным.
-    //
-    // ПРЕДЕЛ НАЗВАН: заклинателю оружие для заклинания не нужно, и он тут будет признан
-    // «не могущим бить» слишком рано. Это осознанно: без оружия он всё равно теряет и
-    // автоудар, и жезл, а различать классы по книге заклинаний здесь — это тот же обход
-    // книги на каждом такте, от которого мы уже отказались в другом месте.
-    bool CannotFight(Player* self) const
-    {
-        return self->GetWeaponForAttack(BASE_ATTACK, true) == nullptr;
     }
 
     void LogFightOutcome(Player* self, Unit* victim, char const* how, Companion& c)
@@ -5473,76 +5198,6 @@ public:
         if (out)
             *out = owner->GetPosition();
         return true;
-    }
-
-    // выбрать цель и ударить — ровно то, что делает игрок мышью
-    bool TryAttack(Companion& c, Player* self, Creature* target)
-    {
-        WorldPacket rawSel(CMSG_SET_SELECTION);
-        WorldPackets::Misc::SetSelection sel(std::move(rawSel));
-        sel.Selection = target->GetGUID();
-        c.Session->HandleSetSelectionOpcode(sel);
-
-        FaceTarget(c, self, target);        // иначе ядро ответит BadFacing и не ударит
-        WorldPacket rawSwing(CMSG_ATTACK_SWING);
-        WorldPackets::Combat::AttackSwing swing(std::move(rawSwing));
-        swing.Victim = target->GetGUID();
-        c.Session->HandleAttackSwingOpcode(swing);
-
-        // проверяем ПОСЛЕДСТВИЕ, а не факт вызова: сокета нет, ответа не будет
-        if (self->GetVictim() == target)
-        {
-            ++_fightsStarted;
-            // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою.
-            // Register заводит запись, если её ещё нет; обработчики урона делают только
-            // find(), поэтому персонажи оператора в счёт не попадают.
-            Manager::Blows const b = Manager::Instance()->RegisterAndSnapshot(self->GetGUID());
-            c.SwingsAtStart = b.Swings;
-            c.LandedAtStart = b.Landed;
-            c.ZeroedAtStart = b.Zeroed;
-            c.DealtAtStart  = b.Dealt;
-            c.HitsAtStart   = b.Hits;
-            c.TakenAtStart  = b.Taken;
-            c.KillsAtStart  = b.Kills;
-            c.GateTicks = c.GateEvading = c.GateBusy = 0;
-            c.GateNoState = c.GateOutOfRange = c.GateBadFacing = 0;
-            c.GateNotReady = c.VictimSwaps = 0;
-            c.CastMs = 1500;            // первое решение — сразу, а не через полторы секунды
-            c.Cast.CastsTried = c.Cast.CastsWent = c.Cast.LastSpell = 0;
-            c.Cast.CastsBusy = c.CastsDiedUnder = 0;
-            c.Cast.CastFailNoted = false;
-            c.Cast.WasCasting = false;
-            c.DamageVictim = target->GetGUID();
-            c.VictimHp = b.Dealt;       // отсечка сторожа: урон НА НАЧАЛО этого боя
-            c.NoDamageMs = 0;
-            c.FightVictim = target->GetGUID();
-            c.FightVictimName = target->GetName();
-            c.FightVictimEntry = target->GetEntry();
-            // ХАРАКТЕРИСТИКА ЦЕЛИ В МОМЕНТ НАЧАЛА БОЯ. Исход пишется не всегда (ядро
-            // очищает жертву при её смерти, и ветка победы почти не срабатывает), а
-            // начало — всегда. Без этого нельзя сравнить того, кого спутники бьют, с
-            // тем, от кого гибнут: по базе у них одна настройка содержимого и один
-            // множитель здоровья, а в мире — разное.
-            if (c.FightsLogged < 3)
-            {
-                ++c.FightsLogged;
-                TC_LOG_INFO("server.worldserver",
-                    "Constellation БОЙ-НАЧАЛО {} (ур {}/эфф {}, жизни {}) -> {} ({}): сырой ур {}, ДЛЯ НАС ур {}, "
-                    "жизней сырых {} / для нас {:.0f}, его урон x{:.2f}, его броня x{:.2f}",
-                    self->GetName(), uint32(self->GetLevel()), uint32(self->GetEffectiveLevel()), self->GetMaxHealth(),
-                    target->GetName(), target->GetEntry(),
-                    uint32(target->GetLevel()), uint32(target->GetLevelForTarget(self)),
-                    target->GetMaxHealth(),
-                    float(target->GetMaxHealth()) * target->GetHealthMultiplierForTarget(self),
-                    target->GetDamageMultiplierForTarget(self),
-                    target->GetArmorMultiplierForTarget(self));
-            }
-            return true;
-        }
-        TC_LOG_INFO("server.worldserver", "Constellation: {} — удар по {} ({}) не принят: жертва {}, дистанция {:.1f}",
-            self->GetName(), target->GetName(), target->GetEntry(),
-            self->GetVictim() ? self->GetVictim()->GetName() : "нет", self->GetExactDist2d(target));
-        return false;
     }
     // ВЗЯТИЕ КВЕСТА — цепочкой опкодов, и выбор ТОЖЕ клиентский.
     //
@@ -5790,179 +5445,6 @@ public:
             }
             return;                             // по одному за раз, как человек
         }
-    }
-    // КОМУ СДАВАТЬ И ГДЕ ОН СТОИТ.
-    //
-    // Оператор: «у квестодателей и принимающих есть конкретные точки, их не надо
-    // искать, а идти к ним». Так и делает игрок: журнал показывает метку возврата.
-    //
-    // ЦЕНА. Первая версия перебирала ВСЕ спавны мира — и делала это каждый такт у
-    // каждого стоящего спутника. Кодекс посчитал: 122 спутника на 4 Гц дают 488
-    // полных обходов мира в СЕКУНДУ, в потоке обновления мира. На стенде с восемью
-    // ботами это не проявилось никак. Теперь указатель строится ОДИН РАЗ при
-    // загрузке, а поиск идёт только по нужному виду на нашей карте.
-    bool FindTurnIn(Companion& c, Player* self) const
-    {
-        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-        {
-            uint32 qid = self->GetQuestSlotQuestId(slot);
-            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
-                continue;
-            if (c.TurnInBackoff.count(qid))      // недавно не вышло — не долбимся
-                continue;
-            if (c.Impossible.count(qid))         // закрыть нечем — и не станет
-                continue;
-            Quest const* quest = sObjectMgr->GetQuestTemplate(qid);
-            if (!quest || !self->CanRewardQuest(quest, false))
-                continue;
-
-            // САМОСТОЯТЕЛЬНАЯ СДАЧА — ПО ФЛАГУ ЯДРА, А НЕ ПО ОТСУТСТВИЮ ПРИНИМАЮЩЕГО.
-            //
-            // Повод: оператор увидел двух эльфов второго уровня, стоящих на месте, — в
-            // живом журнале 4007 попыток сдать квест 55660 «Time Trials», у которого нет
-            // строки в creature_questender.
-            //
-            // Первая версия объявила самосдаваемым ЛЮБОЙ квест без принимающего-НПС. Это
-            // была догадка, и Кодекс её снёс, а замер по базе подтвердил его правоту:
-            // без принимающего и без флага — 19 868 квестов, а настоящих самосдаваемых —
-            // 4 733. Ошибка вчетверо, и не в безопасную сторону.
-            //
-            // Разрешение выдаёт САМО ЯДРО, и одной строкой: HandleQuestgiverCompleteQuest
-            // пропускает режим самосдачи только при QUEST_FLAGS_AUTO_COMPLETE, иначе
-            // требует, чтобы объект ЧИСЛИЛСЯ принимающим, — а объект в этом режиме сам
-            // игрок. Спрашиваем ровно этот флаг. У 55660 его, к слову, нет.
-            if (quest->HasFlag(QUEST_FLAGS_AUTO_COMPLETE))
-            {
-                c.TurnInQuest = qid;
-                c.TurnInPosFromTable = false;
-                c.TurnInEntry = 0;              // 0 = сдать самому себе, никуда не идти
-                c.TurnInPos = self->GetPosition();
-                c.TurnInDist = 0.0f;
-                return true;
-            }
-
-            bool anyEnder = false, summoned = false;
-            for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
-            {
-                anyEnder = true;            // принимающий В МИРЕ есть — приговора не будет
-                if (!_spawnedSomewhere.count(enderEntry))
-                    summoned = true;        // его нигде не ставят — значит призывают
-                auto mapIt = _spawns.find(self->GetMapId());
-                if (mapIt == _spawns.end())
-                    continue;
-                auto entryIt = mapIt->second.find(enderEntry);
-                if (entryIt == mapIt->second.end())
-                    continue;
-                Position const* bestSpawn = nullptr;
-                float bestDist = 100000.0f;
-                for (Position const& pos : entryIt->second)
-                {
-                    float d = self->GetExactDist2d(pos.GetPositionX(), pos.GetPositionY());
-                    if (d < bestDist)
-                        { bestDist = d; bestSpawn = &pos; }
-                }
-                if (!bestSpawn)
-                    continue;
-                c.TurnInQuest = qid;
-                c.TurnInEntry = enderEntry;
-                c.TurnInPos = *bestSpawn;
-                c.TurnInPosFromTable = true;
-                c.TurnInDist = bestDist;
-                return true;
-            }
-
-            // ПРИНИМАЮЩИЙ, КОТОРОГО ПРИЗЫВАЮТ, СТОИТ РЯДОМ, А НЕ НА ТОЧКЕ.
-            //
-            // Тариндрелла (49480) принимает «The Woodland Protector» у семерых ночных эльфов и
-            // не имеет в мире НИ ОДНОЙ точки появления: её призывает Дентария заклинанием при
-            // сдаче предыдущего квеста, а держит spell_area (аура 92237 на площади 257, пока
-            // квест в журнале). Такой NPC ходит за игроком — и найти его можно только живым.
-            // Обзор дорогой, поэтому: лишь для видов, которых нет в мире нигде, не чаще раза в
-            // десять секунд, и с отсрочкой квесту, если рядом никого.
-            if (summoned && !c.LiveEnderMs)
-            {
-                c.LiveEnderMs = 10000;
-                std::list<Creature*> near;
-                Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
-                Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
-                Cell::VisitGridObjects(self, searcher, 60.0f);
-                Creature* live = nullptr;
-                float bestLive = 100000.0f;
-                for (Creature* cr : near)
-                {
-                    if (!cr->IsAlive())
-                        continue;
-                    // ЧУЖОЙ ЛИЧНЫЙ ПРИЗЫВ — НЕ НАШ ПРИНИМАЮЩИЙ. Такой NPC принадлежит другому
-                    // игроку, и ядро всё равно не даст с ним говорить (WorldObject::_privateObjectOwner).
-                    if (cr->IsPrivateObject() && cr->GetPrivateObjectOwner() != self->GetGUID())
-                        continue;
-                    bool mine = false;
-                    for (auto const& [_, enderEntry] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
-                        if (cr->GetEntry() == enderEntry && !_spawnedSomewhere.count(enderEntry))
-                            { mine = true; break; }
-                    if (!mine)
-                        continue;
-                    float const d = self->GetExactDist(cr);
-                    if (d < bestLive)
-                        { bestLive = d; live = cr; }
-                }
-                if (live)
-                {
-                    c.TurnInQuest = qid;
-                    c.TurnInEntry = live->GetEntry();
-                    c.TurnInGuid = live->GetGUID();
-                    c.TurnInPos = live->GetPosition();
-                    c.TurnInPosFromTable = false;   // это ЖИВОЕ существо: высота у него своя (Кодекс)
-                    c.TurnInDist = bestLive;
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation СДАЧА {}: принимающий {} ({}) квеста {} нигде не появляется — он призван и стоит в {:.0f} ярдах, иду к нему",
-                        self->GetName(), live->GetName(), live->GetEntry(), qid, bestLive);
-                    return true;
-                }
-                c.TurnInBackoff[qid] = 300000;      // призванного рядом нет — не искать каждый обзор
-            }
-
-            // ПРИГОВОР — ТОЛЬКО ЗА УСТРОЙСТВО КВЕСТА, А НЕ ЗА ТО, ГДЕ МЫ СТОИМ.
-            //
-            // Кодекс остановил этим выкладку, и правильно: поиск точки идёт по ТЕКУЩЕЙ
-            // карте спутника, а первая редакция приговаривала квест, если точки на ней
-            // не нашлось. То есть принимающий на другой карте означал «никогда» — и
-            // спутник, доехавший туда позже, сдать бы уже не смог. Регрессию внёс я,
-            // вместе с самой пометкой, часом раньше.
-            //
-            // Навсегда помечаем ровно тот случай, который и наблюдался: принимающего нет
-            // НИ СРЕДИ СУЩЕСТВ, НИ СРЕДИ ОБЪЕКТОВ, и флага самосдачи тоже нет. По замеру
-            // базы это 19 868 квестов — их закрывают сценарии и события, которые модулю
-            // изображать незачем. Всё остальное просто ждёт: FindTurnIn вернёт false,
-            // спутник займётся делом и попробует снова, когда окажется где надо.
-            //
-            // lazy: 970 квестов принимает ИГРОВОЙ ОБЪЕКТ — они сюда НЕ попадают (проверяем
-            // и эту таблицу), но и сдать их модуль пока не умеет. Задача 0020.
-            if (!anyEnder && sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).begin()
-                             == sObjectMgr->GetGOQuestInvolvedRelationReverseBounds(qid).end())
-            {
-                // МОДУЛЬ НЕ БРОСАЕТ КВЕСТЫ — НИКАКИЕ (оператор, 2026-09-03).
-                //
-                // Здесь стоял единственный сброс: выполненный праздничный квест без принимающего.
-                // Условие было из пяти пунктов и подходило во всей базе к 227 квестам — заглушкам
-                // REUSE и <NYI>, подаркам праздников. Сработало оно за всё время РОВНО на одном,
-                // 55660 'Time Trials', 97 раз, и каждый раз ядро возвращало квест обратно, потому
-                // что раздаёт такие само (QUEST_FLAGS_EX_AUTO_PUSH, Player::PushQuests).
-                //
-                // После того как 55660 закрыли условием уровня в базе мира, живого случая у
-                // правила не осталось — остался только теоретический вред: выполненный праздничный
-                // квест, награду которого выдаёт сценарий, при сбросе потерял бы выполнение.
-                // Мёртвый код, умеющий разрушать прогресс, хуже отсутствия кода.
-                //
-                // Вместо сброса — пометка ниже. Спутник перестаёт ходить к такому квесту, журнал
-                // говорит почему, слот занят одним из двадцати пяти, и НИЧЕГО не разрушено.
-                if (c.Impossible.insert(qid).second)
-                    TC_LOG_INFO("server.worldserver", "Constellation: {} — квест {} '{}' закрыть нечем: {}",
-                        self->GetName(), qid, quest->GetLogTitle(),
-                        SeasonalKind(quest) ? "сезонный, вне своего события" : "ни принимающего, ни флага самосдачи");
-            }
-        }
-        return false;
     }
 
     // Указатель «карта -> вид -> где стоит», построенный один раз.
@@ -6361,45 +5843,6 @@ public:
         TC_LOG_INFO("server.worldserver", "Constellation: {} — сдача квеста {} не прошла ({})",
             self->GetName(), questId, ender.IsEmpty() ? "самому себе" : "у принимающего");
         return false;
-    }
-
-    // ОТПРАВИТЕЛЬ ЛЕСТНИЦЫ — те же три пакета через её сессию, что стояли в этом теле.
-    static void TurnInHelloFor(void* u, ObjectGuid ender)
-    {
-        WorldPacket raw(CMSG_QUEST_GIVER_HELLO);
-        WorldPackets::Quest::QuestGiverHello hello(std::move(raw));
-        hello.QuestGiverGUID = ender;
-        static_cast<Companion*>(u)->Session->HandleQuestgiverHelloOpcode(hello);
-    }
-    static void TurnInCompleteFor(void* u, ObjectGuid ender, uint32 questId)
-    {
-        Companion* c = static_cast<Companion*>(u);
-        WorldPacket raw(CMSG_QUEST_GIVER_COMPLETE_QUEST);
-        WorldPackets::Quest::QuestGiverCompleteQuest done(std::move(raw));
-        done.QuestGiverGUID = ender.IsEmpty() ? c->Session->GetPlayer()->GetGUID() : ender;
-        done.QuestID = questId;
-        done.FromScript = ender.IsEmpty();
-        c->Session->HandleQuestgiverCompleteQuest(done);
-    }
-    static void TurnInChooseFor(void* u, ObjectGuid ender, uint32 questId, uint32 itemId, LootItemType type)
-    {
-        Companion* c = static_cast<Companion*>(u);
-        WorldPacket raw(CMSG_QUEST_GIVER_CHOOSE_REWARD);
-        WorldPackets::Quest::QuestGiverChooseReward pick(std::move(raw));
-        pick.QuestGiverGUID = ender.IsEmpty() ? c->Session->GetPlayer()->GetGUID() : ender;
-        pick.QuestID = questId;
-        pick.Choice.Item.ItemID = itemId;
-        pick.Choice.LootItemType = type;
-        c->Session->HandleQuestgiverChooseRewardOpcode(pick);
-    }
-
-    // Обёртка лестницы, подпись прежняя (`:4140`, `:4201`); ender == nullptr — самосдача.
-    bool TurnInAt(Companion& c, Player* self, Creature* ender)
-    {
-        Constellation::Ai::TurnInSender send;
-        send.Hello = &TurnInHelloFor; send.Complete = &TurnInCompleteFor; send.Choose = &TurnInChooseFor;
-        send.User = &c;
-        return TurnInCore(self, ender ? ender->GetGUID() : ObjectGuid::Empty, c.TurnInQuest, send);
     }
 
     // Существо рядом, которое ЧИСЛИТСЯ ЦЕЛЬЮ незакрытого квеста в журнале.
@@ -6934,64 +6377,6 @@ public:
         out->Where = best;
         out->Worth = true;
         return true;
-    }
-
-    // ПРИБОРЫ ЛЕСТНИЦЫ ДЛЯ ПОХОДА — по разу, с числами от её же полного предиката (тот же приём,
-    // что у строки смертельного места в обходе целей, шаг 14B).
-    static void TravelNoteQuestFor(void* user, uint32 questId)
-    {
-        DangerBinding const* b = static_cast<DangerBinding const*>(user);
-        Companion& c = *const_cast<Companion*>(b->C);
-        if (!c.KilledOnQuestNoted.insert(questId).second)
-            return;
-        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        auto const& q = c.KilledOnQuest.at(questId);
-        TC_LOG_INFO("server.worldserver",
-            "Constellation ПОХОД {}: квест {} «{}» стоил мне {} гибел. — маршрут не строю, пока не перерасту (был ур {}, нужен {})",
-            b->Self->GetName(), questId, quest ? quest->GetLogTitle() : "?",
-            uint32(q.first), uint32(q.second), uint32(q.second) + 3);
-    }
-
-    static void TravelNoteSpotFor(void* user, float x, float y)
-    {
-        DangerBinding const* b = static_cast<DangerBinding const*>(user);
-        Companion& c = *const_cast<Companion*>(b->C);
-        uint64 deadly = 0; uint32 deadlyTotal = 0, deadlyLevel = 0;
-        Manager::Instance()->DeathSpotBlocked(c, b->Self, b->Self->GetMapId(), x, y,
-                                              &deadly, &deadlyTotal, &deadlyLevel);
-        if (c.DeathSpotNoted.insert(deadly).second)
-            TC_LOG_INFO("server.worldserver",
-                "Constellation ПОХОД {}: вокруг места {:.0f} {:.0f} меня убивали {} раз(а) — не иду, пока не перерасту (был ур {}, нужен {})",
-                b->Self->GetName(), x, y, deadlyTotal, deadlyLevel, deadlyLevel + 3);
-    }
-
-    static bool TravelBackedOffFor(void const* user, uint32 questId)
-    {
-        Companion const* c = static_cast<Companion const*>(user);
-        return c && c->TravelBackoff.count(questId) != 0;
-    }
-
-    // Обёртка лестницы: подпись прежняя, вызов в `Idle` (`:3337`) не тронут. Выходы копируются
-    // ровно так, как их писало старое тело: квест и порог — на каждого найденного кандидата
-    // (обработчик гибели читает `TravelQuest`), точка — только когда идти стоит.
-    bool FindObjectiveSpot(Companion& c, Player* self) const
-    {
-        DangerBinding bind{ &c, self };
-        Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
-        danger.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
-        Constellation::Ai::TravelMemory mem;
-        mem.BackedOff = &TravelBackedOffFor; mem.User = &c;
-        mem.NoteQuest = &TravelNoteQuestFor; mem.NoteSpot = &TravelNoteSpotFor; mem.DiagUser = &bind;
-        Constellation::Ai::TravelSpot out;
-        bool const worth = FindObjectiveSpotCore(self, danger, mem, &out);
-        if (out.Found)
-        {
-            c.TravelQuest = out.QuestId;
-            c.TravelStop  = out.Stop;
-        }
-        if (worth)
-            c.TravelPos = out.Where;
-        return worth;
     }
 
     // НАДЕТЬ ЛУЧШЕЕ ИЗ ТОГО, ЧТО ЛЕЖИТ В СУМКАХ. Задача 0009, часть А, по журналу Легиона.
@@ -7609,95 +6994,6 @@ public:
         return true;
     }
 
-    // ПАМЯТЬ И ОТПРАВИТЕЛЬ ЛЕСТНИЦЫ — те же контейнеры и та же сессия, что были в ветке.
-    struct TalkBinding { Companion* C; Player* Self; };
-    static uint32 TalkTalkedFor(void* u)                       { return ++static_cast<TalkBinding*>(u)->C->Talked; }
-    static void TalkSpeciesFor(void* u, uint32 entry, uint32 ms) { static_cast<TalkBinding*>(u)->C->TalkBackoff[entry] = ms; }
-    static void TalkIndividualFor(void* u, ObjectGuid g)       { static_cast<TalkBinding*>(u)->C->TalkUnreachable.insert(g); }
-    static void TalkRetryFor(void* u, ObjectGuid g, uint32 ms) { static_cast<TalkBinding*>(u)->C->TalkRetry[g] = ms; }
-    static void TalkPauseFor(void* u, uint32 ms)               { static_cast<TalkBinding*>(u)->C->ToolActionMs = ms; }
-    static void TalkFaceFor(void* u, ObjectGuid g)
-    {
-        TalkBinding* b = static_cast<TalkBinding*>(u);
-        if (Creature* who = ObjectAccessor::GetCreature(*b->Self, g))
-            b->Self->SetFacingToObject(who);
-    }
-    static void TalkSpellClickFor(void* u, ObjectGuid unit)
-    {
-        WorldPacket raw(CMSG_SPELL_CLICK);
-        WorldPackets::Spells::SpellClick sc(std::move(raw));
-        sc.SpellClickUnitGuid = unit;
-        sc.TryAutoDismount = false;
-        static_cast<TalkBinding*>(u)->C->Session->HandleSpellClick(sc);
-    }
-    static void TalkUseItemFor(void* u, uint8 bag, uint8 slot, ObjectGuid item, uint32 spellId,
-                               Constellation::Ai::ClientAct::UseItemTarget const& target)
-    {
-        using Constellation::Ai::ClientAct;
-        TalkBinding* b = static_cast<TalkBinding*>(u);
-        WorldPacket raw(CMSG_USE_ITEM);
-        WorldPackets::Spells::UseItem use(std::move(raw));
-        use.PackSlot = bag;
-        use.Slot = slot;
-        use.CastItem = item;
-        use.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(
-            SPELL_CAST_SOURCE_NORMAL, b->Self->GetMapId(), spellId,
-            b->Self->GetMap()->GenerateLowGuid<HighGuid::Cast>());
-        use.Cast.SpellID = int32(spellId);
-        if (target.What == ClientAct::UseItemTarget::Unit)
-        {
-            use.Cast.Target.Flags = TARGET_FLAG_UNIT;
-            use.Cast.Target.Unit = target.Guid;
-        }
-        else if (target.What == ClientAct::UseItemTarget::Dest)
-        {
-            use.Cast.Target.Flags = TARGET_FLAG_DEST_LOCATION;
-            WorldPackets::Spells::TargetLocation loc;
-            loc.Location = target.Where;
-            use.Cast.Target.DstLocation = loc;
-        }
-        else
-            use.Cast.Target.Flags = TARGET_FLAG_NONE;
-        b->C->Session->HandleUseItemOpcode(use);
-    }
-    static void TalkGossipHelloFor(void* u, ObjectGuid unit)
-    {
-        WorldPacket raw(CMSG_TALK_TO_GOSSIP);
-        WorldPackets::NPC::Hello hello(std::move(raw));
-        hello.Unit = unit;
-        static_cast<TalkBinding*>(u)->C->Session->HandleGossipHelloOpcode(hello);
-    }
-    static void TalkGossipSelectFor(void* u, ObjectGuid unit, uint32 menuId, uint32 optionId)
-    {
-        WorldPacket raw(CMSG_GOSSIP_SELECT_OPTION);
-        WorldPackets::NPC::GossipSelectOption sel(std::move(raw));
-        sel.GossipUnit = unit;
-        sel.GossipID = menuId;
-        sel.GossipOptionID = optionId;
-        static_cast<TalkBinding*>(u)->C->Session->HandleGossipSelectOptionOpcode(sel);
-    }
-    static Constellation::Ai::TalkMemory TalkMemoryOf(TalkBinding* b)
-    {
-        Constellation::Ai::TalkMemory m;
-        m.Talked = &TalkTalkedFor; m.SpeciesBackoff = &TalkSpeciesFor; m.Individual = &TalkIndividualFor;
-        m.Retry = &TalkRetryFor; m.ActionPause = &TalkPauseFor; m.User = b;
-        return m;
-    }
-    static Constellation::Ai::TalkSender TalkSenderOf(TalkBinding* b)
-    {
-        Constellation::Ai::TalkSender s;
-        s.Face = &TalkFaceFor; s.SpellClick = &TalkSpellClickFor; s.UseItem = &TalkUseItemFor;
-        s.GossipHello = &TalkGossipHelloFor; s.GossipSelect = &TalkGossipSelectFor; s.User = b;
-        return s;
-    }
-
-    // Обёртка лестницы, подпись прежняя (вызов из `Idle`, `:3124`, не тронут).
-    bool ReconcileLateCredit(Companion& c, Player* self) const
-    {
-        TalkBinding b{ &c, self };
-        return ReconcileLateCreditCore(self, c.Talk, TalkMemoryOf(&b));
-    }
-
     // ПРИШЛИ И ЗАКРЫВАЕМ — тело из `case Behavior::Talking` (`:5198-5561`), одно на лестницу и
     // на движок. Ни одной записи в спутника: состояние попытки — `st`, память механизма — `mem`,
     // отправка — `send`, выход — исходом. Строки журнала остались здесь: они про само
@@ -8082,26 +7378,6 @@ public:
                     self->GetName(), at->ID, qid, q->GetLogTitle(), done ? "зачёт" : "без зачёта");
             }
         }
-    }
-
-    static bool TriggerSentFor(void const* u, uint32 id) { return static_cast<Companion const*>(u)->TriggerSentMs.count(id) != 0; }
-    static void TriggerNoteFor(void* u, uint32 id)       { static_cast<Companion*>(u)->TriggerSentMs[id] = 60000; }
-    static void TriggerSendFor(void* u, int32 id)
-    {
-        WorldPacket raw(CMSG_AREA_TRIGGER);
-        WorldPackets::AreaTrigger::AreaTrigger pkt(std::move(raw));
-        pkt.AreaTriggerID = id;
-        pkt.Entered = true;
-        pkt.FromClient = true;
-        static_cast<Companion*>(u)->Session->HandleAreaTriggerOpcode(pkt);
-    }
-
-    // Обёртка лестницы, подпись прежняя (`Idle` и `Travelling` зовут её каждый такт).
-    void TouchAreaTriggers(Companion& c, Player* self) const
-    {
-        Constellation::Ai::TriggerMemory mem;
-        mem.SentRecently = &TriggerSentFor; mem.NoteSent = &TriggerNoteFor; mem.User = &c;
-        TouchAreaTriggersCore(self, mem, &TriggerSendFor, &c);
     }
 
     // БЛИЖАЙШИЙ ТОРГОВЕЦ ПО КАРТЕ, умеющий нужное и не враждебный по своей фракции.
@@ -8588,15 +7864,6 @@ public:
         return "улететь не вышло";
     }
 
-    bool HearthTowards(Companion& c, Player* self, Position const& target)
-    {
-        float walkAll = 0.0f, fromHome = 0.0f;
-        if (!HearthWorthCore(c, self, target, &walkAll, &fromHome))
-            return false;
-        Constellation::Ai::ClientAct act(self, c.Session);
-        return HearthCastCore(c, self, walkAll, fromHome, act, c.Move);
-    }
-
     // УЗНАТЬ ПОЛЁТНУЮ ТОЧКУ У МАСТЕРА, МИМО КОТОРОГО ПРОХОДИМ.
     //
     // Игрок, впервые подошедший к полётному мастеру, получает точку — и дальше может к ней
@@ -8901,94 +8168,6 @@ public:
         if (!wardrobe.empty())
             TC_LOG_INFO("server.worldserver", "Constellation ГАРДЕРОБ {} (ур. {}, класс {}): {}",
                 self->GetName(), uint32(self->GetLevel()), uint32(self->GetClass()), wardrobe);
-    }
-
-    void LogIdle(Companion const& c, Player* self) const
-    {
-        std::string waiting;
-        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-        {
-            uint32 const qid = self->GetQuestSlotQuestId(slot);
-            if (!qid || self->GetQuestStatus(qid) != QUEST_STATUS_COMPLETE)
-                continue;
-            char const* why = "ждёт";
-            if (c.Impossible.count(qid))
-                why = "закрыть нечем";
-            else if (c.TurnInBackoff.count(qid))
-                why = "отсрочка";
-            else
-            {
-                bool spawn = false, ender = false;
-                auto mapIt = _spawns.find(self->GetMapId());
-                for (auto const& [_, e] : sObjectMgr->GetCreatureQuestInvolvedRelationReverseBounds(qid))
-                {
-                    ender = true;
-                    if (mapIt != _spawns.end() && mapIt->second.count(e))
-                        spawn = true;
-                }
-                why = !ender ? "принимающего-существа нет" : (spawn ? "принимающий на карте" : "у принимающего нет точки на карте");
-            }
-            waiting += std::to_string(qid) + " (" + why + ") ";
-        }
-        std::list<Creature*> around;
-        Trinity::AnyUnitInObjectRangeCheck check(self, 60.0f);
-        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
-        Cell::VisitGridObjects(self, searcher, 60.0f);
-        uint32 printed = 0;
-        for (Creature* cr : around)
-        {
-            if (printed >= 6)
-                break;
-            auto const rel = sObjectMgr->GetCreatureQuestRelations(cr->GetEntry());
-            if (rel.begin() == rel.end())
-                continue;
-            std::string quests;
-            uint32 k = 0;
-            for (uint32 qid : rel)
-            {
-                if (++k > 4)
-                    { quests += "…"; break; }
-                Quest const* q = sObjectMgr->GetQuestTemplate(qid);
-                if (!q)
-                    continue;
-                static char const* const colourName[5] = { "серое", "зелёное", "жёлтое", "красное", "цвет?" };
-                quests += std::to_string(qid) + " " + colourName[std::min<uint8>(QuestColour(self, q), 4)]
-                        + "/" + FirstFailingGate(self, q) + (self->CanSeeStartQuest(q) ? "/видит" : "")
-                        + (c.QuestRefused.count(qid) ? " (отказной)" : "") + "; ";
-            }
-            ++printed;
-            // СВОИ ФИЛЬТРЫ — ОТДЕЛЬНО ОТ ВОРОТ ЯДРА (Кодекс): чёрный список и отказные — модуля,
-            // и без них строка обвинила бы ядро.
-            // 3D-расстояние и фаза по спавну (Кодекс/оператор: «боты знают, на какой они стадии»):
-            // грид ищет по 3D, а печаталось только 2D; фазу до сих пор не печатал никто.
-            CreatureData const* crData = cr->GetCreatureData();
-            bool const inPhase = crData
-                ? PhasingHandler::InDbPhaseShift(self, crData->phaseUseFlags, uint16(crData->phaseId), crData->phaseGroup)
-                : self->GetPhaseShift().CanSee(cr->GetPhaseShift());
-            TC_LOG_INFO("server.worldserver",
-                "Constellation ПРОСТОЙ {} (ур. {}, зона {}): {} ({}) в {:.0f} ярдах ({:.0f} по 3D), видно {}, фаза {}, в чёрном списке {}, статус {:X}: {}",
-                self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), cr->GetName(), cr->GetEntry(),
-                self->GetExactDist2d(cr), self->GetExactDist(cr), self->IsWithinLOSInMap(cr) ? 1 : 0, inPhase ? 1 : 0,
-                c.GiverUnreachable.count(cr->GetGUID()) ? 1 : 0,
-                uint64(self->GetQuestDialogStatus(cr)), quests);
-            // МЕНЮ ЗДЕСЬ НЕ СПРАШИВАЕМ, И ЭТО РЕШЕНИЕ, А НЕ УПУЩЕНИЕ (Кодекс, вторая проверка).
-            //
-            // Первая редакция слала отсюда Hello и беседу, чтобы показать меню, которое ядро
-            // собрало бы игроку. Но эти обработчики не только печатают: они запускают сценарии
-            // приветствия и меняют состояние меню у персонажа. Прибор обязан быть немым, иначе
-            // он лечит то, что измеряет. Настоящее меню и так видно в строке РАЗГОВОР, которую
-            // печатает сам путь взятия квеста, когда спутник до квестодателя доходит.
-        }
-        LogWardrobe(self);
-
-
-        TC_LOG_INFO("server.worldserver",
-        // ПЛОЩАДЬ, А НЕ ТОЛЬКО ЗОНА: ауры по местности ядро вешает по ПЛОЩАДИ
-            // (Player::UpdateAreaDependentAuras), и призванный принимающий держится именно ими.
-            "Constellation ПРОСТОЙ {} (ур. {}, зона {} «{}», площадь {}, полётных точек {}): квестодателей в 60 ярдах с квестами {}; готовые ждут: {}",
-            self->GetName(), uint32(self->GetLevel()), self->GetZoneId(), ZoneName(self->GetZoneId()),
-            self->GetAreaId(),
-            KnownTaxiNodes(self), printed, waiting.empty() ? "-" : waiting);
     }
 
     // ---------------------------------------------------------------- имя зоны из ядра
@@ -9483,98 +8662,10 @@ public:
         }
     }
 
-    // ПАМЯТЬ ЛЕСТНИЦЫ О СОБСТВЕННЫХ ПОПЫТКАХ — одним переключателем на все её контейнеры.
-    //
-    // ПОРОГИ ЖИВУТ ЗДЕСЬ, И ЭТО ИХ МЕСТО. «Сколько раз пробовать, прежде чем бросить» —
-    // бухгалтерия механизма, а не свойство мира: у движка на это таблица отсрочек, и его
-    // ответ придёт оттуда, а не из этих чисел.
-    static bool FightBannedById(void const* user, Constellation::Ai::FightBan why, uint64 key)
-    {
-        Companion const* c = static_cast<Companion const*>(user);
-        if (!c)
-            return false;
-        switch (why)
-        {
-            case Constellation::Ai::FightBan::TalkKind:
-                return c->TalkBackoff.count(uint32(key)) != 0;
-            case Constellation::Ai::FightBan::FreeUse:
-            {
-                // Трижды применял эту клетку ради этой цели.
-                auto it = c->FreeTried.find(key);
-                return it != c->FreeTried.end() && it->second >= 3;
-            }
-            case Constellation::Ai::FightBan::GatherPoint:
-            {
-                // ТОТ ЖЕ ПРЕДЕЛ ХОЛОСТЫХ ЗАХОДОВ, ЧТО У ОБЫЧНЫХ ТОЧЕК СБОРА. Я утверждал
-                // обзору, что поход к точке ограничивает себя сам, и ошибся: `GatherLeave`
-                // считает холостой заход точке, а пропускает точку с восемью — ОТБОР точек,
-                // который дорога к клетке обходит, ставя `GatherSpawnId` напрямую. Значит
-                // предела не было вовсе, и спрашивается тот же счёт.
-                auto it = c->GatherEmpty.find(ObjectGuid::LowType(key));
-                return it != c->GatherEmpty.end() && it->second >= 8;
-            }
-            default:
-                return false;
-        }
-    }
-
-    static bool FightBannedByGuid(void const* user, Constellation::Ai::FightBan why, ObjectGuid guid)
-    {
-        Companion const* c = static_cast<Companion const*>(user);
-        if (!c)
-            return false;
-        switch (why)
-        {
-            case Constellation::Ai::FightBan::TalkRetry:     return c->TalkRetry.count(guid) != 0;
-            case Constellation::Ai::FightBan::Unreachable:   return c->TalkUnreachable.count(guid) != 0;
-            case Constellation::Ai::FightBan::TargetRefused:
-            {
-                if (c->Refused.count(guid) != 0)
-                    return true;
-                // ОДИН ПРЕДИКАТ ДОПУСТИМОСТИ БОЯ НА ДВА МЕХАНИЗМА (Кодекс, разбор шва по намерению,
-                // п. 3). Шов отдаёт лестнице ход, когда у движка боевой ставки нет, — в том числе
-                // потому, что движок ОТЛОЖИЛ цель (не дошёл, замах не принят, тридцать секунд без
-                // следа). Лестница со своей памятью взяла бы ту же цель следующим тактом, и отсрочка
-                // движка ничего бы не защищала. Поэтому пока бой у движка включён, его отсрочка —
-                // отказ и для лестницы. Чтение, не запись: таблица движка остаётся его.
-                if (Cfg().Engine
-                    && (Cfg().EngineStrategies & Constellation::Ai::MaskOf(Constellation::Ai::StrategyId::Combat)))
-                {
-                    Constellation::Ai::BackoffKey key;
-                    key.Kind   = Constellation::Ai::BackoffKind::CombatUnreachable;
-                    key.About  = Constellation::Ai::Subject::OfUnit(guid);
-                    key.Detail = 0;
-                    if (Constellation::Ai::Engine::Deferred(c->Engine, key, GameTime::GetGameTimeMS()))
-                        return true;
-                }
-                return false;
-            }
-            default: return false;
-        }
-    }
-
-    // ЕДИНСТВЕННАЯ ЗАПИСЬ, КОТОРУЮ ОБХОД ДЕЛАЕТ ПО ХОДУ ДЕЛА, и она названа отдельно от чтений
-    // именно поэтому. Движок свяжет её со своей отсрочкой; тень — ни с чем, и тогда `Note`
-    // остаётся нулём, а обход ничего не запоминает.
-    static bool FightNote(void* user, Constellation::Ai::FightBan why, ObjectGuid guid)
-    {
-        Companion* c = static_cast<Companion*>(user);
-        if (!c || why != Constellation::Ai::FightBan::Unreachable)
-            return false;
-        return c->TalkUnreachable.insert(guid).second;
-    }
-
     static bool RefusedByCompanion(void const* user, uint32 questId)
     {
         Companion const* c = static_cast<Companion const*>(user);
         return c && c->QuestRefused.count(questId) != 0;
-    }
-
-    // Вторая половина той же памяти: к этой ТОЧКЕ лестница пока не ходит.
-    static bool SeekBackedOffForCompanion(void const* user, uint32 spawnId)
-    {
-        Companion const* c = static_cast<Companion const*>(user);
-        return c && c->SeekBackoff.count(spawnId) != 0;
     }
 
     // ПАМЯТЬ ОБ ОТКАЗАХ — ОБРАТНЫМ ВЫЗОВОМ, как и у выбора из меню. Третий лифт этой формы, и
@@ -9781,11 +8872,6 @@ public:
         *entry = best->Entry;
         *pos = best->Where;
         return true;
-    }
-
-    bool FindMenderByMap(Companion const& c, Player* self, bool needSell, bool needRepair, uint32* entry, Position* pos) const
-    {
-        return FindMenderByMapCore(self, VendorMemoryOf(const_cast<Companion&>(c)), needSell, needRepair, entry, pos);
     }
 
     // ЗАЧЕМ ИДТИ К ТОРГОВЦУ — отбор из `Idle` (`:3204-3252`), без записей в спутника.
@@ -10421,45 +9507,6 @@ public:
             return id;
         }
         return 0;
-    }
-
-    // ПРЕЖНЯЯ ПОДПИСЬ — ТРЁХСТРОЧНАЯ ОБЁРТКА, как у четырёх функций двигателя. Три места
-    // вызова не меняются вовсе, и это проверяется диффом, а не обещается.
-    //
-    // Засев и обратная копия ПОЛНЫЕ и БЕЗУСЛОВНЫЕ. Это не осторожность, а точность: у трёх
-    // выходов три разных времени жизни (см. `ObjectiveScan`), и структура, начинающаяся пустой,
-    // превратила бы стоящую отметку клетки в результат прохода. Засеянная — даёт `if
-    // (!out->CageSpawn)` буква в букву прежнее `if (!c.FreeGoSpawn)`.
-    Creature* FindObjectiveTarget(Companion& c, Player* self) const
-    {
-        Constellation::Ai::ObjectiveScan scan;
-        scan.Talk       = c.TalkCandidate;
-        scan.CageSpawn  = c.FreeGoSpawn;
-        scan.CageEntry  = c.FreeGoEntry;
-        scan.CageFor    = c.FreeGoFor;
-        scan.CagePos    = c.FreeGoPos;
-        scan.Assists    = c.EngageAssists;
-        scan.PackCenter = c.PackCenter;
-        scan.PackKnown  = c.PackCenterKnown;
-
-        Constellation::Ai::FightMemory const mem(&FightBannedById, &FightBannedByGuid,
-                                                 &FightNote, &c,
-                                                 c.ToolActionMs != 0, c.NoTargetMs);
-
-        DangerBinding bind{ &c, self };
-        Constellation::Ai::DangerView danger(&KilledMeTwiceFor, &DeadlyToFightAtFor, &bind);
-
-        Creature* best = ScanObjectives(self, mem, danger, &scan, &c);
-
-        c.TalkCandidate    = scan.Talk;
-        c.FreeGoSpawn      = scan.CageSpawn;
-        c.FreeGoEntry      = scan.CageEntry;
-        c.FreeGoFor        = scan.CageFor;
-        c.FreeGoPos        = scan.CagePos;
-        c.EngageAssists    = scan.Assists;
-        c.PackCenter       = scan.PackCenter;
-        c.PackCenterKnown  = scan.PackKnown;
-        return best;
     }
 
     // СПУТНИК БОЛЬШЕ НЕ ВИДЕН ОТСЮДА НАПРЯМУЮ — И ЭТО НЕ «НЕЗАВИСИМОСТЬ ОТ НЕГО».
@@ -11205,89 +10252,6 @@ public:
                 best ? best->GetName() : "никто", used, range);
         }
         return best;
-    }
-
-    // ровно тот пакет, что шлёт клиент; ядро само решит, принять его или нет
-    // ПОВЕРНУТЬСЯ К ЦЕЛИ — БЕЗ ЭТОГО ЯДРО НЕ ДАЁТ УДАРИТЬ.
-    //
-    // Замер на боевом за десять минут: 896 начатых боёв, ДВЕНАДЦАТЬ побед, 455 смертей,
-    // 421 «две минуты без исхода». Противники при этом — первого-второго уровня с 27-51
-    // единицей здоровья ДЛЯ НАС, а у спутника 148. Проигрывать такому в 98.6 % случаев
-    // невозможно, если бьёшь. Значит не бьёт.
-    //
-    // Ответ нашёлся там, где и положено, — в ядре. Unit::UpdateMeleeAttackingState
-    // требует ДВУХ условий, а не одного:
-    //     if (!IsWithinMeleeRange(victim))                  -> NotInRange
-    //     if (!IsWithinBoundaryRadius(victim) && !HasInArc(2*PI/3, victim)) -> BadFacing
-    // Дальность я держал, а ПОВОРОТ не задавал никогда. Пока спутник идёт, он смотрит по
-    // ходу движения; дойдя, шлёт пакет остановки со СТАРОЙ ориентацией. Если она мимо
-    // цели — каждый замах отвергается, таймер переставляется на 100 мс, и так до самой
-    // смерти. Ноль урона.
-    //
-    // Отсюда же и разница со стендом, которая сбивала меня всю ночь: там цели далеко,
-    // спутник ИДЁТ к ним и в конце пути смотрит на цель — 94 победы из 102. На боевом
-    // мобы подходят сами, спутник бьёт не сойдя с места и глядя в сторону.
-    //
-    // Поворот шлём тем же опкодом, что и клиент: CMSG_MOVE_SET_FACING через тот же
-    // HandleMovementOpcode. Нулевой инвариант цел.
-    void FaceTarget(Companion& c, Player* self, Unit* target)
-    {
-        if (!target)
-            return;
-
-        // УГОЛ СЧИТАЕМ ЗНАКОВЫЙ, А НЕ ЧЕРЕЗ НОРМАЛИЗАЦИЮ В [0, 2PI).
-        // Кодекс, проход 9: NormalizeOrientation превращает -0.01 в 6.27, и модуль
-        // считал бы «повёрнут неверно» при отклонении в полградуса — с одной стороны
-        // цели пакеты шли бы без конца, с другой не шли бы вовсе.
-        float ang = self->GetAbsoluteAngle(target);
-        float diff = ang - self->GetOrientation();
-        while (diff > float(M_PI))  diff -= 2.0f * float(M_PI);
-        while (diff < -float(M_PI)) diff += 2.0f * float(M_PI);
-        if (std::fabs(diff) < 0.05f)
-            return;                         // уже смотрим куда надо — не сорим пакетами
-
-        // СОСТОЯНИЕ ДВИЖЕНИЯ СОХРАНЯЕМ ЦЕЛИКОМ.
-        // Обработчик не правит ориентацию, а ЗАМЕЩАЕТ весь m_movementInfo присланным
-        // (MovementHandler.cpp:356). Мой «c.Move.Moving ? FORWARD : 0» стирал бы флаги,
-        // дополнительные флаги, транспорт, падение, прыжок и тангаж. Берём нынешнее
-        // состояние игрока и меняем в нём только положение, поворот и время.
-        MovementInfo mi = self->m_movementInfo;
-        mi.guid = self->GetGUID();
-        Position pos = self->GetPosition();
-        pos.SetOrientation(ang);
-        mi.pos.Relocate(pos);
-        mi.time = GameTime::GetGameTimeMS();
-        c.Session->HandleMovementOpcode(CMSG_MOVE_SET_FACING, mi);
-    }
-
-    // ШАГ СПИНОЙ: идём назад, но смотрим на цель — иначе ядро отвергнет каждый замах
-    // (Unit::UpdateMeleeAttackingState требует IsWithinMeleeRange И HasInArc). Один пакет, как и
-    // обычный шаг: позиция сзади, ориентация на цель.
-    void StepBackFacing(Companion& c, Player* self, Position const& to, Unit* face, float dt)
-    {
-        float const speed = self->GetSpeed(MOVE_WALK) * 0.9f;   // пятимся медленнее, и это к лучшему:
-        float const go = std::min(speed * dt, self->GetExactDist2d(to.GetPositionX(), to.GetPositionY()));
-        if (go <= 0.05f)
-            return;
-        float const ang = self->GetAbsoluteAngle(to.GetPositionX(), to.GetPositionY());
-        float const nx = self->GetPositionX() + std::cos(ang) * go;
-        float const ny = self->GetPositionY() + std::sin(ang) * go;
-        float nz = self->GetMap()->GetHeight(self->GetPhaseShift(), nx, ny, self->GetPositionZ() + 2.0f);
-        if (nz <= INVALID_HEIGHT)
-            nz = self->GetPositionZ();
-        Position next(nx, ny, nz, self->GetAbsoluteAngle(face));    // ЛИЦОМ К ЦЕЛИ
-        SendMove(c, self, next, MOVEMENTFLAG_BACKWARD);
-        c.Move.Moving = true;
-    }
-
-    void SendMove(Companion& c, Player* self, Position const& pos, uint32 flags)
-    {
-        MovementInfo mi;
-        mi.guid = self->GetGUID();
-        mi.pos.Relocate(pos);
-        mi.flags = flags;
-        mi.time = GameTime::GetGameTimeMS();
-        c.Session->HandleMovementOpcode(CMSG_MOVE_HEARTBEAT, mi);
     }
     // ЗА КЕМ ИДТИ — ЯВНЫЙ ХОЗЯИН, А НЕ «КТО ПРИДЁТСЯ».
     //

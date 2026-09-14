@@ -123,9 +123,6 @@ namespace Constellation::Ai
         };
         FleeState Flee;
 
-        // ЦЕЛЬ КАМНЯ: позиционного предмета у ставки нет, предпосылка дороги кладёт её сюда.
-        Position HearthTarget;
-        bool     HearthTargetSet = false;
         // ДЛЯ КАКОЙ ДОРОГИ СЧИТАН ПЛАН ПОЛЁТА. У лестницы план потребляется тем же тактом
         // (`Switch(TakingFlight)`); здесь он лежит в слоте, и дорога может исчезнуть раньше —
         // чужой план другой дороге не достаётся.
@@ -354,8 +351,6 @@ namespace Constellation::Ai
         // migrated, its entry is added here IN THE SAME COMMIT THAT DELETES ITS OLD BODY — and
         // it becomes true for EVERY companion, never for a canary subset. The module's switch
         // has no `default:` arm, so a companion in a mode with a deleted body and an engine that
-        // does not own it would do nothing at all, every tick, forever.
-        static bool Owns(uint8 /*mode*/) { return false; }
 
         // §10 — THE SHADOW: the engine chooses and does NOT execute, while the ladder still
         // decides.
