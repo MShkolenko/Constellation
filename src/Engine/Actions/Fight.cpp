@@ -639,7 +639,10 @@ namespace
 
             // НАПАЛИ — НЕ ДО ОТДЫХА. Первая проверка ветки лестницы, и здесь она первая же.
             if (ctx.World.IsInCombat())
+            {
+                ctx.St->RestAfterRevive = false;    // «в бою не до отдыха» (`Recovering`, `:3496`)
                 return false;
+            }
 
             // ВСТАТЬ — ЭТО ДЕЙСТВИЕ, А НЕ ОТСУТСТВИЕ ДЕЙСТВИЯ. Перестать слать шаги не значит
             // остановиться: сервер ведёт туда, куда его отправили в последний раз. Лестница шлёт
@@ -658,6 +661,10 @@ namespace
             if (ctx.World.RestedEnough())
             {
                 ctx.St->RestingMs = 0;
+                // ФЛАГ ПОДЪЁМА СНИМАЕТ САМ ОТДЫХ (2026-09-14, шаг 1 удаления лестницы): прежде его
+                // снимал `Switch` из `Recovering`, а режим больше не входится — иначе «отдых после
+                // подъёма» стал бы «отдыхом всегда, когда не полон».
+                ctx.St->RestAfterRevive = false;    // «отдышался» (`:3503`)
                 return true;            // отдышался; в следующем такте `Useful` уже не позовёт
             }
 
@@ -672,6 +679,7 @@ namespace
                 // короче самого отдыха.
                 uint32 const ban = cap > (0xFFFFFFFFu / 2u) ? 0xFFFFFFFFu : cap * 2u;
                 Defer(ctx, BackoffKind::Visited, bid.About, REST_DETAIL, ban);
+                ctx.St->RestAfterRevive = false;    // «отдых не помогает, иду как есть» (`:3522`)
                 return false;           // восстановление не идёт — иду как есть
             }
             return true;
@@ -844,6 +852,7 @@ namespace Constellation::Ai
         if (ctx.World.RestedEnough())
         {
             ctx.St->RestHeld = false;
+            ctx.St->RestAfterRevive = false;    // отдышался и без отдыха — флаг подъёма снят (Кодекс, п. 1)
             return false;
         }
         return ctx.St->Running == ActionId::Rest || ctx.St->RestHeld || ctx.St->RestAfterRevive;

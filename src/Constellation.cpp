@@ -2060,8 +2060,11 @@ public:
                     RepairIfBroken(self, "после смерти");
                     c.BrokenNoted = false;
                     c.TravelCooldownMs = std::max<uint32>(c.TravelCooldownMs, 300000);
-                    c.Engine.RestAfterRevive = true;    // событие видит только лестница — см. EngineState
-                    Switch(c, self, Behavior::Recovering, "поднялся у своего тела");
+                    // ПОДЪЁМ ОСТАВЛЯЕТ СПУТНИКА В IDLE (2026-09-14, шаг 1 удаления лестницы): отдых
+                    // после подъёма — дело движка по `RestAfterRevive` (`RestWanted`), режим
+                    // `Recovering` больше не входится; флаг снимает сам `RestAction` на выходах.
+                    c.Engine.RestAfterRevive = true;
+                    Switch(c, self, Behavior::Idle, "поднялся у своего тела");
                     TC_LOG_INFO("server.worldserver",
                         "Constellation ТЕЛО {}: поднялся у своего тела", self->GetName());
                     return;
@@ -2227,8 +2230,8 @@ public:
             c.GraveWalkNoted = false;
             c.HealerStepNoted = false;
             c.HealerRings = 0;
-            c.Engine.RestAfterRevive = true;            // событие видит только лестница — см. EngineState
-            Switch(c, self, Behavior::Recovering, "воскрес, перевожу дух");
+            c.Engine.RestAfterRevive = true;            // отдых — движку (см. подъём у тела)
+            Switch(c, self, Behavior::Idle, "воскрес, перевожу дух");
             TC_LOG_INFO("server.worldserver", "Constellation: {} воскрес у целительницы душ",
                 self->GetName());
         }
