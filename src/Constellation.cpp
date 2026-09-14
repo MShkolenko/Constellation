@@ -14527,9 +14527,26 @@ namespace Constellation::Ai
     bool StepAlong(MoveState& m, Player* self, MoveSendFn send, void* user,
                    Position const& to, float stopAt, float dt)
     {
-        return Constellation::Manager::Instance()->StepTowardCore(
-            m, self, send, user, to.GetPositionX(), to.GetPositionY(), to.GetPositionZ(),
-            stopAt, dt, nullptr);
+        // ТА ЖЕ ПОПРАВКА, ЧТО У ЛЕСТНИЦЫ, но помнит её дорога (см. `MoveState::Fix*`): к той же
+        // цели по x,y идём с исправленной высотой; к новой — спрашиваем ядро и запоминаем ответ.
+        Position fix = to;
+        bool const sameTarget = m.FixSet
+            && std::fabs(to.GetPositionX() - m.FixX) < 0.5f && std::fabs(to.GetPositionY() - m.FixY) < 0.5f;
+        if (sameTarget)
+            fix.m_positionZ = m.FixZ;
+        else
+            m.FixSet = false;                       // новая цель — старая поправка ей не принадлежит (Кодекс)
+        bool const going = Constellation::Manager::Instance()->StepTowardCore(
+            m, self, send, user, fix.GetPositionX(), fix.GetPositionY(), fix.GetPositionZ(),
+            stopAt, dt, &fix);
+        if (sameTarget && m.Stalled)
+            m.FixSet = false;                       // с поправкой упёрлись — следующий такт с исходной высотой (Кодекс, проход 2)
+        else if (std::fabs(fix.GetPositionZ() - to.GetPositionZ()) > 0.01f)
+        {
+            m.FixX = to.GetPositionX(); m.FixY = to.GetPositionY(); m.FixZ = fix.GetPositionZ();
+            m.FixSet = true;
+        }
+        return going;
     }
 
     // ЛУТ С ТРУПА ДЛЯ ДВИЖКА: то же тело, что у лестницы, — дистанция по числу обработчика,
