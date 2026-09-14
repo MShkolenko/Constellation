@@ -957,18 +957,20 @@ public:
                 "Constellation WIPE: nothing done. Repeat with the confirmation word to proceed.");
             if (strangers)
                 handler->PSendSysMessage(
-                    "Constellation WIPE: %u non-companion player(s) online — the command would refuse.",
+                    "Constellation WIPE: %u non-companion player(s) online — the wipe proceeds regardless.",
                     strangers);
             return true;
         }
 
+        // ОТКАЗА ПРИ ЖИВОМ ИГРОКЕ БОЛЬШЕ НЕТ (оператор, 2026-09-14: «никаких отказов!! делай»).
+        // Вайп стирает ТОЛЬКО спутников состава (список — из модуля, не из базы); чужой игрок в
+        // мире ему не мешает и им не трогается. Прежний отказ выключал вайп, когда оператор сам
+        // был в игре, — то есть ровно тогда, когда он смотрел. Строка в журнал остаётся: видно,
+        // при ком стирали.
         if (strangers)
-        {
             handler->PSendSysMessage(
-                "Constellation WIPE: REFUSED — %u non-companion player(s) online. "
-                "Wipe only on an empty realm.", strangers);
-            return false;
-        }
+                "Constellation WIPE: %u non-companion player(s) online — proceeding anyway (operator, 2026-09-14).",
+                strangers);
 
         // СНАЧАЛА ВЫВЕСТИ ИЗ МИРА, ПОТОМ УДАЛЯТЬ. Живой Player держит состояние в памяти, и
         // выход записал бы его обратно поверх удаления (Кодекс: WorldSession.cpp:635).
