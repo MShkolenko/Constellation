@@ -215,17 +215,6 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             return relevance;
         }
 
-        // КАМЕНЬ ИЛИ ПОЛЁТ К СДАЧЕ (`:3129-3137`) — предпосылка дороги, только когда ender не в обзоре.
-        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
-        {
-            if (!ctx.St || bid.About.What() != Subject::Kind::Quest)
-                return;
-            for (TurnInCandidate const& t : Val<ValueId::CompletedTurnIns>(ctx))
-                if (t.QuestId == bid.About.Id() && t.EnderEntry
-                    && !ctx.World.NearestQuestGiverOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
-                    AirPrerequisites(ctx, bid, Subject::OfSpecies(t.EnderEntry), t.Where, true, sink);
-        }
-
         bool Execute(Ctx& ctx, Bid const& bid) override
         {
             if (bid.About.What() != Subject::Kind::Quest)
@@ -523,15 +512,6 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
         }
 
-        // ПОЛЁТ К КВЕСТОДАТЕЛЮ (`:3361-3364`) — без камня, как у лестницы.
-        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
-        {
-            SeekTarget const& t = Val<ValueId::GiverToSeek>(ctx);
-            if (ctx.St && t.Found && uint32(t.SpawnId) == bid.About.Id()
-                && ctx.World.DistanceTo2d(t.Where) > SEEK_ARRIVED_YARDS)
-                AirPrerequisites(ctx, bid, bid.About, t.Where, false, sink);
-        }
-
         bool Execute(Ctx& ctx, Bid const& bid) override
         {
             if (!ctx.St)
@@ -605,15 +585,6 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             if (!t.Worth || t.QuestId != bid.About.Id())
                 return relevance;
             return relevance - ctx.World.DistanceTo2d(t.Where) * YARD_COST;
-        }
-
-        // КАМЕНЬ ИЛИ ПОЛЁТ К МЕСТУ ЗАДАНИЯ (`:3320-3326`).
-        void Prerequisites(Ctx& ctx, Bid const& bid, BidSink& sink) const override
-        {
-            TravelSpot const& t = Val<ValueId::ObjectiveSpot>(ctx);
-            if (ctx.St && t.Worth && t.QuestId == bid.About.Id()
-                && ctx.World.DistanceTo2d(t.Where) > t.Stop + TRAVEL_ARRIVED_SLACK)
-                AirPrerequisites(ctx, bid, bid.About, t.Where, true, sink);
         }
 
         bool Execute(Ctx& ctx, Bid const& bid) override
@@ -710,6 +681,18 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                     sink.Add(ActionId::VisitVendor, rel, Subject::OfSpecies(v.MapEntry));
                 else
                     sink.Add(ActionId::VisitVendor, rel, Subject::OfUnit(v.Near));
+            }
+
+            // ПОЛЁТ ПО ГОТОВОМУ ПЛАНУ — ВЫШЕ БОЁВ, КАК `TakingFlight` У ЛЕСТНИЦЫ (`:3135`, `:3324`,
+            // `:3363`): она уходила в режим полёта сразу и по дороге к мастеру не дралась. Ставкой
+            // предпосылки это не выразить — движок ценит предпосылку как дорогу + 0.002, и полёт
+            // проигрывал каждому бою (замер 10:13-10:36: 1859 планов, ноль взлётов). Вне боя: под
+            // ударом бой главнее, полёт продолжится после.
+            if (ctx.St && !ctx.World.IsInCombat())
+            {
+                FlightPlan plan;
+                if (ctx.World.FlightPlanned(&plan))
+                    sink.Add(ActionId::TakeFlight, REL_MOVE, Subject::OfSpecies(plan.MasterEntry));
             }
 
             // СБОР — ГДЕ У ЛЕСТНИЦЫ (`Idle`, `:3314`): вне боя, после клетки и разговора, до

@@ -23,12 +23,11 @@ namespace
     inline constexpr float  MASTER_STOP_YARDS    = 15.0f;
     inline constexpr float  MASTER_TALK_YARDS    = 5.0f;
     inline constexpr uint32 FLIGHT_FAIL_MS       = 600000;
-    // ПЛАН ПРИНАДЛЕЖИТ СВОЕЙ ДОРОГЕ ЭТИ СЕКУНДЫ (замер 2026-09-14 04:13-04:31: 274 плана, ноль
-    // взлётов). Две дороги — сдача (`OfSpecies`) и поход (`OfQuest`) — в одном такте обе
-    // спрашивают предпосылку; каждая видела чужой план, снимала его и строила свой: маршруты
-    // графа пятнадцать раз в минуту, и ни один `TakeFlight` не доживал до выбора. Чужой свежий
-    // план не трогаем; несвежий (его дорога не вернулась) — снимаем без отката, как и было.
-    inline constexpr uint32 FLIGHT_PLAN_HOLD_MS  = 5000;
+    // НЕ ЧАЩЕ РАЗА В МИНУТУ НА СПУТНИКА (замер 10:13-10:36: 1859 планов за 23 минуты, ноль
+    // взлётов): две дороги, сменяющие друг друга после каждого боя, перестраивали план на каждой
+    // смене — маршруты графа раз в шесть секунд. Метка ставится ДО попытки, чтобы и неудачный
+    // план ждал минуту (Кодекс).
+    inline constexpr uint32 FLIGHT_REPLAN_MS     = 60000;
 
     // КАМЕНЬ. С 2026-09-14 читается прямо из начала дороги (`AirAtRoadStart`); действие оставлено
     // зарегистрированным, но ставок на него больше нет — снять вместе с `HearthTarget` при уборке.
@@ -149,34 +148,11 @@ namespace Constellation::Ai
     // к этой цели) — план стоит дорого (маршруты графа); ставший план держится в слоте и ставится,
     // пока не отработан. Сдача и поход спрашивают камень; поиск квестодателя — только полёт, как
     // у лестницы.
-    // ПРЕДПОСЫЛКА СТАВИТ ТОЛЬКО ГОТОВЫЙ ПЛАН СВОЕЙ ДОРОГИ. Планирование здесь было ошибкой
-    // (замер 04:13-05:07: 1501 план, два взлёта; 08:13-08:34 с гистерезисом: 286, два): у одного
-    // спутника две дороги — сдача и поход — обе живут в очереди, обе спрашивают предпосылку при
-    // каждом выборе и спорят за один план. План строится ОДИН раз — в первый такт исполнения
-    // дороги (`AirAtRoadStart`), когда движок её уже выбрал; остальные дороги не планируют вовсе.
-    // Аренду продлевает исполнение `TakeFlight` (Кодекс); чужой брошенный план снимается без отката.
-    void AirPrerequisites(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth, BidSink& sink)
-    {
-        (void)bid; (void)target; (void)hearth;
-        if (!ctx.St || !Tuning().Flying)
-            return;
-        FlightPlan plan;
-        if (!ctx.World.FlightPlanned(&plan))
-            return;
-        if (ctx.St->FlightRoad == road)
-        {
-            sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
-            return;
-        }
-        if (ctx.NowMs - ctx.St->FlightRoadMs >= FLIGHT_PLAN_HOLD_MS)
-            ctx.World.FlightAbort(0);               // чужой и брошенный — снять без отката
-    }
-
     // НАЧАЛО ДОРОГИ — там, где лестница спрашивала камень и полёт перед `Switch` в режим дороги
     // (`:3131-3137`, `:3320-3326`, `:3361-3364`): первый такт исполнения выбранной дороги
     // (`Running` ещё не она). Камень — читаем сразу и отдаём такт (страховка `:2690` держит спутника
-    // на время чтения); полёт — план в слот, такт отдаём, следующим тактом предпосылка ставит
-    // `TakeFlight` выше дороги. true = такт потрачен на воздух, дорога вернётся пешком или после посадки.
+    // на время чтения); полёт — план в слот, такт отдаём, следующим тактом стратегия ставит
+    // `TakeFlight` выше боёв (REL_MOVE), как лестница уходила в `TakingFlight`. true = такт потрачен на воздух, дорога вернётся пешком или после посадки.
     bool AirAtRoadStart(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth)
     {
         if (!ctx.St || !Tuning().Flying)
@@ -184,14 +160,22 @@ namespace Constellation::Ai
         if (ctx.St->Running == bid.Action && ctx.St->RunningAbout == bid.About)
             return false;                           // дорога уже идёт — воздух спрошен при её начале
         if (ctx.World.FlightPlanned(nullptr))
-            return false;                           // план уже есть (свой или чужой свежий) — не планировать
+        {
+            if (ctx.St->FlightRoad == road)
+                return false;                       // свой план — стратегия ставит полёт выше боёв
+            if (ctx.NowMs - ctx.St->FlightRoadMs < FLIGHT_REPLAN_MS)
+                return false;                       // чужой, но свежий — пешком, не перестраивать
+            ctx.World.FlightAbort(0);               // чужой и старый — исполняется другая дорога
+        }
+        else if (ctx.St->FlightRoadMs && ctx.NowMs - ctx.St->FlightRoadMs < FLIGHT_REPLAN_MS)
+            return false;                           // недавно планировали (и план ушёл) — не чаще минуты
         if (hearth && ctx.World.HearthWorth(target) && ctx.World.HearthCast(target, ctx.Act, ctx.St->Move))
             return true;                            // читаем камень — такт отдан
+        ctx.St->FlightRoadMs = ctx.NowMs;           // метка ДО попытки: неудача тоже ждёт минуту
         FlightPlan plan;
         if (ctx.World.PlanFlight(target, &plan))
         {
             ctx.St->FlightRoad = road;
-            ctx.St->FlightRoadMs = ctx.NowMs;
             return true;                            // план в слоте — следующим тактом полетим
         }
         return false;
