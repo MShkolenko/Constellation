@@ -591,6 +591,9 @@ namespace Constellation::Ai
     // ОТХОД (2026-09-13): сломанных вещей на теле (`BrokenCount`) и точка отхода от нападающего
     // (`FleePointCore`) — те же тела, что у `Idle` лестницы.
     uint32 BrokenGearFor(Player* self);
+    // СЛЕДОВАНИЕ ЗА ХОЗЯИНОМ (2026-09-14): где он — тем же телом, что у лестницы (`FollowTargetPos`,
+    // включая отладочную цель). false = идти не за кем.
+    bool FollowTargetFor(Player* self, Position* out);
     bool FleePointFor(Player* self, ObjectGuid from, Position* out);
 
     enum class TalkOutcome : uint8
@@ -736,6 +739,7 @@ namespace Constellation::Ai
         // Точка отхода от этого нападающего; false — некуда.
         bool FleePointFrom(ObjectGuid from, Position* out) const;
         char const* NameOf(ObjectGuid unit) const;         // имя существа для журнала, «?» если нет
+        bool FollowTarget(Position* out) const;              // хозяин рядом на этой карте — где он
 
         // НАДО ЛИ ПЕРЕВЕСТИ ДУХ, И ХВАТИТ ЛИ УЖЕ. Два предиката лестницы целиком
         // (`Constellation.cpp:8371-8387`), а не их пересказ: пороги живут в её настройке, и
@@ -1009,6 +1013,9 @@ namespace Constellation::Ai
         bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
         bool   Quests         = true;     // `Constellation.Quests`: сбор и квесты разрешены (`Idle`, `:3314`)
         bool   Flying         = true;     // `Constellation.Flying`: полёты и камень разрешены
+        bool   Follow         = true;     // `Constellation.Follow`: следовать за хозяином
+        float  FollowDistance = 4.0f;     // насколько близко держаться
+        float  FollowMaxRange = 60.0f;    // дальше — не наш
     };
     EngineTuning Tuning();
 

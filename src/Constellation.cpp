@@ -861,6 +861,7 @@ public:
         Constellation::Ai::RegisterGatherActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterFleeActions(Constellation::Ai::Engine::Instance());
         Constellation::Ai::RegisterAirActions(Constellation::Ai::Engine::Instance());
+        Constellation::Ai::RegisterFollowActions(Constellation::Ai::Engine::Instance());
             Constellation::Ai::Engine::Instance().Seal();
         }
 
@@ -3029,6 +3030,9 @@ public:
                         != Constellation::Ai::Engine::TickResult::Idle)
                         return;
 
+                    // СЛЕДОВАНИЕ ПЕРЕНЕСЕНО (2026-09-14, шаг 2): `FollowOwner` ставит Survival
+                    // последним; блок ниже больше не входится и уйдёт вместе со `switch`.
+                    return;
                     // ДВИЖОК-ХОЗЯИН ПУСТ — IDLE ЛЕСТНИЦЫ ДАЛЬШЕ НЕ ВЫБИРАЕТ (2026-09-13, замер
                     // 20:29-21:06). Провал в её отбор вёл спутника МИМО отказов движка: поход
                     // отвергнут как смертельный / квест стоил гибелей — а лестничный `Travelling`
@@ -14792,6 +14796,13 @@ namespace Constellation::Ai
             m->BindAtInn(*c, self, act);
     }
 
+    bool FollowTargetFor(Player* self, Position* out)
+    {
+        Constellation::Manager* m = Constellation::Manager::Instance();
+        Constellation::Companion* c = m->FindByPlayer(self);
+        return c && out && m->FollowTargetPos(*c, self, out);
+    }
+
     uint32 BrokenGearFor(Player* self)
     {
         return Constellation::Manager::Instance()->BrokenCount(self);
@@ -14885,6 +14896,9 @@ namespace Constellation::Ai
         t.Vending         = Constellation::Cfg().Vending;
         t.Quests          = Constellation::Cfg().Quests;
         t.Flying          = Constellation::Cfg().Flying;
+        t.Follow          = Constellation::Cfg().Follow;
+        t.FollowDistance  = Constellation::Cfg().FollowDistance;
+        t.FollowMaxRange  = Constellation::Cfg().FollowMaxRange;
         return t;
     }
 }

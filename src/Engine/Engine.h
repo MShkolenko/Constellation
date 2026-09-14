@@ -522,6 +522,7 @@ namespace Constellation::Ai
     void RegisterGatherActions(Engine& engine);
     void RegisterFleeActions(Engine& engine);
     void RegisterAirActions(Engine& engine);
+    void RegisterFollowActions(Engine& engine);
     // Начало дороги: камень (если разрешён для этой дороги) или план полёта — см. `Air.cpp`.
     bool AirAtRoadStart(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth);
 

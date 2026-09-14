@@ -132,6 +132,11 @@ namespace Constellation::Ai
         return _self && out && FleePointFor(_self, from, out);
     }
 
+    bool WorldView::FollowTarget(Position* out) const
+    {
+        return _self && out && FollowTargetFor(_self, out);
+    }
+
     char const* WorldView::NameOf(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

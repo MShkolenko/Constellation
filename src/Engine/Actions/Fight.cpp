@@ -736,6 +736,15 @@ namespace
                     sink.Add(ctx.World.NearestAttacker() ? ActionId::FleeCombat : ActionId::EndEmptyCombat,
                              REL_MOVE, Subject());
             }
+            // ЗА ХОЗЯИНОМ — ПОСЛЕДНИМ, КАК У ЛЕСТНИЦЫ (последняя ветка Idle, `:3390-3396`): когда
+            // больше нечего делать. REL_BACKGROUND, вне боя; далеко — не ставится (`Useful`).
+            if (ctx.St && Tuning().Follow && !ctx.World.IsInCombat())
+            {
+                Position owner;
+                if (ctx.World.FollowTarget(&owner))
+                    sink.Add(ActionId::FollowOwner, REL_BACKGROUND, Subject());
+            }
+
             // ВЫШЛИ ИЗ БОЯ — СЧЁТЧИКИ ОТХОДА ЗАНОВО (`:3128-3131`).
             if (ctx.St && !ctx.World.IsInCombat()
                 && (ctx.St->Flee.Ms || ctx.St->Flee.Noted || ctx.St->Flee.HasPoint))
