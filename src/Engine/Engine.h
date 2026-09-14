@@ -524,6 +524,7 @@ namespace Constellation::Ai
     void RegisterAirActions(Engine& engine);
     // Предпосылка дороги: камень (если разрешён для этой дороги) или полёт — см. `Air.cpp`.
     void AirPrerequisites(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth, BidSink& sink);
+    bool AirAtRoadStart(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth);
 
     // ОТДЫХ ХОЧЕТСЯ — тот же предикат, что у `Rest::Useful`: ниже порога, или уже отдыхаем и ещё не
     // восстановились, или поднялись и ещё не восстановились. Один на действие и на стратегии,

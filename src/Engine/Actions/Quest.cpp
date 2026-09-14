@@ -286,6 +286,10 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 // что у похода к квестодателю и у боя, — дойти и сделать, — и части те же.
                 float const dt = ctx.Act.SliceSeconds();
 
+                // НАЧАЛО ДОРОГИ: камень или план полёта (`AirAtRoadStart`) — один раз.
+                if (AirAtRoadStart(ctx, bid, Subject::OfSpecies(t.EnderEntry), t.Where, true))
+                    return true;
+
                 // ВИДЕН, НО НЕ ДОСЯГАЕМ — идём к нему самому (см. `TURNIN_TALK_YARDS`).
                 if (std::optional<ObjectGuid> const seen = ctx.World.NearestCreatureOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
                 {
@@ -546,6 +550,8 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             }
 
             float const dt = ctx.Act.SliceSeconds();
+            if (AirAtRoadStart(ctx, bid, bid.About, t.Where, false))
+                return true;
             bool const going = WalkTowards(ctx, t.Where, SEEK_ARRIVED_YARDS, dt);
 
             // ПРИБЛИЖАЕМСЯ ЛИ — ВОПРОС ОТДЕЛЬНЫЙ ОТ «СДЕЛАН ЛИ ШАГ». Двигатель отвечает про шаг,
@@ -639,6 +645,8 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             }
 
             float const dt = ctx.Act.SliceSeconds();
+            if (AirAtRoadStart(ctx, bid, bid.About, t.Where, true))
+                return true;
             bool const going = WalkTowards(ctx, t.Where, t.Stop, dt);
             uint32 const sliceMs = uint32(dt * 1000.0f);
             if (AdvanceWalk(ctx, bid.About, d, sliceMs, !going) != WalkVerdict::Going)

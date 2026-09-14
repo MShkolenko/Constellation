@@ -30,10 +30,8 @@ namespace
     // план не трогаем; несвежий (его дорога не вернулась) — снимаем без отката, как и было.
     inline constexpr uint32 FLIGHT_PLAN_HOLD_MS  = 5000;
 
-    // КАМЕНЬ. Ставится предпосылкой дороги, когда «стоит»: дом на этой карте, цель дальше
-    // FlyIfFartherThan, от дома до неё меньше половины пути и экономия не меньше FlyIfSaves.
-    // Одна отправка; страховка такта (`:2690`) держит спутника смирно, пока идёт чтение, и в
-    // полёте/после переноса дорога планируется заново уже от дома.
+    // КАМЕНЬ. С 2026-09-14 читается прямо из начала дороги (`AirAtRoadStart`); действие оставлено
+    // зарегистрированным, но ставок на него больше нет — снять вместе с `HearthTarget` при уборке.
     class UseHearthstoneAction final : public Action
     {
     public:
@@ -151,43 +149,51 @@ namespace Constellation::Ai
     // к этой цели) — план стоит дорого (маршруты графа); ставший план держится в слоте и ставится,
     // пока не отработан. Сдача и поход спрашивают камень; поиск квестодателя — только полёт, как
     // у лестницы.
+    // ПРЕДПОСЫЛКА СТАВИТ ТОЛЬКО ГОТОВЫЙ ПЛАН СВОЕЙ ДОРОГИ. Планирование здесь было ошибкой
+    // (замер 04:13-05:07: 1501 план, два взлёта; 08:13-08:34 с гистерезисом: 286, два): у одного
+    // спутника две дороги — сдача и поход — обе живут в очереди, обе спрашивают предпосылку при
+    // каждом выборе и спорят за один план. План строится ОДИН раз — в первый такт исполнения
+    // дороги (`AirAtRoadStart`), когда движок её уже выбрал; остальные дороги не планируют вовсе.
+    // Аренду продлевает исполнение `TakeFlight` (Кодекс); чужой брошенный план снимается без отката.
     void AirPrerequisites(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth, BidSink& sink)
     {
+        (void)bid; (void)target; (void)hearth;
         if (!ctx.St || !Tuning().Flying)
             return;
         FlightPlan plan;
-        if (ctx.World.FlightPlanned(&plan))
+        if (!ctx.World.FlightPlanned(&plan))
+            return;
+        if (ctx.St->FlightRoad == road)
         {
-            if (ctx.St->FlightRoad == road)
-            {
-                // Аренду продлевает ИСПОЛНЕНИЕ `TakeFlight`, не ставка (Кодекс): ставка, которую
-                // никогда не выбирают, иначе держала бы план вечно.
-                sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
-                return;
-            }
-            if (ctx.NowMs - ctx.St->FlightRoadMs < FLIGHT_PLAN_HOLD_MS)
-                return;                             // чужой, но свежий — не перехватываем
-            ctx.World.FlightAbort(0);               // чужой и брошенный — снять без отката, считать заново
+            sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
+            return;
         }
-        // НАЧАЛО ДОРОГИ — ЭТО «ДОРОГА СЕЙЧАС НЕ ИДЁТ», а не «к этой цели ещё не ходили»:
-        // `Walk.Toward` — исторический след, он переживает бой и не даёт переспросить план при
-        // возобновлении той же дороги, хотя лестница спрашивала его на каждом переходе Idle -> режим
-        // (Кодекс, задача mtzzx6ur, п. 3). Текущее действие — та же дорога с той же целью: план
-        // был спрошен, когда она начиналась.
+        if (ctx.NowMs - ctx.St->FlightRoadMs >= FLIGHT_PLAN_HOLD_MS)
+            ctx.World.FlightAbort(0);               // чужой и брошенный — снять без отката
+    }
+
+    // НАЧАЛО ДОРОГИ — там, где лестница спрашивала камень и полёт перед `Switch` в режим дороги
+    // (`:3131-3137`, `:3320-3326`, `:3361-3364`): первый такт исполнения выбранной дороги
+    // (`Running` ещё не она). Камень — читаем сразу и отдаём такт (страховка `:2690` держит спутника
+    // на время чтения); полёт — план в слот, такт отдаём, следующим тактом предпосылка ставит
+    // `TakeFlight` выше дороги. true = такт потрачен на воздух, дорога вернётся пешком или после посадки.
+    bool AirAtRoadStart(Ctx& ctx, Bid const& bid, Subject const& road, Position const& target, bool hearth)
+    {
+        if (!ctx.St || !Tuning().Flying)
+            return false;
         if (ctx.St->Running == bid.Action && ctx.St->RunningAbout == bid.About)
-            return;
-        if (hearth && ctx.World.HearthWorth(target))
-        {
-            ctx.St->HearthTarget = target;          // позиционного предмета у ставки нет — цель в состоянии
-            ctx.St->HearthTargetSet = true;
-            sink.Add(ActionId::UseHearthstone, REL_HIGH, Subject());
-            return;
-        }
+            return false;                           // дорога уже идёт — воздух спрошен при её начале
+        if (ctx.World.FlightPlanned(nullptr))
+            return false;                           // план уже есть (свой или чужой свежий) — не планировать
+        if (hearth && ctx.World.HearthWorth(target) && ctx.World.HearthCast(target, ctx.Act, ctx.St->Move))
+            return true;                            // читаем камень — такт отдан
+        FlightPlan plan;
         if (ctx.World.PlanFlight(target, &plan))
         {
             ctx.St->FlightRoad = road;
             ctx.St->FlightRoadMs = ctx.NowMs;
-            sink.Add(ActionId::TakeFlight, REL_HIGH, Subject::OfSpecies(plan.MasterEntry));
+            return true;                            // план в слоте — следующим тактом полетим
         }
+        return false;
     }
 }
