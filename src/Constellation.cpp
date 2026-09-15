@@ -4579,6 +4579,19 @@ public:
                 picks[asked].LootListId = uint8(item.LootListId);
                 askedIds.insert(item.itemid);
                 ++asked;
+                // ПРИБОР (0026 пункт 3, 2026-09-16): за сутки 49 раз «открыл Bundle of Wood (176793),
+                // но ничего не легло» при «запрошено 1, легло 0» — ядро отказало, а какими воротами,
+                // журнал не говорил: ответ уходит клиенту пакетом. Ворота `Player::StoreLootItem`
+                // (Player.cpp:26817): предмет пуст/взят, не наш, заблокирован, `CanStoreNewItem`.
+                // Спрашиваем последние ДО отправки тем же вызовом ядра — ответ с кодом.
+                {
+                    ItemPosCountVec dest;
+                    InventoryResult const can = self->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item.itemid, item.count);
+                    if (can != EQUIP_ERR_OK)
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ЛУТ-ОТКАЗ {}: предмет {} кол {} — ядро не положит, код {} (до отправки)",
+                            self->GetName(), item.itemid, item.count, uint32(can));
+                }
             }
         }
         if (asked)
@@ -4612,10 +4625,44 @@ public:
             got = landed;
             n.Items += landed;
             if (landed != asked)
+            {
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, легло {} (ячеек занято {}) — "
                     "разница это стопки и отказы ядра",
                     self->GetName(), asked, landed, slotsUsedUp);
+                // ПРИБОР (0026 пункт 3): что ядро оставило в окне после отправки. Окна нет —
+                // ядро его закрыло само (`SendLootRelease`: объект не найден или дистанция,
+                // LootHandler.cpp:86-99; `SendLootReleaseAll`: не наш/заблокирован); есть, а
+                // предмет не «взят» — отказ `CanStoreNewItem` (см. строку «до отправки»).
+                for (uint32 i = 0; i < asked; ++i)
+                {
+                    auto const view = self->GetAELootView().find(picks[i].Object);
+                    Loot const* loot = view != self->GetAELootView().end() ? view->second : nullptr;
+                    if (!loot)
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ЛУТ-ОТКАЗ {}: {} ({}) — после отправки окна добычи нет: ядро закрыло его само",
+                            self->GetName(), what, entry);
+                        continue;
+                    }
+                    // По полю, не по индексу: ядро присваивает `LootListId = items.size()` при вставке
+                    // (Loot.cpp:947/959/967) и само берёт `items[lootListId]` (Loot.cpp:1079), так что
+                    // сегодня это одно и то же; поиск по полю переживёт и изменение этого правила (Кодекс).
+                    auto const li = std::find_if(loot->items.begin(), loot->items.end(),
+                        [id = picks[i].LootListId](LootItem const& it) { return it.LootListId == id; });
+                    if (li == loot->items.end())
+                    {
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ЛУТ-ОТКАЗ {}: {} ({}) — после отправки предмета с LootListId {} в окне нет",
+                            self->GetName(), what, entry, uint32(picks[i].LootListId));
+                        continue;
+                    }
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ЛУТ-ОТКАЗ {}: {} ({}) предмет {} после отправки — взят {}, наш {}, заблокирован {}, ffa {}",
+                        self->GetName(), what, entry, li->itemid, li->is_looted ? 1 : 0,
+                        li->HasAllowedLooter(self->GetGUID()) ? 1 : 0, li->is_blocked ? 1 : 0, li->freeforall ? 1 : 0);
+                }
+            }
         }
 
         TC_LOG_INFO("server.worldserver",
