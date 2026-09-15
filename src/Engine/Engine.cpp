@@ -414,7 +414,18 @@ namespace Constellation::Ai
         for (size_t i = 0; i < n; ++i)
         {
             Bid const& b = st.Queue[i];
-            cmp[i] = b.Score * ((sticky && b.Action == st.Running) ? STICKINESS : 1.0f);
+            // HYSTERESIS HOLDS THE BID BEING EXECUTED - action AND subject - not the action class.
+            // It used to test `b.Action == st.Running` alone, so every bid of the running action's
+            // kind inherited the 1.35x. Live, Cecily 2026-09-16 00:33: TurnInQuest had just handed
+            // 26393 to Bartlett the Brave (21 yards); the next tick "сдать 1097" to Grimand Elmore,
+            // 1225 yards away, scored 7.75 x 1.35 = 10.46 and beat "взять квест рядом" on Bartlett,
+            // 9.9 - the bot walked to Stormwind and the chain quest 26394 was never taken (1 of 6 in
+            // the 20:13 window; the deferral instrument showed no deferral on Bartlett at all).
+            // Stickiness exists so the choice does not flicker between near-equal bids for the SAME
+            // work; `RunningAbout` is the work (Reset/Cancel already use it). A fight keeps its
+            // victim, not every victim; rest bids carry the empty Subject and still match it.
+            bool const running = sticky && b.Action == st.Running && b.About == st.RunningAbout;
+            cmp[i] = b.Score * (running ? STICKINESS : 1.0f);
             if (cmp[i] > bestCmp)
                 bestCmp = cmp[i];
         }
