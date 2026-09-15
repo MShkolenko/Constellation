@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Constellation — the one door through which an action may touch the world.
  *
  * Contract: homelab/.agent/design/constellation-engine/engine-spec-v1.md §6, as amended by v2
@@ -243,6 +243,19 @@ namespace Constellation::Ai
         // Found by reading BindAtInn (Constellation.cpp:9359) for the innkeeper trigger: the
         // sixteenth method, and the hearthstone is worthless without it.
         bool BinderActivate(ObjectGuid innkeeper);                  // CMSG_BINDER_ACTIVATE
+
+        // -- death, teleport acks, equipping (2026-09-15, `audit_writes.py` 15 → 7) --------------
+        //
+        // These are the module's SERVICES above the engine (release the spirit, run to the corpse,
+        // the spirit healer, the teleport acks a client must send, the right-click equip). They
+        // are not bids and never will be; they sent the same opcodes through the session directly,
+        // which the audit counted as sends past the door. Bodies moved field for field.
+        bool RepopRequest();                                        // CMSG_REPOP_REQUEST
+        bool ReclaimCorpse(ObjectGuid corpse);                      // CMSG_RECLAIM_CORPSE
+        bool SpiritHealerActivate(ObjectGuid healer);               // CMSG_SPIRIT_HEALER_ACTIVATE
+        bool MoveTeleportAck();                                     // CMSG_MOVE_TELEPORT_ACK (near)
+        bool MoveWorldportAck();                                    // far teleport: the core's own ack
+        bool AutoEquipItem(uint8 bag, uint8 slot);                  // CMSG_AUTO_EQUIP_ITEM
 
         // -- movement ----------------------------------------------------------------------
         //

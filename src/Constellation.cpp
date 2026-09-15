@@ -1860,10 +1860,7 @@ public:
 
         if (!self->HasPlayerFlag(PLAYER_FLAGS_GHOST))
         {
-            WorldPacket raw(CMSG_REPOP_REQUEST);
-            WorldPackets::Misc::RepopRequest repop(std::move(raw));
-            repop.CheckInstance = false;
-            c.Session->HandleRepopRequest(repop);
+            Constellation::Ai::ClientAct(self, c.Session).RepopRequest();
             return;                     // отпустили дух; переносом займётся ядро
         }
 
@@ -2038,10 +2035,7 @@ public:
                     return;
                 }
 
-                WorldPacket raw(CMSG_RECLAIM_CORPSE);
-                WorldPackets::Misc::ReclaimCorpse reclaim(std::move(raw));
-                reclaim.CorpseGUID = body2->GetGUID();
-                c.Session->HandleReclaimCorpse(reclaim);
+                Constellation::Ai::ClientAct(self, c.Session).ReclaimCorpse(body2->GetGUID());
                 c.ReviveTries = 0;              // подъём у тела считается своим счётчиком
                 if (self->IsAlive())
                 {
@@ -2196,10 +2190,7 @@ public:
             return;
         }
 
-        WorldPacket raw(CMSG_SPIRIT_HEALER_ACTIVATE);
-        WorldPackets::NPC::SpiritHealerActivate act(std::move(raw));
-        act.Healer = healer->GetGUID();
-        c.Session->HandleSpiritHealerActivate(act);
+        Constellation::Ai::ClientAct(self, c.Session).SpiritHealerActivate(healer->GetGUID());
         if (self->IsAlive())
         {
             ++_revived;
@@ -2267,17 +2258,12 @@ public:
         // стороны — HandleMoveWorldportAck().
         if (self->IsBeingTeleportedNear())
         {
-            WorldPacket raw(CMSG_MOVE_TELEPORT_ACK);
-            WorldPackets::Movement::MoveTeleportAck ack(std::move(raw));
-            ack.MoverGUID = self->GetGUID();
-            ack.AckIndex = 0;
-            ack.MoveTime = GameTime::GetGameTimeMS();
-            c.Session->HandleMoveTeleportAck(ack);
+            Constellation::Ai::ClientAct(self, c.Session).MoveTeleportAck();
             return;                     // этот такт ушёл на перенос
         }
         if (self->IsBeingTeleportedFar())
         {
-            c.Session->HandleMoveWorldportAck();
+            Constellation::Ai::ClientAct(self, c.Session).MoveWorldportAck();
             return;
         }
 
@@ -5059,12 +5045,8 @@ public:
 
         if (c.GiverUnreachable.size() > 40)
             c.GiverUnreachable.clear();  // список не должен расти без предела
-        if (c.Mode == Behavior::Attacking && me->GetVictim())
-            {
-                WorldPacket raw(CMSG_ATTACK_STOP);
-                WorldPackets::Combat::AttackStop stop(std::move(raw));
-                c.Session->HandleAttackStopOpcode(stop);
-            }
+        // `Mode == Attacking` — мёртвая ветка с удаления лестницы (`Mode` всегда «стою»); бой движка
+        // останавливает само действие. Блок с CMSG_ATTACK_STOP снят 2026-09-15.
         }
         // ВЫХОД ИЗ РАЗГОВОРА ЛЮБЫМ ПУТЁМ — окно ожидания и снимок счётчиков его не переживают
         // (Кодекс): иначе следующий разговор с другой целью начинался бы со старым окном и
@@ -6249,12 +6231,7 @@ public:
 
             // ТЕМ ЖЕ ОПКОДОМ, ЧТО КЛИК ПРАВОЙ КНОПКОЙ. Обработчик требует РОВНО одну запись
             // в Inv.Items — иначе отвергает (ItemHandler.cpp: Inv.Items.size() != 1).
-            WorldPacket raw(CMSG_AUTO_EQUIP_ITEM);
-            WorldPackets::Item::AutoEquipItem eq(std::move(raw));
-            eq.PackSlot = bagSlot;
-            eq.Slot = slot;
-            eq.Inv.Items.push_back({ bagSlot, slot });
-            c.Session->HandleAutoEquipItemOpcode(eq);
+            Constellation::Ai::ClientAct(self, c.Session).AutoEquipItem(bagSlot, slot);
 
             // ПРАВДА ИЗ СОСТОЯНИЯ: лежит ли теперь в слоте именно этот предмет
             Item* now = self->GetItemByPos(INVENTORY_SLOT_BAG_0, dst);
@@ -6328,12 +6305,7 @@ public:
                 return false;
             uint32 const entry = it->GetEntry();
             uint8 const bagSlot = it->GetBagSlot(), slot = it->GetSlot();
-            WorldPacket raw(CMSG_AUTO_EQUIP_ITEM);
-            WorldPackets::Item::AutoEquipItem eq(std::move(raw));
-            eq.PackSlot = bagSlot;
-            eq.Slot = slot;
-            eq.Inv.Items.push_back({ bagSlot, slot });
-            c.Session->HandleAutoEquipItemOpcode(eq);
+            Constellation::Ai::ClientAct(self, c.Session).AutoEquipItem(bagSlot, slot);
             Item* now = self->GetItemByPos(INVENTORY_SLOT_BAG_0, emptySlot);
             if (now && now->GetEntry() == entry)
             {

@@ -566,6 +566,74 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::RepopRequest()                                  // from the death service, :1863
+    {
+        if (!Usable())
+            return false;
+        WorldPacket raw(CMSG_REPOP_REQUEST);
+        WorldPackets::Misc::RepopRequest repop(std::move(raw));
+        repop.CheckInstance = false;
+        _session->HandleRepopRequest(repop);
+        return true;
+    }
+
+    bool ClientAct::ReclaimCorpse(ObjectGuid corpse)                // :2041
+    {
+        if (!Usable() || corpse.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_RECLAIM_CORPSE);
+        WorldPackets::Misc::ReclaimCorpse reclaim(std::move(raw));
+        reclaim.CorpseGUID = corpse;
+        _session->HandleReclaimCorpse(reclaim);
+        return true;
+    }
+
+    bool ClientAct::SpiritHealerActivate(ObjectGuid healer)         // :2199
+    {
+        if (!Usable() || healer.IsEmpty())
+            return false;
+        WorldPacket raw(CMSG_SPIRIT_HEALER_ACTIVATE);
+        WorldPackets::NPC::SpiritHealerActivate act(std::move(raw));
+        act.Healer = healer;
+        _session->HandleSpiritHealerActivate(act);
+        return true;
+    }
+
+    bool ClientAct::MoveTeleportAck()                               // :2270
+    {
+        if (!Usable())
+            return false;
+        WorldPacket raw(CMSG_MOVE_TELEPORT_ACK);
+        WorldPackets::Movement::MoveTeleportAck ack(std::move(raw));
+        ack.MoverGUID = _self->GetGUID();
+        ack.AckIndex = 0;
+        ack.MoveTime = GameTime::GetGameTimeMS();
+        _session->HandleMoveTeleportAck(ack);
+        return true;
+    }
+
+    bool ClientAct::MoveWorldportAck()                              // :2280
+    {
+        if (!Usable())
+            return false;
+        _session->HandleMoveWorldportAck();
+        return true;
+    }
+
+    bool ClientAct::AutoEquipItem(uint8 bag, uint8 slot)            // :6254
+    {
+        if (!Usable())
+            return false;
+        // The handler wants EXACTLY one entry in Inv.Items (ItemHandler.cpp) — copied from the site.
+        WorldPacket raw(CMSG_AUTO_EQUIP_ITEM);
+        WorldPackets::Item::AutoEquipItem eq(std::move(raw));
+        eq.PackSlot = bag;
+        eq.Slot = slot;
+        eq.Inv.Items.push_back({ bag, slot });
+        _session->HandleAutoEquipItemOpcode(eq);
+        return true;
+    }
+
     bool ClientAct::EnableTaxiNode(ObjectGuid master)               // :9478
     {
         if (!Usable() || master.IsEmpty())
