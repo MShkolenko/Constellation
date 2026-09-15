@@ -79,6 +79,17 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
     inline constexpr float  TAKE_TALK_YARDS       = 4.0f;
     inline constexpr uint32 TAKE_UNREACHABLE_MS   = 600000;
 
+    // ПРИБОР ОТСРОЧЕК (Мастер, 2026-09-15 21:50). Три `Defer` ниже молчали, обе отсрочки по десять
+    // минут — и по журналу было не различить, какая из них гасит ставку на квестодателя после сдачи
+    // (26394/26393 = 1/6 в окне 20:13). Строка — что, кому, на сколько и почему; ветвление не меняет.
+    // Формат стабилен для grep: `ОТСРОЧКА <имя>: <вид> <кто> (<вид существа>) на <мс> мс — <почему>`.
+    void LogDefer(Ctx& ctx, BackoffKind kind, ObjectGuid giver, uint32 ms, char const* why)
+    {
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ОТСРОЧКА {}: {} {} ({}) на {} мс — {}",
+            ctx.World.Name(), NameOf(kind), ctx.World.NameOf(giver), ctx.World.EntryOf(giver), ms, why);
+    }
+
     // НА СКОЛЬКО ЗАБЫТЬ КВЕСТ, КОТОРЫЙ НЕ ВЗЯЛСЯ. У лестницы такой запрет ВЕЧНЫЙ
     // (`QuestRefused.insert`), и это осознанная разница, а не упущение: её набор растёт без
     // предела, наша таблица ограничена шестнадцатью записями на спутника. Мы меняем вечность на
@@ -438,13 +449,16 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 std::optional<float> const dn = ctx.World.DistanceTo(giver);
                 if (!at || !dn)
                 {
+                    LogDefer(ctx, BackoffKind::Unreachable, giver, TAKE_UNREACHABLE_MS, "виден, но места нет");
                     Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TAKE_UNREACHABLE_MS);
                     return false;
                 }
                 float const dt = ctx.Act.SliceSeconds();
                 bool const near = WalkTowards(ctx, *at, TAKE_TALK_YARDS, dt);
-                if (AdvanceWalk(ctx, bid.About, *dn, uint32(dt * 1000.0f), !near) != WalkVerdict::Going)
+                WalkVerdict const verdict = AdvanceWalk(ctx, bid.About, *dn, uint32(dt * 1000.0f), !near);
+                if (verdict != WalkVerdict::Going)
                 {
+                    LogDefer(ctx, BackoffKind::Unreachable, giver, TAKE_UNREACHABLE_MS, NameOf(verdict));
                     Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TAKE_UNREACHABLE_MS);
                     return false;
                 }
@@ -475,6 +489,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             if (!quest)
             {
                 // Предлагать действительно нечего — забываем его на десять минут.
+                LogDefer(ctx, BackoffKind::NothingOffered, giver, GIVER_EMPTY_MS, "меню пусто");
                 Defer(ctx, BackoffKind::NothingOffered, bid.About, 0, GIVER_EMPTY_MS);
                 return false;
             }
