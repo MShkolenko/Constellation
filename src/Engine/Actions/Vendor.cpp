@@ -146,8 +146,35 @@ namespace
 
 namespace Constellation::Ai
 {
+    // ТОРГОВЛЯ — СВОЯ СТРАТЕГИЯ (§3.4; П1 2026-09-15). До этого ставка на торговца жила внутри
+    // `Quests`, и бит 8 маски ничего не включал. Цены — те же, что стояли там: сломанный, с полными
+    // сумками или по команде оператора — REL_HIGH (боя у него всё равно нет: обход со сломанным не
+    // даёт целей); хлам и «мимоходом» — REL_NORMAL. Место в очереди у лестницы: после сдачи и
+    // отдыха, перед боем, взятием и походами (`Idle`, `:3221` против `:3258`).
+    class TradeStrategy final : public Strategy
+    {
+    public:
+        TradeStrategy() : Strategy(StrategyId::Trade) { }
+
+        void DefaultBids(Ctx& ctx, BidSink& sink) const override
+        {
+            VendorNeed const& v = Val<ValueId::VendorTrip>(ctx);
+            if (v.Reason == VendorNeed::None)
+                return;
+            float const rel = (v.Reason == VendorNeed::Helpless || v.Reason == VendorNeed::Stuffed || v.Reason == VendorNeed::Operator) ? REL_HIGH : REL_NORMAL;
+            if (v.ByMap)
+                sink.Add(ActionId::VisitVendor, rel, Subject::OfSpecies(v.MapEntry));
+            else
+                sink.Add(ActionId::VisitVendor, rel, Subject::OfUnit(v.Near));
+        }
+    };
+}
+
+namespace Constellation::Ai
+{
     void RegisterVendorActions(Engine& engine)
     {
         engine.Register(std::make_unique<VisitVendorAction>());
+        engine.Register(std::make_unique<TradeStrategy>());
     }
 }

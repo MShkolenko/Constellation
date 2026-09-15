@@ -670,18 +670,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
                     sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
 
-            // К ТОРГОВЦУ — ТАМ ЖЕ, ГДЕ У ЛЕСТНИЦЫ: после сдачи и отдыха, ПЕРЕД боем, взятием и походами
-            // (`Idle`, `:3221` против `:3258`). Сломанный или с полными сумками — REL_HIGH: у него
-            // и боя-то нет (обход со сломанным не даёт целей); хлам и «мимоходом» — REL_NORMAL.
-            VendorNeed const& v = Val<ValueId::VendorTrip>(ctx);
-            if (v.Reason != VendorNeed::None)
-            {
-                float const rel = (v.Reason == VendorNeed::Helpless || v.Reason == VendorNeed::Stuffed || v.Reason == VendorNeed::Operator) ? REL_HIGH : REL_NORMAL;
-                if (v.ByMap)
-                    sink.Add(ActionId::VisitVendor, rel, Subject::OfSpecies(v.MapEntry));
-                else
-                    sink.Add(ActionId::VisitVendor, rel, Subject::OfUnit(v.Near));
-            }
+            // К ТОРГОВЦУ — СТАВИТ СТРАТЕГИЯ `Trade` (Vendor.cpp, П1 2026-09-15), бит 8 маски.
 
             // ПОЛЁТ ПО ГОТОВОМУ ПЛАНУ — ВЫШЕ БОЁВ, КАК `TakingFlight` У ЛЕСТНИЦЫ (`:3135`, `:3324`,
             // `:3363`): она уходила в режим полёта сразу и по дороге к мастеру не дралась. Ставкой

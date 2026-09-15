@@ -63,8 +63,30 @@ namespace
 
 namespace Constellation::Ai
 {
+    // СЛЕДОВАНИЕ — СВОЯ СТРАТЕГИЯ (§3.4; П1 2026-09-15). Ставка жила в `Survival`, и бит 32 маски
+    // ничего не включал. Место и цена те же: последним, когда больше нечего делать (последняя
+    // ветка Idle лестницы, `:3390-3396`) — REL_BACKGROUND, вне боя; далеко — не ставится (`Useful`).
+    class FollowStrategy final : public Strategy
+    {
+    public:
+        FollowStrategy() : Strategy(StrategyId::Follow) { }
+
+        void DefaultBids(Ctx& ctx, BidSink& sink) const override
+        {
+            if (!ctx.St || !Tuning().Follow || ctx.World.IsInCombat())
+                return;
+            Position owner;
+            if (ctx.World.FollowTarget(&owner))
+                sink.Add(ActionId::FollowOwner, REL_BACKGROUND, Subject());
+        }
+    };
+}
+
+namespace Constellation::Ai
+{
     void RegisterFollowActions(Engine& engine)
     {
         engine.Register(std::make_unique<FollowOwnerAction>());
+        engine.Register(std::make_unique<FollowStrategy>());
     }
 }
