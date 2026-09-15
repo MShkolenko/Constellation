@@ -865,12 +865,17 @@ namespace Constellation::Ai
         return ctx.World.TalkRefuseAt(who, plan, st, TalkMemoryByEngine(ctx));
     }
 
-    bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n)
+    LootSender DoorLootSender(ClientAct& act)
     {
         LootSender send;
         send.Open = &DoorLootOpen; send.Money = &DoorLootMoney;
-        send.Items = &DoorLootItems; send.Release = &DoorLootRelease; send.User = &ctx.Act;
-        return ctx.World.LootFor(corpse, send, n);
+        send.Items = &DoorLootItems; send.Release = &DoorLootRelease; send.User = &act;
+        return send;
+    }
+
+    bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n)
+    {
+        return ctx.World.LootFor(corpse, DoorLootSender(ctx.Act), n);
     }
 
     // НА СКОЛЬКО ЗАБЫТЬ ОСОБЬ, ДО КОТОРОЙ НЕ ДОБРАТЬСЯ. Десять минут — срок лестницы для

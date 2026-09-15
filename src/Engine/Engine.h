@@ -562,6 +562,9 @@ namespace Constellation::Ai
     // чем шлётся — не его параметр.
     bool CastThroughDoor(Ctx& ctx, ObjectGuid victim, CastMemory& m);
     bool LootThroughDoor(Ctx& ctx, ObjectGuid corpse, LootCounters& n);
+    // ОТПРАВЩИК ЛУТА НАД ДВЕРЬЮ — один на трупы и на сундуки (П4 2026-09-15): общее тело сбора
+    // (`GatherOpenCore`) получает `ClientAct&` и берёт добычу этим отправщиком, а не сессией.
+    LootSender DoorLootSender(ClientAct& act);
 }
 
 #endif // CONSTELLATION_ENGINE_ENGINE_H

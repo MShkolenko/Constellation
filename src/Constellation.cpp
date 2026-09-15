@@ -3856,7 +3856,8 @@ public:
         // в сумках вокруг самого Use, а не только по окну.
         uint32 const landed = self->GetAELootView().empty()
             ? (spaceBefore > FreeBagSpace(self) ? spaceBefore - FreeBagSpace(self) : 0u)
-            : TakeOpenLoot(c, self, go->GetGUID(), name, entry);
+            : TakeOpenLootCore(self, go->GetGUID(), name, entry,
+                               Constellation::Ai::DoorLootSender(act), c.Loot);   // через дверь (П4)
         // УСПЕХ — ЭТО ДОБЫЧА ИЛИ СДВИГ ЦЕЛЕЙ, И НИЧТО ИНОЕ. Объединённый выход раньше
         // объявлял успехом любой заход, из-за чего предел не действовал ровно там, где
         // он и был нужен (Кодекс, задача 104).
@@ -4552,61 +4553,6 @@ public:
         return repaired || !stillPoor;
     }
 
-    // ЛУТ СБОРА ЕЩЁ ИДЁТ ЧЕРЕЗ СЕССИЮ: общее тело `GatherOpenCore` берёт добычу через `TakeOpenLoot`
-    // с этим отправщиком; перевод на дверь `ClientAct` — в backlog после переноса.
-    static bool LadderLootOpen(void* user, ObjectGuid unit)
-    {
-        Companion& c = *static_cast<Companion*>(user);
-        WorldPacket raw(CMSG_LOOT_UNIT);
-        WorldPackets::Loot::LootUnit open(std::move(raw));
-        open.Unit = unit;
-        c.Session->HandleLootOpcode(open);
-        return true;
-    }
-
-    static bool LadderLootMoney(void* user)
-    {
-        Companion& c = *static_cast<Companion*>(user);
-        WorldPacket raw(CMSG_LOOT_MONEY);
-        WorldPackets::Loot::LootMoney money(std::move(raw));
-        c.Session->HandleLootMoneyOpcode(money);
-        return true;
-    }
-
-    static bool LadderLootItems(void* user, Constellation::Ai::LootPick const* picks, uint32 count)
-    {
-        Companion& c = *static_cast<Companion*>(user);
-        WorldPacket rawItems(CMSG_LOOT_ITEM);
-        WorldPackets::Loot::LootItem take(std::move(rawItems));
-        for (uint32 i = 0; i < count; ++i)
-        {
-            WorldPackets::Loot::LootRequest& req = take.Loot.emplace_back();
-            req.Object     = picks[i].Object;       // КЛЮЧ вида — это и есть GUID объекта лута
-            req.LootListID = picks[i].LootListId;   // НЕ номер в списке
-        }
-        c.Session->HandleAutostoreLootItemOpcode(take);
-        return true;
-    }
-
-    static bool LadderLootRelease(void* user, ObjectGuid unit)
-    {
-        Companion& c = *static_cast<Companion*>(user);
-        WorldPacket raw(CMSG_LOOT_RELEASE);
-        WorldPackets::Loot::LootRelease done(std::move(raw));
-        done.Unit = unit;
-        c.Session->HandleLootReleaseOpcode(done);
-        return true;
-    }
-
-    static Constellation::Ai::LootSender LadderLootSender(Companion& c)
-    {
-        Constellation::Ai::LootSender s;
-        s.Open = &LadderLootOpen; s.Money = &LadderLootMoney;
-        s.Items = &LadderLootItems; s.Release = &LadderLootRelease;
-        s.User = &c;
-        return s;
-    }
-
     uint32 TakeOpenLootCore(Player* self, ObjectGuid src, std::string const& what, uint32 entry,
                             Constellation::Ai::LootSender const& send, Constellation::Ai::LootCounters& n)
     {
@@ -4728,12 +4674,6 @@ public:
         // 4. ОТПУСТИТЬ. Иначе вид остаётся открытым и следующий труп не откроется.
         send.Release(send.User, src);
         return got;
-    }
-
-    // Обёртка лестницы: подпись прежняя, вызовы в ветках (`:4919`) не тронуты.
-    uint32 TakeOpenLoot(Companion& c, Player* self, ObjectGuid src, std::string const& what, uint32 entry)
-    {
-        return TakeOpenLootCore(self, src, what, entry, LadderLootSender(c), c.Loot);
     }
 
     bool LootFromCorpseCore(Player* self, ObjectGuid corpseGuid,
