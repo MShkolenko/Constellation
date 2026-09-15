@@ -171,6 +171,7 @@ namespace Constellation::Ai
             ObjectGuid    Victim;               // пусто = боя нет
             uint32        VictimEntry = 0;
             bool          Engaged     = false;  // ядро приняло замах: `GetVictim() == Victim`
+            bool          Defensive   = false;  // бой начат нападающим, а не обходом: «цель набрана» не про него
             BlowsSnapshot Base;                 // отсчёт ЭТОГО боя (`RegisterAndSnapshot`)
             // СВОЙ УРОН, А НЕ ЗДОРОВЬЕ ЦЕЛИ — у лестницы это поле звалось `VictimHp` и лгало
             // именем (Кодекс): максимум накопленного собственного урона, по нему сторож.

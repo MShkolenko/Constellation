@@ -206,7 +206,7 @@ namespace
             if (f.WantedCheckMs >= WANTED_EVERY_MS)
             {
                 f.WantedCheckMs = 0;
-                if (!ctx.World.StillWanted(f.VictimEntry))
+                if (!f.Defensive && !ctx.World.StillWanted(f.VictimEntry))
                     return End(ctx, f, "цель задания набрана", /*ban=*/false);
             }
 
@@ -310,6 +310,11 @@ namespace
             // С ЧЕМ ШЛИ В БОЙ — снимок обхода на момент выбора, как `EngageAssists`/`PackCenter`
             // у лестницы: обход пересчитается через секунду и уже про другую цель.
             ObjectiveScan const& scan = Val<ValueId::Objectives>(ctx);
+            // ОБОРОНА — БОЙ, КОТОРЫЙ НАЧАЛ НЕ ОБХОД (0026 п. 1а): цель не из обхода, значит и
+            // «цель задания набрана» её не касается. Первые два часа без этого флага: 2258 боёв
+            // за 2 ч обрывались через секунду по `StillWanted` и начинались заново на следующем
+            // такте — сторожа своего урона и телеметрия сбрасывались каждую секунду.
+            f.Defensive   = (scan.Fight != victim);
             if (scan.Fight == victim)
             {
                 f.Assists    = scan.Assists;
