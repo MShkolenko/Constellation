@@ -739,6 +739,10 @@ namespace Constellation::Ai
         // Точка отхода от этого нападающего; false — некуда.
         bool FleePointFrom(ObjectGuid from, Position* out) const;
         char const* NameOf(ObjectGuid unit) const;         // имя существа для журнала, «?» если нет
+        // План: консультация до меню, чтение меню, взятие (П3) — переходники к модулю.
+        void PlanConsult(ObjectGuid giver) const;
+        void PlanMenuRead(ObjectGuid giver) const;
+        void QuestTaken() const;
         bool FollowTarget(Position* out) const;              // хозяин рядом на этой карте — где он
 
         // НАДО ЛИ ПЕРЕВЕСТИ ДУХ, И ХВАТИТ ЛИ УЖЕ. Два предиката лестницы целиком
@@ -1012,6 +1016,7 @@ namespace Constellation::Ai
         uint32 MaxQuests      = 10;
         bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
         bool   Quests         = true;     // `Constellation.Quests`: сбор и квесты разрешены (`Idle`, `:3314`)
+        bool   TakeQuests     = true;     // `Constellation.TakeQuests`: брать квесты (был флаг `QuestTick`)
         bool   Flying         = true;     // `Constellation.Flying`: полёты и камень разрешены
         bool   Follow         = true;     // `Constellation.Follow`: следовать за хозяином
         float  FollowDistance = 4.0f;     // насколько близко держаться
@@ -1034,6 +1039,13 @@ namespace Constellation::Ai
     // Приборы движку не нужны, поэтому последний параметр лестницы сюда не выходит вовсе.
     void ScanObjectivesFor(Player* self, FightMemory const& mem, DangerView const& danger,
                            ObjectiveScan* out);
+
+    // НАБЛЮДЕНИЯ ПЛАНА И СЧЁТЧИК ВЗЯТИЙ (П3 2026-09-15): три точки, в которых их ставил `QuestTick`
+    // лестницы, — перед запросом меню, после его чтения, после успешного взятия. Реализация — в
+    // модуле (там же `FirstFailingGate` и `_questsTaken`), сюда выходят только переходники.
+    void PlanConsultFor(Player* self, ObjectGuid giver);
+    void PlanMenuReadFor(Player* self, ObjectGuid giver);
+    void QuestTakenFor(Player* self);
 
     // Шаг двигателя: одна реализация на лестницу и на движок.
     //

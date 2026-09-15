@@ -71,6 +71,13 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
     // меню), и по той же причине — «уровень растёт, предыдущие квесты закрываются, меню
     // меняется». Запрет по особи, не по виду.
     inline constexpr uint32 GIVER_EMPTY_MS = 600000;
+    // К САМОМУ КВЕСТОДАТЕЛЮ, КОГДА ОН В ОБЗОРЕ, НО ЯДРО НЕ ДАЁТ ГОВОРИТЬ (П3 2026-09-15): та же
+    // дорога, что у сдачи к принимающему (`TURNIN_TALK_YARDS`). До этого `Possible` = «в радиусе
+    // разговора», иначе ставка падала — и последние ярды к знаку ходил `QuestTick` лестницы своим
+    // шагом и сырыми обработчиками мимо двери (43 взятия за окно 10:13 — все его). Не дойти —
+    // десять минут, как у `GiverUnreachable` у него же.
+    inline constexpr float  TAKE_TALK_YARDS       = 4.0f;
+    inline constexpr uint32 TAKE_UNREACHABLE_MS   = 600000;
 
     // НА СКОЛЬКО ЗАБЫТЬ КВЕСТ, КОТОРЫЙ НЕ ВЗЯЛСЯ. У лестницы такой запрет ВЕЧНЫЙ
     // (`QuestRefused.insert`), и это осознанная разница, а не упущение: её набор растёт без
@@ -374,7 +381,13 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             if (bid.About.What() != Subject::Kind::Unit)
                 return false;
             ObjectGuid const giver = bid.About.Guid();
-            if (giver.IsEmpty() || QuestLogFull(ctx))
+            if (giver.IsEmpty() || !ctx.St || QuestLogFull(ctx))
+                return false;
+            // НЕ ДОЙТИ — ДРУГОЙ ВИД, ЧЕМ «ПРЕДЛОЖИТЬ НЕЧЕГО», и фильтр движка его не снимает:
+            // спрашиваем здесь, как поход по карте спрашивает оба своих (`SeekGiverByMap`).
+            BackoffKey far;
+            far.Kind = BackoffKind::Unreachable; far.About = bid.About; far.Detail = 0;
+            if (Engine::Deferred(*ctx.St, far, ctx.NowMs))
                 return false;
             // ВСЁ ЕЩЁ В ОБЗОРЕ И ВСЁ ЕЩЁ СО ЗНАКОМ. Значение фильтрует по флагу квестодателя и
             // по статусу диалога; ушёл из обзора или знак погас — ставка больше не нужна.
@@ -384,11 +397,9 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             return false;
         }
 
-        // ВОЗМОЖНО СЕЙЧАС — ЭТО ВОПРОС К ЯДРУ, А НЕ К РАССТОЯНИЮ. Тот же предикат, что у сдачи.
-        bool Possible(Ctx& ctx, Bid const& bid) override
-        {
-            return ctx.World.CanTalkTo(bid.About.Guid());
-        }
+        // ВОЗМОЖНО, ПОКА ЕСТЬ ГДЕ ХРАНИТЬ ДОРОГУ: далёкий квестодатель — повод подойти, а не
+        // повод снять ставку (П3). Разговор ли это уже или ещё дорога, решает `Execute` у ядра.
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
 
         // Ближе — дешевле, тем же наклоном, что у сдачи. Расстояние в значении по плоскости, и
         // это допустимо: здесь оно ЦЕНА, а не решение. Решает ядро в `Possible`.
@@ -404,8 +415,32 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
         bool Execute(Ctx& ctx, Bid const& bid) override
         {
             ObjectGuid const giver = bid.About.Guid();
-            if (giver.IsEmpty() || !ctx.World.CanTalkTo(giver))
+            if (giver.IsEmpty() || !ctx.St)
                 return false;
+
+            // ВИДЕН, НО ЯДРО НЕ ДАЁТ ГОВОРИТЬ — ИДЁМ К НЕМУ САМОМУ, как сдача к принимающему
+            // (`TURNIN_TALK_YARDS`): ключ прогресса — сам квестодатель, не дойти — десять минут.
+            if (!ctx.World.CanTalkTo(giver))
+            {
+                std::optional<Position> const at = ctx.World.WhereIs(giver);
+                std::optional<float> const dn = ctx.World.DistanceTo(giver);
+                if (!at || !dn)
+                {
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TAKE_UNREACHABLE_MS);
+                    return false;
+                }
+                float const dt = ctx.Act.SliceSeconds();
+                bool const near = WalkTowards(ctx, *at, TAKE_TALK_YARDS, dt);
+                if (AdvanceWalk(ctx, bid.About, *dn, uint32(dt * 1000.0f), !near) != WalkVerdict::Going)
+                {
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TAKE_UNREACHABLE_MS);
+                    return false;
+                }
+                return true;
+            }
+
+            // ПЛАН: консультация точки ДО запроса меню (как у `QuestTick`, П3).
+            ctx.World.PlanConsult(giver);
 
             // ПРИВЕТСТВИЕ — ЭТО НЕ ВЕЖЛИВОСТЬ, А СПОСОБ УЗНАТЬ МЕНЮ. Ядро строит его в ответ на
             // этот опкод; до него читать нечего.
@@ -422,6 +457,8 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                     return false;
                 quest = ctx.World.BestQuestOffered(&QuestRefusedHere, &ctx);
             }
+            // ПЛАН: снимок точки и сверка настоящего меню с зеркалом ворот (только наблюдение).
+            ctx.World.PlanMenuRead(giver);
 
             if (!quest)
             {
@@ -457,6 +494,11 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             // умел.
             if (ctx.St)
                 ctx.St->Values.GiverToSeek.Invalidate();
+            // ОДНА СТРОКА НА ВЗЯТИЕ — прибор, которым мерится окно после ухода `QuestTick`: его
+            // строка «взял квест» была единственной, и без этой ноль взятий не отличить от нуля строк.
+            TC_LOG_INFO("server.worldserver", "Constellation ДВИЖОК {}: взял квест {} у {}",
+                ctx.World.Name(), quest, ctx.World.NameOf(giver));
+            ctx.World.QuestTaken();                 // счётчик статуса и наблюдение плана
             return true;
         }
     };
@@ -666,7 +708,8 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             // Кодекс назвал предел: на восьми спутниках это ничто, на 122 в плотном хабе нужен
             // замер, а возможно и указатель вместо перебора. Очередь ставок ограничена 32, и
             // перебор считается полем `сброшено` в строке решения — по нему и станет видно.
-            if (!QuestLogFull(ctx))
+            // `Constellation.TakeQuests` — флаг лестницы (`QuestTick`), теперь читается здесь (П3).
+            if (Tuning().TakeQuests && !QuestLogFull(ctx))
                 for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
                     sink.Add(ActionId::TakeQuestNearby, REL_NORMAL, Subject::OfUnit(g.Guid));
 

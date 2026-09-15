@@ -885,7 +885,6 @@ public:
         {
             TickSession(c, diff);
             BehaveTick(c, diff);        // автомат поведения: одно намерение за раз
-            QuestTick(c, diff);
             if (budget && AdvanceOne(c))
                 --budget;
         }
@@ -5207,253 +5206,14 @@ public:
             *out = owner->GetPosition();
         return true;
     }
-    // ВЗЯТИЕ КВЕСТА — цепочкой опкодов, и выбор ТОЖЕ клиентский.
-    //
-    // Ограничение, которое надо назвать честно: сессия спутника БЕЗ СОКЕТА, поэтому
-    // ответы сервера до неё не доходят. Правило то же, что для входа без второго
-    // сокета: ДЕЙСТВИЕ идёт опкодом, СВЕДЕНИЯ берутся оттуда же, откуда их берёт
-    // сервер, СОБИРАЯ ПАКЕТ КЛИЕНТУ.
-    //
-    // Первая версия выбирала квест через sObjectMgr->GetCreatureQuestRelations, и
-    // Кодекс справедливо назвал это переходом черты: это внутренний перечень связей
-    // квестодателя, а не то, что видит игрок. Теперь спутник шлёт Hello и читает
-    // МЕНЮ, которое ядро только что построило В ОТВЕТ на этот Hello и попыталось
-    // отправить — тот самый список, что нарисовался бы в окне у игрока, в том же
-    // порядке. Пакет упал в пустой сокет, но меню осталось.
-    void QuestTick(Companion& c, uint32 diff)
-    {
-        if (!Cfg().Quests || !Cfg().TakeQuests || c.State != Stage::InWorld || !c.Session)
-            return;
-        Player* self = c.Session->GetPlayer();
-        if (!self || !self->IsInWorld() || !self->IsAlive())
-            return;
-
-        // ИДЁМ К НАЙДЕННОМУ — КАЖДЫЙ ТАКТ, А НЕ РАЗ В ПЯТЬ СЕКУНД.
-        //
-        // Поиск дорогой и остаётся под сроком, а вот дорога должна идти шагами по 4 Гц,
-        // иначе спутник будет ползти к NPC по одному шагу в пять секунд.
-        if (!c.GiverGuid.IsEmpty())
-        {
-            Creature* going = ObjectAccessor::GetCreature(*self, c.GiverGuid);
-            bool const busy = c.Mode != Behavior::Idle;     // дерётся или идёт по своим делам
-            if (!going || !going->IsAlive() || busy
-                || self->GetExactDist(going) > std::max(Cfg().QuestGiverRange, c.GiverRange) + 15.0f)
-            {
-                c.GiverGuid.Clear();                        // цель протухла — забыть
-            }
-            else if (!self->CanInteractWithQuestGiver(going))
-            {
-                float gx, gy, gz;
-                ApproachPoint(c, going, self, gx, gy, gz, diff);
-                StepToward(c, self, gx, gy, gz, going->GetCombatReach() + 2.0f, diff / 1000.0f);
-
-                // ГРАНИЦЫ ДОРОГИ. Без них спутник топчется у лестницы вечно: шаг формально
-                // удаётся, Stalled не взводится, автомат стоит, боёв нет. Это была живая
-                // регрессия, замеченная оператором в клиенте.
-                c.GiverMs += diff;
-                float const now = ProgressDist(c, self, going);
-                bool const noProgress = c.GiverMs >= 20000 && now > c.GiverDist - 1.0f;
-                bool const giverDone = c.Move.Stalled || noProgress || c.GiverMs >= 30000;
-                if (giverDone && FindReachableApproach(c, self, going))
-                    { c.GiverMs = 0; c.GiverDist = ProgressDist(c, self, going); return; }
-                if (giverDone)
-                {
-                    LogApproachFailure(c, self, going, "квестодателю");
-                    TC_LOG_INFO("server.worldserver",
-                        "Constellation: {} — до квестодателя {} ({}) не дойти за {} с, "
-                        "было {:.1f} ярдов, стало {:.1f}; больше не пробую",
-                        self->GetName(), going->GetName(), going->GetEntry(),
-                        c.GiverMs / 1000, c.GiverDist, now);
-                    c.GiverUnreachable[c.GiverGuid] = 600000;   // иначе выберем его снова
-                    c.GiverGuid.Clear();
-                    c.GiverMs = 0;
-                    StopMoving(c, self);
-                }
-                return;                                     // идём; разговор — как дойдём
-            }
-            // дошли — падаем ниже, к разговору, минуя срок
-            c.QuestMs = Cfg().QuestIntervalMs;
-        }
-
-        c.QuestMs += diff;
-        if (c.QuestMs < Cfg().QuestIntervalMs)
-            return;
-        c.QuestMs = 0;
-
-        // журнал полон — это ВСЕ слоты заняты, а не первые три
-        uint32 used = 0;
-        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
-            if (self->GetQuestSlotQuestId(slot))
-                ++used;
-        if (used >= MAX_QUEST_LOG_SIZE || used >= Cfg().MaxQuests)
-            return;
-
-        Creature* giver = NearestQuestGiver(c, self);
-        if (!giver)
-            return;
-
-        // каноническая проверка ядра: расстояние, флаги, враждебность, смерть.
-        // Прямой вызов обработчика мог бы обойти то, что клиенту не позволено.
-        //
-        // ДАЛЕКО — ЭТО ПОВОД ПОДОЙТИ, А НЕ ПОВОД СДАТЬСЯ. Здесь стоял голый return, и
-        // спутник вечно стоял в пятнадцати ярдах от NPC с восклицательным знаком.
-        // ПРИДЯ — ПОВЕРНУТЬСЯ. На проверку дистанции это не влияет, но это то, что делает
-        // игрок, и это видно в клиенте: спутник, говорящий с NPC спиной, выглядит поломкой.
-        if (self->CanInteractWithQuestGiver(giver))
-            self->SetFacingToObject(giver);
-
-        if (!self->CanInteractWithQuestGiver(giver))
-        {
-            if (c.Mode == Behavior::Idle)
-            {
-                c.GiverGuid = giver->GetGUID();     // пойдём к нему со следующего такта
-                c.GiverMs = 0;
-                c.GiverDist = self->GetExactDist(giver);
-                c.GiverRange = 0.0f;
-            }
-            return;
-        }
-        c.GiverGuid.Clear();                        // дошли и говорим — цель больше не нужна
-
-        // ПЛАН: консультация точки ДО запроса меню — запись снимка с совместимостью по фазе
-        Constellation::Plan::Planner::Instance()->OnConsult(self, giver);
-
-        // «подойти и заговорить» — тот же опкод, что шлёт клиент по клику
-        WorldPacket rawHello(CMSG_QUEST_GIVER_HELLO);
-        WorldPackets::Quest::QuestGiverHello hello(std::move(rawHello));
-        hello.QuestGiverGUID = giver->GetGUID();
-        c.Session->HandleQuestgiverHelloOpcode(hello);
-
-        // У NPC СО СЦЕНАРИЕМ БЕСЕДЫ ЭТОГО ОПКОДА МАЛО — И ЭТО НЕ ДОГАДКА, А СТРОКА ЯДРА.
-        //
-        //     _player->PlayerTalkClass->ClearMenus();
-        //     if (creature->AI()->OnGossipHello(_player))
-        //         return;                              <-- выход ДО подготовки меню
-        //     _player->PrepareQuestMenu(creature->GetGUID());
-        //
-        // То есть если у существа есть свой обработчик приветствия, меню квестов не
-        // готовится вовсе. Замер это и показал: прибор напечатал «предложил пунктов 0» у
-        // всех, кто дошёл до Milly Osworth, — не «ядро не даёт взять», не «отказные», а
-        // ПУСТО. Спутник стучался не в ту дверь.
-        //
-        // Живой игрок в этот момент видит окно беседы, и его клиент шлёт CMSG_GOSSIP_HELLO.
-        // Тот путь идёт через Player::PrepareGossipMenu, который меню квестов заполняет
-        // (Player.cpp: два вызова PrepareQuestMenu внутри). Поэтому: пусто после первого
-        // опкода — шлём второй, ровно как клиент, и читаем снова. Своих внутренних вызовов
-        // ядра по-прежнему нет.
-        if (self->PlayerTalkClass->GetQuestMenu().GetMenuItemCount() == 0)
-        {
-            // опкод в этом ядре зовётся CMSG_TALK_TO_GOSSIP (Opcodes.cpp), а не
-            // CMSG_GOSSIP_HELLO — имя проверено по таблице обработчиков, не по памяти
-            WorldPacket rawGossip(CMSG_TALK_TO_GOSSIP);
-            WorldPackets::NPC::Hello gossip(std::move(rawGossip));
-            gossip.Unit = giver->GetGUID();
-            c.Session->HandleGossipHelloOpcode(gossip);
-        }
-
-        // читаем то, что ядро только что собрало для клиента, в его же порядке
-        QuestMenu const& menu = self->PlayerTalkClass->GetQuestMenu();
-
-        // ПЛАН: снимок точки и сверка настоящего меню с зеркалом ворот (только наблюдение)
-        Constellation::Plan::Planner::Instance()->OnMenuRead(self, giver, menu,
-            [this](Player* p, Quest const* q) { return FirstFailingGate(p, q); });
-
-        // ЧТО ИМЕННО ПРЕДЛОЖИЛИ И ЧТО ИЗ ЭТОГО ОТВЕРГНУТО — ПО РАЗУ НА КАЖДОГО.
-        //
-        // Прибор выше показал, что 56 спутников из 122 квестодателя ВЫБИРАЮТ, при этом за
-        // все часы взят один квест и ни одной строки «не дойти». Значит срыв здесь, и без
-        // этой строки различить «меню пустое» и «CanTakeQuest всё отверг» нельзя.
-        if (!c.TalkDiagDone)
-        {
-            c.TalkDiagDone = true;
-            uint32 refused = 0, noTemplate = 0, cannotTake = 0;
-            for (uint8 i = 0; i < menu.GetMenuItemCount(); ++i)
-            {
-                uint32 const qid = menu.GetItem(i).QuestId;
-                if (c.QuestRefused.count(qid))
-                    { ++refused; continue; }
-                Quest const* q = sObjectMgr->GetQuestTemplate(qid);
-                if (!q)
-                    { ++noTemplate; continue; }
-                if (!self->CanTakeQuest(q, false))
-                    ++cannotTake;
-            }
-            TC_LOG_INFO("server.worldserver",
-                "Constellation РАЗГОВОР {}: {} ({}) предложил пунктов {}, из них ранее отказных {}, "
-                "без шаблона {}, ядро не даёт взять {}",
-                self->GetName(), giver->GetName(), giver->GetEntry(),
-                uint32(menu.GetMenuItemCount()), refused, noTemplate, cannotTake);
-        }
-
-        // ВЫБОР — ОДНОЙ ФУНКЦИЕЙ, ТОЙ ЖЕ, ЧТО ПРЕДСТОИТ ЗВАТЬ ДВИЖКУ. Правила и объяснения
-        // переехали к ней целиком; здесь остаётся только то, что принадлежит ЭТОМУ вызывающему —
-        // его собственная память об отказах и его диагностика.
-        //
-        // `pick.Offered` не читается: переменная `offered` пережила условие `!quest && offered`,
-        // которое её использовало. Убирать её — отдельной правкой, чтобы этот перенос остался
-        // доказуемо пустым по поведению.
-        MenuPick const pick       = PickFromQuestMenu(self, &RefusedByCompanion, &c);
-        uint32 const questId      = pick.QuestId;
-        Quest const* quest        = pick.Template;
-        uint8 const bestColour    = pick.Colour;
-        uint32 const skippedRed   = pick.SkippedRed;
-        uint32 const unknownLevel = pick.UnknownLevel;
-
-        if ((skippedRed || unknownLevel) && !c.RedNoted)
-        {
-            c.RedNoted = true;
-            TC_LOG_INFO("server.worldserver",
-                "Constellation СВЕТОФОР {} (ур. {}): у {} ({}) пропущено красных {}, "
-                "неизвестного уровня {} (эти БЕРЁМ), взято {}",
-                self->GetName(), uint32(self->GetLevel()), giver->GetName(), giver->GetEntry(),
-                skippedRed, unknownLevel, questId);
-        }
-        // ВЕСЬ ПРИЛАВОК НЕ ПО НАМ — К ЭТОМУ КВЕСТОДАТЕЛЮ БОЛЬШЕ НЕ ХОДИМ (Кодекс). Иначе
-        // ближайший, у которого всё красное, выбирался бы снова и снова вместо соседнего с
-        // подходящим заданием. Запрет по особи и не навсегда: уровень растёт, цвет меняется.
-        // ПУСТОЕ МЕНЮ — ТОЖЕ ОТКАЗ, И БЕЗ ЭТОГО ПОХОД НА ЗНАК ЗАЦИКЛИЛСЯ БЫ.
-        // Здесь стояло `!quest && offered`, то есть запрет ставился, только когда меню
-        // что-то предложило. Знак ядра ставится по CanSeeStartQuest, а меню собирается
-        // по CanTakeQuest, поэтому знак бывает при ПУСТОМ меню — и такой квестодатель
-        // выбирался бы снова и снова. Запрет по особи и на десять минут: уровень растёт,
-        // предыдущие квесты закрываются, меню меняется.
-        if (!quest)
-            c.GiverUnreachable[giver->GetGUID()] = 600000;
-        if (quest)
-        {
-            // РАЗГОВОР СОСТОЯЛСЯ И КВЕСТ ВЗЯТ — короткий откат, поставленный при выборе
-            // запасной цели, больше не нужен: к этому квестодателю можно возвращаться
-            // хоть следующим тактом. Если бы меню оказалось пустым, строкой выше стоял
-            // бы десятиминутный запрет, и он бы этот вызов не выполнил.
-            c.GiverUnreachable.erase(giver->GetGUID());
-            WorldPacket rawAccept(CMSG_QUEST_GIVER_ACCEPT_QUEST);
-            WorldPackets::Quest::QuestGiverAcceptQuest accept(std::move(rawAccept));
-            accept.QuestGiverGUID = giver->GetGUID();
-            accept.QuestID = questId;
-            c.Session->HandleQuestgiverAcceptQuestOpcode(accept);
-
-            QuestStatus st = self->GetQuestStatus(questId);
-            if (st == QUEST_STATUS_INCOMPLETE || st == QUEST_STATUS_COMPLETE)
-            {
-                static char const* const colourName[4] = { "серое", "зелёное", "жёлтое", "красное" };
-                TC_LOG_INFO("server.worldserver", "Constellation: {} взял квест {} '{}' у {} — {}, ур. задания {} при своём {}",
-                    self->GetName(), questId, quest->GetLogTitle(), giver->GetName(),
-                    colourName[bestColour < 4 ? bestColour : 3], self->GetQuestLevel(quest), uint32(self->GetLevel()));
-                ++_questsTaken;
-                Constellation::Plan::Planner::Instance()->OnTakeOrTurnIn(self);
-            }
-            else
-            {
-                // Не взялся — запоминаем и больше не долбимся. Так ведут себя
-                // квесты, требующие подтверждения (общие, сопровождение): их
-                // приём — отдельный опкод, и до него дело ещё не дошло.
-                c.QuestRefused.insert(questId);
-                TC_LOG_DEBUG("server.worldserver", "Constellation: {} was refused quest {} (status {})",
-                    self->GetName(), questId, uint32(st));
-            }
-            return;                             // по одному за раз, как человек
-        }
-    }
+    // `QuestTick` — ВТОРОЙ КОНТРОЛЛЕР, СНЯТ (П3 2026-09-15). Двести тридцать строк: свой шаг к
+    // квестодателю (`StepToward`, `ApproachPoint`, `FindReachableApproach`), сырые обработчики
+    // сессии мимо двери (`HandleQuestgiverHelloOpcode`, `HandleGossipHelloOpcode`,
+    // `HandleQuestgiverAcceptQuestOpcode`), `SetFacingToObject` и своя память `GiverUnreachable`.
+    // Шёл каждый такт рядом с движком под флагом `TakeQuests`, потому что `c.Mode != Idle` после
+    // удаления лестницы всегда ложь: в окне 10:13 все 43 «взял квест» — его. Движок делает то же
+    // (`TakeQuestNearby`: приветствие → беседа → выбор → приём → статус) и с этого шага сам ходит к
+    // квестодателю в обзоре; флаг `TakeQuests` читается им же.
 
     // Указатель «карта -> вид -> где стоит», построенный один раз.
     void BuildSpawnIndex()
@@ -7920,27 +7680,11 @@ public:
             // проверяет, что перед нами полётный мастер, и зовёт SendLearnNewTaxiNode.
             act.EnableTaxiNode(cr->GetGUID());
 
-            bool got = self->m_taxi.IsTaximaskNodeKnown(node);
-            std::string why;
-            if (!got)
-            {
-                // ЗОНД (временный): та же работа в обход ворот разговора, и рядом — те самые
-                // величины, которыми ядро принимает решение. Голого bool мало: SendLearnNewTaxiNode
-                // возвращает ИСТИНУ и при curloc == 0, ничего не поставив (TaxiHandler.cpp:134),
-                // поэтому исход разбирается по узлу ядра и его биту, а не по возврату.
-                Player* const sp = c.Session->GetPlayer();
-                uint32 const coreNode = sp ? sObjectMgr->GetNearestTaxiNode(cr->GetPositionX(),
-                    cr->GetPositionY(), cr->GetPositionZ(), cr->GetMapId(), sp->GetTeam()) : 0;
-                bool const wasCore = sp && coreNode && sp->m_taxi.IsTaximaskNodeKnown(coreNode);
-                bool const direct = c.Session->SendLearnNewTaxiNode(cr);
-                bool const nowCore = sp && coreNode && sp->m_taxi.IsTaximaskNodeKnown(coreNode);
-                got = self->m_taxi.IsTaximaskNodeKnown(node);
-                why = Trinity::StringFormat(" [зонд: игрок сессии {}, узел ядра {}, его бит {}->{}, "
-                    "возврат {}, наш бит {}, сторона {}, карта {}, до мастера {:.1f}]",
-                    sp == self ? "тот же" : "ЧУЖОЙ", coreNode, wasCore ? 1 : 0, nowCore ? 1 : 0,
-                    direct ? "да" : "нет", got ? 1 : 0, uint32(self->GetTeam()), cr->GetMapId(),
-                    self->GetDistance(cr));
-            }
+            // ЗОНД СНЯТ (П3 2026-09-15): за сутки на движке строка «точка … узнана/ядро не дало» не
+            // печаталась ни разу — узлы известны с создания, взлётов 50. Прямой `SendLearnNewTaxiNode`
+            // мимо двери больше не зовётся; узел учит `EnableTaxiNode` выше, как клиент.
+            bool const got = self->m_taxi.IsTaximaskNodeKnown(node);
+            std::string const why;
             if (got)
                 c.TaxiDone.insert(cr->GetGUID());
             else
@@ -11594,6 +11338,9 @@ private:
     std::unordered_map<ObjectGuid, Manager::Blows> _blows;  // счёт ударов, по GUID спутника
     bool _debugPairDone = false;
     uint32 _questsTaken = 0;
+public:
+    void NoteQuestTaken() { ++_questsTaken; }       // движок взял квест (П3) — тот же счётчик статуса
+private:
     uint32 _fightsStarted = 0;
     uint32 _transitions = 0;
     uint32 _questsTurnedIn = 0;
@@ -12041,6 +11788,27 @@ namespace Constellation::Ai
         return Constellation::Manager::Instance()->RestedEnough(self);
     }
 
+    void PlanConsultFor(Player* self, ObjectGuid giver)
+    {
+        if (Creature* g = ObjectAccessor::GetCreature(*self, giver))
+            Constellation::Plan::Planner::Instance()->OnConsult(self, g);
+    }
+
+    void PlanMenuReadFor(Player* self, ObjectGuid giver)
+    {
+        Creature* g = ObjectAccessor::GetCreature(*self, giver);
+        if (!g || !self->PlayerTalkClass)
+            return;
+        Constellation::Plan::Planner::Instance()->OnMenuRead(self, g, self->PlayerTalkClass->GetQuestMenu(),
+            [](Player* p, Quest const* q) { return Constellation::Manager::Instance()->FirstFailingGate(p, q); });
+    }
+
+    void QuestTakenFor(Player* self)
+    {
+        Constellation::Manager::Instance()->NoteQuestTaken();
+        Constellation::Plan::Planner::Instance()->OnTakeOrTurnIn(self);
+    }
+
     void ScanObjectivesFor(Player* self, FightMemory const& mem, DangerView const& danger,
                            ObjectiveScan* out)
     {
@@ -12074,6 +11842,7 @@ namespace Constellation::Ai
         t.MaxQuests       = Constellation::Cfg().MaxQuests;
         t.Vending         = Constellation::Cfg().Vending;
         t.Quests          = Constellation::Cfg().Quests;
+        t.TakeQuests      = Constellation::Cfg().TakeQuests;
         t.Flying          = Constellation::Cfg().Flying;
         t.Follow          = Constellation::Cfg().Follow;
         t.FollowDistance  = Constellation::Cfg().FollowDistance;

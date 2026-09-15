@@ -137,6 +137,10 @@ namespace Constellation::Ai
         return _self && out && FollowTargetFor(_self, out);
     }
 
+    void WorldView::PlanConsult(ObjectGuid giver) const   { if (_self) PlanConsultFor(_self, giver); }
+    void WorldView::PlanMenuRead(ObjectGuid giver) const  { if (_self) PlanMenuReadFor(_self, giver); }
+    void WorldView::QuestTaken() const                    { if (_self) QuestTakenFor(_self); }
+
     char const* WorldView::NameOf(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())
