@@ -51,7 +51,7 @@ namespace Constellation::Ai
         // object, which is shared by all 122: the first to tick marked it checked and the rest
         // were told to skip. A per-minute trigger fired once a minute for the whole roster.
         // Flat, fixed-size, no allocation — one word per trigger per companion.
-        uint32 TriggerLastMs[size_t(TriggerId::Count)] = {};
+        uint32 TriggerLastMs[TRIGGER_SLOTS] = {};
 
         // §12 — КЭШ ЗНАЧЕНИЙ ЛЕЖИТ ЗДЕСЬ, А НЕ РЯДОМ, и это единственная причина,
         // по которой `Discard` покрывает его бесплатно: он обнуляет всю структуру. Склада

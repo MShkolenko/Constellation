@@ -294,33 +294,23 @@ struct Companion
     uint32 MoveMs = 0;                  // накопитель времени между шагами следования
     bool DebugWalk = false;             // только стенд: уходить в точку, а не за лидером
     Position DebugTarget;
-    uint32 QuestMs = 0;                 // накопитель между попытками взять квест
-    ObjectGuid GiverGuid;               // квестодатель, к которому идём (пусто = никуда)
-    uint32 GiverMs = 0;                 // сколько уже идём к нему
-    float GiverDist = 0.0f;             // и с какой дистанции начали — меряем прогресс
-    float GiverRange = 0.0f;            // радиус, с которого цель передана по приходу (0 = обычный)
     std::map<ObjectGuid, uint32> GiverUnreachable;  // до кого не дойти: лестницы, помосты, геометрия
-    uint32 GiverForgetMs = 0;           // и когда забыть этот список — «навсегда» было ошибкой
     std::set<uint32> QuestRefused;      // не берётся — не долбимся каждые пять секунд
     uint32 FightMs = 0;                 // накопитель между решениями в бою
     Behavior Mode = Behavior::Idle;     // ровно одно намерение за раз
     ObjectGuid TargetGuid;              // цель, которая не меняется по дороге
     uint32 ModeMs = 0;                  // сколько в этом состоянии — для сроков
-    float LastDist = 0.0f;              // для проверки, что мы вообще приближаемся
     // §31 — ВСЁ СОСТОЯНИЕ ХОДЬБЫ ОДНИМ ТИПОМ. Шестнадцать полей, которые вместе образуют
     // механизм следования: маршрут и место в нём, отступы вбок, отсрочка построителя пути,
     // обнаружение примерзания. Движку предстоит ходить тем же механизмом, а не похожим.
     Constellation::Ai::MoveState Move;
     uint32 TurnInQuest = 0;             // что сдаём
-    uint32 TurnInEntry = 0;
-    bool TurnInPosFromTable = false;    // точка сдачи из указателя (высоту править можно) или от живого             // кому
     ObjectGuid TurnInGuid;              // и кто именно, когда нашёлся
     Position TravelPos;                 // куда идти за целью задания
     uint32 TravelQuest = 0;             // ради какого квеста идём
     std::map<uint32, uint32> TravelBackoff; // квест -> сколько не ходить к нему снова, мс
     uint32 TravelScanMs = 0;            // не перебирать точки чаще раза в две секунды
     uint32 TravelCooldownMs = 0;        // не дойти — не долбиться
-    uint8 FightsLogged = 0;             // по три записи с КАЖДОГО, а не 200 с первых
     uint32 RestSkipMs = 0;              // отдых не помог — столько не отдыхаем вовсе
     uint32 ReviveMs = 0;                // как скоро снова пробовать воскреснуть
     uint32 ReviveTries = 0;             // и сколько раз уже пробовали
@@ -352,14 +342,11 @@ struct Companion
     uint32 VendSold = 0;                // за всё время: продано предметов
     uint64 VendEarned = 0;              //               выручено медяков (64 бита: 122 бота)
     uint32 VendRepaired = 0;            //               починок
-    uint32 VendNoVendor = 0;            //               некому продать поблизости
     uint32 VendPoor = 0;                //               не хватило денег на ремонт
-    ObjectGuid LootTarget;              // труп нашего убийства, который ещё не обобран
     // ПЯТЬ СЧЁТЧИКОВ СТАЛИ ОДНОЙ СТРУКТУРОЙ, потому что тело лута теперь одно на два механизма
     // и пишет в неё, не зная чью (`LootFromCorpseCore`). Смысл полей — в `ClientAct.h`.
     Constellation::Ai::LootCounters Loot;
     uint32 CastsDiedUnder = 0;          // цель умерла, ПОКА мы читали — догадка оператора
-    bool PaletteDumped = false;         // палитра класса выписана — один раз на спутника
     uint32 WantedCheckMs = 0;           // когда в последний раз спрашивали счётчик цели
     uint32 GateNotReady = 0;            //   вентиль открыт, но таймер удара не готов
     uint32 VictimSwaps = 0;             //   сколько раз цель подменилась
@@ -369,7 +356,6 @@ struct Companion
     uint32 ZeroedAtStart = 0;
     uint32 HitsAtStart = 0;
     uint64 TakenAtStart = 0;
-    uint32 KillsAtStart = 0;
     ObjectGuid DamageVictim;            // по кому ведём счёт урона
     uint64 VictimHp = 0;                // НАШ накопленный урон на прошлой проверке
     uint32 NoDamageMs = 0;              // сколько бьём без всякого следа
@@ -391,16 +377,11 @@ struct Companion
     uint32 LiveEnderMs = 0;             // и когда искать ЖИВОГО принимающего без точки появления
     uint32 IdleScanMs = 0;              // «стою» не перебирает мир на каждом такте
     bool FightDiagDone = false;         // диагностика боевого поиска — по разу на КАЖДОГО
-    bool GiverDiagDone = false;         // и то же для поиска квестодателя
     bool GatherDiagDone = false;        // и для отбора точки сбора
-    bool TalkDiagDone = false;          // и для самого разговора
-    bool RedNoted = false;              // сказали ли хоть раз, что пропускаем красные
     bool ImmuneNoted = false;           // и что цель ещё невосприимчива к игрокам
-    ObjectGuid::LowType FreeGoSpawn = 0;// клетка, которой можно освободить неуязвимую цель
     ObjectGuid::LowType FreeGoSpawnUsed = 0; // и она же, пока идём и пока используем
     uint32 FreeGoEntry = 0;             // её вид
     uint32 FreeGoFor = 0;               // и ради какого существа мы к ней идём
-    Position FreeGoPos;                 // где она стоит
     std::unordered_map<uint64, uint32> FreeTried;   // (клетка,существо) -> попыток
     Position KiteTo;                    // куда пятимся, уводя цель от лагеря
     bool Kiting = false;                // и пятимся ли сейчас
@@ -508,9 +489,6 @@ struct Companion
     uint32 CraftHadBefore = 0;      // сколько заготовок было в сумках до отправки
     uint32 CraftSpawn = 0;          // у какой точки применяли — ей снимем холостой заход при удаче
     std::vector<std::pair<uint32, int32>> CraftSnap;
-    std::set<uint32> KilledOnQuestNoted;
-    uint32 FleeMs = 0;                  // сколько уже отходим от того, с кем не справиться
-    bool FleeNoted = false;             // и сказали ли об этом
     bool CorpseRunNoted = false;        // сказали ли, что бежим к своему телу
     uint32 CorpseRunMs = 0;             // сколько уже бежим
     uint32 ReclaimWaitMs = 0;           // сказали ли, что ждём срок подъёма
@@ -525,10 +503,7 @@ struct Companion
     bool CorpseGaveUp = false;          // до тела не добежать или подъём не вышел
     bool RevivePicked = false;          // тихое место у тела выбрано
     Position RevivePos;                 // и вот оно
-    Position FleeTo;                    // ВЫБРАННАЯ точка отхода — она не двигается за нами
-    bool FleeHasPoint = false;
     uint32 FleePauseMs = 0;             // отход не удался — не долбиться
-    uint32 FleeTotalMs = 0;             // общий бюджет отхода: смена точки его не обнуляет
     // ОСОБЬ, КОТОРАЯ СЕЙЧАС НЕ ПОДХОДИТ, НО ПОДОЙДЁТ ПОТОМ (Кодекс): условие заклинания
     // бывает временным — ленивый батрак снова засыпает через пять минут. Вечный запрет
     // (TalkUnreachable) вычеркнул бы его навсегда, поэтому здесь запрет со сроком.
@@ -552,7 +527,6 @@ struct Companion
     // «Speak with ...». Модуль читал тип и шёл их УБИВАТЬ — а они дружественные, и убить
     // их нельзя. То же держит тауренов с десятью такими целями.
     ObjectGuid TalkCandidate;           // нашлась при поиске боевой цели
-    ObjectGuid TalkGuid;                // к кому идём говорить
     Constellation::Ai::TalkState Talk;  // состояние попытки разговора/применения — тело поднято (TalkEngageCore)
     uint32 Talked = 0;                  // сколько разговоров и применений дало зачёт
     uint32 EquipScanMs = 0;             // когда снова смотреть сумки на предмет обновок
@@ -571,8 +545,6 @@ struct Companion
     // ТОРГОВЕЦ ПО КАРТЕ: когда в обзоре никого, идём к ближайшему из указателя спавнов —
     // так же, как к принимающему квест. VendorGuid заполняется, когда он показался.
     uint32 VendorEntry = 0;             // к какому виду торговца идём (0 = ни к какому)
-    Position VendorPos;                 // и где он стоит по таблице
-    float VendorDist = 0.0f;            // с какого расстояния пошли: срок считается от него
     uint32 VendorScanMs = 0;            // обзор сетки у его точки — не чаще раза в 2 с
     // КВЕСТОДАТЕЛЬ ПО КАРТЕ: когда в обзоре никто ничего не предлагает, идём к ближайшему
     // из указателя, у кого ядро дало бы квест по светофору. SeekEntry = 0 — ни к кому.
@@ -583,9 +555,7 @@ struct Companion
     std::unordered_map<ObjectGuid::LowType, uint32> SeekBackoff;   // точка -> сколько не ходить к ней снова
     uint32 IdleDiagMs = 0;              // прибор «ПРОСТОЙ» — раз в пять минут
     bool RingTried = false;             // обход точек вокруг NPC в этом намерении уже был
-    bool FarDiagDone = false;           // «за потолком» — по разу на спутника
     bool RingHeld = false;              // и найденная точка держится до прихода или отказа
-    float TurnInDist = 0.0f;            // с какого расстояния пошли сдавать: срок от него
     std::unordered_map<uint32, uint32> TriggerSentMs;   // зона осмотра -> не слать повторно, мс
     float TravelStop = 10.0f;           // на каком расстоянии от точки считать «пришёл»
     std::unordered_map<uint32, uint32> TalkBackoff;   // ВИД -> когда пробовать снова: это
@@ -594,13 +564,11 @@ struct Companion
     std::set<ObjectGuid> TalkUnreachable;   // а «не дойти» — свойство КОНКРЕТНОЙ особи:
                                         // запрет по виду глушил бы и всех остальных, и все
                                         // задания, где этот вид встречается (Кодекс)
-    Position TurnInPos;                 // и где он стоит
     // ОТСРОЧКА У КАЖДОГО КВЕСТА СВОЯ. Был один таймер на спутника и общий набор:
     // любая новая неудача переписывала таймер, а по его истечении набор очищался
     // ЦЕЛИКОМ. То есть минутная неудача укорачивала чужую пятиминутную, и все
     // отложенные квесты оживали разом (Кодекс, проход 4).
     std::map<uint32, uint32> TurnInBackoff;   // квест -> сколько ещё ждать, мс
-    std::set<uint32> Impossible;        // квесты, которые закрыть НЕЧЕМ (навсегда)
     ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти

@@ -21,13 +21,6 @@ namespace Constellation::Ai
 #undef CONSTELLATION_ACTION_NAME
         };
 
-        char const* const TRIGGER_NAMES[] =
-        {
-#define CONSTELLATION_TRIGGER_NAME(name, text) text,
-            CONSTELLATION_TRIGGERS(CONSTELLATION_TRIGGER_NAME)
-#undef CONSTELLATION_TRIGGER_NAME
-        };
-
         char const* const STRATEGY_NAMES[] =
         {
 #define CONSTELLATION_STRATEGY_NAME(name, text) text,
@@ -46,8 +39,6 @@ namespace Constellation::Ai
         // These assertions are what make that guarantee real rather than a comment.
         static_assert(std::size(ACTION_NAMES)  == size_t(ActionId::Count),
                       "имена действий разошлись с перечислением");
-        static_assert(std::size(TRIGGER_NAMES) == size_t(TriggerId::Count),
-                      "имена триггеров разошлись с перечислением");
         static_assert(std::size(STRATEGY_NAMES) == size_t(StrategyId::Count),
                       "имена стратегий разошлись с перечислением");
         static_assert(std::size(VALUE_NAMES) == size_t(ValueId::Count),
@@ -57,11 +48,6 @@ namespace Constellation::Ai
     char const* NameOf(ActionId id)
     {
         return id < ActionId::Count ? ACTION_NAMES[size_t(id)] : "?";
-    }
-
-    char const* NameOf(TriggerId id)
-    {
-        return id < TriggerId::Count ? TRIGGER_NAMES[size_t(id)] : "?";
     }
 
     char const* NameOf(ValueId id)

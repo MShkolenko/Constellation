@@ -52,18 +52,13 @@ namespace Constellation::Ai
     X(SeekGiverByMap,     "идти к квестодателю по карте")                    \
     X(FollowOwner,        "идти за хозяином")
 
-    // Housekeeping that the ladder skeleton hid (action-matrix.md, "what reading the skim rows
-    // changed"). These are NOT candidates competing for selection — they fire on their own
-    // trigger every scan, whatever the companion chooses. Three of the four send packets.
-#define CONSTELLATION_TRIGGERS(X)                                           \
-    X(StandingInAreaTrigger, "стою в зоне осмотра")                         \
-    X(LateCreditAppeared,    "счётчик вырос сам")                           \
-    X(PassedFlightMaster,    "мимо полётного мастера")                      \
-    X(PassedInnkeeper,       "мимо трактирщика")                            \
-    X(InCombatUnableToFight, "в бою, а драться нечем")                      \
-    X(HasCompletedQuest,     "есть что сдать")                              \
-    X(NeedsRest,             "надо перевести дух")                          \
-    X(VendorWorthATrip,      "к торговцу стоит идти")
+    // §3.2 — TRIGGERS HAVE NO CONSUMER (Master, 2026-09-15 18:25: П2 struck). The eight names
+    // the skeleton listed here (StandingInAreaTrigger, LateCreditAppeared, PassedFlightMaster,
+    // PassedInnkeeper, InCombatUnableToFight, HasCompletedQuest, NeedsRest, VendorWorthATrip)
+    // were never built: the fixed calls before `Execute` (area triggers, flight nodes, the inn
+    // binding) ARE the "in passing" shape. The `Trigger`/`Multiplier` classes and `Register`
+    // stay so a future trigger has a home; the per-companion clock has this many slots.
+    inline constexpr size_t TRIGGER_SLOTS = 8;
 
     // §9 — WHAT A COMPANION IS CURRENTLY DOING WITH ITS LIFE, as a set of named strategies.
     //
@@ -132,16 +127,7 @@ namespace Constellation::Ai
         Count
     };
 
-    enum class TriggerId : uint8
-    {
-#define CONSTELLATION_TRIGGER_ENUM(name, text) name,
-        CONSTELLATION_TRIGGERS(CONSTELLATION_TRIGGER_ENUM)
-#undef CONSTELLATION_TRIGGER_ENUM
-        Count
-    };
-
     char const* NameOf(ActionId id);
-    char const* NameOf(TriggerId id);
     char const* NameOf(StrategyId id);
     char const* NameOf(ValueId id);
 
@@ -639,10 +625,8 @@ namespace Constellation::Ai
     class Trigger
     {
     public:
-        Trigger(TriggerId id, uint32 intervalMs) : _id(id), _intervalMs(intervalMs) { }
+        explicit Trigger(uint32 intervalMs) : _intervalMs(intervalMs) { }
         virtual ~Trigger() = default;
-
-        TriggerId Id() const { return _id; }
 
         // A trigger is not evaluated every tick — that is what made the hand-rolled throttles
         // necessary in the first place.
@@ -665,8 +649,7 @@ namespace Constellation::Ai
         virtual void Handlers(BidSink& out) const = 0;
 
     private:
-        TriggerId _id;
-        uint32    _intervalMs = 0;
+        uint32 _intervalMs = 0;
     };
 
     // ---------------------------------------------------------------------------------------

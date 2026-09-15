@@ -70,6 +70,14 @@ namespace Constellation::Ai
 
     void Engine::Register(std::unique_ptr<Trigger> trigger, uint32 ownerMask)
     {
+        // The per-companion clock is a fixed array (§11, no allocation): a ninth trigger would
+        // index past it. Refuse loudly rather than trust a count that nobody checks.
+        if (_triggers.size() >= TRIGGER_SLOTS)
+        {
+            TC_LOG_ERROR("server.worldserver",
+                "Constellation ДВИЖОК: триггеров больше, чем слотов ({}) — не регистрирую", TRIGGER_SLOTS);
+            return;
+        }
         if (_ready || !trigger)
             return;
         if (!ownerMask)
@@ -1213,7 +1221,7 @@ namespace Constellation::Ai
             if (!(_triggers[ti].Owners & st.StrategyMask))
                 continue;
             auto const& t = _triggers[ti].Obj;
-            uint32& lastMs = st.TriggerLastMs[size_t(t->Id())];
+            uint32& lastMs = st.TriggerLastMs[ti];    // slot = registration order, bounded at Register
             if (!t->NeedsCheck(now, lastMs))
                 continue;
             lastMs = now;                    // this companion's clock, not the trigger's
