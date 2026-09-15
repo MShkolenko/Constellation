@@ -272,7 +272,19 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                         ctx.World.NearestQuestGiverOfEntry(t.EnderEntry, GIVER_SEARCH_YARDS))
                 {
                     if (TurnInThroughDoor(ctx, *ender, quest))
+                    {
+                        // СДАЧА МЕНЯЕТ МЕНЮ ПРИНИМАЮЩЕГО — ЗАБЫТЬ, ЧТО ОН «НИЧЕГО НЕ ПРЕДЛАГАЛ»
+                        // (2026-09-15, окно 16:13). Знак ядра стоит на принимающем и ДО сдачи
+                        // (бит `Quest` у завершённого квеста, который он принимает), взятие идёт к
+                        // нему первым по цене расстояния, меню пусто — и он откладывается на десять
+                        // минут; после сдачи ядро тут же предлагает следующий в цепи (26393 → 26394,
+                        // полёт в Штормград), а квестодатель забыт: 26394 брался 5 из 5 при
+                        // `QuestTick` (он предпочитал квестодателя с берущимся меню) и 1 из 6 без.
+                        BackoffKey offered;
+                        offered.Kind = BackoffKind::NothingOffered; offered.About = Subject::OfUnit(*ender); offered.Detail = 0;
+                        Engine::Allow(*ctx.St, offered);
                         return true;
+                    }
                     Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_FAILED_MS);
                     return false;
                 }
