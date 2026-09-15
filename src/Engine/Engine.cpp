@@ -625,29 +625,42 @@ namespace Constellation::Ai
 
         ++st.BackoffFull;
 
-        // Сперва просроченное — оно уже ничего не стоит.
-        for (uint8 i = 0; i < st.BackoffCount; ++i)
-            if (Expired(st.Backoffs[i], nowMs))
-            {
-                st.Backoffs[i].Key     = key;
-                st.Backoffs[i].SetAtMs = nowMs;
-                st.Backoffs[i].TtlMs   = ttlMs;
-                return false;
-            }
+        // (Просроченных здесь уже нет: подметание выше сняло их до проверки на дубль. Второй
+        // проход «сперва просроченное» стоял тут мёртвым и вводил читателя в заблуждение — Кодекс.)
 
         // Затем — с НАИМЕНЬШИМ ОСТАТКОМ. Не старейшая: возраст создания не равен оставшейся
         // ценности, и «вытесняем старейшее» это способ заставить занятого спутника забыть
         // именно то, что ему нужнее всего помнить.
-        uint8  victim = 0;
-        uint32 least  = Remaining(st.Backoffs[0], nowMs);
-        for (uint8 i = 1; i < st.BackoffCount; ++i)
-        {
-            uint32 const r = Remaining(st.Backoffs[i], nowMs);
-            if (r < least)
-                { least = r; victim = i; }
-        }
+        // ...И НЕ ДОРОЖНАЯ ПАМЯТЬ РАДИ РАЗГОВОРНОЙ (0026 шаг 5): «не дойти» живёт дольше, чем
+        // «меню пусто», когда за место спорят они, — иначе спутник снова идёт туда, куда не дошёл, и
+        // «не дойти» считается дважды. Ключ-дорога вправе вытеснить старшую дорогу. Кандидаты —
+        // все записи, если пишем дорогу; только не-дорожные, если пишем что-то другое и такие есть.
+        // КВОТА, НЕ АБСОЛЮТ (Кодекс, dual-solve): защищённый класс, который постоянно
+        // продлевается, занял бы все места, и дешёвые ключи — «меню пусто», «уже сходил», зоны
+        // осмотра — не запоминались бы никогда. Дорога защищена, пока дорог не больше половины
+        // таблицы; дальше и она отвечает остатком срока, как все.
+        uint8 roads = 0;
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+            if (IsRoadMemory(st.Backoffs[i].Key.Kind))
+                ++roads;
+        bool const spareRoads = !IsRoadMemory(key.Kind) && roads <= BACKOFF_CAP / 2;
+        st.BackoffLastRoads = roads;
+        uint8  victim = BACKOFF_CAP;
+        uint32 least  = 0;
+        for (uint8 pass = 0; pass < 2 && victim == BACKOFF_CAP; ++pass)
+            for (uint8 i = 0; i < st.BackoffCount; ++i)
+            {
+                // pass 0: spare road memory (within its quota); pass 1: anyone
+                if (pass == 0 && spareRoads && IsRoadMemory(st.Backoffs[i].Key.Kind))
+                    continue;
+                uint32 const r = Remaining(st.Backoffs[i], nowMs);
+                if (victim == BACKOFF_CAP || r < least)
+                    { least = r; victim = i; }
+            }
         ++st.BackoffEvictedLive;        // ДЕФЕКТ ЁМКОСТИ, а не рабочий режим — по этому счётчику
-        st.Backoffs[victim].Key     = key;   // и выбирается BACKOFF_CAP при росте состава
+        st.BackoffLastVictimKind   = st.Backoffs[victim].Key.Kind;   // и выбирается BACKOFF_CAP
+        st.BackoffLastVictimLeftMs = least;                          // при росте состава
+        st.Backoffs[victim].Key     = key;
         st.Backoffs[victim].SetAtMs = nowMs;
         st.Backoffs[victim].TtlMs   = ttlMs;
         return true;
@@ -1126,17 +1139,24 @@ namespace Constellation::Ai
         key.Kind   = kind;
         key.About  = about;
         key.Detail = detail;
-        if (Engine::Defer(*ctx.St, key, ttlMs, ctx.NowMs) && !ctx.St->BackoffOverflowLogged)
+        if (Engine::Defer(*ctx.St, key, ttlMs, ctx.NowMs)
+            && (!ctx.St->BackoffOverflowLogged || ctx.NowMs - ctx.St->BackoffOverflowLoggedMs >= 60000))
         {
-            // ОДИН РАЗ НА СПУТНИКА. Переполнение — дефект ЁМКОСТИ: таблица рассчитана на пик
-            // живых ключей, и если живую запись пришлось выбросить, значит пик оценён неверно.
-            // По этой строке и правится `BACKOFF_CAP` при росте состава — по ней, а не по
-            // ощущению, потому что сегодняшние восемь спутников про 122 ничего не доказывают.
-            ctx.St->BackoffOverflowLogged = true;
-            TC_LOG_ERROR("server.worldserver",
-                "Constellation ДВИЖОК {}: таблица отсрочек переполнена, вытеснена ЖИВАЯ запись "
-                "«{}» — ёмкости {} не хватает, поднять её",
-                ctx.World.Name(), NameOf(kind), uint32(BACKOFF_CAP));
+            // РАЗ В МИНУТУ НА СПУТНИКА, НЕ РАЗ НАВСЕГДА, И ПРАВДУ (0026 шаг 5): прежняя строка
+            // печатала вид НОВОГО ключа под словом «вытеснена» и умолкала после первого раза —
+            // ночь читала «вытеснена живая «не дойти»», когда «не дойти» как раз вытесняла кого-то
+            // другого, и «×4» значило «четыре спутника хоть раз», а не число вытеснений. Теперь:
+            // кто вытеснен, сколько ему оставалось, кем, и сколько вытеснений всего — по этому и
+            // решается `BACKOFF_CAP`, по числу, а не по ощущению.
+            ctx.St->BackoffOverflowLoggedMs = ctx.NowMs;
+            ctx.St->BackoffOverflowLogged   = true;
+            // INFO, не ERROR (Кодекс): вытеснение — штатная работа ограниченной таблицы, а ERROR —
+            // метрика полосы боевого мира.
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ДВИЖОК {}: таблица отсрочек переполнена — вытеснена живая «{}» (оставалось {} с) "
+                "ради «{}»; дорожных записей {} из {}, вытеснений всего {}",
+                ctx.World.Name(), NameOf(ctx.St->BackoffLastVictimKind), ctx.St->BackoffLastVictimLeftMs / 1000,
+                NameOf(kind), uint32(ctx.St->BackoffLastRoads), uint32(BACKOFF_CAP), ctx.St->BackoffEvictedLive);
         }
     }
 

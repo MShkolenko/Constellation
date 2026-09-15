@@ -323,6 +323,17 @@ namespace Constellation::Ai
     // надо ПЕРЕПРОВЕРИТЬ по этим счётчикам, а не по ощущению.
     inline constexpr size_t BACKOFF_CAP = 16;
 
+    // ROAD MEMORY OUTLIVES TALK MEMORY (0026 step 5, 2026-09-16). When the table is full, the
+    // entry with the least remaining TTL is evicted - but never a live "could not reach it" for
+    // the sake of "the menu was empty": the first protects a bot from walking the same failed
+    // road again (and counts the failure twice), the second only from an idle talk. A road key
+    // may still evict an older road key. Membership is by kind, not by TTL.
+    inline bool IsRoadMemory(BackoffKind k)
+    {
+        return k == BackoffKind::Unreachable || k == BackoffKind::CombatUnreachable
+            || k == BackoffKind::ObjectUnreachable;
+    }
+
     // -------------------------------------------------------------------------------------------
     // §31 — ПРОГРЕСС ХОДЬБЫ: ОДИН РАЗ НА ВЕСЬ ДВИЖОК.
     //

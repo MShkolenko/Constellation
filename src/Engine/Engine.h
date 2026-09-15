@@ -98,6 +98,14 @@ namespace Constellation::Ai
         };
         BackoffEntry Backoffs[BACKOFF_CAP];
         uint8  BackoffCount       = 0;
+        // What the last live eviction threw away - for the journal line, which used to name the
+        // NEW key's kind and call it the evicted one (read as "a live 'unreachable' was evicted"
+        // when an Unreachable had just evicted something else). Filled by Engine::Defer.
+        BackoffKind BackoffLastVictimKind = BackoffKind::None;
+        uint32      BackoffLastVictimLeftMs = 0;
+        uint32      BackoffOverflowLoggedMs = 0;    // the line is throttled, not once-ever
+        bool        BackoffOverflowLogged   = false; // ...and 0 ms is a valid clock reading (Codex)
+        uint8       BackoffLastRoads = 0;           // road-memory entries at the last overflow
 
         // ДИАГНОСТИКА, А НЕ УКРАШЕНИЕ: по ней и только по ней выбирается `BACKOFF_CAP` при
         // возврате состава к 122. Вытеснение ЖИВОЙ записи — дефект ёмкости, а не рабочий режим.
@@ -261,8 +269,6 @@ namespace Constellation::Ai
 
         uint32 BidsSuppressed     = 0;
 
-        // Крик о переполнении — ОДИН РАЗ на спутника, тем же приёмом, что `UnbackedSeen`.
-        bool   BackoffOverflowLogged = false;
 
         // §11 — reported, because "456 ticks a second is affordable" is an argument, not a
         // measurement. A number that is never printed is a number nobody checks.
