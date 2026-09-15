@@ -80,6 +80,11 @@ namespace
             {
                 f.Ms = f.HasPoint ? 0 : f.Ms;       // сменили точку — время заново (`:3070`)
                 f.HasPoint = ctx.World.FleePointFrom(*nearest, &f.To);
+                // НОВАЯ ТОЧКА — НЕ ЧУЖОЙ ТУПИК. Отход не ходит через `AdvanceWalk`, так что
+                // унаследованный от прошлой дороги `Stalled` сняла бы только она; без этой строки
+                // первый же такт к новой точке читал бы его как «упёрлись» и уходил в паузу
+                // (Кодекс, C5). Лестница снимала его при входе в режим (`Constellation.cpp:5051`).
+                ctx.St->Move.Stalled = false;
                 if (!f.HasPoint)
                 {
                     TC_LOG_INFO("server.worldserver",

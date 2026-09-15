@@ -63,11 +63,18 @@ namespace
             if (d > MASTER_ARRIVED_YARDS)
             {
                 bool const going = WalkTowards(ctx, plan.MasterWhere, MASTER_STOP_YARDS, dt);
-                if (AdvanceWalk(ctx, bid.About, d, sliceMs, !going) != WalkVerdict::Going)
+                WalkVerdict const verdict = AdvanceWalk(ctx, bid.About, d, sliceMs, !going);
+                if (verdict != WalkVerdict::Going)
                 {
+                    // ПРИЧИНА В СТРОКЕ, как у лестницы (`ebf54ef^:3697-3705`): без неё сутки отказов
+                    // читались как одно число, и какой из трёх сроков сработал, было не узнать.
                     TC_LOG_INFO("server.worldserver",
-                        "Constellation ПОЛЁТ {}: до полётного мастера {} не дойти — осталось {:.0f}",
-                        ctx.World.Name(), plan.MasterEntry, d);
+                        "Constellation ПОЛЁТ {}: до полётного мастера {} не дойти — осталось {:.0f}, "
+                        "лучшее было {:.0f}, по высоте {:+.0f}; причина {}, тип пути {:X}, в пути {} с",
+                        ctx.World.Name(), plan.MasterEntry, d, ctx.St->Walk.Best,
+                        plan.MasterWhere.GetPositionZ() - ctx.World.Where().GetPositionZ(),
+                        NameOf(verdict), ctx.St->Move.LastPathType,
+                        (ctx.NowMs - ctx.St->Walk.StartedMs) / 1000);
                     ctx.World.FlightAbort(FLIGHT_FAIL_MS);
                     return false;
                 }
