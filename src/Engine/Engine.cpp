@@ -645,18 +645,26 @@ namespace Constellation::Ai
                 ++roads;
         bool const spareRoads = !IsRoadMemory(key.Kind) && roads <= BACKOFF_CAP / 2;
         st.BackoffLastRoads = roads;
+        // РАНГ ЖЕРТВЫ, ПОТОМ ОСТАТОК (0026 шаг 7, Кодекс): «с этой особью уже говорил» живёт под
+        // крышкой в час, и по одному остатку срока уходила бы ПОСЛЕДНЕЙ из не-дорожных — а должна
+        // первой: она защищает от лишнего клика, не от дороги. Ранг 0 — TalkedTo, 1 — прочая
+        // не-дорожная, 2 — дорога в своей квоте; внутри ранга — наименьший остаток.
+        auto const rank = [&](BackoffKind k) -> uint8
+        {
+            if (k == BackoffKind::TalkedTo)          return 0;
+            if (IsRoadMemory(k) && spareRoads)       return 2;
+            return 1;
+        };
         uint8  victim = BACKOFF_CAP;
+        uint8  vrank  = 3;
         uint32 least  = 0;
-        for (uint8 pass = 0; pass < 2 && victim == BACKOFF_CAP; ++pass)
-            for (uint8 i = 0; i < st.BackoffCount; ++i)
-            {
-                // pass 0: spare road memory (within its quota); pass 1: anyone
-                if (pass == 0 && spareRoads && IsRoadMemory(st.Backoffs[i].Key.Kind))
-                    continue;
-                uint32 const r = Remaining(st.Backoffs[i], nowMs);
-                if (victim == BACKOFF_CAP || r < least)
-                    { least = r; victim = i; }
-            }
+        for (uint8 i = 0; i < st.BackoffCount; ++i)
+        {
+            uint8  const rk = rank(st.Backoffs[i].Key.Kind);
+            uint32 const r  = Remaining(st.Backoffs[i], nowMs);
+            if (victim == BACKOFF_CAP || rk < vrank || (rk == vrank && r < least))
+                { vrank = rk; least = r; victim = i; }
+        }
         ++st.BackoffEvictedLive;        // ДЕФЕКТ ЁМКОСТИ, а не рабочий режим — по этому счётчику
         st.BackoffLastVictimKind   = st.Backoffs[victim].Key.Kind;   // и выбирается BACKOFF_CAP
         st.BackoffLastVictimLeftMs = least;                          // при росте состава
@@ -664,6 +672,39 @@ namespace Constellation::Ai
         st.Backoffs[victim].SetAtMs = nowMs;
         st.Backoffs[victim].TtlMs   = ttlMs;
         return true;
+    }
+
+    // СНЯТЬ ВСЕ ЗАПИСИ ОДНОГО ВИДА (0026 шаг 7). Нужно памяти `TalkedTo`: она держится, пока
+    // журнал квестов не изменился, и снимается разом — по особям её не перебрать снаружи.
+    uint32 Engine::AllowKind(EngineState& st, BackoffKind kind)
+    {
+        uint32 released = 0;
+        for (uint8 i = 0; i < st.BackoffCount; )
+        {
+            if (st.Backoffs[i].Key.Kind == kind)
+            {
+                st.Backoffs[i] = st.Backoffs[st.BackoffCount - 1];
+                --st.BackoffCount;
+                ++released;
+                continue;
+            }
+            ++i;
+        }
+        return released;
+    }
+
+    void ReleaseTalkedTo(Ctx& ctx)
+    {
+        if (!ctx.St)
+            return;
+        uint64 const sig = ctx.World.QuestLogSignature();
+        if (sig == ctx.St->TalkedToQuestLogSig)
+            return;
+        ctx.St->TalkedToQuestLogSig = sig;
+        if (uint32 const n = Engine::AllowKind(*ctx.St, BackoffKind::TalkedTo))
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ОТСРОЧКА {}: журнал квестов изменился — снято «{}» {}",
+                ctx.World.Name(), NameOf(BackoffKind::TalkedTo), n);
     }
 
     void Engine::Allow(EngineState& st, BackoffKey const& key)
@@ -772,11 +813,14 @@ namespace Constellation::Ai
         void DoorTalkSelect(void* u, ObjectGuid unit, uint32 menu, uint32 opt) { static_cast<ClientAct*>(u)->GossipSelect(unit, menu, opt); }
 
         // Память разговора — таблица отсрочек движка, ключи те же, что читает обход целей
-        // (`FightBannedByEngine*`): вид → TalkSpeciesDone, особь → Unreachable, «позже» → TalkRetry.
-        inline constexpr uint32 TALK_INDIVIDUAL_MS = 3600000;   // лестница держит особь до переполнения (>40)
+        // (`FightBannedByEngine*`): вид → TalkSpeciesDone, особь → TalkedTo, «позже» → TalkRetry.
+        // ОСОБЬ — СВОЙ ВИД, НЕ «НЕ ДОЙТИ» (0026 шаг 7): под видом `Unreachable` на час особи разговора
+        // (111 за окно) занимали 12-16 из 16 мест таблицы и вытесняли настоящую дорожную память.
+        // Час остаётся КРЫШКОЙ; настоящий срок — до смены журнала квестов (см. `ReleaseTalkedTo`).
+        inline constexpr uint32 TALK_INDIVIDUAL_MS = 3600000;   // крышка; лестница держала до переполнения (>40)
         uint32 TalkTalkedByEngine(void* u)                    { return ++static_cast<Ctx*>(u)->St->Talked; }
         void TalkSpeciesByEngine(void* u, uint32 entry, uint32 ms) { Defer(*static_cast<Ctx*>(u), BackoffKind::TalkSpeciesDone, Subject::OfSpecies(entry), 0, ms); }
-        void TalkIndividualByEngine(void* u, ObjectGuid g)   { Defer(*static_cast<Ctx*>(u), BackoffKind::Unreachable, Subject::OfUnit(g), 0, TALK_INDIVIDUAL_MS); }
+        void TalkIndividualByEngine(void* u, ObjectGuid g)   { Defer(*static_cast<Ctx*>(u), BackoffKind::TalkedTo, Subject::OfUnit(g), 0, TALK_INDIVIDUAL_MS); }
         void TalkRetryByEngine(void* u, ObjectGuid g, uint32 ms) { Defer(*static_cast<Ctx*>(u), BackoffKind::TalkRetry, Subject::OfUnit(g), 0, ms); }
         void TalkPauseByEngine(void* u, uint32 ms)
         {
@@ -1083,7 +1127,10 @@ namespace Constellation::Ai
             switch (why)
             {
                 case FightBan::Unreachable:
-                    return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfUnit(guid));
+                    // особь, до которой не дойти, И особь, с которой уже говорили: обход целей
+                    // задаёт один вопрос («не эта»), а память — два вида (0026 шаг 7)
+                    return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfUnit(guid))
+                        || EngineRemembers(user, BackoffKind::TalkedTo, Subject::OfUnit(guid));
                 case FightBan::TargetRefused:
                     return EngineRemembers(user, BackoffKind::CombatUnreachable,
                                            Subject::OfUnit(guid));

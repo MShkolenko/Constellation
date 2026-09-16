@@ -812,6 +812,7 @@ namespace Constellation::Ai
         // (сторож подмены цели), ни «жив ли он» (исход), ни «нужен ли он ещё заданию».
         ObjectGuid CurrentVictim() const;                   // `GetVictim()` — ядро обнуляет в момент смерти цели
         bool       IsAliveUnit(ObjectGuid unit) const;      // жив ли (труп на месте — не жив)
+        uint64     QuestLogSignature() const;               // (квест, статус) по слотам — без счётчиков
         uint32     EntryOf(ObjectGuid unit) const;          // вид существа, 0 если его нет
         // ЦЕЛЬ ЕЩЁ НУЖНА ЗАДАНИЮ — предикат лестницы целиком (`StillWanted`): прямая цель,
         // прокси-зачёт по `KillCredit`, источник нужного предмета. Раз в секунду, не на такте:

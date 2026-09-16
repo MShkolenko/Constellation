@@ -511,6 +511,25 @@ namespace Constellation::Ai
         return v ? v->GetGUID() : ObjectGuid::Empty;
     }
 
+    // ЖУРНАЛ КВЕСТОВ ОДНИМ ЧИСЛОМ: квест и его статус по слотам, без счётчиков целей — зачёт
+    // убийства не должен снимать память разговора, а завершение или снятие квеста — должно.
+    uint64 WorldView::QuestLogSignature() const
+    {
+        if (!_self)
+            return 0;
+        uint64 sig = 14695981039346656037ull;              // FNV-1a basis; the pair is mixed as one word, not by byte (a stable rolling hash is all that is needed)
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = _self->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+            uint64 const v = (uint64(questId) << 8) | uint64(uint8(_self->GetQuestStatus(questId)));
+            sig ^= v;
+            sig *= 1099511628211ull;
+        }
+        return sig;
+    }
+
     bool WorldView::IsAliveUnit(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

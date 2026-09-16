@@ -111,6 +111,11 @@ namespace Constellation::Ai
         // возврате состава к 122. Вытеснение ЖИВОЙ записи — дефект ёмкости, а не рабочий режим.
         uint32 BackoffFull        = 0;
         uint32 BackoffEvictedLive = 0;
+        // THE QUEST LOG AS THE `TalkedTo` MEMORY SAW IT LAST (0026 step 7). The engine learns of a
+        // credit or a hand-in only by polling; when the log's (quest, status) set changes, every
+        // "talked to this individual" entry is released - the objective it served is credited, or
+        // the quest is gone. Kill credits do not change it: counters are not part of the signature.
+        uint64 TalkedToQuestLogSig = 0;
 
         // §14 — ПОДАВЛЕННЫЕ СТАВКИ СЧИТАЮТСЯ ОТДЕЛЬНО. Без этого счётчика в теневом режиме
         // подавленное действие выглядит ровно как непредложенное, а чтение теневых отчётов и
@@ -444,6 +449,7 @@ namespace Constellation::Ai
     // потому что имя спутника есть только у него, а безымянная жалоба бесполезна.
     static bool Defer(EngineState& st, BackoffKey const& key, uint32 ttlMs, uint32 nowMs);
     static void Allow(EngineState& st, BackoffKey const& key);
+    static uint32 AllowKind(EngineState& st, BackoffKind kind);   // все записи вида; вернуть число
 
         // Сколько значений отвергнуто при регистрации — читается в `Seal()`, где есть журнал.
         uint32 ValuesRejected() const { return _valuesRejected; }
@@ -496,6 +502,9 @@ namespace Constellation::Ai
     // движок. Если действия начнут злоупотреблять, поменять на результат будет дешевле, чем
     // сейчас откатывать церемонию.
     void Defer(Ctx& ctx, BackoffKind kind, Subject const& about, uint8 detail, uint32 ttlMs);
+    // Память `TalkedTo` снимается разом, когда журнал квестов изменился (0026 шаг 7); зовётся из
+    // значения `Objectives` — там, где движок и так опрашивает мир о целях.
+    void ReleaseTalkedTo(Ctx& ctx);
 
     // §14 — ПАМЯТЬ ДВИЖКА В ВИДЕ, КОТОРЫЙ ПОНИМАЮТ ОБЩИЕ ПОЛИТИКИ. Одна пара на весь движок:
     // обе читают ту же таблицу отсрочек, только разными ключами — квест `CoreRefused`,

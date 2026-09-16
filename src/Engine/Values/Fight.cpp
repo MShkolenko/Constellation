@@ -64,6 +64,7 @@ namespace
             if (!ctx.St)
                 return;
 
+            ReleaseTalkedTo(ctx);       // журнал изменился — особи разговора свободны (0026 шаг 7)
             FightMemory const mem = EngineFightMemory(ctx);
             ctx.World.Objectives(mem, ctx.Danger, &out);
         }
