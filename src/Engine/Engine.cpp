@@ -1140,10 +1140,11 @@ namespace Constellation::Ai
             switch (why)
             {
                 case FightBan::Unreachable:
-                    // особь, до которой не дойти, И особь, с которой уже говорили: обход целей
-                    // задаёт один вопрос («не эта»), а память — два вида (0026 шаг 7)
+                    // особь, до которой не дойти, особь, с которой уже говорили, и особь, которая не
+                    // цель: обход целей задаёт один вопрос («не эта»), а память — три вида (0026 шаги 7-9)
                     return EngineRemembers(user, BackoffKind::Unreachable, Subject::OfUnit(guid))
-                        || EngineRemembers(user, BackoffKind::TalkedTo, Subject::OfUnit(guid));
+                        || EngineRemembers(user, BackoffKind::TalkedTo, Subject::OfUnit(guid))
+                        || EngineRemembers(user, BackoffKind::NotATarget, Subject::OfUnit(guid));
                 case FightBan::TargetRefused:
                     return EngineRemembers(user, BackoffKind::CombatUnreachable,
                                            Subject::OfUnit(guid));
@@ -1162,12 +1163,17 @@ namespace Constellation::Ai
             Ctx* ctx = static_cast<Ctx*>(user);
             if (!ctx || why != FightBan::Unreachable)
                 return false;
+            // THE SCAN'S "NOT A TARGET" IS ITS OWN MEMORY, NOT ROAD MEMORY (0026 step 8, Master
+            // 12:20). This note - a wanted creature immune to players and not a talk partner - was
+            // written as Unreachable for ten minutes, and with the talked-to individuals it filled
+            // 11-15 of 16 table slots as "road", evicting real road memory; the road quota of
+            // 1c96a4b then protected the wrong entries. Same TTL, own kind, evicted before roads.
             Subject const about = Subject::OfUnit(guid);
             BackoffKey key;
-            key.Kind  = BackoffKind::Unreachable;
+            key.Kind  = BackoffKind::NotATarget;
             key.About = about;
             bool const fresh = !ctx->St || !Engine::Deferred(*ctx->St, key, ctx->NowMs);
-            Defer(*ctx, BackoffKind::Unreachable, about, 0, UNREACHABLE_UNIT_MS);
+            Defer(*ctx, BackoffKind::NotATarget, about, 0, UNREACHABLE_UNIT_MS);
             return fresh;
         }
     }
