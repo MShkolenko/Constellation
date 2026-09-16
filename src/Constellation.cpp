@@ -6127,6 +6127,15 @@ public:
                 if (!got)
                     continue;
                 float d = self->GetExactDist2d(dest.GetPositionX(), dest.GetPositionY());
+                // A SPOT WITHIN FightRange IS "HERE": no trip to it - but only for THIS quest (0026
+                // step 8, Master 09:45, APPROVED; reader: 4 of 5 silent bots). It used to be judged
+                // once on the nearest spot of all quests - `if (!found || bestDist < FightRange) return
+                // false` - so one nearby spot (26209's clue point 74 yards from Laine; zone 62 a
+                // hundred yards off) silenced the trip to every farther quest for the whole hour. An
+                // area trigger is exempt: it is entered (stop 3), not fought around, so "here" is not
+                // "done" for it.
+                if (!isTrigger && d < Cfg().FightRange)
+                    continue;
                 if (d < bestDist)
                     {
                         // В КЛЕТКУ, ГДЕ МЕНЯ УЖЕ УБИВАЛИ ТРИЖДЫ, НЕ ИДЁМ. Проверяем саму ТОЧКУ
@@ -6143,7 +6152,7 @@ public:
         }
         out->Found = found;
         // ближе FightRange идти незачем: там цель и так увидит обычный поиск
-        if (!found || bestDist < Cfg().FightRange)
+        if (!found)                         // the near-spot rule now lives in the loop, per quest
             return false;
         out->Where = best;
         out->Worth = true;
@@ -9294,7 +9303,7 @@ public:
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
         Cell::VisitGridObjects(self, searcher, Cfg().FightRange + margin);
 
-        uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0;
+        uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0, rejPack = 0;
         uint32 assists = 0, bestAssists = 0xFFFFFFFF;
         // СПИСОК УГРОЗ — ОДИН РАЗ НА ПРОХОД, А НЕ НА КАЖДОГО КАНДИДАТА (разбор: перебор был
         // квадратичным). Здесь только те, кто вообще может вступить: живой, враждебный, ещё не
@@ -9512,6 +9521,7 @@ public:
             // равно не берём: это отдельное правило.
             if (Cfg().MaxAssist && assists > Cfg().MaxAssist && mem.StarvedMs < Cfg().StarveMs)
             {
+                ++rejPack;
                 if (diag && !diag->ToughNoted)
                 {
                     diag->ToughNoted = true;
@@ -9781,12 +9791,22 @@ public:
         out->Fight = best ? best->GetGUID() : ObjectGuid::Empty;
         if (best)
             out->Assists = bestAssists;         // с чем шли в бой — по этому решим, отводить ли
-        if (!best && matched && !_rejDiagDone)
+        // РАЗ В МИНУТУ НА СПУТНИКА, И НА ПУТИ ДВИЖКА ТОЖЕ (0026 шаг 8): строка стояла один раз на
+        // жизнь сервера (`_rejDiagDone`), и в движке отказ обзора был нем (`diag == nullptr`) -
+        // Aldric стоял среди 46 захватчиков в 183 ярдах от Куртока час, и ни одна строка не сказала
+        // «стая». Теперь с числом «стая» и с порогом голода.
+        if (!best && matched)
         {
-            _rejDiagDone = true;
-            TC_LOG_INFO("server.worldserver",
-                "Constellation REJ {}: видит {}, подходящих {}, чужая фаза {}, занято {}, недопустимо {}, без видимости {}; пример вид {} фракция {}",
-                self->GetName(), seen, matched, rejPhase, rejBusy, rejInvalid, rejLos, lastEntry, lastFaction);
+            uint32 const now = GameTime::GetGameTimeMS();
+            uint32& at = _rejDiagAt[self->GetGUID()];
+            if (!at || now - at >= 60000)
+            {
+                at = now;
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation REJ {}: видит {}, подходящих {}, стая {}, чужая фаза {}, занято {}, недопустимо {}, без видимости {}; голод {} с из {}; пример вид {} фракция {}",
+                    self->GetName(), seen, matched, rejPack, rejPhase, rejBusy, rejInvalid, rejLos,
+                    mem.StarvedMs / 1000, Cfg().StarveMs / 1000, lastEntry, lastFaction);
+            }
         }
         return best;
     }
@@ -11128,7 +11148,7 @@ private:
     mutable bool _fightDiagDone = false;
     uint32 _hops = 0;                   // сколько раз дошли до цели промежуточными прыжками
 
-    mutable bool _rejDiagDone = false;
+    mutable std::unordered_map<ObjectGuid, uint32> _rejDiagAt;   // отказ обзора: последняя строка на спутника
     mutable bool _whyDone = false;
     uint32 _revived = 0;                // сколько раз спутники возвращались из мёртвых
     uint32 _flights = 0;                // сколько раз состав улетал

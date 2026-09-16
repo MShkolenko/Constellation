@@ -83,6 +83,15 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
     // минут — и по журналу было не различить, какая из них гасит ставку на квестодателя после сдачи
     // (26394/26393 = 1/6 в окне 20:13). Строка — что, кому, на сколько и почему; ветвление не меняет.
     // Формат стабилен для grep: `ОТСРОЧКА <имя>: <вид> <кто> (<вид существа>) на <мс> мс — <почему>`.
+    // THE TRIP'S DEFERRALS WERE SILENT (0026 step 8): three Defer(quest) in TravelToObjective wrote
+    // without a line, and the night saw them only as "evicted for «не дойти»" in the overflow line.
+    void LogTravelDefer(Ctx& ctx, BackoffKind kind, TravelSpot const& t, uint32 ms, char const* why)
+    {
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ОТСРОЧКА {}: {} квест {} (точка {:.0f} {:.0f}) на {} мс — {}",
+            ctx.World.Name(), NameOf(kind), t.QuestId, t.Where.GetPositionX(), t.Where.GetPositionY(), ms, why);
+    }
+
     void LogDefer(Ctx& ctx, BackoffKind kind, ObjectGuid giver, uint32 ms, char const* why)
     {
         TC_LOG_INFO("server.worldserver",
@@ -686,6 +695,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             // на пересчёте, а гибель по дороге меняет ответ между пересчётами.
             if (ctx.Danger.DeadlyToTravelTo(t.Where.GetPositionX(), t.Where.GetPositionY()))
             {
+                LogTravelDefer(ctx, BackoffKind::Visited, t, TRAVEL_VISITED_MS, "туда гибли");
                 Defer(ctx, BackoffKind::Visited, bid.About, 0, TRAVEL_VISITED_MS);
                 ctx.St->Values.ObjectiveSpot.Invalidate();
                 return false;
@@ -697,6 +707,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 // ПРИШЛИ, А ЦЕЛЕЙ НЕТ — ВЫХОД, а не стояние до срока (`:3907`): будь цель в
                 // обзоре, ставка боя уже перебила бы поход. Область пуста — выбита или её
                 // наполняет скрипт волнами; откладываем этот квест, пересчёт даст следующий.
+                LogTravelDefer(ctx, BackoffKind::Visited, t, TRAVEL_VISITED_MS, "пришли, целей нет");
                 Defer(ctx, BackoffKind::Visited, bid.About, 0, TRAVEL_VISITED_MS);
                 ctx.St->Values.ObjectiveSpot.Invalidate();
                 return true;
@@ -711,6 +722,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             {
                 // «до места задания не дойти» / «полминуты без приближения» / «в пути слишком
                 // долго» — три исхода лестницы, один ключ: сам квест (`:3953`).
+                LogTravelDefer(ctx, BackoffKind::Unreachable, t, TRAVEL_UNREACHABLE_MS, "дорога не идёт");
                 Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TRAVEL_UNREACHABLE_MS);
                 ctx.St->Values.ObjectiveSpot.Invalidate();
                 return false;
