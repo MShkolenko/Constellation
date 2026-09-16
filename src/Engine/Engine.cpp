@@ -10,6 +10,7 @@
  * Copyright (C) 2026 Constellation contributors. Licensed under the GNU AGPL v3 — see COPYING.
  */
 #include "Engine.h"
+#include <limits>
 
 #include "ClientAct.h"
 #include "Context.h"
@@ -339,13 +340,16 @@ namespace Constellation::Ai
                 continue;
             auto const& m = _multipliers[i].Obj;
             float const k = m->Of(action, ctx);
-            relevance *= k;
-            if (relevance <= 0.0f)
+            // THE MULTIPLIER VETOES, NOT THE SIGN OF THE PRODUCT (0026 step 9). It used to test the
+            // running product: a positive multiplier on an already-negative score read as a veto by
+            // whoever happened to be last in the chain. A veto is k <= 0 - the multiplier said "no".
+            if (k <= 0.0f)
             {
                 if (vetoedBy)
                     *vetoedBy = m->Name();
                 return 0.0f;
             }
+            relevance *= k;
         }
         return relevance;
     }
@@ -410,7 +414,10 @@ namespace Constellation::Ai
 
         float cmp[QUEUE_CAP] = {};
         size_t const n = st.Queue.size() < QUEUE_CAP ? st.Queue.size() : QUEUE_CAP;
-        float bestCmp = -1.0f;
+        // FROM -INFINITY, NOT -1 (0026 step 9): with every score below -1 the old start value stayed
+        // the "best", nothing fell within TIE_EPSILON of it, and the pick fell through to the tail.
+        // NaN is already dropped above, so the maximum exists whenever n > 0.
+        float bestCmp = -std::numeric_limits<float>::infinity();
         for (size_t i = 0; i < n; ++i)
         {
             Bid const& b = st.Queue[i];
@@ -425,7 +432,13 @@ namespace Constellation::Ai
             // work; `RunningAbout` is the work (Reset/Cancel already use it). A fight keeps its
             // victim, not every victim; rest bids carry the empty Subject and still match it.
             bool const running = sticky && b.Action == st.Running && b.About == st.RunningAbout;
-            cmp[i] = b.Score * (running ? STICKINESS : 1.0f);
+            // HYSTERESIS FAVOURS THE EXECUTING BID ON BOTH SIGNS (0026 step 9): x1.35 on a negative
+            // score made it WORSE (-10 -> -13.5) and handed the choice to a rival. "Judged 35% more
+            // favourably" is a bonus of 35 % of the magnitude on either sign (Codex, dual-solve):
+            // +10 -> +13.5, -10 -> -6.5; a negative bid stays negative and still loses to any positive.
+            cmp[i] = b.Score;
+            if (running)
+                cmp[i] += std::fabs(b.Score) * (STICKINESS - 1.0f);
             if (cmp[i] > bestCmp)
                 bestCmp = cmp[i];
         }
@@ -1440,11 +1453,19 @@ namespace Constellation::Ai
             // return a different number, and then what executes is not what won.
             char const* vetoedBy = nullptr;
             float const rel = MultipliedRelevance(*action, ctx, st.StrategyMask, chosenScore, &vetoedBy);
-            if (rel <= 0.0f)
+            // DISTANCE IS A PRICE INSIDE A CLASS, NOT A VETO (0026 step 9, Master 09:45, APPROVED).
+            // This gate read `rel <= 0` with zero multipliers registered - so it removed the SCORE's
+            // own sign: REL_BACKGROUND 5 - yards * 0.01 is negative past 500 yards, REL_HIGH 20 past
+            // 2000, and a trip or a hand-in that far never executed, the DEBUG line said nothing, and
+            // a bot in Stormwind whose remaining work lay 1200-1500 yards away stood for an hour with
+            // every bid negative (reader 09:35: Emrick; the far spot of 5 of 5 silent bots). A bid is
+            // removed only when a multiplier named itself; a negative score stays, loses to any
+            // positive one in Choose, and executes when nothing else is there.
+            if (vetoedBy)
             {
-                TC_LOG_DEBUG("server.worldserver",
+                TC_LOG_INFO("server.worldserver",
                     "Constellation РЕШЕНИЕ {}: «{}» снято правилом «{}»",
-                    ctx.World.Name(), action->Name(), vetoedBy ? vetoedBy : "?");
+                    ctx.World.Name(), action->Name(), vetoedBy);
                 continue;
             }
 
