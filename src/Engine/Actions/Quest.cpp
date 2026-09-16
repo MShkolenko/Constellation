@@ -426,12 +426,30 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
 
         // Ближе — дешевле, тем же наклоном, что у сдачи. Расстояние в значении по плоскости, и
         // это допустимо: здесь оно ЦЕНА, а не решение. Решает ядро в `Possible`.
+        //
+        // A GIVER WITHIN TALK DISTANCE IS FREE WORK, AND FREE WORK IS PRICED LIKE A HAND-IN
+        // (P3', Master 2026-09-16 04:15, APPROVED). Taking there costs a menu read and an accept
+        // packet - no steps; a hand-in 700 yards away costs 700 yards. The relation: a take that
+        // needs no walk is scored from REL_HIGH like a hand-in; a take that needs a walk keeps
+        // REL_NORMAL, so "hand-in > walking to a giver to take" stands and a completed quest is not
+        // carried around while the bot goes to fetch a new one. Live, Rowena 02:25: after handing
+        // 26393 in to Bartlett the Brave (who then offers 26394) the queue held "hand in" at
+        // 13.0-16.2 (ender ~700 yards) and fights at 29.8; the take at 10 - 0.1 = 9.9 never won and
+        // the chain quest was taken 1 time in 6. Now that take scores 20 - 0.1 = 19.9: above any
+        // hand-in farther than ~10 yards, still below a fight. Taking first from a giver whose menu
+        // is empty defers him (NothingOffered), and a hand-in to him lifts that (b21a8d6) - the loop
+        // is closed. "Free" is the core's own answer - CanTalkTo, the same question Execute asks
+        // before it decides to walk (Codex, dual-solve: g.Dist is a 2D yard count, the core measures
+        // interaction in space with reach; the score must not say "walk" where Execute would talk).
         float Score(Ctx& ctx, Bid const& bid, float relevance) const override
         {
             ObjectGuid const giver = bid.About.Guid();
             for (GiverInSight const& g : Val<ValueId::GiversInSight>(ctx))
                 if (g.Guid == giver)
-                    return relevance - g.Dist * YARD_COST;
+                {
+                    float const base = ctx.World.CanTalkTo(giver) ? REL_HIGH : relevance;
+                    return base - g.Dist * YARD_COST;
+                }
             return relevance;
         }
 

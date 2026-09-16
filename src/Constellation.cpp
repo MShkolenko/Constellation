@@ -4657,10 +4657,22 @@ public:
                             self->GetName(), what, entry, uint32(picks[i].LootListId));
                         continue;
                     }
+                    // ДЛЯ FFA «ВЗЯТ» ЛЕЖИТ У ИГРОКА (Loot.cpp:1082-1096, `PlayerFFAItems`), а не в
+                    // `is_looted` предмета: ночь 16.09 читала «взят 0» на 68 трупах и не различала
+                    // успех и отказ. Печатаем и его, и есть ли у игрока ffa-запись вовсе; и
+                    // расстояние до владельца добычи в этот такт (ворота :114 — 30 ярдов).
+                    int ffaTaken = -1;                     // -1: у игрока нет ffa-записи на этот слот
+                    if (li->freeforall)
+                        if (auto const ffa = loot->GetPlayerFFAItems().find(self->GetGUID()); ffa != loot->GetPlayerFFAItems().end())
+                            for (NotNormalLootItem const& nn : *ffa->second)
+                                if (nn.LootListId == li->LootListId)
+                                    { ffaTaken = nn.is_looted ? 1 : 0; break; }
+                    WorldObject const* owner = ObjectAccessor::GetWorldObject(*self, loot->GetOwnerGUID());
                     TC_LOG_INFO("server.worldserver",
-                        "Constellation ЛУТ-ОТКАЗ {}: {} ({}) предмет {} после отправки — взят {}, наш {}, заблокирован {}, ffa {}",
+                        "Constellation ЛУТ-ОТКАЗ {}: {} ({}) предмет {} после отправки — взят {}, наш {}, заблокирован {}, ffa {}, ffa-взят {}, до владельца {:.1f}",
                         self->GetName(), what, entry, li->itemid, li->is_looted ? 1 : 0,
-                        li->HasAllowedLooter(self->GetGUID()) ? 1 : 0, li->is_blocked ? 1 : 0, li->freeforall ? 1 : 0);
+                        li->HasAllowedLooter(self->GetGUID()) ? 1 : 0, li->is_blocked ? 1 : 0, li->freeforall ? 1 : 0,
+                        ffaTaken, owner ? self->GetExactDist(owner) : -1.0f);
                 }
             }
         }
