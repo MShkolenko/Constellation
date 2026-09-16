@@ -563,6 +563,9 @@ namespace Constellation::Ai
     };
     bool GatherSpotFor(Player* self, GatherSpot* out);            // выбирает И настраивает слот
     uint32 GatherSpawnFor(Player* self);                          // на какую точку слот настроен
+    bool   ReserveUnitFor(Player* self, ObjectGuid unit, uint32 ttlMs);   // P5: the fight target is mine; false - held by another
+    bool   IsAttackingMeFor(Player* self, ObjectGuid unit);
+    void   ReleaseReservationFor(Player* self);                           // П5: дело кончилось
     // Тела у точки: nullptr = «стою, вернусь тем же тактом», иначе причина ухода (слот сброшен).
     char const* GatherFocusFor(Player* self, ClientAct& act, MoveState& move);
     char const* GatherOpenFor(Player* self, uint32 spawnId, ClientAct& act, MoveState& move);
@@ -917,6 +920,9 @@ namespace Constellation::Ai
         // это память МИРА про этого спутника, не движка; ставка держится за `GatherSpawn()`.
         bool GatherSpotOf(GatherSpot* out) const;
         uint32 GatherSpawn() const;
+        bool   ReserveUnit(ObjectGuid unit, uint32 ttlMs) const;    // P5; false - another companion holds it
+        bool   IsAttackingMe(ObjectGuid unit) const;                // defence asks no reservation
+        void   ReleaseReservation() const;                          // П5
         char const* GatherFocus(ClientAct& act, MoveState& move) const;
         char const* GatherOpen(uint32 spawnId, ClientAct& act, MoveState& move) const;
         char const* GatherArrivedEmpty() const;

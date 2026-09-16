@@ -35,6 +35,8 @@ namespace
     // ДО ЦЕЛИ НЕ ДОБРАТЬСЯ — НА ДЕСЯТЬ МИНУТ. Столько же держит лестница у недостижимых
     // собеседников, и по той же причине: за это время меняется и уровень, и обстановка вокруг.
     inline constexpr uint32 COMBAT_UNREACHABLE_MS = 600000;
+    inline constexpr uint32 FIGHT_RESERVE_MS      = 600000;   // backstop of the victim reservation (P5): longer than any fight; the real end is the outcome
+    inline constexpr uint32 HELD_BY_OTHER_MS      = 10000;    // target held by another: step back ten seconds, the scan offers a neighbour
 
     // ОСТАНАВЛИВАЕМСЯ НЕ У САМОЙ ТОЧКИ. Ноль означал бы «встань в него», а достаточную близость
     // решает ядро своим `IsWithinMeleeRange`; этот порог — лишь то, на чём двигатель прекращает
@@ -161,7 +163,20 @@ namespace
             // держит его на своей цели до исхода. Невступивший — просто подход, его бросить
             // ничего не стоит.
             if (f.Victim != victim)
+            {
+                // THE VICTIM IS MINE FOR THE FIGHT (P5, spec v1 s7 / v3 s10 quater): every other
+                // companion skips it in its scan unless it attacks them; the slot is released by
+                // Outcome/End, Reset and death/logout, the TTL is only the backstop (an expiry counts
+                // as a defect). TWO SCANS CAN PICK THE SAME LONE TARGET before either Begin (Codex):
+                // whoever reserves second is refused and steps back for ten seconds - unless the
+                // creature is attacking him, and then he fights without an exclusive slot.
+                if (!ctx.World.ReserveUnit(victim, FIGHT_RESERVE_MS) && !ctx.World.IsAttackingMe(victim))
+                {
+                    Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, HELD_BY_OTHER_MS);
+                    return false;
+                }
                 Begin(ctx, f, victim, ctx.World.EntryOf(victim), ctx.NowMs);
+            }
 
             uint32 slice = ctx.NowMs - f.LastTickMs;
             if (f.LastTickMs == 0 || slice > FIGHT_GAP_MS)
@@ -442,6 +457,7 @@ namespace
                 if (AdvanceWalk(ctx, Subject::OfUnit(victim), *d, uint32(dt * 1000.0f), stalled) != WalkVerdict::Going)
                 {
                     Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, COMBAT_UNREACHABLE_MS);
+                    ctx.World.ReleaseReservation();         // Release (P5): the slot must not outlive a refused or unreachable fight (Codex S3)
                     f = EngineState::FightState{ .Loot = f.Loot };
                     return false;
                 }
@@ -471,6 +487,7 @@ namespace
                 if (f.Engaged)
                     return false;
                 Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(victim), 0, COMBAT_UNREACHABLE_MS);
+                ctx.World.ReleaseReservation();         // Release (P5): the slot must not outlive a refused or unreachable fight (Codex S3)
                 f = EngineState::FightState{ .Loot = f.Loot };
                 return false;
             }
@@ -501,6 +518,7 @@ namespace
             else
                 Report(ctx, f, FightEvent::Ended,
                        ctx.World.IsAliveUnit(victim) ? "бой прекратился" : "цель мертва, но добили не мы");
+            ctx.World.ReleaseReservation();         // Release (П5)
             f = EngineState::FightState{ .Loot = f.Loot };
             return true;                            // такт был боем — что бы ни вышло
         }
@@ -511,6 +529,7 @@ namespace
             ctx.Act.AttackStop();
             if (ban)
                 Defer(ctx, BackoffKind::CombatUnreachable, Subject::OfUnit(f.Victim), 0, COMBAT_UNREACHABLE_MS);
+            ctx.World.ReleaseReservation();         // Release (П5)
             f = EngineState::FightState{ .Loot = f.Loot };
             return !ban;
         }

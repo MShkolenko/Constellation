@@ -415,6 +415,22 @@ namespace Constellation::Ai
         return _self ? GatherArrivedEmptyFor(_self) : "спутника нет";
     }
 
+    bool WorldView::ReserveUnit(ObjectGuid unit, uint32 ttlMs) const
+    {
+        return _self && !unit.IsEmpty() && ReserveUnitFor(_self, unit, ttlMs);
+    }
+
+    bool WorldView::IsAttackingMe(ObjectGuid unit) const
+    {
+        return _self && !unit.IsEmpty() && IsAttackingMeFor(_self, unit);
+    }
+
+    void WorldView::ReleaseReservation() const
+    {
+        if (_self)
+            ReleaseReservationFor(_self);
+    }
+
     void WorldView::GatherUnreachable(uint32 backoffMs) const
     {
         if (_self)

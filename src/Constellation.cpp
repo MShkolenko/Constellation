@@ -600,7 +600,7 @@ public:
     {
         for (Companion& c : _companions)
         {
-            Constellation::Ai::Engine::Instance().Discard(c.Engine);
+            DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
         }
     }
 
@@ -2825,7 +2825,7 @@ public:
         // вместе со всем прочим. С 2026-09-14 выключенный движок означает неподвижный состав:
         // лестницы, которая брала ход, больше нет.
         if (!Cfg().Engine && c.Engine.HasTicked)
-            Constellation::Ai::Engine::Instance().Discard(c.Engine);
+            DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
 
         if (Cfg().Engine && Constellation::Ai::Engine::Instance().Ready())
         {
@@ -3418,6 +3418,100 @@ public:
         return "применил у фокуса";
     }
 
+    // ---------------------------------------------------------------- резервации (П5)
+    // Типы — здесь, в открытой части и до первого использования в подписях: свободные функции движка
+    // называют `Manager::ResUnit`/`ResSpawn`; слоты и счётчики — в закрытой части у `_lockCastHold`.
+    enum ReserveKind : uint8 { ResNone = 0, ResUnit = 1, ResSpawn = 2 };
+    struct Reservation { uint8 Kind = ResNone; ObjectGuid Unit; uint64 Spawn = 0; uint32 ExpiresAtMs = 0; };
+    static uint32 const GATHER_RESERVE_MS = 960000;    // страховка: потолок дороги (WalkCapMs 15 мин) + минута; настоящий конец — уход
+
+    bool ReservationLive(Reservation const& r, uint32 now) const
+    {
+        return r.Kind != ResNone && int32(r.ExpiresAtMs - now) > 0;
+    }
+
+    void ReportReservations(uint32 now) const
+    {
+        if (_resReportMs && now - _resReportMs < 60000)
+            return;
+        _resReportMs = now;
+        // SWEEP THE EXPIRED HERE, ONCE A MINUTE: an expired entry is already a defect (v3 s10 quater)
+        // and is counted when it expires, not when its owner happens to touch the slot (Codex).
+        uint32 live = 0;
+        for (auto it = _reservations.begin(); it != _reservations.end(); )
+        {
+            if (it->second.Kind != ResNone && !ReservationLive(it->second, now))
+                { ++_resExpired; it = _reservations.erase(it); continue; }
+            if (ReservationLive(it->second, now))
+                ++live;
+            ++it;
+        }
+        TC_LOG_INFO("server.worldserver",
+            "Constellation РЕЗЕРВ: занято {} слотов при {} спутниках; снято {}, продлено {}, истекло {} (дефект), чужих целей пропущено {}",
+            live, uint32(_companions.size()), _resReleased, _resTransferred, _resExpired, _resSkipped);
+    }
+
+    // FALSE - THE TARGET IS HELD BY ANOTHER (Codex, second pass): two scans see a lone target free,
+    // both pick it, and without this answer both Begins would have written a slot on one target.
+    // The caller decides what a refusal means (a fight steps back ten seconds, unless defending).
+    bool ReserveFor(Player* self, uint8 kind, ObjectGuid unit, uint64 spawn, uint32 ttlMs)
+    {
+        uint32 const now = GameTime::GetGameTimeMS();
+        if (ReservedByOther(self->GetGUID(), kind, unit, spawn))
+            return false;
+        Reservation& r = _reservations[self->GetGUID()];
+        bool const same = r.Kind == kind && r.Unit == unit && r.Spawn == spawn;
+        if (r.Kind != ResNone)
+        {
+            if (!ReservationLive(r, now))
+                ++_resExpired;                              // никто не отпустил — дефект, считаем
+            else if (same)
+                ++_resTransferred;                          // то же дело, продление
+            else
+                ++_resReleased;                             // другое дело — прежнее отпущено этим же
+        }
+        r.Kind = kind; r.Unit = unit; r.Spawn = spawn; r.ExpiresAtMs = now + ttlMs;
+        ReportReservations(now);
+        return true;
+    }
+
+    // DISCARD THE ENGINE AND THE RESERVATION IN ONE CALL, so a brace-less `if` cannot separate them
+    // (Codex found exactly that at the second of the four sites).
+    void DiscardEngineFor(Companion& c)
+    {
+        ReleaseFor(c.Guid);                                 // the reservation dies with the work (v3 s10 quater)
+        Constellation::Ai::Engine::Instance().Discard(c.Engine);
+    }
+
+    void ReleaseFor(ObjectGuid owner)
+    {
+        auto it = _reservations.find(owner);
+        if (it == _reservations.end() || it->second.Kind == ResNone)
+            return;
+        uint32 const now = GameTime::GetGameTimeMS();
+        if (!ReservationLive(it->second, now))
+            ++_resExpired;
+        else
+            ++_resReleased;
+        _reservations.erase(it);
+        ReportReservations(now);
+    }
+
+    // ЗАНЯТО ДРУГИМ — живая резервация чужого спутника на ту же цель. Истёкшая чужая не держит
+    // (и считается дефектом один раз при следующем касании владельцем).
+    bool ReservedByOther(ObjectGuid self, uint8 kind, ObjectGuid unit, uint64 spawn) const
+    {
+        uint32 const now = GameTime::GetGameTimeMS();
+        for (auto const& [owner, r] : _reservations)
+        {
+            if (owner == self || r.Kind != kind || !ReservationLive(r, now))
+                continue;
+            if ((kind == ResUnit && r.Unit == unit) || (kind == ResSpawn && r.Spawn == spawn))
+                { ++_resSkipped; return true; }
+        }
+        return false;
+    }
+
     char const* GatherOpenCore(Companion& c, Player* self, GameObject* go,
                                Constellation::Ai::ClientAct& act, Constellation::Ai::MoveState& move)
     {
@@ -3926,6 +4020,7 @@ public:
     // снимает резерв (владелец отпускает первым — на всех путях).
     void GatherLeaveCore(Companion& c, Player* self, uint32 backoffMs, bool fruitless)
     {
+        ReleaseFor(self->GetGUID());                         // точка отпущена — Release (П5)
         if (c.GatherSpawnId)
         {
             if (backoffMs)
@@ -8967,6 +9062,9 @@ public:
         float best = 0.0f;
         bool found = false;
         for (GatherSpawn const* pc : pool)
+            if (ReservedByOther(self->GetGUID(), ResSpawn, ObjectGuid::Empty, pc->SpawnId))
+                continue;                           // точку читает другой спутник (П5)
+            else
         {
             GatherSpawn const& sp = *pc;
             {
@@ -9303,7 +9401,7 @@ public:
         Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, around, check);
         Cell::VisitGridObjects(self, searcher, Cfg().FightRange + margin);
 
-        uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0, rejPack = 0;
+        uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0, rejPack = 0, rejReserved = 0;
         uint32 assists = 0, bestAssists = 0xFFFFFFFF;
         // СПИСОК УГРОЗ — ОДИН РАЗ НА ПРОХОД, А НЕ НА КАЖДОГО КАНДИДАТА (разбор: перебор был
         // квадратичным). Здесь только те, кто вообще может вступить: живой, враждебный, ещё не
@@ -9770,6 +9868,12 @@ public:
             // при ударе. Здесь отсеиваем лишь то, что уже признано недостижимым.
             if (mem.Banned(FightBan::TargetRefused, creature->GetGUID()))
                 { ++rejLos; ++rejected; continue; }
+            // ЗАНЯТО ДРУГИМ СПУТНИКОМ — не моя цель (П5), кроме той, что бьёт МЕНЯ: защита не
+            // спрашивает разрешения. Схождение (23 % общих убийств в первые 25 минут) — это два
+            // спутника у одного волка; резервация даёт второму соседнего.
+            if (creature->GetVictim() != self
+                && ReservedByOther(self->GetGUID(), ResUnit, creature->GetGUID(), 0))
+                { ++rejReserved; ++rejected; continue; }
             // ЦЕЛЬ ВЫБИРАЕТСЯ ПО ОДИНОЧЕСТВУ, А ПОТОМ УЖЕ ПО БЛИЗОСТИ: так лагерь разбирается
             // с края по одному, а не начинается с середины (оператор: «цеплять по 1-2»).
             float d = self->GetExactDist2d(creature);
@@ -9803,8 +9907,8 @@ public:
             {
                 at = now;
                 TC_LOG_INFO("server.worldserver",
-                    "Constellation REJ {}: видит {}, подходящих {}, стая {}, чужая фаза {}, занято {}, недопустимо {}, без видимости {}; голод {} с из {}; пример вид {} фракция {}",
-                    self->GetName(), seen, matched, rejPack, rejPhase, rejBusy, rejInvalid, rejLos,
+                    "Constellation REJ {}: видит {}, подходящих {}, стая {}, занято другим {}, чужая фаза {}, занято {}, недопустимо {}, без видимости {}; голод {} с из {}; пример вид {} фракция {}",
+                    self->GetName(), seen, matched, rejPack, rejReserved, rejPhase, rejBusy, rejInvalid, rejLos,
                     mem.StarvedMs / 1000, Cfg().StarveMs / 1000, lastEntry, lastFaction);
             }
         }
@@ -10963,7 +11067,7 @@ private:
         if (!self)
         {
             // мира нет — отменять нечего, освобождать есть
-            Constellation::Ai::Engine::Instance().Discard(c.Engine);
+            DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
             return;
         }
         Constellation::Ai::WorldView view(self);
@@ -11027,7 +11131,7 @@ private:
         // накопленное до выключения, пережило бы и роспуск, и остановку мира. Сегодня это
         // безвредно (накапливать нечему), а на шаге 28 это была бы утечка резервации,
         // переживающая сам мир.
-        Constellation::Ai::Engine::Instance().Discard(c.Engine);
+        DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
         // Dismissed survives AutoSummon: only .summon (or restart) re-enters the
         // pipeline. Shutdown uses it too — the world is going away anyway.
         c.State = Stage::Dismissed;
@@ -11200,6 +11304,16 @@ private:
     //
     // Резерв живёт ровно столько же, сколько ожидание, и снимается тем же путём.
     std::unordered_map<uint32, std::pair<uint64, uint32>> _lockCastHold;
+
+    // РЕЗЕРВАЦИИ (0026 П5; план v1 §7, поправка v2 §12, v3 §10⁗). ОДИН СЛОТ НА СПУТНИКА, а не запись на
+    // площадку: размер ограничен составом по построению, держатель каждого занятого слота — живой
+    // спутник. Слот несёт, ЧТО занято: существо (GUID) под бой или точка появления объекта под сбор.
+    // Каждая резервация кончается ОДНИМ из трёх исходов, и код называет который: Release (дело
+    // кончилось, `Reset`, смерть/выход), Transfer (тот же спутник продлевает то же дело), Expire
+    // (никто не отпустил до срока — считается ДЕФЕКТОМ, не рабочим режимом). Срок — только страховка.
+    mutable std::unordered_map<ObjectGuid, Reservation> _reservations;   // владелец -> слот; mutable: подметание из const-отчёта
+    mutable uint32 _resReleased = 0, _resTransferred = 0, _resExpired = 0, _resSkipped = 0;
+    mutable uint32 _resReportMs = 0;
     // СУЩЕСТВО -> ЗАКЛИНАНИЯ, КОТОРЫЕ ДАЮТ ПО НЕМУ ЗАЧЁТ И ТРЕБУЮТ ФОКУСА.
     //
     // Соседний указатель `_itemsForCredit` отвечает на вопрос «что НАДЕТЬ, чтобы получить
@@ -11373,11 +11487,29 @@ namespace Constellation::Ai
             return false;
         c->GatherMs = 0;                                     // как `Idle`, `:3316-3317`
         c->GatherDist = self->GetExactDist(c->GatherPos);
+        (void)m->ReserveFor(self, Constellation::Manager::ResSpawn, ObjectGuid::Empty, c->GatherSpawnId,
+                            Constellation::Manager::GATHER_RESERVE_MS);   // the pool already skipped held spawns; a refusal is a race of two picks, the next recount takes another
         out->SpawnId = c->GatherSpawnId;
         out->Entry   = c->GatherEntry;
         out->Where   = c->GatherPos;
         out->Focus   = c->GatherUseItem || c->GatherCastSpell;
         return true;
+    }
+
+    bool ReserveUnitFor(Player* self, ObjectGuid unit, uint32 ttlMs)
+    {
+        return Constellation::Manager::Instance()->ReserveFor(self, Constellation::Manager::ResUnit, unit, 0, ttlMs);
+    }
+
+    bool IsAttackingMeFor(Player* self, ObjectGuid unit)
+    {
+        Unit* u = ObjectAccessor::GetUnit(*self, unit);
+        return u && u->GetVictim() == self;
+    }
+
+    void ReleaseReservationFor(Player* self)
+    {
+        Constellation::Manager::Instance()->ReleaseFor(self->GetGUID());
     }
 
     uint32 GatherSpawnFor(Player* self)
