@@ -5186,11 +5186,20 @@ public:
         // ЗАЧЁТ ЧЕРЕЗ ДРУГОЕ СУЩЕСТВО. Player::KilledMonsterCredit смотрит KillCredit[0..1]
         // шаблона убитого: цель квеста 39262 не появляется в мире никогда, её засчитывают
         // 39260 и 39261. Обратный указатель нужен для дороги к цели (у самой цели спавнов нет).
-        uint32 credits = 0;
+        uint32 credits = 0, droppers = 0;
         for (auto const& [entry, tpl] : sObjectMgr->GetCreatureTemplates())
+        {
             for (uint32 i = 0; i < MAX_KILL_CREDIT; ++i)
                 if (tpl.KillCredit[i])
                     { _creditedBy[tpl.KillCredit[i]].push_back(entry); ++credits; }
+            // WHO DROPS A QUEST ITEM - the reverse of the core's per-creature list, so that "is
+            // there anywhere to go for this item objective" is one lookup (0026 step 8).
+            if (std::vector<uint32> const* qi = sObjectMgr->GetCreatureQuestItemList(entry, DIFFICULTY_NONE))
+                for (uint32 item : *qi)
+                    { _itemDroppers[item].push_back(entry); ++droppers; }
+        }
+        TC_LOG_INFO("server.loading", "Constellation: указатель «кто роняет предмет» — {} связок у {} предметов",
+            droppers, uint32(_itemDroppers.size()));
         TC_LOG_INFO("server.loading", "Constellation: указатель зачёта через других — {} связок у {} целей",
             credits, uint32(_creditedBy.size()));
 
@@ -5592,6 +5601,48 @@ public:
         return false;
     }
 
+    // IS THERE ANYWHERE TO GO FOR THIS OBJECTIVE (0026 step 8, Master 09:45, APPROVED). The map-seek
+    // gate (Quest.cpp: `UnmetObjectives == 0 && Talk.IsEmpty()`) read "unmet" as "unfinished", and an
+    // unfinished objective the engine has no place for - the four Furlbrow clues of 26209 (42414-42417,
+    // no creature row: credit comes from clue objects), the pet-battle "Kill Credit" entries of
+    // 31308/31309/31550/31785 (65355/64320/65356/65876, no spawns), Kurtok while the pack rule refuses
+    // him - locked the gate for the rest of the window: 5 of 5 silent bots (reader, 09:35). A place is
+    // a spawn on this map of the entry itself, of a creature that credits it (KillCredit), or of a
+    // creature or object that drops the item. Not a POI point: 26209 has one, and it leads to clue
+    // objects the engine cannot use. Spawns are what the objective scan and the travel spot resolve
+    // (SpawnDestination, _creditedBy, _itemFromGo), so the gate now asks the same question they answer.
+    bool ObjectiveHasPlace(Player* self, Quest const* quest, QuestObjective const& obj) const
+    {
+        uint32 const mapId = self->GetMapId();
+        auto onMap = _spawns.find(mapId);
+        auto spawned = [&](uint32 entry) { return onMap != _spawns.end() && onMap->second.count(entry) > 0; };
+        if (obj.Type == QUEST_OBJECTIVE_MONSTER)
+        {
+            if (spawned(uint32(obj.ObjectID)))
+                return true;
+            if (!quest->HasFlagEx(QUEST_FLAGS_EX_NO_CREDIT_FOR_PROXY))
+                if (auto cb = _creditedBy.find(uint32(obj.ObjectID)); cb != _creditedBy.end())
+                    for (uint32 crediting : cb->second)
+                        if (spawned(crediting))
+                            return true;
+            return false;
+        }
+        if (obj.Type == QUEST_OBJECTIVE_ITEM)
+        {
+            if (auto dr = _itemDroppers.find(uint32(obj.ObjectID)); dr != _itemDroppers.end())
+                for (uint32 entry : dr->second)
+                    if (spawned(entry))
+                        return true;
+            if (auto go = _itemFromGo.find(uint32(obj.ObjectID)); go != _itemFromGo.end())
+                if (auto gm = _goSpawns.find(mapId); gm != _goSpawns.end())
+                    for (uint32 goEntry : go->second)
+                        if (gm->second.count(goEntry))
+                            return true;
+            return false;
+        }
+        return false;
+    }
+
     void WantedEntries(Player* self, std::set<uint32>& wanted, uint32* slotsUsed = nullptr,
         uint32* incomplete = nullptr, uint32* monsterObjs = nullptr, uint32* unmet = nullptr,
         std::set<uint32>* wantedItems = nullptr, std::set<uint32>* proxyOk = nullptr) const
@@ -5626,7 +5677,10 @@ public:
                 if (isMonster && monsterObjs) ++*monsterObjs;
                 if (self->GetQuestObjectiveData(obj) >= obj.Amount)
                     continue;                       // эта цель уже набрана
-                if (unmet) ++*unmet;
+                // «НЕЗАКРЫТАЯ» ДЛЯ ВОРОТ — ТА, КУДА ЕСТЬ КУДА ИДТИ (0026 шаг 8): цель без спавнов на
+                // этой карте поход по карте не запирает; `wanted`/`wantedItems` она пополняет как
+                // раньше - обзор на месте вправе встретить то, чего нет в указателе.
+                if (unmet && ObjectiveHasPlace(self, quest, obj)) ++*unmet;
                 if (isMonster)
                 {
                     wanted.insert(uint32(obj.ObjectID));
@@ -11085,6 +11139,7 @@ private:
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
     std::unordered_map<uint32, std::vector<uint32>> _creditedBy;
+    std::unordered_map<uint32, std::vector<uint32>> _itemDroppers;   // предмет -> виды существ, что его роняют
     std::unordered_set<uint32> _spawnedSomewhere;   // виды, у которых есть хоть одна точка появления
     // ГДЕ СТОЯТ ПОЛЁТНЫЕ МАСТЕРА — своя запись, потому что узел ядро выводит из их позиции.
     struct FlightPoint { uint32 Entry; uint32 Faction; Position Where; };
