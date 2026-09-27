@@ -1406,7 +1406,14 @@ namespace Constellation::Ai
         }
 
         if (st.Queue.empty())
+        {
+            // ПОХОД К КВЕСТОДАТЕЛЮ, КОТОРЫЙ НИЧЕМ НЕ СМЕНИЛСЯ, ТОЖЕ ОТДАЁТ ОТМЕТКУ (Кодекс, второй
+            // проход 28.09): цель пропала, ставка отвергнута, а `Cancel` на простое не зовётся.
+            // Безопасно на любом таком такте: живой поход ставит отметку заново каждым `Execute`.
+            if (st.Running == ActionId::SeekGiverByMap)
+                ctx.World.ClearVisit();
             return Finish(st, TickResult::Idle);
+        }
 
         // ВЗЯЛСЯ ЛИ ХОТЬ ЗА ЧТО-НИБУДЬ. Ставится РЯДОМ с вызовом исполнения, а не по его исходу:
         // в этом и весь смысл — мир мог быть тронут и при отказе.
@@ -1614,6 +1621,11 @@ namespace Constellation::Ai
             Push(st, st.Scratch, rel + REL_ALTERNATIVE, now);
         }
 
+        // ПОХОД К КВЕСТОДАТЕЛЮ, КОТОРЫЙ НИЧЕМ НЕ СМЕНИЛСЯ, ТОЖЕ ОТДАЁТ ОТМЕТКУ (Кодекс, второй
+        // проход 28.09): цель пропала, ставка отвергнута, а `Cancel` на простое не зовётся.
+        // Безопасно на любом таком такте: живой поход ставит отметку заново каждым `Execute`.
+        if (st.Running == ActionId::SeekGiverByMap)
+            ctx.World.ClearVisit();
         return Finish(st, attempted ? TickResult::Attempted : TickResult::Idle);
     }
 }

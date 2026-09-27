@@ -2891,7 +2891,7 @@ public:
     // `QuestLogItemId`, предмет-источник, уже выполненная цель. Не копируем его, а смотрим
     // следствие: сколько зачлось за время отправки. Отправка синхронна, другого источника
     // прироста в этот миг нет.
-    static uint32 ItemObjectiveProgress(Player const* self)
+    static uint32 ItemObjectiveProgress(Player const* self, uint32 itemId)
     {
         uint32 total = 0;
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
@@ -2903,7 +2903,7 @@ public:
             if (!q)
                 continue;
             for (QuestObjective const& obj : q->GetObjectives())
-                if (obj.Type == QUEST_OBJECTIVE_ITEM)
+                if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == itemId)
                     total += uint32(std::max<int32>(self->GetQuestObjectiveData(obj), 0));
         }
         return total;
@@ -4867,7 +4867,13 @@ public:
             uint32 countBefore = 0;
             for (uint32 id : askedIds)
                 countBefore += self->GetItemCount(id, true);
-            uint32 const creditBefore = ItemObjectiveProgress(self);
+            // ПО КАЖДОМУ ПРЕДМЕТУ: сумка и прогресс его целей (Кодекс, второй проход 28.09). Обычный
+            // квестовый предмет ложится в сумку И двигает цель; зачтённым в задание считается только
+            // прирост СВЕРХ того, что легло, - иначе отказ второго предмета «объяснялся» первым.
+            std::vector<std::pair<uint32, uint32>> perItem;     // (в сумке, прогресс) до отправки
+            perItem.reserve(askedIds.size());
+            for (uint32 id : askedIds)
+                perItem.emplace_back(self->GetItemCount(id, true), ItemObjectiveProgress(self, id));
             uint32 const spaceBefore = FreeBagSpace(self);
             send.Items(send.User, picks, asked);
             uint32 const spaceAfter = FreeBagSpace(self);
@@ -4876,8 +4882,20 @@ public:
                 countAfter += self->GetItemCount(id, true);
 
             uint32 const landed = countAfter > countBefore ? countAfter - countBefore : 0;
-            uint32 const creditAfter = ItemObjectiveProgress(self);
-            uint32 const credited = creditAfter > creditBefore ? creditAfter - creditBefore : 0;
+            uint32 credited = 0;
+            {
+                size_t i = 0;
+                for (uint32 id : askedIds)
+                {
+                    uint32 const bagNow  = self->GetItemCount(id, true);
+                    uint32 const progNow = ItemObjectiveProgress(self, id);
+                    uint32 const bagUp   = bagNow > perItem[i].first ? bagNow - perItem[i].first : 0;
+                    uint32 const progUp  = progNow > perItem[i].second ? progNow - perItem[i].second : 0;
+                    if (progUp > bagUp)
+                        credited += progUp - bagUp;
+                    ++i;
+                }
+            }
             uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
             got = landed;
             n.Items += landed;
@@ -5230,8 +5248,12 @@ public:
         // нет, — и все три засчитывались как непрошедшие. Общий откат стартует в обоих
         // случаях, и это тот же вопрос, которым ядро само решает, можно ли исполнять
         // следующий запрос.
+        // АВТОВЫСТРЕЛ ИДЁТ В СВОЙ СЛОТ, `CURRENT_AUTOREPEAT_SPELL`, без общего отката: окно
+        // 00:13 (28.09) насчитало 23 боя с Auto Shot «без следа» - ложь прибора. Слот спрашиваем,
+        // только если отправлен сам автоповтор, иначе он «подтвердил» бы любой другой каст.
         if (self->GetSpellHistory()->GetRemainingGlobalCooldown(si) > 0ms
             || self->GetCurrentSpell(CURRENT_GENERIC_SPELL)
+            || (si->IsAutoRepeatRangedSpell() && self->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
             || self->GetSpellHistory()->HasCooldown(si))
         {
             ++m.CastsWent;
