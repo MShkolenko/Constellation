@@ -4964,7 +4964,12 @@ public:
             SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
             if (!si || si->IsPassive())
                 continue;
-            if (!si->HasEffect(SPELL_EFFECT_INTERRUPT_CAST))
+            // ДВЕ ФОРМЫ ПРЕРЫВАНИЯ, И ОБЕ СПРАШИВАЮТСЯ У ЯДРА. Pummel, Rebuke, Counter Shot,
+            // Kick, Counterspell, Spear Hand Strike несут эффект 68 (INTERRUPT_CAST). Silence
+            // жреца (15487) - нет: он накладывает ауру 27, немоту, и каст обрывается ею
+            // (проверено по данным заклинаний, 27.09). Прерывание чернокнижника (Spell Lock)
+            // принадлежит питомцу и сюда не попадёт никак - это пробел, записанный отдельно.
+            if (!si->HasEffect(SPELL_EFFECT_INTERRUPT_CAST) && !si->HasAura(SPELL_AURA_MOD_SILENCE))
                 continue;
             if (si->IsAffectingArea() || si->IsTargetingArea())
                 continue;
