@@ -325,7 +325,10 @@ namespace Constellation::Ai
     // на спутника, а счётчики `BackoffFull` и `BackoffEvictedLive` в `EngineState` для того и
     // заведены. Шестнадцать — начальное значение при составе из восьми; при возврате к 122 его
     // надо ПЕРЕПРОВЕРИТЬ по этим счётчикам, а не по ощущению.
-    inline constexpr size_t BACKOFF_CAP = 16;
+    // ПЕРЕПРОВЕРЕНО 2026-09-28 при составе из восьми: 16 вытеснений живых записей за вечер 27.09
+    // (у Deverel 11), таблицу забивают «не цель - невосприимчив» и выталкивают «с этой особью уже
+    // говорил» с часом в запасе. Удвоено; число проверки - строк «вытеснена живая» в окне 0.
+    inline constexpr size_t BACKOFF_CAP = 32;
 
     // ROAD MEMORY OUTLIVES TALK MEMORY (0026 step 5, 2026-09-16). When the table is full, the
     // entry with the least remaining TTL is evicted - but never a live "could not reach it" for
