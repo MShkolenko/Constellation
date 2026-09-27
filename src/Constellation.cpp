@@ -2882,6 +2882,27 @@ public:
     // ПЕРИОДИЧЕСКИЙ ЛИ ЭТО УРОН — ОДИН ВОПРОС В ОДНОМ МЕСТЕ, потому что его задают трое:
     // предикат «бьёт ли это», ступень поддержания и проверка предыдущего выбора.
     // SpellInfo::HasAura принимает ОДИН тип ауры, не маску, поэтому именно три вызова.
+    // ПРЕДМЕТ ЗАСЧИТЫВАЕТСЯ В ЗАДАНИЕ И В СУМКУ НЕ ЛОЖИТСЯ - вопрос тем же флагом, что задаёт
+    // ядро (`Player::StoreNewItem`, Player.cpp:11355: `ItemAddedQuestCheck` с
+    // QUEST_OBJECTIVE_FLAG_2_QUEST_BOUND_ITEM зачитывает цель и возвращает nullptr).
+    static bool IsQuestBoundFor(Player const* self, uint32 itemId)
+    {
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const qid = self->GetQuestSlotQuestId(slot);
+            if (!qid)
+                continue;
+            Quest const* q = sObjectMgr->GetQuestTemplate(qid);
+            if (!q)
+                continue;
+            for (QuestObjective const& obj : q->GetObjectives())
+                if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == itemId
+                    && (obj.Flags2 & QUEST_OBJECTIVE_FLAG_2_QUEST_BOUND_ITEM))
+                    return true;
+        }
+        return false;
+    }
+
     static bool IsOverTime(SpellInfo const* si)
     {
         return si && (si->HasAura(SPELL_AURA_PERIODIC_DAMAGE)
@@ -4718,6 +4739,7 @@ public:
         Constellation::Ai::LootPick picks[Constellation::Ai::LOOT_PICK_CAP];
         uint32 const freeSlots = FreeBagSpace(self);
         uint32 asked = 0, got = 0;
+        uint32 boundAsked = 0;          // из запрошенного: засчитывается в задание, в сумку не ляжет
         // lazy: `std::set` выделяет память, как и у лестницы; лут — событие, не такт, и на
         // 122 спутниках это единицы выделений в минуту. Заменить на массив по `askedIds`,
         // если профиль когда-нибудь покажет его.
@@ -4763,6 +4785,8 @@ public:
                 picks[asked].Object     = lootGuid;
                 picks[asked].LootListId = uint8(item.LootListId);
                 askedIds.insert(item.itemid);
+                if (IsQuestBoundFor(self, item.itemid))
+                    ++boundAsked;
                 ++asked;
                 // ПРИБОР (0026 пункт 3, 2026-09-16): за сутки 49 раз «открыл Bundle of Wood (176793),
                 // но ничего не легло» при «запрошено 1, легло 0» — ядро отказало, а какими воротами,
@@ -4809,7 +4833,14 @@ public:
             uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
             got = landed;
             n.Items += landed;
-            if (landed != asked)
+            // НЕДОСТАЧА, ЦЕЛИКОМ ОБЪЯСНЁННАЯ КВЕСТОВЫМИ ПРЕДМЕТАМИ, - НЕ ОТКАЗ: ядро их засчитало
+            // в задание и не создавало. Ночь 16.09 назвала «отказом ядра» 263 таких предмета
+            // при 42 сдачах того самого квеста. Отказом остаётся только остаток.
+            if (landed != asked && landed + boundAsked >= asked)
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ЛУТ {}: запрошено {}, в сумку {}, зачтено в задание {}",
+                    self->GetName(), asked, landed, boundAsked);
+            else if (landed != asked)
             {
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, легло {} (ячеек занято {}) — "
