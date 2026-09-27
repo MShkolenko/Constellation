@@ -2544,8 +2544,8 @@ public:
                             ++q.first;
                         q.second = uint8(self->GetLevel());
                         TC_LOG_INFO("server.worldserver",
-                            "Constellation ГИБЕЛЬ-КВЕСТ {}: квест {} стоил гибелей {} (маршрут закрыт с двух, до ур {})",
-                            self->GetName(), travelQuest, uint32(q.first), uint32(q.second) + 2);
+                            "Constellation ГИБЕЛЬ-КВЕСТ {}: квест {} стоил гибелей {} (маршрут закрыт с двух, откроется с ур {})",
+                            self->GetName(), travelQuest, uint32(q.first), uint32(q.second) + 3);
                     }
                 }
                 // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать
@@ -2886,11 +2886,14 @@ public:
     // ПЕРИОДИЧЕСКИЙ ЛИ ЭТО УРОН — ОДИН ВОПРОС В ОДНОМ МЕСТЕ, потому что его задают трое:
     // предикат «бьёт ли это», ступень поддержания и проверка предыдущего выбора.
     // SpellInfo::HasAura принимает ОДИН тип ауры, не маску, поэтому именно три вызова.
-    // ПРЕДМЕТ ЗАСЧИТЫВАЕТСЯ В ЗАДАНИЕ И В СУМКУ НЕ ЛОЖИТСЯ - вопрос тем же флагом, что задаёт
-    // ядро (`Player::StoreNewItem`, Player.cpp:11355: `ItemAddedQuestCheck` с
-    // QUEST_OBJECTIVE_FLAG_2_QUEST_BOUND_ITEM зачитывает цель и возвращает nullptr).
-    static bool IsQuestBoundFor(Player const* self, uint32 itemId)
+    // ПРОГРЕСС ПРЕДМЕТНЫХ ЦЕЛЕЙ ЖУРНАЛА ЦЕЛИКОМ - до и после отправки добычи (Кодекс, постфактум
+    // 28.09). Правило ядра (`ItemAddedQuestCheck`) шире одного флага: эффекты предмета,
+    // `QuestLogItemId`, предмет-источник, уже выполненная цель. Не копируем его, а смотрим
+    // следствие: сколько зачлось за время отправки. Отправка синхронна, другого источника
+    // прироста в этот миг нет.
+    static uint32 ItemObjectiveProgress(Player const* self)
     {
+        uint32 total = 0;
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
             uint32 const qid = self->GetQuestSlotQuestId(slot);
@@ -2900,11 +2903,10 @@ public:
             if (!q)
                 continue;
             for (QuestObjective const& obj : q->GetObjectives())
-                if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == itemId
-                    && (obj.Flags2 & QUEST_OBJECTIVE_FLAG_2_QUEST_BOUND_ITEM))
-                    return true;
+                if (obj.Type == QUEST_OBJECTIVE_ITEM)
+                    total += uint32(std::max<int32>(self->GetQuestObjectiveData(obj), 0));
         }
-        return false;
+        return total;
     }
 
     static bool IsOverTime(SpellInfo const* si)
@@ -3624,6 +3626,17 @@ public:
             ReleaseSlot(owner, s);
     }
 
+    // ОТПУСКАЕТ СЛОТ, ТОЛЬКО ЕСЛИ В НЁМ БРОНЬ ЭТОГО ВИДА (Кодекс, постфактум 28.09). Слот
+    // занятия делят сбор и визит, а движок отменяет прежнее действие ПОСЛЕ `Execute` нового:
+    // переход со сбора на визит писал отметку визита, и отмена сбора тут же её стирала.
+    void ReleaseSlotOf(ObjectGuid owner, uint8 slot, uint8 kind)
+    {
+        auto it = _reservations.find(owner);
+        if (it == _reservations.end() || it->second.Slot[slot].Kind != kind)
+            return;
+        ReleaseSlot(owner, slot);
+    }
+
     // СКОЛЬКО ЧУЖИХ ИДЁТ К ЭТИМ ТОЧКАМ (П6). Один проход по владельцам, а не по кандидатам:
     // спутников восемь (в планах сорок), а квестодателей на карте сотни, и считать для
     // каждого кандидата отдельно значило бы множить одно на другое на каждом пересчёте.
@@ -4166,7 +4179,7 @@ public:
     // снимает резерв (владелец отпускает первым — на всех путях).
     void GatherLeaveCore(Companion& c, Player* self, uint32 backoffMs, bool fruitless)
     {
-        ReleaseSlot(self->GetGUID(), SlotActivity);          // точка отпущена — Release (П5)
+        ReleaseSlotOf(self->GetGUID(), SlotActivity, ResSpawn);  // точка отпущена - только бронь сбора
         if (c.GatherSpawnId)
         {
             if (backoffMs)
@@ -4774,7 +4787,6 @@ public:
         Constellation::Ai::LootPick picks[Constellation::Ai::LOOT_PICK_CAP];
         uint32 const freeSlots = FreeBagSpace(self);
         uint32 asked = 0, got = 0;
-        uint32 boundAsked = 0;          // из запрошенного: засчитывается в задание, в сумку не ляжет
         // lazy: `std::set` выделяет память, как и у лестницы; лут — событие, не такт, и на
         // 122 спутниках это единицы выделений в минуту. Заменить на массив по `askedIds`,
         // если профиль когда-нибудь покажет его.
@@ -4820,8 +4832,6 @@ public:
                 picks[asked].Object     = lootGuid;
                 picks[asked].LootListId = uint8(item.LootListId);
                 askedIds.insert(item.itemid);
-                if (IsQuestBoundFor(self, item.itemid))
-                    ++boundAsked;
                 ++asked;
                 // ПРИБОР (0026 пункт 3, 2026-09-16): за сутки 49 раз «открыл Bundle of Wood (176793),
                 // но ничего не легло» при «запрошено 1, легло 0» — ядро отказало, а какими воротами,
@@ -4857,6 +4867,7 @@ public:
             uint32 countBefore = 0;
             for (uint32 id : askedIds)
                 countBefore += self->GetItemCount(id, true);
+            uint32 const creditBefore = ItemObjectiveProgress(self);
             uint32 const spaceBefore = FreeBagSpace(self);
             send.Items(send.User, picks, asked);
             uint32 const spaceAfter = FreeBagSpace(self);
@@ -4865,16 +4876,18 @@ public:
                 countAfter += self->GetItemCount(id, true);
 
             uint32 const landed = countAfter > countBefore ? countAfter - countBefore : 0;
+            uint32 const creditAfter = ItemObjectiveProgress(self);
+            uint32 const credited = creditAfter > creditBefore ? creditAfter - creditBefore : 0;
             uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
             got = landed;
             n.Items += landed;
             // НЕДОСТАЧА, ЦЕЛИКОМ ОБЪЯСНЁННАЯ КВЕСТОВЫМИ ПРЕДМЕТАМИ, - НЕ ОТКАЗ: ядро их засчитало
             // в задание и не создавало. Ночь 16.09 назвала «отказом ядра» 263 таких предмета
             // при 42 сдачах того самого квеста. Отказом остаётся только остаток.
-            if (landed != asked && landed + boundAsked >= asked)
+            if (landed != asked && credited && landed + credited >= asked)
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, в сумку {}, зачтено в задание {}",
-                    self->GetName(), asked, landed, boundAsked);
+                    self->GetName(), asked, landed, credited);
             else if (landed != asked)
             {
                 TC_LOG_INFO("server.worldserver",
@@ -5017,6 +5030,8 @@ public:
     {
         Spell* cur = victim->GetCurrentSpell(CURRENT_GENERIC_SPELL);
         if (!cur)
+            cur = victim->GetCurrentSpell(CURRENT_CHANNELED_SPELL);  // канал прерывается тоже (Кодекс)
+        if (!cur)
             return 0;
         SpellInfo const* target = cur->GetSpellInfo();
         if (!target || !target->CanBeInterrupted(self, victim))
@@ -5037,6 +5052,17 @@ public:
             // принадлежит питомцу и сюда не попадёт никак - это пробел, записанный отдельно.
             if (!si->HasEffect(SPELL_EFFECT_INTERRUPT_CAST) && !si->HasAura(SPELL_AURA_MOD_SILENCE))
                 continue;
+            // НЕМОТА ОБРЫВАЕТ КАСТ, ТОЛЬКО ЕСЛИ ЛЯЖЕТ (Кодекс, постфактум 28.09): `CanBeInterrupted`
+            // говорит о прерывании, а не об иммунитете к немоте. Спрашиваем ядро по самому эффекту.
+            if (!si->HasEffect(SPELL_EFFECT_INTERRUPT_CAST))
+            {
+                bool lands = false;
+                for (SpellEffectInfo const& eff : si->GetEffects())
+                    if (eff.IsAura(SPELL_AURA_MOD_SILENCE) && !victim->IsImmunedToSpellEffect(si, eff, self))
+                        lands = true;
+                if (!lands)
+                    continue;
+            }
             if (si->IsAffectingArea() || si->IsTargetingArea())
                 continue;
             if (!si->NeedsExplicitUnitTarget())
@@ -5063,12 +5089,7 @@ public:
                 if (inRange != SPELL_CAST_OK)
                     continue;
             }
-            TC_LOG_INFO("server.worldserver",
-                "Constellation ПРЕРЫВАНИЕ {} (класс {}): {} ({}) против {} ({}), читалось {} ({})",
-                self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], id,
-                victim->GetName(), victim->GetEntry(),
-                target->SpellName->Str[LOCALE_enUS], target->Id);
-            return id;
+            return id;                      // строка ПРЕРЫВАНИЕ - на отправке, с исходом (Кодекс)
         }
         return 0;
     }
@@ -5141,8 +5162,15 @@ public:
             if (uint32 heal = PickSelfHeal(self))
                 { spellId = heal; castTarget = self; }
         // ЧУЖОЙ КАСТ ВАЖНЕЕ СВОЕГО УДАРА, НО НЕ ВАЖНЕЕ СОБСТВЕННОЙ ЖИЗНИ: лечение выше (П8).
+        uint32 cutSpell = 0;                // что читал враг, если это прерывание
         if (!spellId)
-            spellId = PickInterrupt(self, victim);
+            if ((spellId = PickInterrupt(self, victim)))
+            {
+                Spell const* cut = victim->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+                if (!cut)
+                    cut = victim->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+                cutSpell = cut ? cut->GetSpellInfo()->Id : 1;
+            }
         if (!spellId)
             spellId = PickAttackSpell(self, victim, m.LastSpell);
         if (!spellId)
@@ -5207,9 +5235,19 @@ public:
             || self->GetSpellHistory()->HasCooldown(si))
         {
             ++m.CastsWent;
+            if (cutSpell)
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ПРЕРЫВАНИЕ {} (класс {}): {} ({}) против {} ({}), читалось {} - ушло",
+                    self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
+                    victim->GetName(), victim->GetEntry(), cutSpell);
             return true;
         }
 
+        if (cutSpell)
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРЕРЫВАНИЕ {} (класс {}): {} ({}) против {} ({}), читалось {} - без следа",
+                self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
+                victim->GetName(), victim->GetEntry(), cutSpell);
         // СЛЕДА НЕТ. Причину ядро шлёт в SMSG_CAST_FAILED, а сокета у спутника нет; повторять
         // его проверки своими руками нельзя — обвинит не ту (Кодекс, трижды). Поэтому строка
         // НИЧЕГО НЕ УТВЕРЖДАЕТ: она записывает величины момента, а виноватого назовёт сводка
@@ -8805,7 +8843,10 @@ public:
             float cost = d;
             if (auto vc = visitors.find(g.SpawnId); vc != visitors.end())
                 cost += std::min(VISIT_CROWD_CAP, VISIT_CROWD_YARDS * float(vc->second));
-            if (cost > bestD + 0.01f || d < Cfg().QuestGiverRange)
+            // ДАЛЬНОСТЬ - НАСТОЯЩИМ РАССТОЯНИЕМ, ЦЕНА - ТОЛЬКО ПРОТИВ НАЙДЕННОГО ЛУЧШЕГО (Кодекс,
+            // постфактум 28.09): `bestD` начинается с потолка, и цена сравнивалась с ним - занятый
+            // единственный квестодатель в 500 ярдах получал 650 и выпадал из выбора совсем.
+            if (d > Cfg().GiverSeekRange + 0.01f || (best && cost > bestD + 0.01f) || d < Cfg().QuestGiverRange)
                 continue;                       // дальше лучшего — не нужен; в обзоре — уже спрошен и молчит
             if (mem.BackedOff && mem.BackedOff(mem.BackoffUser, g.SpawnId))
                 continue;
@@ -11783,7 +11824,8 @@ namespace Constellation::Ai
 
     void ClearVisitFor(Player* self)                         // П6: дошёл или передумал
     {
-        Constellation::Manager::Instance()->ReleaseSlot(self->GetGUID(), Constellation::Manager::SlotActivity);
+        Constellation::Manager::Instance()->ReleaseSlotOf(self->GetGUID(), Constellation::Manager::SlotActivity,
+                                                          Constellation::Manager::ResVisit);
     }
 
     bool ReserveGatherFor(Player* self, uint32 spawnId)      // взятие на ИСПОЛНЕНИИ сбора (П5-fix)

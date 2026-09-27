@@ -1569,6 +1569,10 @@ namespace Constellation::Ai
                 // одно действие, которое держит слот занятия, и уходит оно своей дверью.
                 if (st.Running == ActionId::GatherObjective && bid.Action != ActionId::GatherObjective)
                     ctx.World.GatherCancel();
+                // И ОТМЕТКА ВИЗИТА (П6, Кодекс постфактум 28.09): брошенный поход к квестодателю
+                // держал её до десяти минут и дорожил его другим. Снимается только своя - вид сверен.
+                if (st.Running == ActionId::SeekGiverByMap && bid.Action != ActionId::SeekGiverByMap)
+                    ctx.World.ClearVisit();
                 // И ТО ЖЕ ДЛЯ НЕВСТУПИВШЕГО ПОДХОДА (третий проход Кодекса). Бронь боя
                 // берётся на подходе, а `Reset`, который её отпустил бы, висит на `ModeEpoch`
                 // (`:1292`), а не на смене действия - значит при уходе с подхода на сдачу или

@@ -449,10 +449,10 @@ namespace
             {
                 std::optional<Position> const where = ctx.World.WhereIs(victim);
                 if (!where)
-                    return false;                   // цель исчезла между выбором и шагом
+                    return Abandon(ctx, f);         // цель исчезла между выбором и шагом
                 std::optional<float> const d = ctx.World.DistanceTo(victim);
                 if (!d)
-                    return false;
+                    return Abandon(ctx, f);
                 float const dt = ctx.Act.SliceSeconds();
                 // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
                 // включённых умениях (`Constellation.Abilities = 1` на реалме), иначе четыре ярда.
@@ -475,16 +475,22 @@ namespace
             return Swing(ctx, f, victim);
         }
 
+        // НЕВСТУПИВШИЙ ПОДХОД, КОТОРЫЙ НЕ ИСПОЛНИЛСЯ, ОТДАЁТ БРОНЬ (Кодекс, постфактум 28.09).
+        // После `false` движок стирает `Running`, и ветка замены подхода прежнюю работу уже не
+        // узнаёт - цель оставалась занятой до страховки в 600 с. Добыча переживает, как везде.
+        static bool Abandon(Ctx& ctx, EngineState::FightState& f)
+        {
+            ctx.World.ReleaseReservation();
+            f = EngineState::FightState{ .Loot = f.Loot };
+            return false;
+        }
+
         // ВСТУПЛЕНИЕ: повернуться, выбрать, ударить — и спросить у ядра, приняло ли оно замах.
         bool Swing(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
         {
             // ПОВОРОТ ПЕРВЫМ: `Unit::UpdateMeleeAttackingState` требует `HasInArc`.
-            if (!ctx.Act.Face(victim))
-                return false;
-            if (!ctx.Act.SetSelection(victim))
-                return false;
-            if (!ctx.Act.AttackSwing(victim))
-                return false;
+            if (!ctx.Act.Face(victim) || !ctx.Act.SetSelection(victim) || !ctx.Act.AttackSwing(victim))
+                return f.Engaged ? false : Abandon(ctx, f);
             // ПРОВЕРЯЕМ ПОСЛЕДСТВИЕ, А НЕ ФАКТ ВЫЗОВА: сокета нет, ответа не будет. Ядро приняло
             // — оно и назвало нас атакующим. Не приняло — цель не наша, как у лестницы («удар
             // не принят ядром» → отказ по цели).

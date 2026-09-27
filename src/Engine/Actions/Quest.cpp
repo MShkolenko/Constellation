@@ -571,6 +571,9 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
     public:
         SeekGiverByMapAction() : Action(ActionId::SeekGiverByMap) { }
 
+        // `Reset` и терминальные концы зовут `Cancel` - отметка визита уходит и там (П6).
+        void Cancel(Ctx& ctx, Subject const&, CancelReason) override { ctx.World.ClearVisit(); }
+
         // §14 — ПО ВИДУ «УЖЕ СХОДИЛ», потому что именно его ставит это действие. Второй вид,
         // «не дойти», ловится в `Useful` через общую память о точке: `DeferKind` возвращает
         // один, а причин у точки две.
@@ -642,6 +645,7 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             if (AdvanceWalk(ctx, bid.About, d, sliceMs, !going) != WalkVerdict::Going)
             {
                 Defer(ctx, BackoffKind::Unreachable, bid.About, 0, SEEK_UNREACHABLE_MS);
+                ctx.World.ClearVisit();     // П6: не дошли - отметка никого больше не сдвигает
                 return false;
             }
             return true;
