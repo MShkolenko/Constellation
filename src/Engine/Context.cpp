@@ -420,6 +420,18 @@ namespace Constellation::Ai
         return _self && !unit.IsEmpty() && ReserveUnitFor(_self, unit, ttlMs);
     }
 
+    void WorldView::NoteVisit(uint32 spawnId) const
+    {
+        if (_self)
+            NoteVisitFor(_self, spawnId);
+    }
+
+    void WorldView::ClearVisit() const
+    {
+        if (_self)
+            ClearVisitFor(_self);
+    }
+
     bool WorldView::ReserveGather(uint32 spawnId) const
     {
         return _self && spawnId && ReserveGatherFor(_self, spawnId);

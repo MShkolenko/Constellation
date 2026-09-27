@@ -564,6 +564,8 @@ namespace Constellation::Ai
     bool GatherSpotFor(Player* self, GatherSpot* out);            // выбирает И настраивает слот
     uint32 GatherSpawnFor(Player* self);                          // на какую точку слот настроен
     bool   ReserveUnitFor(Player* self, ObjectGuid unit, uint32 ttlMs);   // P5: the fight target is mine; false - held by another
+    void   NoteVisitFor(Player* self, uint32 spawnId);                    // П6: отметка «иду к нему», никому не запрет
+    void   ClearVisitFor(Player* self);                                   // П6: снять отметку визита
     bool   ReserveGatherFor(Player* self, uint32 spawnId);                // П5-fix: точка сбора моя; false - держит другой
     bool   IsAttackingMeFor(Player* self, ObjectGuid unit);
     void   ReleaseReservationFor(Player* self);                           // П5: дело кончилось
@@ -922,6 +924,8 @@ namespace Constellation::Ai
         bool GatherSpotOf(GatherSpot* out) const;
         uint32 GatherSpawn() const;
         bool   ReserveUnit(ObjectGuid unit, uint32 ttlMs) const;    // P5; false - another companion holds it
+        void   NoteVisit(uint32 spawnId) const;                     // П6: считаемая отметка визита
+        void   ClearVisit() const;                                  // П6
         bool   ReserveGather(uint32 spawnId) const;                 // П5-fix; false - точку держит другой
         bool   IsAttackingMe(ObjectGuid unit) const;                // defence asks no reservation
         void   ReleaseReservation() const;                          // П5

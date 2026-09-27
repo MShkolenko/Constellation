@@ -619,12 +619,17 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
             float const d = ctx.World.DistanceTo2d(t.Where);
             if (d <= SEEK_ARRIVED_YARDS)
             {
+                ctx.World.ClearVisit();     // П6: дошёл - отметка визита больше никого не сдвигает
                 // ДОШЛИ — И ИМЕННО ЗДЕСЬ СТАВИТСЯ СРОК. Не в неудаче: у лестницы он стоит при
                 // удачном приходе тоже, и по её же причине.
                 Defer(ctx, BackoffKind::Visited, bid.About, 0, SEEK_VISITED_MS);
                 return true;
             }
 
+            // П6: ОТМЕТКА «ИДУ К НЕМУ» - СЧИТАЕМАЯ, НЕ ЗАПРЕТ. Следующий, кто будет выбирать
+            // квестодателя по карте, увидит эту точку дороже на 150 ярдов и при равных
+            // условиях пойдёт к другому. Снимается приходом выше, сменой занятия и концом жизни.
+            ctx.World.NoteVisit(uint32(t.SpawnId));
             float const dt = ctx.Act.SliceSeconds();
             if (AirAtRoadStart(ctx, bid, bid.About, t.Where, false))
                 return true;

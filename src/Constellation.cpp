@@ -3421,7 +3421,11 @@ public:
     // ---------------------------------------------------------------- резервации (П5)
     // Типы — здесь, в открытой части и до первого использования в подписях: свободные функции движка
     // называют `Manager::ResUnit`/`ResSpawn`; слоты и счётчики — в закрытой части у `_lockCastHold`.
-    enum ReserveKind : uint8 { ResNone = 0, ResUnit = 1, ResSpawn = 2 };
+    // `ResVisit` НЕ ЗАПРЕЩАЕТ НИКОМУ НИЧЕГО (П6). Он живёт в том же слоте занятия, но
+    // `ReservedByOther` сверяет вид, поэтому визит не отвечает ни на один запрос занятости -
+    // его только СЧИТАЮТ. Квестодатель не расходуемая цель: моба убивают один раз, а NPC
+    // обслуживает каждого по очереди, и меню квестов принадлежит игроку.
+    enum ReserveKind : uint8 { ResNone = 0, ResUnit = 1, ResSpawn = 2, ResVisit = 3 };
     struct Reservation { uint8 Kind = ResNone; ObjectGuid Unit; uint64 Spawn = 0; uint32 ExpiresAtMs = 0; };
 
     // ДВА СЛОТА, А НЕ ОДИН, И ЭТО ИСПРАВЛЕНИЕ ДЕФЕКТА, А НЕ РАСШИРЕНИЕ (дуал-солв Кодекса по П6,
@@ -3434,6 +3438,9 @@ public:
     struct OwnerClaims { Reservation Slot[SlotCount]; };
 
     static uint8 SlotOf(uint8 kind) { return kind == ResUnit ? SlotCombat : SlotActivity; }
+    static uint32 const VISIT_NOTE_MS     = 600000;    // страховка визита; настоящий конец - приход или смена занятия
+    static constexpr float VISIT_CROWD_YARDS = 150.0f;    // столько ярдов стоит каждый чужой идущий (поиск ходит на 600)
+    static constexpr float VISIT_CROWD_CAP   = 300.0f;    // и не больше: третий идущий уже ничего не добавляет
     static uint32 const GATHER_RESERVE_MS = 960000;    // страховка: потолок дороги (WalkCapMs 15 мин) + минута; настоящий конец — уход
 
     bool ReservationLive(Reservation const& r, uint32 now) const
@@ -3475,7 +3482,10 @@ public:
     bool ReserveFor(Player* self, uint8 kind, ObjectGuid unit, uint64 spawn, uint32 ttlMs)
     {
         uint32 const now = GameTime::GetGameTimeMS();
-        if (ReservedByOther(self->GetGUID(), kind, unit, spawn))
+        // ВИЗИТ НЕ СПРАШИВАЕТ РАЗРЕШЕНИЯ (П6). Он не исключительный вид: если бы он шёл через
+        // эту проверку, второй идущий к тому же квестодателю просто не записался бы, счёт толпы
+        // застрял бы на единице, и цена никогда не выросла бы выше первого шага.
+        if (kind != ResVisit && ReservedByOther(self->GetGUID(), kind, unit, spawn))
             return false;
         Reservation& r = _reservations[self->GetGUID()].Slot[SlotOf(kind)];
         bool const same = r.Kind == kind && r.Unit == unit && r.Spawn == spawn;
@@ -3531,6 +3541,22 @@ public:
     {
         for (uint8 s = 0; s < SlotCount; ++s)
             ReleaseSlot(owner, s);
+    }
+
+    // СКОЛЬКО ЧУЖИХ ИДЁТ К ЭТИМ ТОЧКАМ (П6). Один проход по владельцам, а не по кандидатам:
+    // спутников восемь (в планах сорок), а квестодателей на карте сотни, и считать для
+    // каждого кандидата отдельно значило бы множить одно на другое на каждом пересчёте.
+    void VisitorCounts(ObjectGuid self, std::unordered_map<uint64, uint32>& out) const
+    {
+        uint32 const now = GameTime::GetGameTimeMS();
+        for (auto const& [owner, claims] : _reservations)
+        {
+            if (owner == self)
+                continue;
+            Reservation const& r = claims.Slot[SlotActivity];
+            if (r.Kind == ResVisit && r.Spawn && ReservationLive(r, now))
+                ++out[r.Spawn];
+        }
     }
 
     // ЗАНЯТО ДРУГИМ — живая резервация чужого спутника на ту же цель. Истёкшая чужая не держит
@@ -8593,6 +8619,10 @@ public:
         float nearestFar = 0.0f;                    // и на каком расстоянии ближайшая из них
         uint32 nearestFarEntry = 0;
         std::unordered_map<uint32, uint32> byEntry;     // вид -> квест (0 = ничего): ядро спрашиваем раз на вид
+        // ТОЛПА СТОИТ ЯРДОВ (П6). Не запрет: у кого на карте один полезный квестодатель, тот
+        // к нему и пойдёт - просто занятый проиграет пустому, если тот не дальше на цену.
+        std::unordered_map<uint64, uint32> visitors;
+        VisitorCounts(self->GetGUID(), visitors);
         for (Giver const& g : it->second)
         {
             float const d = self->GetExactDist2d(g.Where.GetPositionX(), g.Where.GetPositionY());
@@ -8602,7 +8632,13 @@ public:
                 if (!nearestFar || d < nearestFar)
                     { nearestFar = d; nearestFarEntry = g.Entry; }
             }
-            if (d > bestD + 0.01f || d < Cfg().QuestGiverRange)
+            // ТОЛПА СТОИТ ЯРДОВ (П6): цена решает, кто лучше, но дальность и близость
+            // по-прежнему меряются настоящим расстоянием - занятый квестодатель не может
+            // вылететь за потолок похода и ближний не может стать дальним.
+            float cost = d;
+            if (auto vc = visitors.find(g.SpawnId); vc != visitors.end())
+                cost += std::min(VISIT_CROWD_CAP, VISIT_CROWD_YARDS * float(vc->second));
+            if (cost > bestD + 0.01f || d < Cfg().QuestGiverRange)
                 continue;                       // дальше лучшего — не нужен; в обзоре — уже спрошен и молчит
             if (mem.BackedOff && mem.BackedOff(mem.BackoffUser, g.SpawnId))
                 continue;
@@ -8627,9 +8663,9 @@ public:
                 continue;                       // чужой ярус: по плоскости рядом, пешком — никак
             // УСТОЙЧИВЫЙ ВЫБОР (Кодекс): при равном расстоянии — меньший номер точки, а не
             // порядок контейнера.
-            if (best && std::fabs(d - bestD) <= 0.01f && g.SpawnId > best->SpawnId)
+            if (best && std::fabs(cost - bestD) <= 0.01f && g.SpawnId > best->SpawnId)
                 continue;
-            bestD = d;
+            bestD = cost;
             best = &g;
             bestQuest = qid;
         }
@@ -11568,6 +11604,19 @@ namespace Constellation::Ai
     void ReleaseReservationFor(Player* self)                 // конец боя - только слот боя
     {
         Constellation::Manager::Instance()->ReleaseSlot(self->GetGUID(), Constellation::Manager::SlotCombat);
+    }
+
+    void NoteVisitFor(Player* self, uint32 spawnId)          // П6: иду к этому квестодателю
+    {
+        if (spawnId)
+            (void)Constellation::Manager::Instance()->ReserveFor(self, Constellation::Manager::ResVisit,
+                                                                 ObjectGuid::Empty, spawnId,
+                                                                 Constellation::Manager::VISIT_NOTE_MS);
+    }
+
+    void ClearVisitFor(Player* self)                         // П6: дошёл или передумал
+    {
+        Constellation::Manager::Instance()->ReleaseSlot(self->GetGUID(), Constellation::Manager::SlotActivity);
     }
 
     bool ReserveGatherFor(Player* self, uint32 spawnId)      // взятие на ИСПОЛНЕНИИ сбора (П5-fix)
