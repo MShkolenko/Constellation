@@ -3252,13 +3252,25 @@ public:
             // модификаторы). Разведку дальности (`flatRanking`) НЕ трогаем: она выбирает
             // заклинание, чтобы решить, насколько подходить, и фильтр по нынешней дистанции
             // отнял бы у неё ответ.
-            if (!flatRanking)
+            // СТОЙКА, СКРЫТНОСТЬ, СНАРЯЖЕНИЕ - ТОЖЕ ВОПРОСЫ ЯДРА, и они от дистанции не зависят,
+            // поэтому задаются и разведке. Замер 23:07-23:38: разбойник 45 боёв подряд просил
+            // Ambush без скрытности (SPELL_ATTR0_ONLY_STEALTHED), воин 6 раз Shield Slam без
+            // щита. Функции те же, что зовёт `Spell::CheckCast` (`CheckShapeshift`, признак
+            // скрытности) и `Spell::CheckItems` целиком (оружие, щит, реагенты, тотемы).
+            // lazy: ауры SPELL_AURA_MOD_IGNORE_SHAPESHIFT, которые ядро учитывает перед
+            // `CheckShapeshift`, здесь не спрашиваются - ошибка только в сторону «не взять
+            // годное»; если у спутников появятся такие ауры, спросить `CheckCast` целиком.
+            if (si->CheckShapeshift(self->GetShapeshiftForm()) != SPELL_CAST_OK)
+                continue;
+            if (si->HasAttribute(SPELL_ATTR0_ONLY_STEALTHED) && !self->HasStealthAura())
+                continue;
             {
                 Spell* ask = new Spell(self, si, TRIGGERED_NONE);
                 ask->m_targets.SetUnitTarget(victim);
-                SpellCastResult const inRange = ask->CheckRange(true);
+                SpellCastResult const gear = ask->CheckItems(nullptr, nullptr);
+                SpellCastResult const inRange = flatRanking ? SPELL_CAST_OK : ask->CheckRange(true);
                 delete ask;
-                if (inRange != SPELL_CAST_OK)
+                if (gear != SPELL_CAST_OK || inRange != SPELL_CAST_OK)
                     continue;
             }
 
