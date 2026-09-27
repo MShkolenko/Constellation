@@ -794,6 +794,7 @@ namespace Constellation::Ai
         // «не None» вместо маски — главная ошибка всей этой ветки: 56 спутников из 122 шли к
         // ПРИНИМАЮЩЕМУ их же текущего квеста и брали там ноль.
         void ForEachQuestGiverInRange(float range, GiverSightVisitor visit, void* user) const;
+        bool OffersByMenu(uint32 entry, QuestRefusedFn refused, void const* user) const;   // правило меню
 
         // Указатель карты, построенный ОДИН раз при загрузке (`Manager::_givers`,
         // Constellation.cpp:7786-7797). Сетку не трогает вовсе — это чтение таблицы, и именно
@@ -1042,6 +1043,9 @@ namespace Constellation::Ai
 
     // Тот же приём: одна реализация в модуле, переходник для движка.
     bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out);
+    // ПРАВИЛО МЕНЮ, А НЕ ЗНАКА: есть ли у существа квест, который меню ядра действительно
+    // предложит (`Manager::TakeableQuestAt`). 0 - меню будет пустым.
+    uint32 TakeableQuestAtFor(Player const* self, uint32 entry, QuestRefusedFn refused, void const* user);
 
     // ОТДЫХ: два предиката лестницы целиком, а не их пересказ. Пороги живут в её настройке,
     // и вторая копия правила разошлась бы с первой на первом же изменении конфига.

@@ -290,6 +290,11 @@ namespace Constellation::Ai
         }
     }
 
+    bool WorldView::OffersByMenu(uint32 entry, QuestRefusedFn refused, void const* user) const
+    {
+        return _self && TakeableQuestAtFor(_self, entry, refused, user) != 0;
+    }
+
     void WorldView::ForEachQuestGiverInRange(float range, GiverSightVisitor visit, void* user) const
     {
         if (!_self || !visit || range <= 0.0f)

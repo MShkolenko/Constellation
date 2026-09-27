@@ -70,12 +70,20 @@ namespace
         void Calculate(Ctx& ctx, GiverSightList& out) const override
         {
             out.Clear();
+            // ТОЛЬКО ТЕ, ЧЬЁ МЕНЮ НЕ БУДЕТ ПУСТЫМ. Мир отдаёт квестодателей по ЗНАКУ
+            // (`GetQuestDialogStatus & offers`), а меню ядро строит по правилу ВЗЯТИЯ - и знак
+            // показывает квест, которого меню не даст. Замер 16.09: McBride, Milly, Paxton
+            // встречали пустым меню восьмерых, восьмерых и шестерых. Правило меню в модуле уже
+            // есть (`TakeableQuestAt`, им пользуется поиск по карте) - берём его, а не пишем второе.
+            struct Pass { GiverSightList* Out; Ctx* C; } pass{ &out, &ctx };
             ctx.World.ForEachQuestGiverInRange(Tuning().QuestGiverRange,
                 [](void* user, GiverInSight const& g)
                 {
-                    static_cast<GiverSightList*>(user)->Add(g);
+                    Pass* p = static_cast<Pass*>(user);
+                    if (p->C->World.OffersByMenu(g.Entry, &QuestRefusedByEngine, p->C))
+                        p->Out->Add(g);
                 },
-                &out);
+                &pass);
         }
     };
 

@@ -11956,6 +11956,13 @@ namespace Constellation::Ai
         Constellation::Manager::Instance()->ScanObjectives(self, mem, danger, out, nullptr);
     }
 
+    uint32 TakeableQuestAtFor(Player const* self, uint32 entry, QuestRefusedFn refused, void const* user)
+    {
+        if (!self || !entry)
+            return 0;
+        return Constellation::Manager::Instance()->TakeableQuestAt(self, refused, user, entry);
+    }
+
     bool FindGiverToWalkTo(Player const* self, SeekMemory const& mem, SeekTarget* out)
     {
         if (!self || !out)
