@@ -1593,7 +1593,11 @@ namespace Constellation::Ai
             // the thing that just failed kept a 1.35× advantage for the whole replan cooldown and
             // would be chosen again ahead of a working alternative. Clearing it also lets the
             // next successful action be reported as a change (§5) instead of being swallowed.
-            if (st.Running == bid.Action)
+            // СБРАСЫВАЕТСЯ ТОЛЬКО ТА СТАВКА, ЧТО ПРОВАЛИЛАСЬ, - действие И предмет (П3″).
+            // По одному действию провал одной сдачи квеста снимал «выполняется» с другой сдачи,
+            // которая и не падала: она теряла липкость и своё имя в строке решения. То же
+            // отношение, что у самой липкости (`a589085`): держится и снимается ставка, а не класс.
+            if (st.Running == bid.Action && st.RunningAbout == bid.About)
             {
                 st.Running      = ActionId::None;
                 st.RunningAbout = Subject();
