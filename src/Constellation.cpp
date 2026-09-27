@@ -3243,6 +3243,25 @@ public:
                 }
             }
 
+            // ДОСТАЁТ ЛИ ОТСЮДА - СПРАШИВАЕМ ЯДРО ЕГО ЖЕ ПРОВЕРКОЙ, а не своей формулой. Замер окна
+            // 20:13-22:13 (27.09): из 186 кастов «без следа» 70 были вне объявленной дальности,
+            // 49 из них - Crusader Strike паладина с 7-8 ярдов, пока Judgment на 30 стоял готовый.
+            // Приём тот же, что у кузни выше и у ядра в `HandleAcceptTrade`: собрать `Spell`,
+            // выставить `m_targets`, спросить, удалить. `CheckRange(true)` - ровно та мера, по
+            // которой ядро потом отвечает SPELL_FAILED_OUT_OF_RANGE (досягаемость, 8/3 на бегу,
+            // модификаторы). Разведку дальности (`flatRanking`) НЕ трогаем: она выбирает
+            // заклинание, чтобы решить, насколько подходить, и фильтр по нынешней дистанции
+            // отнял бы у неё ответ.
+            if (!flatRanking)
+            {
+                Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+                ask->m_targets.SetUnitTarget(victim);
+                SpellCastResult const inRange = ask->CheckRange(true);
+                delete ask;
+                if (inRange != SPELL_CAST_OK)
+                    continue;
+            }
+
             int rung = RUNG_FILL;
             if (si->GetRecoveryTime() > 0 || si->ChargeCategoryId)
                 rung = RUNG_READY;      // откат или заряды объявлены; что готово — проверено выше
@@ -5022,6 +5041,16 @@ public:
                     { affordable = false; break; }
             if (!affordable)
                 continue;
+            // НЕ ДОСТАЁТ - НЕ ПРЕРЫВАНИЕ: та же проба дальности ядром, что в `PickAttackSpell`.
+            // Иначе Pummel с восьми ярдов уходил бы в отказ, а строка ПРЕРЫВАНИЕ писалась бы.
+            {
+                Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+                ask->m_targets.SetUnitTarget(victim);
+                SpellCastResult const inRange = ask->CheckRange(true);
+                delete ask;
+                if (inRange != SPELL_CAST_OK)
+                    continue;
+            }
             TC_LOG_INFO("server.worldserver",
                 "Constellation ПРЕРЫВАНИЕ {} (класс {}): {} ({}) против {} ({}), читалось {} ({})",
                 self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], id,
