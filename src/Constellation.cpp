@@ -4804,6 +4804,7 @@ public:
         // 122 спутниках это единицы выделений в минуту. Заменить на массив по `askedIds`,
         // если профиль когда-нибудь покажет его.
         std::set<uint32> askedIds;      // ЧТО именно просили — чтобы сосчитать пришедшее
+        std::map<uint32, uint32> askedQty;  // и СКОЛЬКО штук каждого - для сверки по предмету
         for (auto const& [lootGuid, loot] : self->GetAELootView())
         {
             if (!loot)
@@ -4845,6 +4846,7 @@ public:
                 picks[asked].Object     = lootGuid;
                 picks[asked].LootListId = uint8(item.LootListId);
                 askedIds.insert(item.itemid);
+                askedQty[item.itemid] += item.count;    // в штуках: ядро отдаёт `item->count` целиком
                 ++asked;
                 // ПРИБОР (0026 пункт 3, 2026-09-16): за сутки 49 раз «открыл Bundle of Wood (176793),
                 // но ничего не легло» при «запрошено 1, легло 0» — ядро отказало, а какими воротами,
@@ -4903,7 +4905,18 @@ public:
                 countAfter += self->GetItemCount(id, true);
 
             uint32 const landed = countAfter > countBefore ? countAfter - countBefore : 0;
+            // СВЕРКА ПО ПРЕДМЕТУ, В ШТУКАХ (Кодекс, четвёртый проход 28.09). Недостача объяснена,
+            // только если КАЖДЫЙ запрошенный предмет сам покрыл свой запрос сумкой и зачётом: чужой
+            // зачёт чужой отказ не объясняет, и стопка не меряется запросами. Предмет, чью цель мог
+            // двинуть другой запрошенный через `QuestLogItemId`, не засчитывается вовсе - уходит в
+            // диагностику отказов, безопасную сторону.
+            std::set<uint32> ambiguous;
+            for (uint32 id : askedIds)
+                if (ItemTemplate const* t = sObjectMgr->GetItemTemplate(id))
+                    if (t->QuestLogItemId && uint32(t->QuestLogItemId) != id && askedIds.count(uint32(t->QuestLogItemId)))
+                        ambiguous.insert(uint32(t->QuestLogItemId));
             uint32 credited = 0;
+            bool everyItemCovered = true;
             {
                 size_t i = 0;
                 std::vector<int32> progNow;
@@ -4913,8 +4926,10 @@ public:
                     ItemObjectiveSnapshot(self, id, progNow);
                     uint32 const bagUp   = bagNow > bagBefore[i] ? bagNow - bagBefore[i] : 0;
                     uint32 const progUp  = ItemObjectiveRise(progBefore[i], progNow);
-                    if (progUp > bagUp)
-                        credited += progUp - bagUp;
+                    uint32 const mine    = (progUp > bagUp && !ambiguous.count(id)) ? progUp - bagUp : 0;
+                    credited += mine;
+                    if (bagUp + mine < askedQty[id])
+                        everyItemCovered = false;
                     ++i;
                 }
             }
@@ -4924,7 +4939,7 @@ public:
             // НЕДОСТАЧА, ЦЕЛИКОМ ОБЪЯСНЁННАЯ КВЕСТОВЫМИ ПРЕДМЕТАМИ, - НЕ ОТКАЗ: ядро их засчитало
             // в задание и не создавало. Ночь 16.09 назвала «отказом ядра» 263 таких предмета
             // при 42 сдачах того самого квеста. Отказом остаётся только остаток.
-            if (landed != asked && credited && landed + credited >= asked)
+            if (landed != asked && credited && everyItemCovered)
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, в сумку {}, зачтено в задание {}",
                     self->GetName(), asked, landed, credited);
