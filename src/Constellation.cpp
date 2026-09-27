@@ -4909,6 +4909,64 @@ public:
     // самолечение»), а не сюрприз: постепенное лечение при 35 % здоровья и так почти
     // всегда опаздывает. Расширять — вместе со счётчиками вылеченного и перелеченного,
     // иначе нечем будет доказать, что стало лучше.
+    // ПРЕРЫВАНИЕ: ЕДИНСТВЕННОЕ, ЧТО ЯДРО РАЗРЕШИТ, И ТОЛЬКО ПОКА ЦЕЛЬ ЧИТАЕТ (П8).
+    //
+    // `PickAttackSpell` требует урона в эффектах, поэтому прерывания в палитру не попадали:
+    // у разбойника шестого уровня Kick (1766) - «прочее», и с ним за бортом остаётся вся
+    // его небоевая половина книги. Урон - верный фильтр для ОРУЖИЯ, но прерывание ценно не
+    // уроном, а тем, что чужой каст не состоится.
+    //
+    // МОЖНО ЛИ ПРЕРВАТЬ - СПРАШИВАЕМ У ЯДРА, А НЕ РЕШАЕМ САМИ: `SpellInfo::CanBeInterrupted`
+    // (`SpellInfo.cpp:1584`) взвешивает иммунитет цели к механике прерывания, ауры
+    // `PREVENT_INTERRUPT` и тип защиты самого заклинания. Своя проверка здесь повторила бы
+    // ту же ошибку, что когда-то с дистанцией: выдумать контракт вместо того, чтобы прочитать.
+    //
+    // ПЛОЩАДНЫЕ СЮДА НЕ ЕДУТ. Запрет на площадь оплачен цепными смертями и остаётся.
+    uint32 PickInterrupt(Player* self, Unit* victim) const
+    {
+        Spell* cur = victim->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (!cur)
+            return 0;
+        SpellInfo const* target = cur->GetSpellInfo();
+        if (!target || !target->CanBeInterrupted(self, victim))
+            return 0;
+
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        for (auto const& [id, ps] : self->GetSpellMap())
+        {
+            if (!self->HasActiveSpell(id))
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            if (!si || si->IsPassive())
+                continue;
+            if (!si->HasEffect(SPELL_EFFECT_INTERRUPT_CAST))
+                continue;
+            if (si->IsAffectingArea() || si->IsTargetingArea())
+                continue;
+            if (!si->NeedsExplicitUnitTarget())
+                continue;
+            if (!si->CanBeUsedInCombat(self))
+                continue;
+            if (si->CheckTarget(self, victim, false) != SPELL_CAST_OK)
+                continue;
+            if (!self->GetSpellHistory()->IsReady(si))
+                continue;
+            bool affordable = true;
+            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
+                if (cost.Amount > 0 && self->GetPower(cost.Power) < cost.Amount)
+                    { affordable = false; break; }
+            if (!affordable)
+                continue;
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ПРЕРЫВАНИЕ {} (класс {}): {} ({}) против {} ({}), читалось {} ({})",
+                self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], id,
+                victim->GetName(), victim->GetEntry(),
+                target->SpellName->Str[LOCALE_enUS], target->Id);
+            return id;
+        }
+        return 0;
+    }
+
     uint32 PickSelfHeal(Player* self) const
     {
         Difficulty const diff = self->GetMap()->GetDifficultyID();
@@ -4976,6 +5034,9 @@ public:
         if (self->GetHealthPct() <= 35.0f)
             if (uint32 heal = PickSelfHeal(self))
                 { spellId = heal; castTarget = self; }
+        // ЧУЖОЙ КАСТ ВАЖНЕЕ СВОЕГО УДАРА, НО НЕ ВАЖНЕЕ СОБСТВЕННОЙ ЖИЗНИ: лечение выше (П8).
+        if (!spellId)
+            spellId = PickInterrupt(self, victim);
         if (!spellId)
             spellId = PickAttackSpell(self, victim, m.LastSpell);
         if (!spellId)
