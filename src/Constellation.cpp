@@ -2509,10 +2509,11 @@ public:
                 // существа — им же ядро зачитывает убийство в KilledMonsterCredit) или как
                 // источник нужного предмета (список предметов задания у существа даёт ядро).
                 // Не связан — смерть на квест не пишется; блок по виду при этом остаётся.
-                if (c.TravelQuest && killer && self->GetQuestStatus(c.TravelQuest) == QUEST_STATUS_INCOMPLETE)
+                uint32 const travelQuest = c.TravelQuest ? c.TravelQuest : c.Engine.TravelQuest;
+                if (travelQuest && killer && self->GetQuestStatus(travelQuest) == QUEST_STATUS_INCOMPLETE)
                 {
                     bool related = false;
-                    Quest const* tq = sObjectMgr->GetQuestTemplate(c.TravelQuest);
+                    Quest const* tq = sObjectMgr->GetQuestTemplate(travelQuest);
                     CreatureTemplate const* kt = sObjectMgr->GetCreatureTemplate(killer);
                     std::vector<uint32> const* drops = sObjectMgr->GetCreatureQuestItemList(killer, self->GetMap()->GetDifficultyID());
                     if (tq)
@@ -2538,10 +2539,13 @@ public:
                         }
                     if (related)
                     {
-                        auto& q = c.KilledOnQuest[c.TravelQuest];
+                        auto& q = c.KilledOnQuest[travelQuest];
                         if (q.first < 250)
                             ++q.first;
                         q.second = uint8(self->GetLevel());
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ГИБЕЛЬ-КВЕСТ {}: квест {} стоил гибелей {} (маршрут закрыт с двух, до ур {})",
+                            self->GetName(), travelQuest, uint32(q.first), uint32(q.second) + 2);
                     }
                 }
                 // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать

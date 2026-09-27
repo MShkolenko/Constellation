@@ -706,6 +706,8 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 return false;
             }
 
+            ctx.St->TravelQuest = t.QuestId;    // для памяти опасности: за что гибнем (Engine.h)
+
             float const d = ctx.World.DistanceTo2d(t.Where);
             if (d <= t.Stop + TRAVEL_ARRIVED_SLACK)
             {
