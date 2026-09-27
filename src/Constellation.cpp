@@ -3423,6 +3423,17 @@ public:
     // называют `Manager::ResUnit`/`ResSpawn`; слоты и счётчики — в закрытой части у `_lockCastHold`.
     enum ReserveKind : uint8 { ResNone = 0, ResUnit = 1, ResSpawn = 2 };
     struct Reservation { uint8 Kind = ResNone; ObjectGuid Unit; uint64 Spawn = 0; uint32 ExpiresAtMs = 0; };
+
+    // ДВА СЛОТА, А НЕ ОДИН, И ЭТО ИСПРАВЛЕНИЕ ДЕФЕКТА, А НЕ РАСШИРЕНИЕ (дуал-солв Кодекса по П6,
+    // 2026-09-27; обе цитаты проверены Мастером). Слот был один на спутника, и `ReserveFor`
+    // перезаписывал его безусловно. Бой берёт бронь ТОЛЬКО на смене цели (`Fight.cpp:165`),
+    // поэтому любая вторая бронь - сбор - сносила бронь боя, и та НЕ БРАЛАСЬ ЗАНОВО до конца боя:
+    // ровно то, ради чего П5 написан, переставало держаться. Слоты разделены по СРОКУ ЖИЗНИ:
+    // бой живёт своим исходом, занятие - своим, и одно не может стереть другое.
+    enum ClaimSlot : uint8 { SlotCombat = 0, SlotActivity = 1, SlotCount = 2 };
+    struct OwnerClaims { Reservation Slot[SlotCount]; };
+
+    static uint8 SlotOf(uint8 kind) { return kind == ResUnit ? SlotCombat : SlotActivity; }
     static uint32 const GATHER_RESERVE_MS = 960000;    // страховка: потолок дороги (WalkCapMs 15 мин) + минута; настоящий конец — уход
 
     bool ReservationLive(Reservation const& r, uint32 now) const
@@ -3440,10 +3451,17 @@ public:
         uint32 live = 0;
         for (auto it = _reservations.begin(); it != _reservations.end(); )
         {
-            if (it->second.Kind != ResNone && !ReservationLive(it->second, now))
-                { ++_resExpired; it = _reservations.erase(it); continue; }
-            if (ReservationLive(it->second, now))
-                ++live;
+            uint32 held = 0;
+            for (uint8 s = 0; s < SlotCount; ++s)
+            {
+                Reservation& r = it->second.Slot[s];
+                if (r.Kind != ResNone && !ReservationLive(r, now))
+                    { ++_resExpired; r = Reservation(); continue; }   // истёк - дефект, слот чистится
+                if (ReservationLive(r, now))
+                    { ++live; ++held; }
+            }
+            if (!held)
+                { it = _reservations.erase(it); continue; }           // владелец без живых слотов не хранится
             ++it;
         }
         TC_LOG_INFO("server.worldserver",
@@ -3459,7 +3477,7 @@ public:
         uint32 const now = GameTime::GetGameTimeMS();
         if (ReservedByOther(self->GetGUID(), kind, unit, spawn))
             return false;
-        Reservation& r = _reservations[self->GetGUID()];
+        Reservation& r = _reservations[self->GetGUID()].Slot[SlotOf(kind)];
         bool const same = r.Kind == kind && r.Unit == unit && r.Spawn == spawn;
         if (r.Kind != ResNone)
         {
@@ -3479,22 +3497,40 @@ public:
     // (Codex found exactly that at the second of the four sites).
     void DiscardEngineFor(Companion& c)
     {
-        ReleaseFor(c.Guid);                                 // the reservation dies with the work (v3 s10 quater)
+        ReleaseAllFor(c.Guid);                              // the reservation dies with the work (v3 s10 quater)
         Constellation::Ai::Engine::Instance().Discard(c.Engine);
     }
 
-    void ReleaseFor(ObjectGuid owner)
+    // ОТПУСКАНИЕ НАЗЫВАЕТ СВОЙ СЛОТ. Прежняя редакция стирала владельца целиком, и конец боя
+    // снёс бы живую бронь сбора (Кодекс: «ReleaseAll вместо адресного - стирает что попало»).
+    void ReleaseSlot(ObjectGuid owner, uint8 slot)
     {
         auto it = _reservations.find(owner);
-        if (it == _reservations.end() || it->second.Kind == ResNone)
+        if (it == _reservations.end())
+            return;
+        Reservation& r = it->second.Slot[slot];
+        if (r.Kind == ResNone)
             return;
         uint32 const now = GameTime::GetGameTimeMS();
-        if (!ReservationLive(it->second, now))
+        if (!ReservationLive(r, now))
             ++_resExpired;
         else
             ++_resReleased;
-        _reservations.erase(it);
+        r = Reservation();
+        bool empty = true;
+        for (uint8 s = 0; s < SlotCount; ++s)
+            if (it->second.Slot[s].Kind != ResNone)
+                empty = false;
+        if (empty)
+            _reservations.erase(it);
         ReportReservations(now);
+    }
+
+    // СМЕРТЬ, ВЫХОД И РОСПУСК СНИМАЮТ ВСЁ - у этих концов нет «своего» слота.
+    void ReleaseAllFor(ObjectGuid owner)
+    {
+        for (uint8 s = 0; s < SlotCount; ++s)
+            ReleaseSlot(owner, s);
     }
 
     // ЗАНЯТО ДРУГИМ — живая резервация чужого спутника на ту же цель. Истёкшая чужая не держит
@@ -3502,9 +3538,12 @@ public:
     bool ReservedByOther(ObjectGuid self, uint8 kind, ObjectGuid unit, uint64 spawn) const
     {
         uint32 const now = GameTime::GetGameTimeMS();
-        for (auto const& [owner, r] : _reservations)
+        for (auto const& [owner, claims] : _reservations)
         {
-            if (owner == self || r.Kind != kind || !ReservationLive(r, now))
+            if (owner == self)
+                continue;
+            Reservation const& r = claims.Slot[SlotOf(kind)];
+            if (r.Kind != kind || !ReservationLive(r, now))
                 continue;
             if ((kind == ResUnit && r.Unit == unit) || (kind == ResSpawn && r.Spawn == spawn))
                 { ++_resSkipped; return true; }
@@ -4020,7 +4059,7 @@ public:
     // снимает резерв (владелец отпускает первым — на всех путях).
     void GatherLeaveCore(Companion& c, Player* self, uint32 backoffMs, bool fruitless)
     {
-        ReleaseFor(self->GetGUID());                         // точка отпущена — Release (П5)
+        ReleaseSlot(self->GetGUID(), SlotActivity);          // точка отпущена — Release (П5)
         if (c.GatherSpawnId)
         {
             if (backoffMs)
@@ -11083,6 +11122,22 @@ private:
             Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS() };
             Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
         }
+        // КОНЕЦ ЖИЗНИ РАБОТЫ ОТПУСКАЕТ ОБА СЛОТА, И НЕ ЧЕРЕЗ `Cancel`. Этот `Ctx` собран без
+        // состояния (`ctx.St` = nullptr), поэтому `Gather::Cancel` внутри `Reset` ничего не
+        // делает, а сам `Reset` после разделения слотов освобождает только бой: смерть во
+        // время сбора оставляла точку занятой на 16 минут. До разделения единственный слот
+        // стирался целиком - значит это регрессия самой правки, её и чиним, безусловно
+        // (проверка Кодекса по П5-fix, п. 3).
+        switch (why)
+        {
+            case Constellation::Ai::CancelReason::Died:
+            case Constellation::Ai::CancelReason::LoggedOut:
+            case Constellation::Ai::CancelReason::MapChanged:
+                ReleaseAllFor(c.Guid);
+                break;
+            default:
+                break;
+        }
     }
 
     void DropSession(Companion& c)
@@ -11311,7 +11366,7 @@ private:
     // Каждая резервация кончается ОДНИМ из трёх исходов, и код называет который: Release (дело
     // кончилось, `Reset`, смерть/выход), Transfer (тот же спутник продлевает то же дело), Expire
     // (никто не отпустил до срока — считается ДЕФЕКТОМ, не рабочим режимом). Срок — только страховка.
-    mutable std::unordered_map<ObjectGuid, Reservation> _reservations;   // владелец -> слот; mutable: подметание из const-отчёта
+    mutable std::unordered_map<ObjectGuid, OwnerClaims> _reservations;   // владелец -> два слота; mutable: подметание из const-отчёта
     mutable uint32 _resReleased = 0, _resTransferred = 0, _resExpired = 0, _resSkipped = 0;
     mutable uint32 _resReportMs = 0;
     // СУЩЕСТВО -> ЗАКЛИНАНИЯ, КОТОРЫЕ ДАЮТ ПО НЕМУ ЗАЧЁТ И ТРЕБУЮТ ФОКУСА.
@@ -11487,8 +11542,11 @@ namespace Constellation::Ai
             return false;
         c->GatherMs = 0;                                     // как `Idle`, `:3316-3317`
         c->GatherDist = self->GetExactDist(c->GatherPos);
-        (void)m->ReserveFor(self, Constellation::Manager::ResSpawn, ObjectGuid::Empty, c->GatherSpawnId,
-                            Constellation::Manager::GATHER_RESERVE_MS);   // the pool already skipped held spawns; a refusal is a race of two picks, the next recount takes another
+        // БРОНЬ БЕРЁТСЯ НЕ ЗДЕСЬ. Этот отбор зовётся из ПРОИЗВОДИТЕЛЯ ЗНАЧЕНИЯ
+        // (`Values/Quest.cpp:264`), то есть пока движок ещё только перебирает кандидатов: простой
+        // подсчёт значения занимал слот, а отказ выбрасывался через `(void)`. Взятие переехало в
+        // исполнение сбора (`Gather.cpp`), где отказ можно исполнить - отступить и взять другую
+        // точку (дуал-солв Кодекса по П6, 2026-09-27).
         out->SpawnId = c->GatherSpawnId;
         out->Entry   = c->GatherEntry;
         out->Where   = c->GatherPos;
@@ -11507,9 +11565,16 @@ namespace Constellation::Ai
         return u && u->GetVictim() == self;
     }
 
-    void ReleaseReservationFor(Player* self)
+    void ReleaseReservationFor(Player* self)                 // конец боя - только слот боя
     {
-        Constellation::Manager::Instance()->ReleaseFor(self->GetGUID());
+        Constellation::Manager::Instance()->ReleaseSlot(self->GetGUID(), Constellation::Manager::SlotCombat);
+    }
+
+    bool ReserveGatherFor(Player* self, uint32 spawnId)      // взятие на ИСПОЛНЕНИИ сбора (П5-fix)
+    {
+        return Constellation::Manager::Instance()->ReserveFor(self, Constellation::Manager::ResSpawn,
+                                                              ObjectGuid::Empty, spawnId,
+                                                              Constellation::Manager::GATHER_RESERVE_MS);
     }
 
     uint32 GatherSpawnFor(Player* self)

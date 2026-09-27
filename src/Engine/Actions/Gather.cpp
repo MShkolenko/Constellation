@@ -70,6 +70,17 @@ namespace
                 return false;
             }
 
+            // ТОЧКА МОЯ - И СПРАШИВАЕТСЯ ЭТО ЗДЕСЬ, НА ИСПОЛНЕНИИ (П5-fix, 2026-09-27). Раньше
+            // бронь бралась внутри отбора, то есть из производителя значения, пока движок ещё
+            // перебирал кандидатов, и отказ выбрасывался. Здесь отказ имеет смысл: точку уже
+            // держит другой спутник - бросаем этого кандидата, пересчёт возьмёт другого. Повтор
+            // на своей же точке продлевает бронь, а не отнимает её (`ReserveFor`: `same`).
+            if (!ctx.World.ReserveGather(gs.SpawnId))
+            {
+                ctx.St->Values.GatherTarget.Invalidate();
+                return false;
+            }
+
             float const dt = ctx.Act.SliceSeconds();
             uint32 const sliceMs = uint32(dt * 1000.0f);
             float const d = ctx.World.DistanceTo(gs.Where);
