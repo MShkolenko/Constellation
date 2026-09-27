@@ -4917,6 +4917,7 @@ public:
                         ambiguous.insert(uint32(t->QuestLogItemId));
             uint32 credited = 0;
             bool everyItemCovered = true;
+            bool bagCovered = true;     // каждый предмет лёг в сумку целиком - недостачи нет вовсе
             {
                 size_t i = 0;
                 std::vector<int32> progNow;
@@ -4928,6 +4929,8 @@ public:
                     uint32 const progUp  = ItemObjectiveRise(progBefore[i], progNow);
                     uint32 const mine    = (progUp > bagUp && !ambiguous.count(id)) ? progUp - bagUp : 0;
                     credited += mine;
+                    if (bagUp < askedQty[id])
+                        bagCovered = false;
                     if (bagUp + mine < askedQty[id])
                         everyItemCovered = false;
                     ++i;
@@ -4939,11 +4942,13 @@ public:
             // НЕДОСТАЧА, ЦЕЛИКОМ ОБЪЯСНЁННАЯ КВЕСТОВЫМИ ПРЕДМЕТАМИ, - НЕ ОТКАЗ: ядро их засчитало
             // в задание и не создавало. Ночь 16.09 назвала «отказом ядра» 263 таких предмета
             // при 42 сдачах того самого квеста. Отказом остаётся только остаток.
-            if (landed != asked && credited && everyItemCovered)
+            // НЕДОСТАЧА - ПО ПРЕДМЕТАМ, А НЕ «ШТУК ПРОТИВ ЗАПРОСОВ» (Кодекс, пятый проход 28.09):
+            // стопка A, легшая целиком, уравнивала счёт и прятала отказ B.
+            if (!bagCovered && credited && everyItemCovered)
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, в сумку {}, зачтено в задание {}",
                     self->GetName(), asked, landed, credited);
-            else if (landed != asked)
+            else if (!bagCovered)
             {
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ {}: запрошено {}, легло {} (ячеек занято {}) — "
