@@ -8605,9 +8605,9 @@ public:
         // пишется — оно не исход, и строк было бы вдвое больше.
         if (ev.What != Constellation::Ai::FightEvent::Engaged)
             TC_LOG_INFO("server.worldserver",
-                "Constellation БОЙ-ДВИЖОК {}: против {} ({}) — {}",
+                "Constellation БОЙ-ДВИЖОК {}: против {} ({}) — {} (кастов {}, ушло {})",
                 b->Self->GetName(), c.FightVictimName.empty() ? "?" : c.FightVictimName,
-                ev.VictimEntry, ev.Why);
+                ev.VictimEntry, ev.Why, ev.CastsTried, ev.CastsWent);
         switch (ev.What)
         {
             case Constellation::Ai::FightEvent::Engaged:

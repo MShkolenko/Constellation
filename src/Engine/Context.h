@@ -674,6 +674,8 @@ namespace Constellation::Ai
         uint32      MapId       = 0;    // для Won: клетка ПОБЕДИТЕЛЯ, не убитого — как у лестницы
         float       X = 0.0f, Y = 0.0f; // (`:5570-5576`: жертву ядро уже очистило)
         char const* Why         = "";   // словами, для журнала
+        uint32      CastsTried  = 0;    // П8: попросили ядро произнести за этот бой
+        uint32      CastsWent   = 0;    //     и сколько ушло по следу в ядре
     };
 
     class FightView

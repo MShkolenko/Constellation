@@ -553,6 +553,8 @@ namespace
             ev.X = here.GetPositionX();
             ev.Y = here.GetPositionY();
             ev.Why = why;
+            ev.CastsTried = f.Cast.CastsTried;   // П8: настоящие касты, а не «разные заклинания»
+            ev.CastsWent  = f.Cast.CastsWent;
             ctx.Fight.Report(ev);
         }
     };
