@@ -2891,9 +2891,12 @@ public:
     // `QuestLogItemId`, предмет-источник, уже выполненная цель. Не копируем его, а смотрим
     // следствие: сколько зачлось за время отправки. Отправка синхронна, другого источника
     // прироста в этот миг нет.
-    static uint32 ItemObjectiveProgress(Player const* self, uint32 itemId)
+    // СНИМОК ПО ЦЕЛЯМ, А НЕ СУММА (Кодекс, третий проход 28.09): один предмет может двинуть
+    // несколько целей сразу, и сумма засчитала бы его дважды. Порядок - слоты журнала и цели в
+    // квесте; за синхронную отправку журнал не меняется, поэтому снимки сравнимы поэлементно.
+    static void ItemObjectiveSnapshot(Player const* self, uint32 itemId, std::vector<int32>& out)
     {
-        uint32 total = 0;
+        out.clear();
         for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
         {
             uint32 const qid = self->GetQuestSlotQuestId(slot);
@@ -2904,9 +2907,19 @@ public:
                 continue;
             for (QuestObjective const& obj : q->GetObjectives())
                 if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == itemId)
-                    total += uint32(std::max<int32>(self->GetQuestObjectiveData(obj), 0));
+                    out.push_back(self->GetQuestObjectiveData(obj));
         }
-        return total;
+    }
+
+    // НАИБОЛЬШИЙ ПРИРОСТ ОДНОЙ ЦЕЛИ - столько штук этого предмета ядро засчитало.
+    static uint32 ItemObjectiveRise(std::vector<int32> const& before, std::vector<int32> const& after)
+    {
+        if (before.size() != after.size())
+            return 0;                       // журнал сменился - не судим, уходит в диагностику
+        int32 best = 0;
+        for (size_t i = 0; i < before.size(); ++i)
+            best = std::max(best, after[i] - before[i]);
+        return uint32(best);
     }
 
     static bool IsOverTime(SpellInfo const* si)
@@ -4870,10 +4883,18 @@ public:
             // ПО КАЖДОМУ ПРЕДМЕТУ: сумка и прогресс его целей (Кодекс, второй проход 28.09). Обычный
             // квестовый предмет ложится в сумку И двигает цель; зачтённым в задание считается только
             // прирост СВЕРХ того, что легло, - иначе отказ второго предмета «объяснялся» первым.
-            std::vector<std::pair<uint32, uint32>> perItem;     // (в сумке, прогресс) до отправки
-            perItem.reserve(askedIds.size());
-            for (uint32 id : askedIds)
-                perItem.emplace_back(self->GetItemCount(id, true), ItemObjectiveProgress(self, id));
+            std::vector<uint32> bagBefore;                  // в сумке до отправки, по askedIds
+            std::vector<std::vector<int32>> progBefore;     // прогресс целей до отправки, по askedIds
+            bagBefore.reserve(askedIds.size());
+            progBefore.resize(askedIds.size());
+            {
+                size_t i = 0;
+                for (uint32 id : askedIds)
+                {
+                    bagBefore.push_back(self->GetItemCount(id, true));
+                    ItemObjectiveSnapshot(self, id, progBefore[i++]);
+                }
+            }
             uint32 const spaceBefore = FreeBagSpace(self);
             send.Items(send.User, picks, asked);
             uint32 const spaceAfter = FreeBagSpace(self);
@@ -4885,12 +4906,13 @@ public:
             uint32 credited = 0;
             {
                 size_t i = 0;
+                std::vector<int32> progNow;
                 for (uint32 id : askedIds)
                 {
                     uint32 const bagNow  = self->GetItemCount(id, true);
-                    uint32 const progNow = ItemObjectiveProgress(self, id);
-                    uint32 const bagUp   = bagNow > perItem[i].first ? bagNow - perItem[i].first : 0;
-                    uint32 const progUp  = progNow > perItem[i].second ? progNow - perItem[i].second : 0;
+                    ItemObjectiveSnapshot(self, id, progNow);
+                    uint32 const bagUp   = bagNow > bagBefore[i] ? bagNow - bagBefore[i] : 0;
+                    uint32 const progUp  = ItemObjectiveRise(progBefore[i], progNow);
                     if (progUp > bagUp)
                         credited += progUp - bagUp;
                     ++i;
