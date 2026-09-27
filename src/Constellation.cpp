@@ -3194,6 +3194,30 @@ public:
                 continue;
 
             // НА КАКУЮ СТУПЕНЬ. Все вопросы задаём ядру.
+            // ДОБИВАЮЩИЙ ЖДЁТ ПОЛНЫХ ОЧКОВ КОМБО - ИЛИ УМИРАЮЩЕЙ ЦЕЛИ (П8, второй срез).
+            // Замер 27.09: разбойник 6 ур. чередует Sinister Strike и Eviscerate почти один к
+            // одному. Оба на `RUNG_FILL`, внутри ступени побеждает старший уровень, и Eviscerate
+            // (ур. 2) обходит Sinister Strike (ур. 1), едва появляется первое очко: полная цена
+            // энергии за добивающий на одном очке из пяти. Правило класса обычное - копить до
+            // полных, а тратить раньше только когда цель может умереть и унести очки с собой.
+            // «Тратит очки» спрашиваем у цены самого заклинания, очки - у ядра, так что это
+            // любой добивающий любого класса, а не список.
+            {
+                bool spendsCombo = false;
+                for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
+                    if (cost.Power == POWER_COMBO_POINTS && cost.Amount > 0)
+                        spendsCombo = true;
+                if (spendsCombo)
+                {
+                    int32 const cp    = self->GetPower(POWER_COMBO_POINTS);
+                    int32 const cpMax = self->GetMaxPower(POWER_COMBO_POINTS);
+                    bool const full   = cpMax > 0 && cp >= cpMax;
+                    bool const dying  = victim->GetHealthPct() <= FINISHER_DYING_PCT;
+                    if (!full && !dying)
+                        continue;
+                }
+            }
+
             int rung = RUNG_FILL;
             if (si->GetRecoveryTime() > 0 || si->ChargeCategoryId)
                 rung = RUNG_READY;      // откат или заряды объявлены; что готово — проверено выше
@@ -3438,6 +3462,7 @@ public:
     struct OwnerClaims { Reservation Slot[SlotCount]; };
 
     static uint8 SlotOf(uint8 kind) { return kind == ResUnit ? SlotCombat : SlotActivity; }
+    static constexpr float FINISHER_DYING_PCT = 30.0f;  // ниже этого добивающий тратит сколько есть: цель может умереть с очками
     static uint32 const VISIT_NOTE_MS     = 600000;    // страховка визита; настоящий конец - приход или смена занятия
     static constexpr float VISIT_CROWD_YARDS = 150.0f;    // столько ярдов стоит каждый чужой идущий (поиск ходит на 600)
     static constexpr float VISIT_CROWD_CAP   = 300.0f;    // и не больше: третий идущий уже ничего не добавляет
