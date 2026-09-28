@@ -1847,6 +1847,49 @@ public:
                     }
                 }
             }
+            // ЧЕРЕЗ ЛАВУ И СЛИЗЬ НЕ ХОДИМ (окно 28.09 15:28: Rowena шла сдавать задание и вошла в
+            // лаву Чёрной горы). Фильтр ядра для игрока включает NAV_MAGMA_SLIME
+            // (PathGenerator::CreateFilter, «just stay 'safe'»), а сузить его снаружи нельзя,
+            // поэтому построенный путь проверяем сами: точки через 4 ярда, жидкость у земли.
+            // Кто уже стоит в лаве, того выпускаем - иначе он не выйдет никогда.
+            if (built && pts && pts->size() >= 2)
+            {
+                Map* const map = self->GetMap();
+                auto burns = [&](float x, float y, float z) -> bool
+                {
+                    ZLiquidStatus const st = map->GetLiquidStatus(self->GetPhaseShift(), x, y, z,
+                        map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime);
+                    return (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
+                };
+                if (!burns(self->GetPositionX(), self->GetPositionY(), self->GetPositionZ()))
+                {
+                    bool lava = false;
+                    for (size_t i = 1; i < pts->size() && !lava; ++i)
+                    {
+                        G3D::Vector3 const& a = (*pts)[i - 1];
+                        G3D::Vector3 const& b = (*pts)[i];
+                        float const len = (b - a).length();
+                        uint32 const steps = std::max(1u, uint32(len / 4.0f));
+                        for (uint32 k = 1; k <= steps && !lava; ++k)
+                        {
+                            G3D::Vector3 const p = a + (b - a) * (float(k) / float(steps));
+                            lava = burns(p.x, p.y, p.z);
+                        }
+                    }
+                    if (lava)
+                    {
+                        built = false;
+                        ++_lavaPaths;
+                        if (_lavaPathsLogged < 20)
+                        {
+                            ++_lavaPathsLogged;
+                            TC_LOG_INFO("server.worldserver",
+                                "Constellation STEP {}: путь к {:.0f} {:.0f} идёт через лаву или слизь - не иду (таких путей {})",
+                                self->GetName(), tx, ty, _lavaPaths);
+                        }
+                    }
+                }
+            }
             if (!built)
             {
                 ++_noPath;
@@ -12170,6 +12213,8 @@ private:
     uint32 _otherTier = 0;              // сколько раз путь дался к цели на другом ярусе
     uint32 _straightSaved = 0;          // сколько раз выручило построение без сглаживания
     uint32 _noPath = 0;                 // сколько раз сетка не дала маршрута
+    uint32 _lavaPaths = 0;          // путей, отвергнутых из-за лавы и слизи
+    uint32 _lavaPathsLogged = 0;
     uint32 _noPathLogged = 0;           // из них записано в журнал (потолок 20)
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<Position>>> _spawns;
     std::unordered_map<uint32, std::vector<AreaTriggerEntry const*>> _questTriggers;   // квест -> зоны
