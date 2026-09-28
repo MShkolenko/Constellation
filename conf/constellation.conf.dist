@@ -62,3 +62,29 @@ Constellation.EngineShadow = 0
 #
 
 Constellation.EngineStrategies = 0
+
+#
+#    Constellation.PathClear
+#        Description: Path clearing. A companion on an errand pulls, one at a
+#                     time, the aggressive creatures whose aggro reaches the
+#                     next 40 yards of its route instead of running through
+#                     them; with only strong ones on the route the errand waits
+#                     (at most two three-minute waits in any ten minutes).
+#                     Read at .reload config.
+#        Default:     1
+#
+
+Constellation.PathClear = 1
+
+#
+#    Constellation.Squads
+#        Description: Squads. Companions sharing an open quest group with each
+#                     other through the core party (up to five, levels within
+#                     two), follow the leader's travel spot and fight for a
+#                     squad-mate. Off stops inviting, following and assisting;
+#                     a formed group is not dissolved by the switch.
+#                     Read at .reload config.
+#        Default:     1
+#
+
+Constellation.Squads = 1

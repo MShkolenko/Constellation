@@ -162,9 +162,9 @@ namespace
                     return true;
             // УГРОЗА НА ПУТИ - ТОЖЕ МОЯ ЦЕЛЬ (часть B): её назвал поиск по маршруту этой секунды.
             // НАПАДАЮЩИЙ НА СОСЕДА ПО ОТРЯДУ - ТОЖЕ МОЯ ЦЕЛЬ (срез 2).
-            if (!ctx.St->SquadAssist.IsEmpty() && ctx.St->SquadAssist == victim)
+            if (Tuning().Squads && !ctx.St->SquadAssist.IsEmpty() && ctx.St->SquadAssist == victim)
                 return true;
-            if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat == victim)
+            if (Tuning().PathClear && !ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat == victim)
                 return true;
             return Val<ValueId::Objectives>(ctx).Fight == victim;
         }
@@ -889,13 +889,17 @@ namespace
             // `AttackersValue.cpp:69`): нападающий на соседа по группе в пределах сорока ярдов - и мой
             // нападающий. Свой нападающий уже взят выше (оборона); отдых - строкой раньше; сломанный
             // не идёт. Раз в секунду, как угроза пути.
+            if (ctx.St && !Tuning().Squads)
+                ctx.St->SquadAssist = ObjectGuid::Empty;    // выключено - и память о цели тоже
+            if (ctx.St && !Tuning().PathClear)
+                ctx.St->PathThreat = ObjectGuid::Empty;
             if (ctx.St && ctx.World.BrokenGear() == 0 && Tuning().Squads)
             {
                 if (getMSTimeDiff(ctx.St->SquadAssistAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)
                 {
                     ObjectGuid member;
                     ObjectGuid const was = ctx.St->SquadAssist;
-                    ctx.St->SquadAssist = ctx.World.SquadAttacker(SQUAD_ASSIST_YARDS, &member);
+                    ctx.St->SquadAssist = ctx.World.SquadAttacker(SQUAD_ASSIST_YARDS, &member, &SkipPathThreat, &ctx);
                     ctx.St->SquadAssistAtMs = ctx.NowMs;
                     if (!ctx.St->SquadAssist.IsEmpty() && ctx.St->SquadAssist != was)
                         ctx.World.LogSquadAssist(member, ctx.St->SquadAssist);

@@ -3695,10 +3695,19 @@ public:
     bool ReservedByOther(ObjectGuid self, uint8 kind, ObjectGuid unit, uint64 spawn) const
     {
         uint32 const now = GameTime::GetGameTimeMS();
+        // ЦЕЛЬ БОЯ ОБЩАЯ ВНУТРИ ГРУППЫ (Кодекс, verdict23): эксклюзивная бронь отказывала второму
+        // члену отряда в бою за соседа - «держит другой», отсрочка, круг. Точка сбора остаётся
+        // исключительной: её лутает один.
+        Player const* me = kind == ResUnit ? ObjectAccessor::FindConnectedPlayer(self) : nullptr;
+        Group const* myGroup = me ? me->GetGroup() : nullptr;
         for (auto const& [owner, claims] : _reservations)
         {
             if (owner == self)
                 continue;
+            if (myGroup)
+                if (Player const* op = ObjectAccessor::FindConnectedPlayer(owner))
+                    if (op->GetGroup() == myGroup)
+                        continue;
             Reservation const& r = claims.Slot[SlotOf(kind)];
             if (r.Kind != kind || !ReservationLive(r, now))
                 continue;
@@ -4873,11 +4882,15 @@ public:
                         if (uint32 const q = self->GetQuestSlotQuestId(slot))
                             if (Quest const* qt = sObjectMgr->GetQuestTemplate(q))
                                 for (QuestObjective const& obj : qt->GetObjectives())
-                                    if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == item.itemid)
+                                    if (obj.Type == QUEST_OBJECTIVE_ITEM
+                                        && (uint32(obj.ObjectID) == item.itemid
+                                            || (tpl->QuestLogItemId && obj.ObjectID == tpl->QuestLogItemId)))
                                     {
+                                        // НАИБОЛЬШИЙ ОСТАТОК, А НЕ СУММА (Кодекс, verdict23): ядро
+                                        // прибавляет одну пачку к каждой подходящей цели сразу.
                                         int32 const have = self->GetQuestObjectiveData(obj);
                                         if (have < obj.Amount)
-                                            need += uint32(obj.Amount - have);
+                                            need = std::max(need, uint32(obj.Amount - have));
                                     }
                     auto const already = askedQty.find(item.itemid);
                     if (need && already != askedQty.end() && already->second >= need)
@@ -5260,11 +5273,6 @@ public:
     bool CastAtTargetCore(Player* self, Unit* victim,
                           Constellation::Ai::CastSender const& send, Constellation::Ai::CastMemory& m)
     {
-        // ОГЛУШЁН ИЛИ СБИТ С ТОЛКУ - НЕ ПРОСИМ (проба ядра, окно 28.09 08:27: 18 из 19 кастов «без
-        // следа» - код 129 SPELL_FAILED_STUNNED, один - 30 CONFUSED). Ядро отказало бы, а просьба
-        // считалась бы попыткой; вернёмся, когда состояние снимется.
-        if (self->HasUnitState(UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED))
-            return false;
         bool const castingNow = self->HasUnitState(UNIT_STATE_CASTING);
         m.WasCasting = castingNow;
 
@@ -5296,6 +5304,13 @@ public:
             return false;
         SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, self->GetMap()->GetDifficultyID());
         if (!si)
+            return false;
+        // ОГЛУШЁН ИЛИ СБИТ С ТОЛКУ - НЕ ПРОСИМ ТО, ЧТО ЯДРО ПОД ЭТИМ НЕ РАЗРЕШАЕТ (проба ядра, окно
+        // 28.09 08:27: 18 из 19 «без следа» - код 129 STUNNED, один 30 CONFUSED). По заклинанию,
+        // а не заранее (Кодекс, verdict23): `SPELL_ATTR5_ALLOW_WHILE_*` ядро пропускает.
+        if (self->HasUnitState(UNIT_STATE_STUNNED) && !si->HasAttribute(SPELL_ATTR5_ALLOW_WHILE_STUNNED))
+            return false;
+        if (self->HasUnitState(UNIT_STATE_CONFUSED) && !si->HasAttribute(SPELL_ATTR5_ALLOW_WHILE_CONFUSED))
             return false;
         // очередь этой сборки: если она не примет, слать бессмысленно (Player.cpp:30922)
         if (!self->CanRequestSpellCast(si, self))
@@ -10476,6 +10491,10 @@ public:
             if (o.Engine.Running != Constellation::Ai::ActionId::TravelToObjective)
                 return false;
             Constellation::Ai::TravelSpot const& s = o.Engine.Values.ObjectiveSpot.Buffer;
+            // КЭШ ДОЛЖЕН БЫТЬ ТЕМ, К ЧЕМУ ЛИДЕР ИДЁТ СЕЙЧАС (Кодекс, verdict23): иначе до пересчёта
+            // копировалась прежняя точка.
+            if (!(o.Engine.RunningAbout == Constellation::Ai::Subject::OfQuest(s.QuestId)))
+                return false;
             if (!s.Worth || s.MapId != self->GetMapId()
                 || self->GetQuestStatus(s.QuestId) != QUEST_STATUS_INCOMPLETE)
                 return false;

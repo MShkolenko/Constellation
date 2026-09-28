@@ -752,7 +752,7 @@ namespace Constellation::Ai
         // НАПАДАЮЩИЙ НА СОСЕДА ПО ГРУППЕ (отряд, срез 2; эталон `AttackersValue.cpp:69`): ближайший
         // ко мне из тех, кто бьёт живого члена моей группы в пределах `range`. `memberOut` - кого
         // защищаем. Пусто - соседи не под ударом.
-        ObjectGuid SquadAttacker(float range, ObjectGuid* memberOut) const;
+        ObjectGuid SquadAttacker(float range, ObjectGuid* memberOut, PathSkipFn skip, void* skipUser) const;
         void LogSquadAssist(ObjectGuid member, ObjectGuid attacker) const;
         ObjectGuid PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
                               uint32* packOut, uint32* strongOut, PathSkipFn skip, void* skipUser) const;

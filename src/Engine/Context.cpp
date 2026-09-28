@@ -213,7 +213,7 @@ namespace Constellation::Ai
         return best->GetGUID();
     }
 
-    ObjectGuid WorldView::SquadAttacker(float range, ObjectGuid* memberOut) const
+    ObjectGuid WorldView::SquadAttacker(float range, ObjectGuid* memberOut, PathSkipFn skip, void* skipUser) const
     {
         if (memberOut)
             *memberOut = ObjectGuid::Empty;
@@ -232,6 +232,8 @@ namespace Constellation::Ai
             {
                 if (!a || !a->IsAlive() || !_self->IsValidAttackTarget(a))
                     continue;
+                if (skip && skip(skipUser, a->GetGUID(), a->GetEntry()))
+                    continue;                   // отложен движком или убивал дважды (Кодекс, verdict23)
                 float const d = _self->GetExactDist(a);
                 if (d < bestD)
                 {
