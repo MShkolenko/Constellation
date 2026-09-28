@@ -1288,7 +1288,13 @@ public:
             handler->PSendSysMessage("Constellation: спутника %s в мире нет", name.c_str());
             return true;
         }
-        Unit* target = p->GetVictim() ? p->GetVictim() : p;
+        // ЦЕЛЬ: жертва ядра, а у мага, который в ближний бой не ходит и жертвы не имеет, - цель боя
+        // движка (ночной тест сосулек 29.09: копьё уходило «по себе»), иначе сам спутник
+        Unit* target = p->GetVictim();
+        if (!target)
+            target = ObjectAccessor::GetUnit(*p, c->Engine.Fight.Victim);
+        if (!target || !target->IsAlive())
+            target = p;
         SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
         bool const knows = p->HasSpell(spellId);
         bool const gcdBefore = info && p->GetSpellHistory()->HasGlobalCooldown(info);
