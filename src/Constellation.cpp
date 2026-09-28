@@ -5351,21 +5351,24 @@ public:
             // SMSG_CAST_FAILED задал бы клиенту. ПРОБА НЕПОЛНАЯ (Кодекс, 28.09): она не проходит
             // подготовку настоящего каста (`LoadScripts`, `m_powerCost`) - скриптовых запретов и
             // цены с рунами не видит, так что 0 значит «проба не нашла причины», а не «разрешено».
-            // Заклинания с побочными ветками `CheckCast` (питомец, приручение, маунт) не пробуем.
-            uint32 coreSays = 0;
-            if (!si->HasEffect(SPELL_EFFECT_SUMMON_PET) && !si->HasEffect(SPELL_EFFECT_TAME_CREATURE)
-                && !si->HasAura(SPELL_AURA_MOUNTED))
+            // Заклинания с побочными ветками `CheckCast` не пробуем: питомец, приручение, маунт и
+            // создание предметов (`CheckItems` шлёт ошибки, у мага вызывает `CastSpell` - Кодекс, 28.09).
+            std::string coreSays = "пропущена";
+            if (!si->HasEffect(SPELL_EFFECT_SUMMON_PET) && !si->HasEffect(SPELL_EFFECT_TAMECREATURE)
+                && !si->HasAura(SPELL_AURA_MOUNTED) && !si->HasEffect(SPELL_EFFECT_CREATE_ITEM)
+                && !si->HasEffect(SPELL_EFFECT_CREATE_LOOT))
             {
                 Spell* ask = new Spell(self, si, TRIGGERED_NONE);
                 ask->m_targets.SetUnitTarget(castTarget);
-                coreSays = uint32(ask->CheckCast(true));
+                SpellCastResult const code = ask->CheckCast(true);
+                coreSays = code == SPELL_CAST_OK ? std::string("0") : std::to_string(uint32(code));
                 delete ask;
             }
             TC_LOG_INFO("server.worldserver",
                 "Constellation КАСТ {} (класс {}): {} ({}) без следа — проба ядра (без скриптов и цены): код {}, дистанция {:.1f}, "
                 "объявленные границы {:.1f}..{:.1f}, объявленное чтение {} мс, в движении {}, сила {}",
                 self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
-                coreSays == uint32(SPELL_CAST_OK) ? 0u : coreSays,
+                coreSays,
                 self->GetExactDist(castTarget), si->GetMinRange(friendly),
                 si->GetMaxRange(friendly), si->CalcCastTime(),
                 self->isMoving() ? 1 : 0,
