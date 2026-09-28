@@ -267,6 +267,10 @@ struct Companion
     ObjectGuid Guid;                    // filled once the character exists
     WorldSession* Session = nullptr;    // owned by the module, not the manager
     Constellation::Ai::EngineState Engine;   // ставки, счётчики, отметки триггеров
+    // БОЙ В МИГ СМЕРТИ - снимок до `EngineReset(Died)`, который бой теперь гасит (`de71fc8`).
+    // Строка ГИБЕЛЬ читает цель отсюда: после сброса в `Engine.Fight` пусто, и все гибели
+    // окна 03:27 подписались «цели не было».
+    Constellation::Ai::EngineState::FightState DeathFight;
     // §10 — У ТЕНИ СВОЁ СОСТОЯНИЕ, И ЭТО НЕ АККУРАТНОСТЬ.
     //
     // Общее состояние делало тень бессмысленной И опасной сразу. Тень считает
@@ -2464,6 +2468,7 @@ public:
             if (!c.EngineDead)
             {
                 c.EngineDead = true;
+                c.DeathFight = c.Engine.Fight;     // до сброса - для строки ГИБЕЛЬ
                 EngineReset(c, Constellation::Ai::CancelReason::Died);
             }
             // ГИБЕЛЬ СЧИТАЕТСЯ ЗДЕСЬ, ОДИН РАЗ, И НЕЗАВИСИМО ОТ СПОСОБА ПОДЪЁМА (Кодекс).
@@ -2602,8 +2607,8 @@ public:
                     // лежит в `c.Engine.Fight.Victim`, а `c.TargetGuid` пуст — и 258 гибелей за девять
                     // часов вышли «цели не было», разделить «погиб в своём бою» и «застигнут в пути»
                     // было нечем.
-                    ObjectGuid const foeGuid = !c.Engine.Fight.Victim.IsEmpty() ? c.Engine.Fight.Victim : c.TargetGuid;
-                    char const* const foeBy = !c.Engine.Fight.Victim.IsEmpty() ? "движок" : "лестница";
+                    ObjectGuid const foeGuid = !c.DeathFight.Victim.IsEmpty() ? c.DeathFight.Victim : c.TargetGuid;
+                    char const* const foeBy = !c.DeathFight.Victim.IsEmpty() ? "движок" : "лестница";
                     std::string foe = "цели не было";
                     if (Creature* t = ObjectAccessor::GetCreature(*self, foeGuid))
                         foe = Trinity::StringFormat("{} ({}, {:.0f} ярд, у него {:.0f}%, вёл {})",
@@ -2614,10 +2619,10 @@ public:
                     // на момент выбора, оборона или обход, и сколько бой длился. Без этого «рядом
                     // враждебных N» в момент смерти не отличает «обход взял цель в толпе» от «толпа
                     // пришла во время боя» — а это два разных тела и две разные правки.
-                    if (!c.Engine.Fight.Victim.IsEmpty())
+                    if (!c.DeathFight.Victim.IsEmpty())
                         foe += Trinity::StringFormat(", при входе заступников {}, {}, бой {} с",
-                            c.Engine.Fight.Assists, c.Engine.Fight.Defensive ? "оборона" : "обход",
-                            c.Engine.Fight.FightMs / 1000);
+                            c.DeathFight.Assists, c.DeathFight.Defensive ? "оборона" : "обход",
+                            c.DeathFight.FightMs / 1000);
 
                     // ОКРУЖЕНИЕ ТРУПА — именно окружение, а не причина урона (Кодекс).
                     // Землю ищем от своего Z с запасом: трассировка от MAX_HEIGHT цепляет мост
