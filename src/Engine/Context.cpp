@@ -216,6 +216,13 @@ namespace Constellation::Ai
     {
         if (!_self)
             return;
+        if (unit.IsEmpty())
+        {
+            TC_LOG_INFO("server.worldserver",
+                "Constellation ЗАЧИСТКА {}: на пути только сильные ({}) - одному не пройти, дело «{}» ждёт три минуты",
+                _self->GetName(), strong, errand ? errand : "?");
+            return;
+        }
         Creature const* c = ObjectAccessor::GetCreature(*_self, unit);
         TC_LOG_INFO("server.worldserver",
             "Constellation ЗАЧИСТКА {}: на пути {} ({}, {:.0f} ярд) - выманиваю; рядом с ним ещё {}, сильных пропущено {}; дело: {}",

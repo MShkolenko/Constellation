@@ -40,6 +40,7 @@ namespace
     // агра обычного моба с запасом на подход. Раз в секунду - поиск по сетке, а не каждый такт.
     inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
     inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
+    inline constexpr uint32 PATH_STRONG_DEFER_MS  = 180000;   // на пути только сильные - дело ждёт три минуты
 
     // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
     // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
@@ -902,6 +903,20 @@ namespace
                     ctx.St->PathThreatAtMs = ctx.NowMs;
                     if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat != was)
                         ctx.World.LogPathThreat(ctx.St->PathThreat, pack, strong, NameOf(ctx.St->Running));
+                    // НА ПУТИ ТОЛЬКО СИЛЬНЫЕ - ДЕЛО ОТКЛАДЫВАЕТСЯ (Кодекс, verdict18 P1): одиночка
+                    // не входит в зону агра элиты или большой пачки. Ключ отсрочки - тот же, каким
+                    // само действие откладывает себя, так что через три минуты оно вернётся
+                    // (моб сдвинулся, спутник подрос, рядом отряд), а пока берётся другое дело.
+                    if (ctx.St->PathThreat.IsEmpty() && strong > 0)
+                        if (Action const* errand = Engine::Instance().Find(ctx.St->Running))
+                            if (BackoffKind const kind = errand->DeferKind(); kind != BackoffKind::None)
+                            {
+                                Bid b;
+                                b.Action = ctx.St->Running;
+                                b.About = ctx.St->RunningAbout;
+                                Defer(ctx, kind, b.About, errand->DeferDetail(b), PATH_STRONG_DEFER_MS);
+                                ctx.World.LogPathThreat(ObjectGuid::Empty, 0, strong, NameOf(ctx.St->Running));
+                            }
                 }
                 if (!ctx.St->PathThreat.IsEmpty())
                 {
