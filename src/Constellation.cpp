@@ -87,6 +87,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
+#include "TraitMgr.h"
 #include "TraitPackets.h"
 #include "AreaTriggerPackets.h"
 #include "Player.h"
@@ -588,9 +589,9 @@ struct Companion
     uint32 SquadScanAtMs = 0;           // отряд (проект v1, A1): когда последний раз искали, кого позвать
     uint32 HoldSinceMs = 0;             // консоль держит спутника на месте (выбор специализации - каст 5 с)
     uint32 TalentCheckAtMs = 0;         // таланты: когда последний раз смотрели
-    uint32 TalentLevel = 0;             // на каком уровне и для какого спека стартовая сборка включена
-    uint32 TalentSpec = 0;
-    bool TalentReported = true;         // итог включения записан в журнал
+    uint32 TalentSentAtMs = 0;          // когда слали пакет талантов или просили спек (отсрочка повтора)
+    uint32 TalentSpec = 0;              // для какого спека и уровня считаются попытки
+    uint8 TalentTries = 0;              // попыток без результата для этого спека
     uint32 SquadAwaySinceMs = 0;        // и с какого момента отстали от лидера (0 - рядом)
     // ГРУППА ОТ ЧЕЛОВЕКА (Кодекс, verdict17): признак происхождения, а не состава. Человек ушёл,
     // лидерство досталось спутнику - группа всё равно человеческая и живёт по старым правилам.
@@ -1182,11 +1183,18 @@ public:
 
     // ТАЛАНТЫ - СТАРТОВАЯ СБОРКА КЛИЕНТА (оператор 2026-09-28: «сделай заготовки для всех классов в
     // каждой ветке»). Заготовки уже есть в клиенте: TraitTreeLoadout, по одной на каждый из 39 спеков
-    // 11.2.7, и ядро их грузит (TraitMgr::InitializeStarterBuildTraitConfig). Спутник включает её
-    // тем же пакетом, что кнопка «Стартовая сборка» (инвариант 0), и повторяет на каждом новом
-    // уровне: сборка берёт столько узлов, сколько есть очков, а доращивать её ядро само не станет.
+    // 11.2.7, и ядро их грузит (TraitMgr::InitializeStarterBuildTraitConfig). Два клиентских пакета:
+    // - кнопка «Стартовая сборка» (CMSG_CLASS_TALENTS_SET_STARTER_BUILD_ACTIVE) - один раз на спек,
+    //   пока у конфига нет флага StarterBuild; это каст 384255, спутник на него стоит;
+    // - на новых уровнях сборка доращивается подтверждением талантов (CMSG_TRAITS_COMMIT_CONFIG) с
+    //   узлами той же сборки: только добавления, поэтому без каста, с прежним LocalIdentifier и без
+    //   перезагрузки панелей. Повторная кнопка на каждом уровне давала бы и то и другое (Кодекс, 26).
+    // Шлём, только когда сборка хочет больше рангов, чем в конфиге; каждая отправка и просьба о спеке
+    // выжидают минуту, а после трёх неудач для спека - пока спек не сменится.
     // Без спека талантов нет, поэтому с 10-го уровня спек выбирается: первый урон класса по порядку
-    // клиента (у паладина Возмездие, у монаха Танцующий с ветром).
+    // клиента (у паладина Воздаяние, у монаха Танцующий с ветром).
+    static constexpr uint32 TALENT_RETRY_MS = 60000;
+    static constexpr uint8 TALENT_MAX_TRIES = 3;
     void KeepTalents(Companion& c, Player* self)
     {
         uint32 const now = GameTime::GetGameTimeMS();
@@ -1195,13 +1203,24 @@ public:
         c.TalentCheckAtMs = now ? now : 1;
         if (!self->IsAlive() || self->IsInCombat() || self->IsNonMeleeSpellCast(false) || self->GetLevel() < 10)
             return;
+        bool const waiting = c.TalentSentAtMs && getMSTimeDiff(c.TalentSentAtMs, now) < TALENT_RETRY_MS;
         ChrSpecializationEntry const* spec = self->GetPrimarySpecializationEntry();
+        uint32 const specKey = (spec ? spec->ID : 0) * 1000 + self->GetLevel();   // попытки считаются заново на новом уровне
+        if (c.TalentSpec != specKey)
+        {
+            c.TalentSpec = specKey;
+            c.TalentTries = 0;
+        }
+        if (waiting || c.TalentTries >= TALENT_MAX_TRIES)
+            return;
         if (!spec || spec->OrderIndex >= INITIAL_SPECIALIZATION_INDEX)
         {
             for (uint32 i = 0; i < INITIAL_SPECIALIZATION_INDEX; ++i)
                 if (ChrSpecializationEntry const* s = sDB2Manager.GetChrSpecializationByIndex(self->GetClass(), i))
                     if (s->GetRole() == ChrSpecializationRole::Dps)
                     {
+                        c.TalentSentAtMs = now ? now : 1;
+                        ++c.TalentTries;
                         RequestSpec(c, self, s->ID);
                         return;
                     }
@@ -1211,37 +1230,53 @@ public:
         UF::TraitConfig const* config = self->GetTraitConfig(configId);
         if (!config)
             return;
-        if (c.TalentLevel == self->GetLevel() && c.TalentSpec == spec->ID)
+        uint32 have = 0;
+        for (UF::TraitEntry const& e : config->Entries)
+            have += std::max(0, int32(e.Rank));
+        if (!(*config->CombatConfigFlags & AsUnderlyingType(TraitCombatConfigFlags::StarterBuild)))
         {
-            if (!c.TalentReported)
+            WorldPacket raw(CMSG_CLASS_TALENTS_SET_STARTER_BUILD_ACTIVE);
+            WorldPackets::Traits::ClassTalentsSetStarterBuildActive starter(std::move(raw));
+            starter.ConfigID = configId;
+            starter.Active = true;
+            c.TalentSentAtMs = now ? now : 1;
+            ++c.TalentTries;
+            c.HoldSinceMs = now ? now : 1;                     // каст 384255: стоим, как при выборе спека
+            Constellation::Ai::ClientAct(self, c.Session).StopMoving();
+            c.Session->HandleClassTalentsSetStarterBuildActive(starter);
+            TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: кнопка стартовой сборки, спек {} ур {} (рангов было {}, попытка {})",
+                self->GetName(), spec->ID, self->GetLevel(), have, c.TalentTries);
+            return;
+        }
+        // СБОРКА, КАКОЙ ОНА ДОЛЖНА БЫТЬ СЕЙЧАС, - тем же расчётом, что ядро делает по кнопке
+        WorldPackets::Traits::TraitConfig want(*config);
+        TraitMgr::InitializeStarterBuildTraitConfig(want, self);
+        uint32 wanted = 0;
+        WorldPacket raw(CMSG_TRAITS_COMMIT_CONFIG);
+        WorldPackets::Traits::TraitsCommitConfig commit(std::move(raw));
+        commit.Config = WorldPackets::Traits::TraitConfig(*config);
+        commit.Config.Entries.clear();
+        for (WorldPackets::Traits::TraitEntry const& e : want.Entries)
+            if (e.Rank > 0)                                   // выданные ядром узлы (ранг 0) не шлём: их ранг 0 = «убрать»
             {
-                c.TalentReported = true;
-                uint32 nodes = 0, ranks = 0;
-                for (UF::TraitEntry const& e : config->Entries)
-                    if (e.Rank > 0)
-                    {
-                        ++nodes;
-                        ranks += e.Rank;
-                    }
-                TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: спек {} ур {} - узлов {}, рангов {}, стартовая {}",
-                    self->GetName(), spec->ID, self->GetLevel(), nodes, ranks,
-                    (*config->CombatConfigFlags & AsUnderlyingType(TraitCombatConfigFlags::StarterBuild)) ? "да" : "нет");
+                wanted += e.Rank;
+                commit.Config.Entries.push_back(e);
+            }
+        if (wanted <= have)
+        {
+            if (c.TalentTries)
+            {
+                TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: спек {} ур {} - рангов {}, стартовая сборка на месте",
+                    self->GetName(), spec->ID, self->GetLevel(), have);
+                c.TalentTries = 0;
             }
             return;
         }
-        WorldPacket raw(CMSG_CLASS_TALENTS_SET_STARTER_BUILD_ACTIVE);
-        WorldPackets::Traits::ClassTalentsSetStarterBuildActive starter(std::move(raw));
-        starter.ConfigID = configId;
-        starter.Active = true;
-        // смена талантов - каст 384255 со временем: стоим, как при выборе спека
-        c.HoldSinceMs = now ? now : 1;
-        Constellation::Ai::ClientAct(self, c.Session).StopMoving();
-        c.Session->HandleClassTalentsSetStarterBuildActive(starter);
-        c.TalentLevel = self->GetLevel();
-        c.TalentSpec = spec->ID;
-        c.TalentReported = false;
-        TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: включаю стартовую сборку спека {} на ур {} (конфиг {})",
-            self->GetName(), spec->ID, self->GetLevel(), configId);
+        c.TalentSentAtMs = now ? now : 1;
+        ++c.TalentTries;
+        c.Session->HandleTraitsCommitConfig(commit);
+        TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: дорастить сборку спека {} на ур {}: рангов {} -> {} (попытка {})",
+            self->GetName(), spec->ID, self->GetLevel(), have, wanted, c.TalentTries);
     }
 
     bool CastFor(ChatHandler* handler, std::string const& name, uint32 spellId)
