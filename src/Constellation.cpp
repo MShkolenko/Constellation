@@ -2877,7 +2877,24 @@ public:
                             "Constellation ГИБЕЛЬ-КВЕСТ {}: квест {} стоил гибелей {} (маршрут закрыт с двух, откроется с ур {})",
                             self->GetName(), travelQuest, uint32(q.first), uint32(q.second) + 3);
                     }
+                    else
+                    {
+                        // ПРИБОР (28.09): Kobold Tunneler убил за сутки 71 раз, а на квест записано 7
+                        // гибелей. Какие цели квеста остались открытыми, когда убийца к нему не
+                        // относится, - разведка, предмет с другого вида, чужая цель по дороге.
+                        std::string open;
+                        if (tq)
+                            for (QuestObjective const& obj : tq->GetObjectives())
+                                if (self->GetQuestObjectiveData(obj) < std::max<int32>(obj.Amount, 1))
+                                    open += Trinity::StringFormat("{}{}:{}", open.empty() ? "" : " ", uint32(obj.Type), obj.ObjectID);
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation ГИБЕЛЬ-КВЕСТ {}: шёл ради квеста {}, убийца {} к нему не относится (открытые цели тип:вид {})",
+                            self->GetName(), travelQuest, killer, open.empty() ? std::string("нет") : open);
+                    }
                 }
+                else if (killer)
+                    TC_LOG_INFO("server.worldserver", "Constellation ГИБЕЛЬ-КВЕСТ {}: квеста похода нет (убийца {})",
+                        self->GetName(), killer);
                 // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать
                 // в момент самого перехода, а не по косвенным признакам в ветке воскрешения.
                 c.RingHeld = false;
