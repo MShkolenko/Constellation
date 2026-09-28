@@ -1186,6 +1186,23 @@ public:
         return true;
     }
 
+    bool LearnFor(ChatHandler* handler, std::string const& name, uint32 spellId)
+    {
+        Companion* c = FindByName(name);
+        Player* p = c && c->Session ? c->Session->GetPlayer() : nullptr;
+        if (!p || !sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+        {
+            handler->PSendSysMessage("Constellation: нет спутника %s в мире или заклинания %u", name.c_str(), spellId);
+            return true;
+        }
+        // ТО ЖЕ, ЧТО GM-КОМАНДА `.learn` ПО ВЫБРАННОЙ ЦЕЛИ (cs_learn.cpp: targetPlayer->LearnSpell), из консоли
+        p->LearnSpell(spellId, false);
+        TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-ОБУЧЕНИЕ {}: {} - знает {}", p->GetName(), spellId,
+            p->HasSpell(spellId) ? "да" : "нет");
+        handler->PSendSysMessage("Constellation: %s учит %u", p->GetName().c_str(), spellId);
+        return true;
+    }
+
     bool ListAuras(ChatHandler* handler, std::string const& name)
     {
         Companion* c = FindByName(name);
@@ -12701,6 +12718,7 @@ public:
             { "spec",    HandleSpec,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "auras",   HandleAuras,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "cast",    HandleCast,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "learn",   HandleLearn,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -12779,6 +12797,12 @@ public:
     static bool HandleCast(ChatHandler* handler, std::string name, uint32 spellId)
     {
         return Constellation::Manager::Instance()->CastFor(handler, name, spellId);
+    }
+
+    // .constellation learn <имя> <заклинание> — то же, что GM .learn по выбранному спутнику
+    static bool HandleLearn(ChatHandler* handler, std::string name, uint32 spellId)
+    {
+        return Constellation::Manager::Instance()->LearnFor(handler, name, spellId);
     }
 
     // .constellation auras <имя> — ауры спутника со стопками (проверка сосулек)
