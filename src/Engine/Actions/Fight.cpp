@@ -860,6 +860,16 @@ namespace
             // проходить». Идём по делу - смотрим на сорок ярдов вперёд по маршруту ядра; агрессивный
             // враг, чья зона агра задевает путь, выманивается по одному, прежде чем идти дальше.
             // Отдых стоит выше (строкой раньше): к следующему пулу подходим восстановившись.
+            // ИДЁМ НА САМУ УГРОЗУ - ОНА ДЕРЖИТСЯ: без этого на подходе `Running` уже не поход, угроза
+            // стиралась, `Useful` её отвергал, подход бросался, поход возобновлялся - и так по кругу.
+            bool const onThreat = ctx.St && !ctx.St->PathThreat.IsEmpty()
+                && ctx.St->Running == ActionId::KillObjective
+                && ctx.St->RunningAbout == Subject::OfUnit(ctx.St->PathThreat);
+            if (onThreat && !inCombat)
+            {
+                sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(ctx.St->PathThreat));
+                return;
+            }
             if (ctx.St && !inCombat && IsErrand(ctx.St->Running)
                 && ctx.St->Move.WaypointIndex < ctx.St->Move.Waypoints.size())
             {
