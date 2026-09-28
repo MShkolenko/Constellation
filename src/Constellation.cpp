@@ -2849,7 +2849,24 @@ public:
                     if (tq)
                         for (QuestObjective const& obj : tq->GetObjectives())
                         {
-                            if (obj.ObjectID <= 0 || self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
+                            if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
+                                continue;
+                            // РАЗВЕДКА: ДОРОГА И ЕСТЬ ЦЕЛЬ (прибор 28.09: квест 62, шахта Fargodeep - 9
+                            // гибелей от кобольдов, ни одной на квест). Гибель в сотне ярдов от зоны
+                            // осмотра этого квеста - гибель за него, кто бы ни убил.
+                            if (obj.Type == QUEST_OBJECTIVE_AREATRIGGER)
+                            {
+                                auto const zones = _questTriggers.find(travelQuest);
+                                if (zones != _questTriggers.end())
+                                    for (AreaTriggerEntry const* at : zones->second)
+                                        if (at->ContinentID == self->GetMapId()
+                                            && self->GetExactDist2d(at->Pos.X, at->Pos.Y) <= 100.0f)
+                                            { related = true; break; }
+                                if (related)
+                                    break;
+                                continue;
+                            }
+                            if (obj.ObjectID <= 0)
                                 continue;
                             uint32 const want = uint32(obj.ObjectID);
                             if (obj.Type == QUEST_OBJECTIVE_MONSTER)
