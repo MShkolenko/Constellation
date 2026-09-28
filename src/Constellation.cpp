@@ -5233,6 +5233,11 @@ public:
     bool CastAtTargetCore(Player* self, Unit* victim,
                           Constellation::Ai::CastSender const& send, Constellation::Ai::CastMemory& m)
     {
+        // ОГЛУШЁН ИЛИ СБИТ С ТОЛКУ - НЕ ПРОСИМ (проба ядра, окно 28.09 08:27: 18 из 19 кастов «без
+        // следа» - код 129 SPELL_FAILED_STUNNED, один - 30 CONFUSED). Ядро отказало бы, а просьба
+        // считалась бы попыткой; вернёмся, когда состояние снимется.
+        if (self->HasUnitState(UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED))
+            return false;
         bool const castingNow = self->HasUnitState(UNIT_STATE_CASTING);
         m.WasCasting = castingNow;
 
