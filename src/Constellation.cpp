@@ -4856,6 +4856,27 @@ public:
                 // не использовалась никогда — при freeSlots == 1 отказывали даже первому предмету.
                 else if (!forQuest && asked + 2 > freeSlots) skip = "мало-места-под-хлам";
                 else if (asked >= freeSlots)            skip = "сумки-полны";
+                // НЕ БОЛЬШЕ, ЧЕМ ОСТАЛОСЬ ДО ЦЕЛИ (окно 28.09 06:27: общий лут с нескольких трупов
+                // просил свечей 772 больше, чем нужно квесту 60; лишние ядро забирало впустую - 137
+                // «ffa-взят, не легло»). Считаем по целям журнала с этим предметом; ноль - предмет
+                // нужен не целью (стартер, флаг ядра), тогда не ограничиваем.
+                else if (forQuest && !junk)
+                {
+                    uint32 need = 0;
+                    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+                        if (uint32 const q = self->GetQuestSlotQuestId(slot))
+                            if (Quest const* qt = sObjectMgr->GetQuestTemplate(q))
+                                for (QuestObjective const& obj : qt->GetObjectives())
+                                    if (obj.Type == QUEST_OBJECTIVE_ITEM && uint32(obj.ObjectID) == item.itemid)
+                                    {
+                                        int32 const have = self->GetQuestObjectiveData(obj);
+                                        if (have < obj.Amount)
+                                            need += uint32(obj.Amount - have);
+                                    }
+                    auto const already = askedQty.find(item.itemid);
+                    if (need && already != askedQty.end() && already->second >= need)
+                        skip = "хватит-для-задания";
+                }
                 TC_LOG_INFO("server.worldserver",
                     "Constellation ЛУТ-СОДЕРЖИМОЕ {}: предмет {} кач {} кол {} квест {} "
                     "свободно {} (ядро говорит {}) -> {}",
