@@ -1138,6 +1138,52 @@ public:
                 return &c;
         return nullptr;
     }
+    // ВЫБОР СПЕЦИАЛИЗАЦИИ ТЕМ ЖЕ ПАКЕТОМ, ЧТО КЛИЕНТ (инвариант 0): каст 200749 «Activating
+    // Specialization» с номером в Misc[0] - ядро кладёт его в `m_misc.SpecializationId`
+    // (Player.cpp:31045) и само проверяет уровень и прочее в CheckCast.
+    bool SetSpec(ChatHandler* handler, std::string const& name, uint32 specId)
+    {
+        Companion* c = FindByName(name);
+        Player* p = c && c->Session ? c->Session->GetPlayer() : nullptr;
+        if (!p)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s в мире нет", name.c_str());
+            return true;
+        }
+        WorldPacket raw(CMSG_CAST_SPELL);
+        WorldPackets::Spells::CastSpell cast(std::move(raw));
+        cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
+            p->GetMapId(), 200749, p->GetMap()->GenerateLowGuid<HighGuid::Cast>());
+        cast.Cast.SpellID = 200749;
+        cast.Cast.Misc[0] = int32(specId);
+        c->Session->HandleCastSpellOpcode(cast);
+        TC_LOG_INFO("server.worldserver", "Constellation СПЕЦИАЛИЗАЦИЯ {}: запрошена {} (уровень {}, сейчас {})",
+            p->GetName(), specId, p->GetLevel(), uint32(p->GetPrimarySpecialization()));
+        handler->PSendSysMessage("Constellation: %s просит специализацию %u", p->GetName().c_str(), specId);
+        return true;
+    }
+
+    bool ListAuras(ChatHandler* handler, std::string const& name)
+    {
+        Companion* c = FindByName(name);
+        Player* p = c && c->Session ? c->Session->GetPlayer() : nullptr;
+        if (!p)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s в мире нет", name.c_str());
+            return true;
+        }
+        std::string line = Trinity::StringFormat("Constellation АУРЫ {} (ур {}, спец {}):", p->GetName(),
+            p->GetLevel(), uint32(p->GetPrimarySpecialization()));
+        for (auto const& [id, app] : p->GetAppliedAuras())
+        {
+            Aura const* a = app->GetBase();
+            line += Trinity::StringFormat(" {}x{}", a->GetId(), uint32(a->GetStackAmount()));
+        }
+        TC_LOG_INFO("server.worldserver", "{}", line);
+        handler->PSendSysMessage("%s", line.c_str());
+        return true;
+    }
+
     Companion* FindByPlayer(Player const* self)
     {
         if (!self)
@@ -12623,6 +12669,8 @@ public:
             { "faction", HandleFaction, rbac::RBAC_PERM_COMMAND_GM, Console::No },
             { "credit",  HandleCredit,  rbac::RBAC_PERM_COMMAND_GM, Console::No },
             { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "spec",    HandleSpec,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "auras",   HandleAuras,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -12689,6 +12737,18 @@ public:
     static bool HandleRepair(ChatHandler* handler)
     {
         return Constellation::Manager::Instance()->RepairAll(handler);
+    }
+
+    // .constellation spec <имя> <номер> — спутник выбирает специализацию пакетом клиента
+    static bool HandleSpec(ChatHandler* handler, std::string name, uint32 specId)
+    {
+        return Constellation::Manager::Instance()->SetSpec(handler, name, specId);
+    }
+
+    // .constellation auras <имя> — ауры спутника со стопками (проверка сосулек)
+    static bool HandleAuras(ChatHandler* handler, std::string name)
+    {
+        return Constellation::Manager::Instance()->ListAuras(handler, name);
     }
 
     // .constellation spell <id> — эффекты заклинания глазами ядра (Spell.db2 в памяти сервера)
