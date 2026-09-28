@@ -889,7 +889,7 @@ namespace
             // `AttackersValue.cpp:69`): нападающий на соседа по группе в пределах сорока ярдов - и мой
             // нападающий. Свой нападающий уже взят выше (оборона); отдых - строкой раньше; сломанный
             // не идёт. Раз в секунду, как угроза пути.
-            if (ctx.St && ctx.World.BrokenGear() == 0)
+            if (ctx.St && ctx.World.BrokenGear() == 0 && Tuning().Squads)
             {
                 if (getMSTimeDiff(ctx.St->SquadAssistAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)
                 {
@@ -912,13 +912,13 @@ namespace
             bool const onThreat = ctx.St && !ctx.St->PathThreat.IsEmpty()
                 && ctx.St->Running == ActionId::KillObjective
                 && ctx.St->RunningAbout == Subject::OfUnit(ctx.St->PathThreat);
-            if (onThreat && !inCombat)
+            if (onThreat && !inCombat && Tuning().PathClear)
             {
                 sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(ctx.St->PathThreat));
                 return;
             }
             // СЛОМАННЫЙ НЕ ЗАЧИЩАЕТ (Кодекс): ему драться нечем, он идёт чиниться.
-            if (ctx.St && !inCombat && IsErrand(ctx.St->Running) && ctx.World.BrokenGear() == 0
+            if (ctx.St && !inCombat && IsErrand(ctx.St->Running) && ctx.World.BrokenGear() == 0 && Tuning().PathClear
                 && ctx.St->Move.WaypointIndex < ctx.St->Move.Waypoints.size())
             {
                 if (getMSTimeDiff(ctx.St->PathThreatAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)

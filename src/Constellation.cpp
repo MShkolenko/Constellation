@@ -131,6 +131,8 @@ struct Settings
     bool  Follow          = true;
     bool  Quests          = true;
     bool  TakeQuests      = true;       // БРАТЬ квесты; сдавать разрешает Quests
+    bool  PathClear       = true;       // зачистка пути (проект отрядов v1, часть B)
+    bool  Squads          = true;       // отряды спутников по общей цели (часть A1)
     bool  Fight           = true;
     bool  Abilities       = false;      // произносить умения, а не только выбирать
     bool  Loot            = false;      // подбирать добычу с собственных убийств
@@ -189,6 +191,10 @@ struct Settings
         // ключ, а не Quests=0: сдавать уже взятое надо продолжать, иначе журналы у 122
         // спутников так и останутся забитыми невыполнимым.
         TakeQuests      = sConfigMgr->GetBoolDefault("Constellation.TakeQuests", true);
+        // ВЫКЛЮЧАТЕЛИ НОВЫХ МЕХАНИЗМОВ (2026-09-28): окно 08:27 показало, что зачистка пути гибелей
+        // не сняла; если суд повторится, её гасит `.reload config`, а не откат и пересборка.
+        PathClear       = sConfigMgr->GetBoolDefault("Constellation.PathClear", true);
+        Squads          = sConfigMgr->GetBoolDefault("Constellation.Squads", true);
         Fight           = sConfigMgr->GetBoolDefault("Constellation.Fight", true);
         // УМЕНИЯ ПО УМОЛЧАНИЮ ТОЛЬКО ВЫБИРАЮТСЯ, НО НЕ ПРОИЗНОСЯТСЯ.
         // Второй читатель трижды показал, что безопасность выбора нельзя доказать
@@ -10424,7 +10430,7 @@ public:
         if (getMSTimeDiff(c.SquadScanAtMs, now) < SQUAD_SCAN_MS)
             return;
         c.SquadScanAtMs = now;
-        if (!c.Owner.IsEmpty() || player->GetGroupInvite() || !player->IsAlive())
+        if (!Cfg().Squads || !c.Owner.IsEmpty() || player->GetGroupInvite() || !player->IsAlive())
             return;
         Group* g = player->GetGroup();
         if (g && (!IsBotSquad(g) || !g->IsLeader(player->GetGUID()) || g->isRaidGroup()
@@ -10457,7 +10463,7 @@ public:
     bool SquadLeaderSpot(Player const* self, Constellation::Ai::TravelSpot* out) const
     {
         Group const* g = self->GetGroup();
-        if (!g || !IsBotSquad(g) || g->IsLeader(self->GetGUID()))
+        if (!Cfg().Squads || !g || !IsBotSquad(g) || g->IsLeader(self->GetGUID()))
             return false;
         ObjectGuid const lead = g->GetLeaderGUID();
         for (Companion const& o : _companions)
@@ -12425,6 +12431,8 @@ namespace Constellation::Ai
         t.Vending         = Constellation::Cfg().Vending;
         t.Quests          = Constellation::Cfg().Quests;
         t.TakeQuests      = Constellation::Cfg().TakeQuests;
+        t.PathClear       = Constellation::Cfg().PathClear;
+        t.Squads          = Constellation::Cfg().Squads;
         t.Flying          = Constellation::Cfg().Flying;
         t.Follow          = Constellation::Cfg().Follow;
         t.FollowDistance  = Constellation::Cfg().FollowDistance;

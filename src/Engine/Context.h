@@ -1050,6 +1050,8 @@ namespace Constellation::Ai
         bool   Vending        = true;     // `Constellation.Vending`: походы к торговцу разрешены
         bool   Quests         = true;     // `Constellation.Quests`: сбор и квесты разрешены (`Idle`, `:3314`)
         bool   TakeQuests     = true;     // `Constellation.TakeQuests`: брать квесты (был флаг `QuestTick`)
+        bool   PathClear      = true;     // `Constellation.PathClear`: зачистка пути
+        bool   Squads         = true;     // `Constellation.Squads`: отряды (общий бой, одна цель)
         bool   Flying         = true;     // `Constellation.Flying`: полёты и камень разрешены
         bool   Follow         = true;     // `Constellation.Follow`: следовать за хозяином
         float  FollowDistance = 4.0f;     // насколько близко держаться
