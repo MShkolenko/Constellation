@@ -5348,9 +5348,13 @@ public:
             bool const friendly = self->IsFriendlyTo(castTarget);
             // ПРИЧИНУ ГОВОРИТ ЯДРО, А НЕ МЫ: та же проба, что у кузни и у `HandleAcceptTrade` -
             // `Spell` с целью, `CheckCast(true)`, удалить. Её код - ответ на вопрос, который
-            // SMSG_CAST_FAILED задал бы клиенту. 0 = ядро сейчас разрешило бы (отказ был мгновенным
-            // и прошёл, или состояние сменилось между отправкой и пробой).
+            // SMSG_CAST_FAILED задал бы клиенту. ПРОБА НЕПОЛНАЯ (Кодекс, 28.09): она не проходит
+            // подготовку настоящего каста (`LoadScripts`, `m_powerCost`) - скриптовых запретов и
+            // цены с рунами не видит, так что 0 значит «проба не нашла причины», а не «разрешено».
+            // Заклинания с побочными ветками `CheckCast` (питомец, приручение, маунт) не пробуем.
             uint32 coreSays = 0;
+            if (!si->HasEffect(SPELL_EFFECT_SUMMON_PET) && !si->HasEffect(SPELL_EFFECT_TAME_CREATURE)
+                && !si->HasAura(SPELL_AURA_MOUNTED))
             {
                 Spell* ask = new Spell(self, si, TRIGGERED_NONE);
                 ask->m_targets.SetUnitTarget(castTarget);
@@ -5358,7 +5362,7 @@ public:
                 delete ask;
             }
             TC_LOG_INFO("server.worldserver",
-                "Constellation КАСТ {} (класс {}): {} ({}) без следа — ядро: код {}, дистанция {:.1f}, "
+                "Constellation КАСТ {} (класс {}): {} ({}) без следа — проба ядра (без скриптов и цены): код {}, дистанция {:.1f}, "
                 "объявленные границы {:.1f}..{:.1f}, объявленное чтение {} мс, в движении {}, сила {}",
                 self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
                 coreSays == uint32(SPELL_CAST_OK) ? 0u : coreSays,
