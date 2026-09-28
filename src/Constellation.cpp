@@ -578,6 +578,9 @@ struct Companion
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
     uint32 SquadScanAtMs = 0;           // отряд (проект v1, A1): когда последний раз искали, кого позвать
     uint32 SquadAwaySinceMs = 0;        // и с какого момента отстали от лидера (0 - рядом)
+    // ГРУППА ОТ ЧЕЛОВЕКА (Кодекс, verdict17): признак происхождения, а не состава. Человек ушёл,
+    // лидерство досталось спутнику - группа всё равно человеческая и живёт по старым правилам.
+    bool GroupFromHuman = false;
     bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
@@ -10373,10 +10376,17 @@ public:
 
     // ОТРЯД БОТОВ - группа, которую ведёт спутник. Группа, куда позвал человек, живёт по своим
     // правилам (человек - хозяин и лидер), и эти не трогают её.
+    // ПО GUID ЛИДЕРА СРЕДИ СПУТНИКОВ, а не по его подключению (Кодекс, verdict17): вышедший лидер
+    // держит лидерство ещё две минуты по таймеру ядра, и отряд не должен распадаться от этого.
     bool IsBotSquad(Group const* g) const
     {
-        Player const* lead = g ? ObjectAccessor::FindConnectedPlayer(g->GetLeaderGUID()) : nullptr;
-        return lead && lead->GetSession() && IsCompanionAccount(lead->GetSession()->GetAccountId());
+        if (!g)
+            return false;
+        ObjectGuid const lead = g->GetLeaderGUID();
+        for (Companion const& o : _companions)
+            if (!o.Guid.IsEmpty() && o.Guid == lead)
+                return true;
+        return false;
     }
 
     // ПОЗВАТЬ ОДНОГО, раз в десять секунд. Зовёт старший по уровню, при равенстве - младший GUID:
@@ -11438,7 +11448,7 @@ private:
                     }
                     // ОТРЯД БОТОВ ЧЕЛОВЕКА НЕ ЖДЁТ (решение оператора 2026-09-28): он распадается сам,
                     // когда общей цели больше нет или спутник надолго отстал от лидера.
-                    bool const squad = !humanInside && IsBotSquad(grp);
+                    bool const squad = !humanInside && !c.GroupFromHuman && IsBotSquad(grp);
                     if (squad)
                     {
                         Player* lead = ObjectAccessor::FindConnectedPlayer(grp->GetLeaderGUID());
@@ -11499,7 +11509,14 @@ private:
                 // становится хозяином — и это не меняется ни от смены лидера, ни от
                 // того, кого позовут в группу потом. Приглашение от другого спутника
                 // отвергается: сцепка ботов между собой не предусмотрена.
-                if (Group* inv = player->GetGroupInvite())
+                if (!player->GetGroup())
+                    c.GroupFromHuman = false;           // группы нет - и признака нет
+                // СВОЁ ПРИГЛАШЕНИЕ НЕ ОТВЕЧАЕМ (Кодекс, verdict17): ядро метит приглашением и
+                // пригласившего, и ответ на собственное снял бы его защиту от чужих приглашений.
+                Group* inv = player->GetGroupInvite();
+                if (inv && inv->GetLeaderGUID() == player->GetGUID())
+                    inv = nullptr;
+                if (inv)
                 {
                     Player* inviter = ObjectAccessor::FindConnectedPlayer(inv->GetLeaderGUID());
                     if (!inviter || !inviter->GetSession())
@@ -11520,6 +11537,7 @@ private:
                     }
                     c.Owner = inviter->GetGUID();
                     c.OwnerFromGroup = true;    // поводок — группа; порвётся вместе с ней
+                    c.GroupFromHuman = true;    // и группа человеческая, даже если он уйдёт
                     WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
                     WorldPackets::Party::PartyInviteResponse response(std::move(raw));
                     response.Accept = true;
