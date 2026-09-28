@@ -576,6 +576,8 @@ struct Companion
     ObjectGuid Owner;                   // кто позвал; пусто = не идти ни за кем
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
+    uint32 SquadScanAtMs = 0;           // отряд (проект v1, A1): когда последний раз искали, кого позвать
+    uint32 SquadAwaySinceMs = 0;        // и с какого момента отстали от лидера (0 - рядом)
     bool BrokenNoted = false;           // о сломанном снаряжении сказано один раз, не в каждый такт
     bool JumpProbed = false;            // самопроверка прыжка на стенде уже сделана
     uint32 FollowCooldownMs = 0;        // не дёргаться к хозяину, до которого не дойти
@@ -10340,6 +10342,79 @@ public:
         return owner;
     }
 
+    // ОТРЯД ПО ОБЩЕЙ ЦЕЛИ (проект отрядов v1, часть A1; решение оператора 2026-09-28).
+    // Числа эталона (`InviteToGroupAction.cpp:55`): разница уровней не больше двух, в пределах
+    // обзора. Общая цель - хотя бы один квест, незакрытый у обоих.
+    static constexpr int32  SQUAD_LEVEL_SPREAD = 2;
+    static constexpr float  SQUAD_GATHER_YARDS = 100.0f;
+    static constexpr uint32 SQUAD_SCAN_MS      = 10000;
+    static constexpr uint32 SQUAD_MAX          = 5;
+    static constexpr float  SQUAD_AWAY_YARDS   = 250.0f;
+    static constexpr uint32 SQUAD_AWAY_MS      = 120000;
+
+    static bool ShareOpenQuest(Player const* a, Player const* b)
+    {
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const q = a->GetQuestSlotQuestId(slot);
+            if (q && a->GetQuestStatus(q) == QUEST_STATUS_INCOMPLETE
+                && b->GetQuestStatus(q) == QUEST_STATUS_INCOMPLETE)
+                return true;
+        }
+        return false;
+    }
+
+    static bool SquadFit(Player const* a, Player const* b)
+    {
+        return a->GetMapId() == b->GetMapId() && a->IsAlive() && b->IsAlive()
+            && std::abs(int32(a->GetLevel()) - int32(b->GetLevel())) <= SQUAD_LEVEL_SPREAD
+            && a->GetExactDist2d(b) <= SQUAD_GATHER_YARDS && ShareOpenQuest(a, b);
+    }
+
+    // ОТРЯД БОТОВ - группа, которую ведёт спутник. Группа, куда позвал человек, живёт по своим
+    // правилам (человек - хозяин и лидер), и эти не трогают её.
+    bool IsBotSquad(Group const* g) const
+    {
+        Player const* lead = g ? ObjectAccessor::FindConnectedPlayer(g->GetLeaderGUID()) : nullptr;
+        return lead && lead->GetSession() && IsCompanionAccount(lead->GetSession()->GetAccountId());
+    }
+
+    // ПОЗВАТЬ ОДНОГО, раз в десять секунд. Зовёт старший по уровню, при равенстве - младший GUID:
+    // иначе двое звали бы друг друга разом. Лидер неполного отряда зовёт дальше. Спутник с
+    // хозяином-человеком не зовёт и не зовётся - он идёт за человеком.
+    void SquadInvite(Companion& c, Player* player)
+    {
+        uint32 const now = GameTime::GetGameTimeMS();
+        if (getMSTimeDiff(c.SquadScanAtMs, now) < SQUAD_SCAN_MS)
+            return;
+        c.SquadScanAtMs = now;
+        if (!c.Owner.IsEmpty() || player->GetGroupInvite() || !player->IsAlive())
+            return;
+        Group* g = player->GetGroup();
+        if (g && (!IsBotSquad(g) || !g->IsLeader(player->GetGUID()) || g->isRaidGroup()
+                  || g->GetMembersCount() >= SQUAD_MAX))
+            return;
+        for (Companion& o : _companions)
+        {
+            if (&o == &c || o.State != Stage::InWorld || !o.Session || !o.Owner.IsEmpty())
+                continue;
+            Player* op = o.Session->GetPlayer();
+            if (!op || op->GetGroup() || op->GetGroupInvite() || !SquadFit(player, op))
+                continue;
+            if (!g && (op->GetLevel() > player->GetLevel()
+                       || (op->GetLevel() == player->GetLevel() && op->GetGUID() < player->GetGUID())))
+                continue;                   // звать будет он, а не я
+            WorldPacket raw(CMSG_PARTY_INVITE);
+            WorldPackets::Party::PartyInviteClient invite(std::move(raw));
+            invite.TargetName = op->GetName();
+            invite.TargetGUID = op->GetGUID();
+            c.Session->HandlePartyInviteOpcode(invite);
+            TC_LOG_INFO("server.worldserver", "Constellation ОТРЯД {}: зову {} (ур {} и {}, {:.0f} ярд, общий квест есть)",
+                player->GetName(), op->GetName(), player->GetLevel(), op->GetLevel(), player->GetExactDist2d(op));
+            return;                         // по одному за раз
+        }
+    }
+
     bool IsCompanionAccount(uint32 accountId) const
     {
         for (Companion const& c : _companions)
@@ -11361,7 +11436,49 @@ private:
                             && !IsCompanionAccount(member->GetSession()->GetAccountId()))
                             { humanInside = true; break; }
                     }
-                    if (!humanInside)
+                    // ОТРЯД БОТОВ ЧЕЛОВЕКА НЕ ЖДЁТ (решение оператора 2026-09-28): он распадается сам,
+                    // когда общей цели больше нет или спутник надолго отстал от лидера.
+                    bool const squad = !humanInside && IsBotSquad(grp);
+                    if (squad)
+                    {
+                        Player* lead = ObjectAccessor::FindConnectedPlayer(grp->GetLeaderGUID());
+                        bool leave = false;
+                        char const* why = "";
+                        if (lead && lead != player)
+                        {
+                            uint32 const now = GameTime::GetGameTimeMS();
+                            bool const away = lead->GetMapId() != player->GetMapId()
+                                || lead->GetExactDist2d(player) > SQUAD_AWAY_YARDS;
+                            if (!away)
+                                c.SquadAwaySinceMs = 0;
+                            else if (!c.SquadAwaySinceMs)
+                                c.SquadAwaySinceMs = now ? now : 1;
+                            if (!ShareOpenQuest(player, lead))
+                                { leave = true; why = "общих квестов с лидером нет"; }
+                            else if (c.SquadAwaySinceMs && getMSTimeDiff(c.SquadAwaySinceMs, now) >= SQUAD_AWAY_MS)
+                                { leave = true; why = "две минуты вдали от лидера"; }
+                        }
+                        else if (lead == player)
+                        {
+                            bool anyone = false;
+                            for (Group::MemberSlot const& slot : grp->GetMemberSlots())
+                                if (Player* m = ObjectAccessor::FindConnectedPlayer(slot.guid))
+                                    if (m != player && ShareOpenQuest(player, m))
+                                        anyone = true;
+                            if (!anyone && grp->GetMembersCount() > 1)
+                                { leave = true; why = "ни с кем в отряде общих квестов нет"; }
+                        }
+                        if (leave)
+                        {
+                            WorldPacket rawLeave(CMSG_LEAVE_GROUP);
+                            WorldPackets::Party::LeaveGroup leaveGroup(std::move(rawLeave));
+                            c.Session->HandleLeaveGroupOpcode(leaveGroup);
+                            c.SquadAwaySinceMs = 0;
+                            TC_LOG_INFO("server.worldserver", "Constellation ОТРЯД {}: выхожу - {}", player->GetName(), why);
+                            return false;
+                        }
+                    }
+                    if (!humanInside && !squad)
                     {
                         WorldPacket rawLeave(CMSG_LEAVE_GROUP);
                         WorldPackets::Party::LeaveGroup leave(std::move(rawLeave));
@@ -11385,9 +11502,22 @@ private:
                 if (Group* inv = player->GetGroupInvite())
                 {
                     Player* inviter = ObjectAccessor::FindConnectedPlayer(inv->GetLeaderGUID());
-                    if (!inviter || !inviter->GetSession()
-                        || IsCompanionAccount(inviter->GetSession()->GetAccountId()))
-                        return false;               // не человек — не принимаем
+                    if (!inviter || !inviter->GetSession())
+                        return false;
+                    // ПРИГЛАШЕНИЕ СПУТНИКА - В ОТРЯД (решение оператора 2026-09-28, отменяет запрет
+                    // 2026-08-30 для связки бот-бот): принимаем, если общая цель есть, хозяином он не
+                    // становится. Не подходит - отказываем тем же ответом, что жмёт человек.
+                    if (IsCompanionAccount(inviter->GetSession()->GetAccountId()))
+                    {
+                        bool const fit = c.Owner.IsEmpty() && !player->GetGroup() && SquadFit(player, inviter);
+                        WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
+                        WorldPackets::Party::PartyInviteResponse response(std::move(raw));
+                        response.Accept = fit;
+                        c.Session->HandlePartyInviteResponseOpcode(response);
+                        TC_LOG_INFO("server.worldserver", "Constellation ОТРЯД {}: {} приглашение {}",
+                            player->GetName(), fit ? "принял" : "отклонил", inviter->GetName());
+                        return false;
+                    }
                     c.Owner = inviter->GetGUID();
                     c.OwnerFromGroup = true;    // поводок — группа; порвётся вместе с ней
                     WorldPacket raw(CMSG_PARTY_INVITE_RESPONSE);
@@ -11396,6 +11526,7 @@ private:
                     c.Session->HandlePartyInviteResponseOpcode(response);
                     TC_LOG_INFO("server.worldserver", "Constellation: {} accepted a group invite", c.Entry->Name);
                 }
+                SquadInvite(c, player);
                 return false;
             }
             case Stage::Failed:
