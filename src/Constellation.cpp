@@ -2862,10 +2862,32 @@ public:
                                 if (zones != _questTriggers.end())
                                     for (AreaTriggerEntry const* at : zones->second)
                                     {
-                                        if (at->ContinentID != self->GetMapId() || (obj.ObjectID > 0 && at->ID != uint32(obj.ObjectID)))
+                                        if (obj.ObjectID > 0 && at->ID != uint32(obj.ObjectID))
                                             continue;
-                                        float const size = at->Radius > 0.0f ? at->Radius : std::max(at->BoxLength, at->BoxWidth) * 0.5f;
-                                        if (self->GetExactDist2d(at->Pos.X, at->Pos.Y) <= size + 30.0f)
+                                        // КАК У ЯДРА (Player::IsInAreaTrigger), НО С ЗАПАСОМ 30 ЯРДОВ: карта, фаза,
+                                        // форма. Сама функция ядра не годится: мёртвому без особых флагов она
+                                        // отвечает «нет», а засчитываем мы именно в миг гибели (Кодекс, verdict46).
+                                        if (at->ContinentID != self->GetMapId() && !self->GetPhaseShift().HasVisibleMapId(at->ContinentID))
+                                            continue;
+                                        if ((at->PhaseID || at->PhaseGroupID || at->PhaseUseFlags)
+                                            && !PhasingHandler::InDbPhaseShift(self, at->PhaseUseFlags, at->PhaseID, at->PhaseGroupID))
+                                            continue;
+                                        float const margin = 30.0f;
+                                        float const dx = self->GetPositionX() - at->Pos.X;
+                                        float const dy = self->GetPositionY() - at->Pos.Y;
+                                        bool near = false;
+                                        if (at->GetShapeType() == AreaTriggerShapeType::Sphere)
+                                            near = std::sqrt(dx * dx + dy * dy) <= at->Radius + margin;
+                                        else if (at->GetShapeType() == AreaTriggerShapeType::Box)
+                                        {
+                                            // в осях коробки: поворот на -BoxYaw
+                                            float const c = std::cos(-at->BoxYaw), sn = std::sin(-at->BoxYaw);
+                                            float const lx = dx * c - dy * sn, ly = dx * sn + dy * c;
+                                            near = std::fabs(lx) <= at->BoxLength * 0.5f + margin
+                                                && std::fabs(ly) <= at->BoxWidth * 0.5f + margin;
+                                        }
+                                        // многоугольник и прочее - не засчитываем: осторожная сторона
+                                        if (near)
                                             { related = true; break; }
                                     }
                                 if (related)
