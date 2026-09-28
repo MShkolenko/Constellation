@@ -47,16 +47,22 @@ namespace
 
     // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
     // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
-    inline bool SkipPathThreat(void* user, ObjectGuid unit, uint32 entry)
+    // И ОДИНОЧКА НЕ ВЫМАНИВАЕТ В КЛЕТКЕ, ГДЕ САМ ПОГИБАЛ ТРИЖДЫ (оператор 2026-09-28, кандидат 2): лагерь
+    // бандитов убил Garrick пять раз подряд, выманивая по одному. Рядом товарищ по отряду - можно.
+    inline uint8 SkipPathThreat(void* user, ObjectGuid unit, uint32 entry, float x, float y)
     {
         Ctx* ctx = static_cast<Ctx*>(user);
         if (!ctx || !ctx->St)
-            return false;
+            return 0;
         BackoffKey key;
         key.Kind = BackoffKind::CombatUnreachable;
         key.About = Subject::OfUnit(unit);
         key.Detail = 0;
-        return Engine::Deferred(*ctx->St, key, ctx->NowMs) || ctx->Danger.KilledMeTwice(entry);
+        if (Engine::Deferred(*ctx->St, key, ctx->NowMs) || ctx->Danger.KilledMeTwice(entry))
+            return 1;
+        if (ctx->Danger.DeadlyToTravelTo(x, y) && ctx->World.SquadMatesNear(SQUAD_ASSIST_YARDS) == 0)
+            return 2;
+        return 0;
     }
 
     // ПОХОД ПО ДЕЛУ - то, во время чего маршрут ядра ведёт спутника мимо мобов.

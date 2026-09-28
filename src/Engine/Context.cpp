@@ -183,8 +183,12 @@ namespace Constellation::Ai
                 continue;                           // по этому пути до него не дотянется
             if (std::fabs(c->GetPositionZ() - nearZ) > 10.0f)
                 continue;                           // другой этаж (Кодекс: поиск был плоским)
-            if (skip && skip(skipUser, c->GetGUID(), c->GetEntry()))
+            if (uint8 const verdict = skip ? skip(skipUser, c->GetGUID(), c->GetEntry(), cx, cy) : 0)
+            {
+                if (verdict == 2 && strongOut)
+                    ++*strongOut;                   // одиночка в своей смертельной клетке - ждёт отряд
                 continue;                           // отложен движком или убивал дважды
+            }
             if (c->IsElite() || c->GetLevelForTarget(_self) > _self->GetLevel() + 2)
             {
                 if (strongOut)
@@ -232,7 +236,7 @@ namespace Constellation::Ai
             {
                 if (!a || !a->IsAlive() || !_self->IsValidAttackTarget(a))
                     continue;
-                if (skip && skip(skipUser, a->GetGUID(), a->GetEntry()))
+                if (skip && skip(skipUser, a->GetGUID(), a->GetEntry(), a->GetPositionX(), a->GetPositionY()) == 1)
                     continue;                   // отложен движком или убивал дважды (Кодекс, verdict23)
                 float const d = _self->GetExactDist(a);
                 if (d < bestD)
@@ -245,6 +249,24 @@ namespace Constellation::Ai
             }
         }
         return best ? best->GetGUID() : ObjectGuid::Empty;
+    }
+
+    uint32 WorldView::SquadMatesNear(float range) const
+    {
+        Group const* g = _self ? _self->GetGroup() : nullptr;
+        if (!g)
+            return 0;
+        uint32 n = 0;
+        for (Group::MemberSlot const& slot : g->GetMemberSlots())
+            if (Player const* m = ObjectAccessor::GetPlayer(*_self, slot.guid))
+                if (m != _self && m->IsAlive() && _self->GetExactDist2d(m) <= range)
+                    ++n;
+        return n;
+    }
+
+    ObjectGuid WorldView::SquadLeader() const
+    {
+        return _self ? SquadLeaderGuidFor(_self) : ObjectGuid::Empty;
     }
 
     void WorldView::LogSquadAssist(ObjectGuid member, ObjectGuid attacker) const

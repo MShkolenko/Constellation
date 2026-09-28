@@ -10479,6 +10479,17 @@ public:
     // ТОЧКА ЛИДЕРА ДЛЯ УЧАСТНИКА (отряд, срез 3). Читается кэш значения лидера: он идёт к ней сам
     // (`Running == TravelToObjective`), значит ответ свежий, а не память о прошлом походе.
     static constexpr float SQUAD_FOLLOW_YARDS = 150.0f;
+    ObjectGuid SquadLeaderGuid(Player const* self) const
+    {
+        Group const* g = self->GetGroup();
+        if (!Cfg().Squads || !g || !IsBotSquad(g) || g->IsLeader(self->GetGUID()))
+            return ObjectGuid::Empty;
+        Player const* lp = ObjectAccessor::FindConnectedPlayer(g->GetLeaderGUID());
+        if (!lp || !lp->IsAlive() || lp->GetMapId() != self->GetMapId())
+            return ObjectGuid::Empty;
+        return lp->GetGUID();
+    }
+
     bool SquadLeaderSpot(Player const* self, Constellation::Ai::TravelSpot* out) const
     {
         Group const* g = self->GetGroup();
@@ -12414,6 +12425,11 @@ namespace Constellation::Ai
         // Приборы — ноль: движок не печатает одноразовых строк лестницы, иначе тень съедала бы
         // ту, что собиралась напечатать работающая ветка.
         Constellation::Manager::Instance()->ScanObjectives(self, mem, danger, out, nullptr);
+    }
+
+    ObjectGuid SquadLeaderGuidFor(Player const* self)
+    {
+        return self ? Constellation::Manager::Instance()->SquadLeaderGuid(self) : ObjectGuid::Empty;
     }
 
     bool SquadLeaderSpotFor(Player const* self, Constellation::Ai::TravelSpot* out)
