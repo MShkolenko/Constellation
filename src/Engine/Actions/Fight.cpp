@@ -41,7 +41,7 @@ namespace
     inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
     inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
     inline constexpr uint32 PATH_STRONG_DEFER_MS  = 180000;   // на пути только сильные - дело ждёт три минуты
-    inline constexpr uint8  PATH_STRONG_DEFER_MAX = 2;        // и не больше двух раз подряд одно дело
+    inline constexpr uint32 PATH_STRONG_WINDOW_MS = 600000;   // и не больше двух таких отсрочек за десять минут
 
     // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
     // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
@@ -922,15 +922,17 @@ namespace
                                 // ОДИН РАЗ НА СРОК (Кодекс, verdict19): уже отложенное не откладываем
                                 // заново - иначе каждая секунда продлевала срок и писала строку, и
                                 // ожидание не кончалось никогда.
-                                // И НЕ БОЛЬШЕ ДВУХ РАЗ ПОДРЯД ОДНО ДЕЛО (Кодекс, verdict20): без других
-                                // дел отсрочка вставала заново в миг истечения, раньше самого дела, -
-                                // простой был вечным. Шесть минут ожидания, потом идём как есть.
-                                if (!(ctx.St->StrongDeferAbout == b.About))
-                                    { ctx.St->StrongDeferAbout = b.About; ctx.St->StrongDeferCount = 0; }
-                                if (!Engine::Deferred(*ctx.St, key, ctx.NowMs)
-                                    && ctx.St->StrongDeferCount < PATH_STRONG_DEFER_MAX)
+                                // НЕ БОЛЬШЕ ДВУХ ОТСРОЧЕК ЗА ДЕСЯТЬ МИНУТ, ПО ВСЕМ ДЕЛАМ (Кодекс, verdict20-21):
+                                // без других дел отсрочка вставала заново в миг истечения, а два дела
+                                // по очереди обнуляли счётчик по делу. Окно по времени ограничивает
+                                // простой шестью минутами из десяти при любом чередовании и не
+                                // привязано к делу - устаревать нечему.
+                                bool const budget = getMSTimeDiff(ctx.St->StrongDeferAtMs[0], ctx.NowMs) >= PATH_STRONG_WINDOW_MS
+                                    || ctx.St->StrongDeferAtMs[0] == 0;
+                                if (!Engine::Deferred(*ctx.St, key, ctx.NowMs) && budget)
                                 {
-                                    ++ctx.St->StrongDeferCount;
+                                    ctx.St->StrongDeferAtMs[0] = ctx.St->StrongDeferAtMs[1];
+                                    ctx.St->StrongDeferAtMs[1] = ctx.NowMs ? ctx.NowMs : 1;
                                     Defer(ctx, kind, b.About, key.Detail, PATH_STRONG_DEFER_MS);
                                     ctx.World.LogPathThreat(ObjectGuid::Empty, 0, strong, NameOf(ctx.St->Running));
                                 }
