@@ -583,6 +583,7 @@ struct Companion
     std::set<ObjectGuid> Refused;       // цели, до которых не дойти или не ударить
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
     uint32 SquadScanAtMs = 0;           // отряд (проект v1, A1): когда последний раз искали, кого позвать
+    uint32 HoldSinceMs = 0;             // консоль держит спутника на месте (выбор специализации - каст 5 с)
     uint32 SquadAwaySinceMs = 0;        // и с какого момента отстали от лидера (0 - рядом)
     // ГРУППА ОТ ЧЕЛОВЕКА (Кодекс, verdict17): признак происхождения, а не состава. Человек ушёл,
     // лидерство досталось спутнику - группа всё равно человеческая и живёт по старым правилам.
@@ -1141,6 +1142,7 @@ public:
     // ВЫБОР СПЕЦИАЛИЗАЦИИ ТЕМ ЖЕ ПАКЕТОМ, ЧТО КЛИЕНТ (инвариант 0): каст 200749 «Activating
     // Specialization» с номером в Misc[0] - ядро кладёт его в `m_misc.SpecializationId`
     // (Player.cpp:31045) и само проверяет уровень и прочее в CheckCast.
+    static constexpr uint32 SPEC_HOLD_MS = 7000;   // каст 200749 - 5000 мс, с запасом
     bool SetSpec(ChatHandler* handler, std::string const& name, uint32 specId)
     {
         Companion* c = FindByName(name);
@@ -1156,6 +1158,9 @@ public:
             p->GetMapId(), 200749, p->GetMap()->GenerateLowGuid<HighGuid::Cast>());
         cast.Cast.SpellID = 200749;
         cast.Cast.Misc[0] = int32(specId);
+        // стоим, пока идёт каст: остановка тем же пакетом, что шлёт клиент, и пауза движка
+        c->HoldSinceMs = GameTime::GetGameTimeMS() ? GameTime::GetGameTimeMS() : 1;
+        Constellation::Ai::ClientAct(p, c->Session).StopMoving();   // CMSG_MOVE_STOP, как клиент
         c->Session->HandleCastSpellOpcode(cast);
         TC_LOG_INFO("server.worldserver", "Constellation СПЕЦИАЛИЗАЦИЯ {}: запрошена {} (уровень {}, сейчас {})",
             p->GetName(), specId, p->GetLevel(), uint32(p->GetPrimarySpecialization()));
@@ -2901,7 +2906,11 @@ public:
         if (!Cfg().Engine && c.Engine.HasTicked)
             DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
 
-        if (Cfg().Engine && Constellation::Ai::Engine::Instance().Ready())
+        // ДЕРЖИМ НА МЕСТЕ ПО КОМАНДЕ КОНСОЛИ: каст 200749 длится пять секунд, и шаг движка его сбивал.
+        bool const held = c.HoldSinceMs && getMSTimeDiff(c.HoldSinceMs, GameTime::GetGameTimeMS()) < SPEC_HOLD_MS;
+        if (!held)
+            c.HoldSinceMs = 0;
+        if (Cfg().Engine && Constellation::Ai::Engine::Instance().Ready() && !held)
         {
             Constellation::Ai::WorldView view(self);
             DangerBinding bind{ &c, self };
