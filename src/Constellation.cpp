@@ -4355,7 +4355,7 @@ public:
             if (c.GatherIsGoober)
                 c.GooberDone.insert(c.GatherSpawnId);
             TC_LOG_INFO("server.worldserver",
-                "Constellation СБОР {}: обобрал {} ({}), предметов легло {}{}; всего объектов {}",
+                "Constellation СБОР {}: обобрал {} ({}), предметов взято {}{}; всего объектов {}",
                 self->GetName(), name, entry, landed,
                 c.GatherIsGoober ? "; точка отработана" : "",
                 c.Gathered);
@@ -5218,7 +5218,9 @@ public:
                 }
             }
             uint32 const slotsUsedUp = spaceBefore > spaceAfter ? spaceBefore - spaceAfter : 0;
-            got = landed;
+            // ВЗЯТО - ЭТО И СУМКА, И ЗАЧЁТ В ЗАДАНИЕ: сбор судит заход по этому числу, и засчитанная
+            // мимо сумки вязанка считалась холостым заходом (Deverel, 28.09: пять походов - пять зачётов)
+            got = landed + credited;
             n.Items += landed;
             // НЕДОСТАЧА, ЦЕЛИКОМ ОБЪЯСНЁННАЯ КВЕСТОВЫМИ ПРЕДМЕТАМИ, - НЕ ОТКАЗ: ядро их засчитало
             // в задание и не создавало. Ночь 16.09 назвала «отказом ядра» 263 таких предмета
