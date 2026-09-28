@@ -1289,11 +1289,22 @@ public:
             return true;
         }
         Unit* target = p->GetVictim() ? p->GetVictim() : p;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        bool const knows = p->HasSpell(spellId);
+        bool const gcdBefore = info && p->GetSpellHistory()->HasGlobalCooldown(info);
+        bool const cdBefore = p->GetSpellHistory()->HasCooldown(spellId);
         bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
+        // ПРИНЯЛО ЛИ ЯДРО: идёт каст, начался ГКД или откат - значит взяло; иначе отказ
+        Spell const* current = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        bool const taken = sent && ((current && current->GetSpellInfo()->Id == spellId)
+            || (info && !gcdBefore && p->GetSpellHistory()->HasGlobalCooldown(info))
+            || (!cdBefore && p->GetSpellHistory()->HasCooldown(spellId)));
+        char const* outcome = !sent ? "не отправлен" : taken ? "принят" : !knows ? "отклонён: не знает"
+            : gcdBefore ? "отклонён: ГКД" : cdBefore ? "отклонён: откат" : "отклонён";
         TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-КАСТ {}: {} по {} ({}) - {}", p->GetName(), spellId,
-            target->GetName(), target->GetEntry(), sent ? "отправлен" : "не отправлен");
+            target->GetName(), target->GetEntry(), outcome);
         handler->PSendSysMessage("Constellation: %s кастует %u по %s - %s", p->GetName().c_str(), spellId,
-            target->GetName().c_str(), sent ? "отправлен" : "не отправлен");
+            target->GetName().c_str(), outcome);
         return true;
     }
 
