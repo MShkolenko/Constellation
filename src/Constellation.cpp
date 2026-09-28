@@ -1449,6 +1449,9 @@ public:
         // падения тогда быть не может, ядро начисляет его от 14.57.
         if (self->GetPositionZ() - land.GetPositionZ() > 3.0f)
             return false;
+        // И НЕ В ЛАВУ: проверяем настоящую точку посадки, с высотой, которую дало ядро (Кодекс, verdict36)
+        if (BurnsAt(self, land.GetPositionX(), land.GetPositionY(), land.GetPositionZ()))
+            return false;
 
         MovementInfo up;
         up.guid = self->GetGUID();
@@ -1525,11 +1528,8 @@ public:
         // пополнялся в Switch(), а спутник может колебаться «иду за хозяином -> стою ->
         // иду за хозяином» бесконечно и прыгать вечно (Кодекс). Поэтому истраченный
         // запас закрывает прыжки на минуту, и смена намерения этого не обходит.
-        // НЕ В ЛАВУ (Кодекс, verdict35): прыжок идёт на пару ярдов к цели, отступ - на шесть вбок
-        float const jumpAng = self->GetAbsoluteAngle(tx, ty);
-        bool const jumpHot = BurnsAt(self, self->GetPositionX() + 2.0f * std::cos(jumpAng),
-            self->GetPositionY() + 2.0f * std::sin(jumpAng), self->GetPositionZ());
-        if (m.JumpsLeft && !jumpHot && JumpCore(m, self, send, user, tx, ty))
+        // НЕ В ЛАВУ (Кодекс, verdict35-36): посадку прыжка проверяет сам JumpCore, отступ - ниже
+        if (m.JumpsLeft && JumpCore(m, self, send, user, tx, ty))
         {
             // ОКНО ОТКРЫВАЕТ ПЕРВЫЙ ПРЫЖОК, а не третий. Прежде запас пополнялся в
             // Switch() при каждой смене намерения, и спутник, тративший по одному-два
