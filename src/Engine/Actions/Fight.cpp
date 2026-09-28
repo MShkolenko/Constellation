@@ -41,6 +41,7 @@ namespace
     inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
     inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
     inline constexpr uint32 PATH_STRONG_DEFER_MS  = 180000;   // на пути только сильные - дело ждёт три минуты
+    inline constexpr uint8  PATH_STRONG_DEFER_MAX = 2;        // и не больше двух раз подряд одно дело
 
     // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
     // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
@@ -921,8 +922,15 @@ namespace
                                 // ОДИН РАЗ НА СРОК (Кодекс, verdict19): уже отложенное не откладываем
                                 // заново - иначе каждая секунда продлевала срок и писала строку, и
                                 // ожидание не кончалось никогда.
-                                if (!Engine::Deferred(*ctx.St, key, ctx.NowMs))
+                                // И НЕ БОЛЬШЕ ДВУХ РАЗ ПОДРЯД ОДНО ДЕЛО (Кодекс, verdict20): без других
+                                // дел отсрочка вставала заново в миг истечения, раньше самого дела, -
+                                // простой был вечным. Шесть минут ожидания, потом идём как есть.
+                                if (!(ctx.St->StrongDeferAbout == b.About))
+                                    { ctx.St->StrongDeferAbout = b.About; ctx.St->StrongDeferCount = 0; }
+                                if (!Engine::Deferred(*ctx.St, key, ctx.NowMs)
+                                    && ctx.St->StrongDeferCount < PATH_STRONG_DEFER_MAX)
                                 {
+                                    ++ctx.St->StrongDeferCount;
                                     Defer(ctx, kind, b.About, key.Detail, PATH_STRONG_DEFER_MS);
                                     ctx.World.LogPathThreat(ObjectGuid::Empty, 0, strong, NameOf(ctx.St->Running));
                                 }

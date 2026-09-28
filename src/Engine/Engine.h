@@ -234,6 +234,9 @@ namespace Constellation::Ai
         // секунду, а не каждый такт; `KillObjective::Useful` принимает эту цель как законную.
         ObjectGuid PathThreat;
         uint32     PathThreatAtMs = 0;
+        // Какое дело откладывали из-за сильных на пути и сколько раз подряд (предел - в Fight.cpp).
+        Subject    StrongDeferAbout;
+        uint8      StrongDeferCount = 0;
 
         // ОТДЫХ — РЕШЕНИЕ, КОТОРОЕ ПЕРЕЖИВАЕТ `Reset`, как и бой. Гистерезис отдыха («ушёл ниже
         // одного порога, вернусь выше другого») держался на `Running == Rest`, а `Reset` на смене
