@@ -5346,10 +5346,22 @@ public:
             // дружественность спрашиваем у ядра: флаг positive у границ означает именно её,
             // а не «цель — это я» (Кодекс). Ресурса нет — пишем «нет», а не ноль процентов.
             bool const friendly = self->IsFriendlyTo(castTarget);
+            // ПРИЧИНУ ГОВОРИТ ЯДРО, А НЕ МЫ: та же проба, что у кузни и у `HandleAcceptTrade` -
+            // `Spell` с целью, `CheckCast(true)`, удалить. Её код - ответ на вопрос, который
+            // SMSG_CAST_FAILED задал бы клиенту. 0 = ядро сейчас разрешило бы (отказ был мгновенным
+            // и прошёл, или состояние сменилось между отправкой и пробой).
+            uint32 coreSays = 0;
+            {
+                Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+                ask->m_targets.SetUnitTarget(castTarget);
+                coreSays = uint32(ask->CheckCast(true));
+                delete ask;
+            }
             TC_LOG_INFO("server.worldserver",
-                "Constellation КАСТ {} (класс {}): {} ({}) без следа — дистанция {:.1f}, "
+                "Constellation КАСТ {} (класс {}): {} ({}) без следа — ядро: код {}, дистанция {:.1f}, "
                 "объявленные границы {:.1f}..{:.1f}, объявленное чтение {} мс, в движении {}, сила {}",
                 self->GetName(), uint32(self->GetClass()), si->SpellName->Str[LOCALE_enUS], spellId,
+                coreSays == uint32(SPELL_CAST_OK) ? 0u : coreSays,
                 self->GetExactDist(castTarget), si->GetMinRange(friendly),
                 si->GetMaxRange(friendly), si->CalcCastTime(),
                 self->isMoving() ? 1 : 0,
