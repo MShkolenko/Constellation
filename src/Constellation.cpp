@@ -11427,7 +11427,12 @@ private:
             Constellation::Ai::ClientAct act(self, c.Session);
             // `Reset` зовёт `Cancel`, а бой вправе доложить «кончил» — живому спутнику по-настоящему.
             Constellation::Ai::FightView fightView(&BlowsSnapshotFor, &BlowsBaselineFor, &FightOutcomeFor, &fightBind);
-            Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS() };
+            // С СОСТОЯНИЕМ, КАК В ТАКТЕ (`:2843`). Без `&c.Engine` здесь `ctx.St` пуст, и `Cancel`
+            // действий, читающих его, молча выходил: смерть НЕ гасила бой. После подъёма стратегия
+            // ставила «вступивший бой» из состояния ценой REL_HIGH мимо памяти опасности, и спутник
+            // шёл обратно к убийце - чистое окно 28.09 02:27: Deverel шесть гибелей подряд от
+            // Rockjaw Bonesnapper в одной точке, строки исхода «погиб» - ноль.
+            Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS(), &c.Engine };
             Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
         }
         // КОНЕЦ ЖИЗНИ РАБОТЫ ОТПУСКАЕТ ОБА СЛОТА, И НЕ ЧЕРЕЗ `Cancel`. Этот `Ctx` собран без
