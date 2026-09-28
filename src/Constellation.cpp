@@ -2893,8 +2893,15 @@ public:
                     }
                 }
                 else if (killer)
-                    TC_LOG_INFO("server.worldserver", "Constellation ГИБЕЛЬ-КВЕСТ {}: квеста похода нет (убийца {})",
-                        self->GetName(), killer);
+                {
+                    // нет квеста похода - или он есть, но уже не в работе (выполнен, сдан) - Кодекс, verdict40
+                    if (!travelQuest)
+                        TC_LOG_INFO("server.worldserver", "Constellation ГИБЕЛЬ-КВЕСТ {}: квеста похода нет (убийца {})",
+                            self->GetName(), killer);
+                    else
+                        TC_LOG_INFO("server.worldserver", "Constellation ГИБЕЛЬ-КВЕСТ {}: квест похода {} уже не в работе (статус {}, убийца {})",
+                            self->GetName(), travelQuest, uint32(self->GetQuestStatus(travelQuest)), killer);
+                }
                 // НОВАЯ СМЕРТЬ — ЧИСТОЕ СОСТОЯНИЕ ПОДХОДА К ЦЕЛИТЕЛЬНИЦЕ (Кодекс): сбрасывать
                 // в момент самого перехода, а не по косвенным признакам в ветке воскрешения.
                 c.RingHeld = false;
