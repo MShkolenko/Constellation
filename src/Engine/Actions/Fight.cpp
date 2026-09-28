@@ -914,8 +914,18 @@ namespace
                                 Bid b;
                                 b.Action = ctx.St->Running;
                                 b.About = ctx.St->RunningAbout;
-                                Defer(ctx, kind, b.About, errand->DeferDetail(b), PATH_STRONG_DEFER_MS);
-                                ctx.World.LogPathThreat(ObjectGuid::Empty, 0, strong, NameOf(ctx.St->Running));
+                                BackoffKey key;
+                                key.Kind = kind;
+                                key.About = b.About;
+                                key.Detail = errand->DeferDetail(b);
+                                // ОДИН РАЗ НА СРОК (Кодекс, verdict19): уже отложенное не откладываем
+                                // заново - иначе каждая секунда продлевала срок и писала строку, и
+                                // ожидание не кончалось никогда.
+                                if (!Engine::Deferred(*ctx.St, key, ctx.NowMs))
+                                {
+                                    Defer(ctx, kind, b.About, key.Detail, PATH_STRONG_DEFER_MS);
+                                    ctx.World.LogPathThreat(ObjectGuid::Empty, 0, strong, NameOf(ctx.St->Running));
+                                }
                             }
                 }
                 if (!ctx.St->PathThreat.IsEmpty())
