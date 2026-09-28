@@ -813,6 +813,7 @@ namespace Constellation::Ai
         // ПРИНИМАЮЩЕМУ их же текущего квеста и брали там ноль.
         void ForEachQuestGiverInRange(float range, GiverSightVisitor visit, void* user) const;
         bool OffersByMenu(uint32 entry, QuestRefusedFn refused, void const* user) const;   // правило меню
+        bool SquadLeaderSpot(TravelSpot* out) const;                                       // отряд, срез 3
 
         // Указатель карты, построенный ОДИН раз при загрузке (`Manager::_givers`,
         // Constellation.cpp:7786-7797). Сетку не трогает вовсе — это чтение таблицы, и именно
@@ -1064,6 +1065,9 @@ namespace Constellation::Ai
     // ПРАВИЛО МЕНЮ, А НЕ ЗНАКА: есть ли у существа квест, который меню ядра действительно
     // предложит (`Manager::TakeableQuestAt`). 0 - меню будет пустым.
     uint32 TakeableQuestAtFor(Player const* self, uint32 entry, QuestRefusedFn refused, void const* user);
+    // ТОЧКА ПОХОДА ЛИДЕРА ОТРЯДА (срез 3): true и `out`, если лидер - спутник на этой карте рядом,
+    // сам идёт к цели задания, и квест этой точки открыт и у меня.
+    bool SquadLeaderSpotFor(Player const* self, TravelSpot* out);
 
     // ОТДЫХ: два предиката лестницы целиком, а не их пересказ. Пороги живут в её настройке,
     // и вторая копия правила разошлась бы с первой на первом же изменении конфига.

@@ -10425,6 +10425,34 @@ public:
         }
     }
 
+    // ТОЧКА ЛИДЕРА ДЛЯ УЧАСТНИКА (отряд, срез 3). Читается кэш значения лидера: он идёт к ней сам
+    // (`Running == TravelToObjective`), значит ответ свежий, а не память о прошлом походе.
+    static constexpr float SQUAD_FOLLOW_YARDS = 150.0f;
+    bool SquadLeaderSpot(Player const* self, Constellation::Ai::TravelSpot* out) const
+    {
+        Group const* g = self->GetGroup();
+        if (!g || !IsBotSquad(g) || g->IsLeader(self->GetGUID()))
+            return false;
+        ObjectGuid const lead = g->GetLeaderGUID();
+        for (Companion const& o : _companions)
+        {
+            if (o.Guid != lead || o.State != Stage::InWorld || !o.Session)
+                continue;
+            Player const* lp = o.Session->GetPlayer();
+            if (!lp || lp->GetMapId() != self->GetMapId() || lp->GetExactDist2d(self) > SQUAD_FOLLOW_YARDS)
+                return false;
+            if (o.Engine.Running != Constellation::Ai::ActionId::TravelToObjective)
+                return false;
+            Constellation::Ai::TravelSpot const& s = o.Engine.Values.ObjectiveSpot.Buffer;
+            if (!s.Worth || s.MapId != self->GetMapId()
+                || self->GetQuestStatus(s.QuestId) != QUEST_STATUS_INCOMPLETE)
+                return false;
+            *out = s;
+            return true;
+        }
+        return false;
+    }
+
     bool IsCompanionAccount(uint32 accountId) const
     {
         for (Companion const& c : _companions)
@@ -12331,6 +12359,11 @@ namespace Constellation::Ai
         // Приборы — ноль: движок не печатает одноразовых строк лестницы, иначе тень съедала бы
         // ту, что собиралась напечатать работающая ветка.
         Constellation::Manager::Instance()->ScanObjectives(self, mem, danger, out, nullptr);
+    }
+
+    bool SquadLeaderSpotFor(Player const* self, Constellation::Ai::TravelSpot* out)
+    {
+        return self && out && Constellation::Manager::Instance()->SquadLeaderSpot(self, out);
     }
 
     uint32 TakeableQuestAtFor(Player const* self, uint32 entry, QuestRefusedFn refused, void const* user)

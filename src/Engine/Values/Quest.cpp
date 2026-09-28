@@ -169,6 +169,16 @@ namespace
             mem.User      = &ctx;
             // Приборы («квест стоил гибелей», «место смертельно») не ставятся: те же две строки
             // на того же спутника уже печатает лестница — см. довод у `GiverToSeek`.
+            // ОДНА ЦЕЛЬ НА ОТРЯД (решение оператора 2026-09-28, проект отрядов v1, срез 3; эталон
+            // `ChooseTravelTargetAction.cpp:383`, «Following group»): участник идёт туда, куда идёт
+            // лидер, если квест этой точки открыт и у него и не отложен его же памятью. Иначе - своя.
+            if (ctx.World.SquadLeaderSpot(&out) && out.Worth
+                && !QuestTravelBackedOffByEngine(&ctx, out.QuestId))
+            {
+                out.MapId = ctx.World.MapId();
+                return;
+            }
+            out = TravelSpot();
             ctx.World.ObjectiveSpotToWalkTo(ctx.Danger, mem, &out);
             out.MapId = ctx.World.MapId();
         }

@@ -462,6 +462,11 @@ namespace Constellation::Ai
         }
     }
 
+    bool WorldView::SquadLeaderSpot(TravelSpot* out) const
+    {
+        return _self && out && SquadLeaderSpotFor(_self, out);
+    }
+
     bool WorldView::OffersByMenu(uint32 entry, QuestRefusedFn refused, void const* user) const
     {
         return _self && TakeableQuestAtFor(_self, entry, refused, user) != 0;
