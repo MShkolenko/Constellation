@@ -1507,6 +1507,14 @@ public:
     // GetFirstCollisionPosition: луч УПИРАЕТСЯ в стену, а не проходит её. Точка вбок
     // становится обычной путевой точкой, к ней идём бегом теми же пакетами. Ни одной
     // прорехи в нулевом инварианте и ни одного прохода сквозь текстуры.
+    // ЛАВА ИЛИ СЛИЗЬ В ТОЧКЕ: жидкость этих видов, и мы в ней или под ней
+    static bool BurnsAt(Player const* self, float x, float y, float z)
+    {
+        ZLiquidStatus const st = self->GetMap()->GetLiquidStatus(self->GetPhaseShift(), x, y, z,
+            map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime);
+        return (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
+    }
+
     bool UnstickCore(Constellation::Ai::MoveState& m, Player* self,
                      Constellation::Ai::MoveSendFn send, void* user, float tx, float ty)
     {
@@ -1517,7 +1525,11 @@ public:
         // пополнялся в Switch(), а спутник может колебаться «иду за хозяином -> стою ->
         // иду за хозяином» бесконечно и прыгать вечно (Кодекс). Поэтому истраченный
         // запас закрывает прыжки на минуту, и смена намерения этого не обходит.
-        if (m.JumpsLeft && JumpCore(m, self, send, user, tx, ty))
+        // НЕ В ЛАВУ (Кодекс, verdict35): прыжок идёт на пару ярдов к цели, отступ - на шесть вбок
+        float const jumpAng = self->GetAbsoluteAngle(tx, ty);
+        bool const jumpHot = BurnsAt(self, self->GetPositionX() + 2.0f * std::cos(jumpAng),
+            self->GetPositionY() + 2.0f * std::sin(jumpAng), self->GetPositionZ());
+        if (m.JumpsLeft && !jumpHot && JumpCore(m, self, send, user, tx, ty))
         {
             // ОКНО ОТКРЫВАЕТ ПЕРВЫЙ ПРЫЖОК, а не третий. Прежде запас пополнялся в
             // Switch() при каждой смене намерения, и спутник, тративший по одному-два
@@ -1541,8 +1553,9 @@ public:
         m.UnstickLeft = !m.UnstickLeft;     // попеременно, чтобы не тереться об угол
 
         Position hop = self->GetFirstCollisionPosition(6.0f, side - self->GetOrientation());
-        if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f)
-            return true;                    // и вбок стена — на следующем такте другая сторона
+        if (self->GetExactDist2d(hop.GetPositionX(), hop.GetPositionY()) < 1.5f
+            || BurnsAt(self, hop.GetPositionX(), hop.GetPositionY(), hop.GetPositionZ()))
+            return true;                    // вбок стена или лава — на следующем такте другая сторона
 
         m.Waypoints.clear();
         m.Waypoints.push_back(hop);
@@ -1852,42 +1865,44 @@ public:
             // (PathGenerator::CreateFilter, «just stay 'safe'»), а сузить его снаружи нельзя,
             // поэтому построенный путь проверяем сами: точки через 4 ярда, жидкость у земли.
             // Кто уже стоит в лаве, того выпускаем - иначе он не выйдет никогда.
+            // Стоящему в лаве прощаются только НАЧАЛЬНЫЕ горящие точки - до первой сухой; дальше
+            // лава снова отказ (Кодекс, verdict35). Отказ - это «застрял» с паузой, а не лестница
+            // прыжков и отступов: её прыжок к цели сам завёл бы в лаву.
             if (built && pts && pts->size() >= 2)
             {
-                Map* const map = self->GetMap();
-                auto burns = [&](float x, float y, float z) -> bool
+                bool leading = BurnsAt(self, self->GetPositionX(), self->GetPositionY(), self->GetPositionZ());
+                bool lava = false;
+                for (size_t i = 1; i < pts->size() && !lava; ++i)
                 {
-                    ZLiquidStatus const st = map->GetLiquidStatus(self->GetPhaseShift(), x, y, z,
-                        map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime);
-                    return (st & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER)) != 0;
-                };
-                if (!burns(self->GetPositionX(), self->GetPositionY(), self->GetPositionZ()))
+                    G3D::Vector3 const& a = (*pts)[i - 1];
+                    G3D::Vector3 const& b = (*pts)[i];
+                    float const len = (b - a).length();
+                    uint32 const steps = std::max(1u, uint32(std::ceil(len / 4.0f)));   // вверх: ни один отрезок не длиннее 4 ярдов
+                    for (uint32 k = 1; k <= steps && !lava; ++k)
+                    {
+                        G3D::Vector3 const p = a + (b - a) * (float(k) / float(steps));
+                        bool const hot = BurnsAt(self, p.x, p.y, p.z);
+                        if (!hot)
+                            leading = false;
+                        else if (!leading)
+                            lava = true;
+                    }
+                }
+                if (lava)
                 {
-                    bool lava = false;
-                    for (size_t i = 1; i < pts->size() && !lava; ++i)
+                    ++_lavaPaths;
+                    if (_lavaPathsLogged < 20)
                     {
-                        G3D::Vector3 const& a = (*pts)[i - 1];
-                        G3D::Vector3 const& b = (*pts)[i];
-                        float const len = (b - a).length();
-                        uint32 const steps = std::max(1u, uint32(len / 4.0f));
-                        for (uint32 k = 1; k <= steps && !lava; ++k)
-                        {
-                            G3D::Vector3 const p = a + (b - a) * (float(k) / float(steps));
-                            lava = burns(p.x, p.y, p.z);
-                        }
+                        ++_lavaPathsLogged;
+                        TC_LOG_INFO("server.worldserver",
+                            "Constellation STEP {}: путь к {:.0f} {:.0f} идёт через лаву или слизь - не иду (таких путей {})",
+                            self->GetName(), tx, ty, _lavaPaths);
                     }
-                    if (lava)
-                    {
-                        built = false;
-                        ++_lavaPaths;
-                        if (_lavaPathsLogged < 20)
-                        {
-                            ++_lavaPathsLogged;
-                            TC_LOG_INFO("server.worldserver",
-                                "Constellation STEP {}: путь к {:.0f} {:.0f} идёт через лаву или слизь - не иду (таких путей {})",
-                                self->GetName(), tx, ty, _lavaPaths);
-                        }
-                    }
+                    m.Waypoints.clear();
+                    m.NoPathMs = 24000;
+                    m.Stalled = true;
+                    StopMovingCore(m, self, send, user);
+                    return false;
                 }
             }
             if (!built)
