@@ -4835,7 +4835,12 @@ public:
                 // признак строки добычи «предмет квестовый» (`QuestRequired`), а не «мой квест его
                 // ждёт»: окно 28.09 04:45 - Rowena и Garrick, давно сдавшие квест 60, раз за разом
                 // просили свечу 772, ядро её не отдавало, строка писала недостачу.
-                bool const forQuest = self->HasQuestForItem(item.itemid);
+                // Три случая ядра (`Loot.cpp:149`, Кодекс 28.09): предмет нужен моему заданию; предмет с
+                // `ITEM_FLAGS_CU_IGNORE_QUEST_STATUS`, который ядро отдаёт мимо проверки; предмет,
+                // начинающий задание, которого у меня ещё не было.
+                bool const forQuest = self->HasQuestForItem(item.itemid)
+                    || (item.needs_quest && tpl->HasFlag(ITEM_FLAGS_CU_IGNORE_QUEST_STATUS))
+                    || (tpl->GetStartQuest() && self->GetQuestStatus(tpl->GetStartQuest()) == QUEST_STATUS_NONE);
                 bool const junk = tpl->GetQuality() == ITEM_QUALITY_POOR;
 
                 // СЫРАЯ ЗАПИСЬ: что лежало и почему не взяли. Без неё «предметов 0»
