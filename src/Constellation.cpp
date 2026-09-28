@@ -1293,7 +1293,7 @@ public:
         Unit* target = p->GetVictim();
         if (!target)
             target = ObjectAccessor::GetUnit(*p, c->Engine.Fight.Victim);
-        if (!target || !target->IsAlive())
+        if (!target || !target->IsAlive() || !p->CanSeeOrDetect(target))   // и видим ему (фаза) - Кодекс, verdict49
             target = p;
         SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
         bool const knows = p->HasSpell(spellId);
