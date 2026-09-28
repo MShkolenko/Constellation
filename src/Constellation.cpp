@@ -87,6 +87,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
+#include "TraitPackets.h"
 #include "AreaTriggerPackets.h"
 #include "Player.h"
 #include "RBAC.h"
@@ -133,6 +134,7 @@ struct Settings
     bool  TakeQuests      = true;       // БРАТЬ квесты; сдавать разрешает Quests
     bool  PathClear       = true;       // зачистка пути (проект отрядов v1, часть B)
     bool  Squads          = true;       // отряды спутников по общей цели (часть A1)
+    bool  Talents         = true;       // спек с 10-го уровня и стартовая сборка талантов клиента
     bool  Fight           = true;
     bool  Abilities       = false;      // произносить умения, а не только выбирать
     bool  Loot            = false;      // подбирать добычу с собственных убийств
@@ -195,6 +197,7 @@ struct Settings
         // не сняла; если суд повторится, её гасит `.reload config`, а не откат и пересборка.
         PathClear       = sConfigMgr->GetBoolDefault("Constellation.PathClear", true);
         Squads          = sConfigMgr->GetBoolDefault("Constellation.Squads", true);
+        Talents         = sConfigMgr->GetBoolDefault("Constellation.Talents", true);
         Fight           = sConfigMgr->GetBoolDefault("Constellation.Fight", true);
         // УМЕНИЯ ПО УМОЛЧАНИЮ ТОЛЬКО ВЫБИРАЮТСЯ, НО НЕ ПРОИЗНОСЯТСЯ.
         // Второй читатель трижды показал, что безопасность выбора нельзя доказать
@@ -584,6 +587,10 @@ struct Companion
     bool OwnerFromGroup = false;        // хозяин держится на ГРУППЕ, а не на памяти
     uint32 SquadScanAtMs = 0;           // отряд (проект v1, A1): когда последний раз искали, кого позвать
     uint32 HoldSinceMs = 0;             // консоль держит спутника на месте (выбор специализации - каст 5 с)
+    uint32 TalentCheckAtMs = 0;         // таланты: когда последний раз смотрели
+    uint32 TalentLevel = 0;             // на каком уровне и для какого спека стартовая сборка включена
+    uint32 TalentSpec = 0;
+    bool TalentReported = true;         // итог включения записан в журнал
     uint32 SquadAwaySinceMs = 0;        // и с какого момента отстали от лидера (0 - рядом)
     // ГРУППА ОТ ЧЕЛОВЕКА (Кодекс, verdict17): признак происхождения, а не состава. Человек ушёл,
     // лидерство досталось спутнику - группа всё равно человеческая и живёт по старым правилам.
@@ -1152,6 +1159,13 @@ public:
             handler->PSendSysMessage("Constellation: спутника %s в мире нет", name.c_str());
             return true;
         }
+        RequestSpec(*c, p, specId);
+        handler->PSendSysMessage("Constellation: %s просит специализацию %u", p->GetName().c_str(), specId);
+        return true;
+    }
+
+    void RequestSpec(Companion& c, Player* p, uint32 specId)
+    {
         WorldPacket raw(CMSG_CAST_SPELL);
         WorldPackets::Spells::CastSpell cast(std::move(raw));
         cast.Cast.CastID = ObjectGuid::Create<HighGuid::Cast>(SPELL_CAST_SOURCE_NORMAL,
@@ -1159,13 +1173,75 @@ public:
         cast.Cast.SpellID = 200749;
         cast.Cast.Misc[0] = int32(specId);
         // стоим, пока идёт каст: остановка тем же пакетом, что шлёт клиент, и пауза движка
-        c->HoldSinceMs = GameTime::GetGameTimeMS() ? GameTime::GetGameTimeMS() : 1;
-        Constellation::Ai::ClientAct(p, c->Session).StopMoving();   // CMSG_MOVE_STOP, как клиент
-        c->Session->HandleCastSpellOpcode(cast);
+        c.HoldSinceMs = GameTime::GetGameTimeMS() ? GameTime::GetGameTimeMS() : 1;
+        Constellation::Ai::ClientAct(p, c.Session).StopMoving();   // CMSG_MOVE_STOP, как клиент
+        c.Session->HandleCastSpellOpcode(cast);
         TC_LOG_INFO("server.worldserver", "Constellation СПЕЦИАЛИЗАЦИЯ {}: запрошена {} (уровень {}, сейчас {})",
             p->GetName(), specId, p->GetLevel(), uint32(p->GetPrimarySpecialization()));
-        handler->PSendSysMessage("Constellation: %s просит специализацию %u", p->GetName().c_str(), specId);
-        return true;
+    }
+
+    // ТАЛАНТЫ - СТАРТОВАЯ СБОРКА КЛИЕНТА (оператор 2026-09-28: «сделай заготовки для всех классов в
+    // каждой ветке»). Заготовки уже есть в клиенте: TraitTreeLoadout, по одной на каждый из 39 спеков
+    // 11.2.7, и ядро их грузит (TraitMgr::InitializeStarterBuildTraitConfig). Спутник включает её
+    // тем же пакетом, что кнопка «Стартовая сборка» (инвариант 0), и повторяет на каждом новом
+    // уровне: сборка берёт столько узлов, сколько есть очков, а доращивать её ядро само не станет.
+    // Без спека талантов нет, поэтому с 10-го уровня спек выбирается: первый урон класса по порядку
+    // клиента (у паладина Возмездие, у монаха Танцующий с ветром).
+    void KeepTalents(Companion& c, Player* self)
+    {
+        uint32 const now = GameTime::GetGameTimeMS();
+        if (c.TalentCheckAtMs && getMSTimeDiff(c.TalentCheckAtMs, now) < 10000)
+            return;
+        c.TalentCheckAtMs = now ? now : 1;
+        if (!self->IsAlive() || self->IsInCombat() || self->IsNonMeleeSpellCast(false) || self->GetLevel() < 10)
+            return;
+        ChrSpecializationEntry const* spec = self->GetPrimarySpecializationEntry();
+        if (!spec || spec->OrderIndex >= INITIAL_SPECIALIZATION_INDEX)
+        {
+            for (uint32 i = 0; i < INITIAL_SPECIALIZATION_INDEX; ++i)
+                if (ChrSpecializationEntry const* s = sDB2Manager.GetChrSpecializationByIndex(self->GetClass(), i))
+                    if (s->GetRole() == ChrSpecializationRole::Dps)
+                    {
+                        RequestSpec(c, self, s->ID);
+                        return;
+                    }
+            return;
+        }
+        int32 const configId = self->m_activePlayerData->ActiveCombatTraitConfigID;
+        UF::TraitConfig const* config = self->GetTraitConfig(configId);
+        if (!config)
+            return;
+        if (c.TalentLevel == self->GetLevel() && c.TalentSpec == spec->ID)
+        {
+            if (!c.TalentReported)
+            {
+                c.TalentReported = true;
+                uint32 nodes = 0, ranks = 0;
+                for (UF::TraitEntry const& e : config->Entries)
+                    if (e.Rank > 0)
+                    {
+                        ++nodes;
+                        ranks += e.Rank;
+                    }
+                TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: спек {} ур {} - узлов {}, рангов {}, стартовая {}",
+                    self->GetName(), spec->ID, self->GetLevel(), nodes, ranks,
+                    (*config->CombatConfigFlags & AsUnderlyingType(TraitCombatConfigFlags::StarterBuild)) ? "да" : "нет");
+            }
+            return;
+        }
+        WorldPacket raw(CMSG_CLASS_TALENTS_SET_STARTER_BUILD_ACTIVE);
+        WorldPackets::Traits::ClassTalentsSetStarterBuildActive starter(std::move(raw));
+        starter.ConfigID = configId;
+        starter.Active = true;
+        // смена талантов - каст 384255 со временем: стоим, как при выборе спека
+        c.HoldSinceMs = now ? now : 1;
+        Constellation::Ai::ClientAct(self, c.Session).StopMoving();
+        c.Session->HandleClassTalentsSetStarterBuildActive(starter);
+        c.TalentLevel = self->GetLevel();
+        c.TalentSpec = spec->ID;
+        c.TalentReported = false;
+        TC_LOG_INFO("server.worldserver", "Constellation ТАЛАНТЫ {}: включаю стартовую сборку спека {} на ур {} (конфиг {})",
+            self->GetName(), spec->ID, self->GetLevel(), configId);
     }
 
     bool CastFor(ChatHandler* handler, std::string const& name, uint32 spellId)
@@ -2942,6 +3018,8 @@ public:
             DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
 
         // ДЕРЖИМ НА МЕСТЕ ПО КОМАНДЕ КОНСОЛИ: каст 200749 длится пять секунд, и шаг движка его сбивал.
+        if (Cfg().Talents && !c.HoldSinceMs)
+            KeepTalents(c, self);
         bool const held = c.HoldSinceMs && getMSTimeDiff(c.HoldSinceMs, GameTime::GetGameTimeMS()) < SPEC_HOLD_MS;
         if (!held)
             c.HoldSinceMs = 0;

@@ -88,3 +88,16 @@ Constellation.PathClear = 1
 #
 
 Constellation.Squads = 1
+
+#
+#    Constellation.Talents
+#        Description: Talents. From level 10 a companion without a specialization
+#                     picks the first damage spec of its class, then switches on
+#                     the client's Starter Build for that spec (the client packet
+#                     of the Starter Build button) and renews it at every new
+#                     level. Off leaves specs and talents as they are.
+#                     Read at .reload config.
+#        Default:     1
+#
+
+Constellation.Talents = 1
