@@ -1168,6 +1168,24 @@ public:
         return true;
     }
 
+    bool CastFor(ChatHandler* handler, std::string const& name, uint32 spellId)
+    {
+        Companion* c = FindByName(name);
+        Player* p = c && c->Session ? c->Session->GetPlayer() : nullptr;
+        if (!p)
+        {
+            handler->PSendSysMessage("Constellation: спутника %s в мире нет", name.c_str());
+            return true;
+        }
+        Unit* target = p->GetVictim() ? p->GetVictim() : p;
+        bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
+        TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-КАСТ {}: {} по {} ({}) - {}", p->GetName(), spellId,
+            target->GetName(), target->GetEntry(), sent ? "отправлен" : "не отправлен");
+        handler->PSendSysMessage("Constellation: %s кастует %u по %s - %s", p->GetName().c_str(), spellId,
+            target->GetName().c_str(), sent ? "отправлен" : "не отправлен");
+        return true;
+    }
+
     bool ListAuras(ChatHandler* handler, std::string const& name)
     {
         Companion* c = FindByName(name);
@@ -12682,6 +12700,7 @@ public:
             { "spell",   HandleSpell,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "spec",    HandleSpec,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "auras",   HandleAuras,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "cast",    HandleCast,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "itemsrc", HandleItemSrc, rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "trig",    HandleTrig,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "path",    HandlePath,    rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -12754,6 +12773,12 @@ public:
     static bool HandleSpec(ChatHandler* handler, std::string name, uint32 specId)
     {
         return Constellation::Manager::Instance()->SetSpec(handler, name, specId);
+    }
+
+    // .constellation cast <имя> <заклинание> — каст по текущей жертве спутника пакетом клиента
+    static bool HandleCast(ChatHandler* handler, std::string name, uint32 spellId)
+    {
+        return Constellation::Manager::Instance()->CastFor(handler, name, spellId);
     }
 
     // .constellation auras <имя> — ауры спутника со стопками (проверка сосулек)
