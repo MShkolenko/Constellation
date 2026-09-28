@@ -1299,7 +1299,7 @@ public:
         // в очередь - только когда есть чего ждать: без ГКД и каста запрос исполняется сразу
         // (Кодекс, verdict29), и его отказ «очередью» не назовёшь
         bool const queueable = info && p->CanRequestSpellCast(info, p)
-            && (gcdBefore || genericBefore);            // канал очереди не держит (Кодекс, verdict30)
+            && (gcdBefore || p->HasUnitState(UNIT_STATE_CASTING));   // как ядро: ГКД или идущий каст (Кодекс, 30-31)
         bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
         // ПРИНЯЛО ЛИ ЯДРО (Кодекс, verdict28). Взяло - если в слоте каста или канала НОВЫЙ объект
         // (не тот, что шёл до отправки: тот же номер, уже идущий, не доказательство), либо начался
