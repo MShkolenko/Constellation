@@ -259,7 +259,8 @@ namespace Constellation::Ai
         uint32 n = 0;
         for (Group::MemberSlot const& slot : g->GetMemberSlots())
             if (Player const* m = ObjectAccessor::GetPlayer(*_self, slot.guid))
-                if (m != _self && m->IsAlive() && _self->GetExactDist2d(m) <= range)
+                if (m != _self && m->IsAlive() && _self->GetExactDist2d(m) <= range
+                    && _self->GetPhaseShift().CanSee(m->GetPhaseShift()))    // невидимый - не поддержка (Кодекс)
                     ++n;
         return n;
     }

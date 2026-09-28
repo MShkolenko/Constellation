@@ -10531,7 +10531,9 @@ public:
         if (!Cfg().Squads || !g || !IsBotSquad(g) || g->IsLeader(self->GetGUID()))
             return ObjectGuid::Empty;
         Player const* lp = ObjectAccessor::FindConnectedPlayer(g->GetLeaderGUID());
-        if (!lp || !lp->IsAlive() || lp->GetMapId() != self->GetMapId())
+        // И ФАЗА (Кодекс, verdict25): одна карта - ещё не одно место, как у `FollowTarget`.
+        if (!lp || !lp->IsAlive() || lp->GetMapId() != self->GetMapId()
+            || !self->GetPhaseShift().CanSee(lp->GetPhaseShift()))
             return ObjectGuid::Empty;
         return lp->GetGUID();
     }
