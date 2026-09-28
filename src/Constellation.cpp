@@ -1293,14 +1293,26 @@ public:
         bool const knows = p->HasSpell(spellId);
         bool const gcdBefore = info && p->GetSpellHistory()->HasGlobalCooldown(info);
         bool const cdBefore = p->GetSpellHistory()->HasCooldown(spellId);
+        // ядро ставит запрос в очередь за 400 мс до конца ГКД или каста (Player::CanRequestSpellCast)
+        bool const queueable = info && p->CanRequestSpellCast(info, p);
+        Spell const* const genericBefore = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        Spell const* const channelBefore = p->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
         bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
-        // ПРИНЯЛО ЛИ ЯДРО: идёт каст, начался ГКД или откат - значит взяло; иначе отказ
-        Spell const* current = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
-        bool const taken = sent && ((current && current->GetSpellInfo()->Id == spellId)
+        // ПРИНЯЛО ЛИ ЯДРО (Кодекс, verdict28). Взяло - если в слоте каста или канала НОВЫЙ объект
+        // (не тот, что шёл до отправки: тот же номер, уже идущий, не доказательство), либо начался
+        // ГКД или откат. Отказ ядро шлёт клиенту пакетом, отсюда его не видно, поэтому без следа
+        // пишем «следа нет» и что мешало, а не «отклонён». Мгновенное без ГКД и отката следа не
+        // оставляет вовсе - для него ответ всегда «следа нет».
+        Spell const* const genericAfter = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        Spell const* const channelAfter = p->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        bool const taken = sent && ((genericAfter && genericAfter != genericBefore)
+            || (channelAfter && channelAfter != channelBefore)
             || (info && !gcdBefore && p->GetSpellHistory()->HasGlobalCooldown(info))
             || (!cdBefore && p->GetSpellHistory()->HasCooldown(spellId)));
-        char const* outcome = !sent ? "не отправлен" : taken ? "принят" : !knows ? "отклонён: не знает"
-            : gcdBefore ? "отклонён: ГКД" : cdBefore ? "отклонён: откат" : "отклонён";
+        char const* outcome = !sent ? "не отправлен" : taken ? "принят" : !knows ? "следа нет: не знает"
+            : queueable ? "в очереди (ГКД или каст на исходе)" : gcdBefore ? "следа нет: шёл ГКД"
+            : cdBefore ? "следа нет: шёл откат" : (genericBefore || channelBefore) ? "следа нет: шёл другой каст"
+            : "следа нет";
         TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-КАСТ {}: {} по {} ({}) - {}", p->GetName(), spellId,
             target->GetName(), target->GetEntry(), outcome);
         handler->PSendSysMessage("Constellation: %s кастует %u по %s - %s", p->GetName().c_str(), spellId,
