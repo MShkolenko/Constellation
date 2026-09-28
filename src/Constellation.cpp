@@ -600,6 +600,10 @@ public:
     {
         for (Companion& c : _companions)
         {
+            // ЖИВОМУ - СНАЧАЛА ЧЕСТНАЯ ОТМЕНА (Кодекс, 28.09 03:20): один `Discard` снимал брони и
+            // забывал состояние, но автоатака и каст у ядра продолжались. `force` пропускает
+            // проверку флага, который к этому моменту уже снят.
+            EngineReset(c, Constellation::Ai::CancelReason::EngineDisabled, /*force=*/true);
             DiscardEngineFor(c);                          // the engine and its reservation go together (P5)
         }
     }
@@ -11402,13 +11406,13 @@ private:
     // §10′ — ЕДИНСТВЕННАЯ точка, через которую модуль гасит работу движка. Игрока здесь
     // может уже не быть (выход, роспуск), поэтому Ctx собирается только если есть кому
     // отменять; иначе состояние чистится без вызова Cancel — отменять нечего.
-    void EngineReset(Companion& c, Constellation::Ai::CancelReason why)
+    void EngineReset(Companion& c, Constellation::Ai::CancelReason why, bool force = false)
     {
         // ОБА ФЛАГА, А НЕ ОДИН. Здесь стояло `if (!Cfg().Engine) return;`, и тогда
         // состояние тени переживало и смерть, и смену карты, и выход из мира — то есть
         // тень сравнивала свежее решение лестницы со своим прошлогодним состоянием.
         // Дефект нашёл Кодекс; он портит НЕ мир, а измерение, ради которого тень и есть.
-        if (!Cfg().Engine)
+        if (!Cfg().Engine && !force)
             return;
         Player* self = c.Session ? c.Session->GetPlayer() : nullptr;
         if (!self)
@@ -11422,7 +11426,7 @@ private:
         Constellation::Ai::DangerView dangerView(&KilledMeTwiceFor, &DeadlyToFightAtFor, &danger);
         dangerView.WireTravel(&DeadlyToTravelToFor, &QuestCostMeDeathsFor);
         FightBinding fightBind{ &c, self };
-        if (Cfg().Engine)
+        if (Cfg().Engine || force)
         {
             Constellation::Ai::ClientAct act(self, c.Session);
             // `Reset` зовёт `Cancel`, а бой вправе доложить «кончил» — живому спутнику по-настоящему.
@@ -11435,9 +11439,9 @@ private:
             Constellation::Ai::Ctx ctx{ view, dangerView, fightView, act, GameTime::GetGameTimeMS(), &c.Engine };
             Constellation::Ai::Engine::Instance().Reset(c.Engine, ctx, why);
         }
-        // КОНЕЦ ЖИЗНИ РАБОТЫ ОТПУСКАЕТ ОБА СЛОТА, И НЕ ЧЕРЕЗ `Cancel`. Этот `Ctx` собран без
-        // состояния (`ctx.St` = nullptr), поэтому `Gather::Cancel` внутри `Reset` ничего не
-        // делает, а сам `Reset` после разделения слотов освобождает только бой: смерть во
+        // КОНЕЦ ЖИЗНИ РАБОТЫ ОТПУСКАЕТ ОБА СЛОТА, И НЕ ТОЛЬКО ЧЕРЕЗ `Cancel`. До `de71fc8` этот `Ctx`
+        // собирался без состояния и `Gather::Cancel` ничего не делал; теперь делает, а освобождение
+        // ниже осталось страховкой - повторное безопасно (`ReleaseSlot` пропускает пустой). Смерть во
         // время сбора оставляла точку занятой на 16 минут. До разделения единственный слот
         // стирался целиком - значит это регрессия самой правки, её и чиним, безусловно
         // (проверка Кодекса по П5-fix, п. 3).
