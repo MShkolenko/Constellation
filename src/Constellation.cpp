@@ -1294,15 +1294,18 @@ public:
         bool const gcdBefore = info && p->GetSpellHistory()->HasGlobalCooldown(info);
         bool const cdBefore = p->GetSpellHistory()->HasCooldown(spellId);
         // ядро ставит запрос в очередь за 400 мс до конца ГКД или каста (Player::CanRequestSpellCast)
-        bool const queueable = info && p->CanRequestSpellCast(info, p);
         Spell const* const genericBefore = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
         Spell const* const channelBefore = p->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        // в очередь - только когда есть чего ждать: без ГКД и каста запрос исполняется сразу
+        // (Кодекс, verdict29), и его отказ «очередью» не назовёшь
+        bool const queueable = info && p->CanRequestSpellCast(info, p)
+            && (gcdBefore || genericBefore || channelBefore);
         bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
         // ПРИНЯЛО ЛИ ЯДРО (Кодекс, verdict28). Взяло - если в слоте каста или канала НОВЫЙ объект
         // (не тот, что шёл до отправки: тот же номер, уже идущий, не доказательство), либо начался
         // ГКД или откат. Отказ ядро шлёт клиенту пакетом, отсюда его не видно, поэтому без следа
-        // пишем «следа нет» и что мешало, а не «отклонён». Мгновенное без ГКД и отката следа не
-        // оставляет вовсе - для него ответ всегда «следа нет».
+        // пишем «следа нет» и что мешало, а не «отклонён». Мгновенное тоже видно: объект каста
+        // лежит в слоте до следующего обновления заклинаний (Кодекс, verdict29).
         Spell const* const genericAfter = p->GetCurrentSpell(CURRENT_GENERIC_SPELL);
         Spell const* const channelAfter = p->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
         bool const taken = sent && ((genericAfter && genericAfter != genericBefore)
