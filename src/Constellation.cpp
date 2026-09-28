@@ -2852,16 +2852,22 @@ public:
                             if (self->GetQuestObjectiveData(obj) >= std::max<int32>(obj.Amount, 1))
                                 continue;
                             // РАЗВЕДКА: ДОРОГА И ЕСТЬ ЦЕЛЬ (прибор 28.09: квест 62, шахта Fargodeep - 9
-                            // гибелей от кобольдов, ни одной на квест). Гибель в сотне ярдов от зоны
-                            // осмотра этого квеста - гибель за него, кто бы ни убил.
+                            // гибелей от кобольдов, ни одной на квест). Гибель у самой зоны осмотра этого
+                            // квеста - гибель за него, кто бы ни убил. «У самой» - размер зоны плюс 30
+                            // ярдов, и зона та, что названа в цели, если названа (Кодекс, verdict45): щедрый
+                            // круг закрывал бы квест за гибели на дороге и у кладбища рядом.
                             if (obj.Type == QUEST_OBJECTIVE_AREATRIGGER)
                             {
                                 auto const zones = _questTriggers.find(travelQuest);
                                 if (zones != _questTriggers.end())
                                     for (AreaTriggerEntry const* at : zones->second)
-                                        if (at->ContinentID == self->GetMapId()
-                                            && self->GetExactDist2d(at->Pos.X, at->Pos.Y) <= 100.0f)
+                                    {
+                                        if (at->ContinentID != self->GetMapId() || (obj.ObjectID > 0 && at->ID != uint32(obj.ObjectID)))
+                                            continue;
+                                        float const size = at->Radius > 0.0f ? at->Radius : std::max(at->BoxLength, at->BoxWidth) * 0.5f;
+                                        if (self->GetExactDist2d(at->Pos.X, at->Pos.Y) <= size + 30.0f)
                                             { related = true; break; }
+                                    }
                                 if (related)
                                     break;
                                 continue;
