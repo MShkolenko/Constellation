@@ -4831,7 +4831,11 @@ public:
                 ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(item.itemid);
                 if (!tpl)
                     continue;
-                bool const forQuest = item.needs_quest || self->HasQuestForItem(item.itemid);
+                // «ДЛЯ КВЕСТА» - ЭТО «НУЖЕН МНЕ», И ОТВЕЧАЕТ ЯДРО (`HasQuestForItem`). `needs_quest` -
+                // признак строки добычи «предмет квестовый» (`QuestRequired`), а не «мой квест его
+                // ждёт»: окно 28.09 04:45 - Rowena и Garrick, давно сдавшие квест 60, раз за разом
+                // просили свечу 772, ядро её не отдавало, строка писала недостачу.
+                bool const forQuest = self->HasQuestForItem(item.itemid);
                 bool const junk = tpl->GetQuality() == ITEM_QUALITY_POOR;
 
                 // СЫРАЯ ЗАПИСЬ: что лежало и почему не взяли. Без неё «предметов 0»
