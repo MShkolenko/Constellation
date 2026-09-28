@@ -746,8 +746,11 @@ namespace Constellation::Ai
         // агра задевает маршрут на `lookahead` ярдов вперёд. Элиту и тех, кто выше на три уровня и
         // больше, не называет - их считает в `strongOut`. `packOut` - сколько агрессивных ещё стоит
         // в десяти ярдах от названного (сорвётся ли пачкой). Пусто - путь чист.
+        // `skip` - спросить движок, не отложена ли цель и не убивала ли дважды (Кодекс, verdict16).
+        // Кандидат, рядом с которым стоят больше двух агрессивных, - не одиночный пул: он идёт в `strongOut`.
+        using PathSkipFn = bool (*)(void* user, ObjectGuid unit, uint32 entry);
         ObjectGuid PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
-                              uint32* packOut, uint32* strongOut) const;
+                              uint32* packOut, uint32* strongOut, PathSkipFn skip, void* skipUser) const;
         // Сломанных вещей на теле; ноль — драться есть чем.
         uint32 BrokenGear() const;
         // Точка отхода от этого нападающего; false — некуда.

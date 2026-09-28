@@ -104,7 +104,7 @@ namespace Constellation::Ai
     }
 
     ObjectGuid WorldView::PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
-                                     uint32* packOut, uint32* strongOut) const
+                                     uint32* packOut, uint32* strongOut, PathSkipFn skip, void* skipUser) const
     {
         if (packOut)
             *packOut = 0;
@@ -120,7 +120,19 @@ namespace Constellation::Ai
         float len = 0.0f;
         for (size_t i = from; i < wps.size() && len < lookahead; ++i)
         {
-            len += line.back().GetExactDist2d(wps[i]);
+            float const seg = line.back().GetExactDist2d(wps[i]);
+            if (len + seg > lookahead && seg > 0.0f)
+            {
+                // ОБРЕЗАЕМ ПОСЛЕДНИЙ ОТРЕЗОК ДО `lookahead` (Кодекс): длинный отрезок проверялся целиком.
+                float const k = (lookahead - len) / seg;
+                Position const& a = line.back();
+                line.emplace_back(a.GetPositionX() + (wps[i].GetPositionX() - a.GetPositionX()) * k,
+                                  a.GetPositionY() + (wps[i].GetPositionY() - a.GetPositionY()) * k,
+                                  a.GetPositionZ() + (wps[i].GetPositionZ() - a.GetPositionZ()) * k);
+                len = lookahead;
+                break;
+            }
+            len += seg;
             line.push_back(wps[i]);
         }
         if (line.size() < 2)
@@ -146,7 +158,7 @@ namespace Constellation::Ai
                 continue;
             // ГДЕ ОН ОТНОСИТЕЛЬНО ПУТИ: ближайшее расстояние до отрезков и сколько ярдов пути до этого места.
             float const cx = c->GetPositionX(), cy = c->GetPositionY();
-            float minD = 1.0e9f, along = 0.0f, acc = 0.0f;
+            float minD = 1.0e9f, along = 0.0f, acc = 0.0f, nearZ = 0.0f;
             for (size_t k = 1; k < line.size(); ++k)
             {
                 float const ax = line[k - 1].GetPositionX(), ay = line[k - 1].GetPositionY();
@@ -159,16 +171,34 @@ namespace Constellation::Ai
                 float const d = std::sqrt(px * px + py * py);
                 float const segLen = std::sqrt(seg2);
                 if (d < minD)
-                    { minD = d; along = acc + t * segLen; }
+                {
+                    minD = d;
+                    along = acc + t * segLen;
+                    nearZ = line[k - 1].GetPositionZ() + t * (line[k].GetPositionZ() - line[k - 1].GetPositionZ());
+                }
                 acc += segLen;
             }
             if (minD > c->GetAttackDistance(_self) + 2.0f)
                 continue;                           // по этому пути до него не дотянется
+            if (std::fabs(c->GetPositionZ() - nearZ) > 10.0f)
+                continue;                           // другой этаж (Кодекс: поиск был плоским)
+            if (skip && skip(skipUser, c->GetGUID(), c->GetEntry()))
+                continue;                           // отложен движком или убивал дважды
             if (c->IsElite() || c->GetLevelForTarget(_self) > _self->GetLevel() + 2)
             {
                 if (strongOut)
                     ++*strongOut;
                 continue;                           // не по силам одному - не выманиваем
+            }
+            uint32 around10 = 0;
+            for (Creature* o : around)
+                if (o != c && aggressive(o) && o->GetExactDist2d(c) <= 10.0f)
+                    ++around10;
+            if (around10 > 2)
+            {
+                if (strongOut)
+                    ++*strongOut;
+                continue;                           // пачка больше трёх - не одиночный пул (Кодекс)
             }
             if (along < bestAlong)
                 { bestAlong = along; best = c; }

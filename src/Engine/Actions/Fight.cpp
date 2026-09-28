@@ -41,6 +41,20 @@ namespace
     inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
     inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
 
+    // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
+    // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
+    inline bool SkipPathThreat(void* user, ObjectGuid unit, uint32 entry)
+    {
+        Ctx* ctx = static_cast<Ctx*>(user);
+        if (!ctx || !ctx->St)
+            return false;
+        BackoffKey key;
+        key.Kind = BackoffKind::CombatUnreachable;
+        key.About = Subject::OfUnit(unit);
+        key.Detail = 0;
+        return Engine::Deferred(*ctx->St, key, ctx->NowMs) || ctx->Danger.KilledMeTwice(entry);
+    }
+
     // ПОХОД ПО ДЕЛУ - то, во время чего маршрут ядра ведёт спутника мимо мобов.
     inline bool IsErrand(ActionId a)
     {
@@ -862,6 +876,10 @@ namespace
             // Отдых стоит выше (строкой раньше): к следующему пулу подходим восстановившись.
             // ИДЁМ НА САМУ УГРОЗУ - ОНА ДЕРЖИТСЯ: без этого на подходе `Running` уже не поход, угроза
             // стиралась, `Useful` её отвергал, подход бросался, поход возобновлялся - и так по кругу.
+            // ЖИВУЮ (Кодекс, verdict16): после исхода боя `Running` ещё на ней, и без этого бой
+            // предлагался трупу.
+            if (ctx.St && !ctx.St->PathThreat.IsEmpty() && !ctx.World.IsAliveUnit(ctx.St->PathThreat))
+                ctx.St->PathThreat = ObjectGuid::Empty;
             bool const onThreat = ctx.St && !ctx.St->PathThreat.IsEmpty()
                 && ctx.St->Running == ActionId::KillObjective
                 && ctx.St->RunningAbout == Subject::OfUnit(ctx.St->PathThreat);
@@ -870,7 +888,8 @@ namespace
                 sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(ctx.St->PathThreat));
                 return;
             }
-            if (ctx.St && !inCombat && IsErrand(ctx.St->Running)
+            // СЛОМАННЫЙ НЕ ЗАЧИЩАЕТ (Кодекс): ему драться нечем, он идёт чиниться.
+            if (ctx.St && !inCombat && IsErrand(ctx.St->Running) && ctx.World.BrokenGear() == 0
                 && ctx.St->Move.WaypointIndex < ctx.St->Move.Waypoints.size())
             {
                 if (getMSTimeDiff(ctx.St->PathThreatAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)
@@ -878,7 +897,8 @@ namespace
                     uint32 pack = 0, strong = 0;
                     ObjectGuid const was = ctx.St->PathThreat;
                     ctx.St->PathThreat = ctx.World.PathThreat(ctx.St->Move.Waypoints, ctx.St->Move.WaypointIndex,
-                                                              PATH_LOOKAHEAD_YARDS, &pack, &strong);
+                                                              PATH_LOOKAHEAD_YARDS, &pack, &strong,
+                                                              &SkipPathThreat, &ctx);
                     ctx.St->PathThreatAtMs = ctx.NowMs;
                     if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat != was)
                         ctx.World.LogPathThreat(ctx.St->PathThreat, pack, strong, NameOf(ctx.St->Running));
