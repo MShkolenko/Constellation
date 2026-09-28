@@ -41,7 +41,9 @@ namespace
     inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
     inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
     inline constexpr uint32 PATH_STRONG_DEFER_MS  = 180000;   // на пути только сильные - дело ждёт три минуты
-    inline constexpr uint32 PATH_STRONG_WINDOW_MS = 600000;   // и не больше двух таких отсрочек за десять минут
+    inline constexpr uint32 PATH_STRONG_WINDOW_MS = 600000;
+    // ОТРЯД: за соседом идём, если он в сорока ярдах - дальность обзора боя, а не всей карты.
+    inline constexpr float  SQUAD_ASSIST_YARDS    = 40.0f;   // и не больше двух таких отсрочек за десять минут
 
     // КОГО НА ПУТИ НЕ ТРОГАЕМ (Кодекс, verdict16): бой с ним уже отложен (не дойти, держит другой -
     // оба пишут `CombatUnreachable` на эту особь) или этот вид убивал меня дважды.
@@ -159,6 +161,9 @@ namespace
                 if (std::optional<ObjectGuid> const a = ctx.World.NearestAttacker(); a && *a == victim)
                     return true;
             // УГРОЗА НА ПУТИ - ТОЖЕ МОЯ ЦЕЛЬ (часть B): её назвал поиск по маршруту этой секунды.
+            // НАПАДАЮЩИЙ НА СОСЕДА ПО ОТРЯДУ - ТОЖЕ МОЯ ЦЕЛЬ (срез 2).
+            if (!ctx.St->SquadAssist.IsEmpty() && ctx.St->SquadAssist == victim)
+                return true;
             if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat == victim)
                 return true;
             return Val<ValueId::Objectives>(ctx).Fight == victim;
@@ -880,6 +885,28 @@ namespace
             // стиралась, `Useful` её отвергал, подход бросался, поход возобновлялся - и так по кругу.
             // ЖИВУЮ (Кодекс, verdict16): после исхода боя `Running` ещё на ней, и без этого бой
             // предлагался трупу.
+            // ОТРЯД ДЕРЁТСЯ ВМЕСТЕ (решение оператора 2026-09-28, проект отрядов v1, срез 2; эталон
+            // `AttackersValue.cpp:69`): нападающий на соседа по группе в пределах сорока ярдов - и мой
+            // нападающий. Свой нападающий уже взят выше (оборона); отдых - строкой раньше; сломанный
+            // не идёт. Раз в секунду, как угроза пути.
+            if (ctx.St && ctx.World.BrokenGear() == 0)
+            {
+                if (getMSTimeDiff(ctx.St->SquadAssistAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)
+                {
+                    ObjectGuid member;
+                    ObjectGuid const was = ctx.St->SquadAssist;
+                    ctx.St->SquadAssist = ctx.World.SquadAttacker(SQUAD_ASSIST_YARDS, &member);
+                    ctx.St->SquadAssistAtMs = ctx.NowMs;
+                    if (!ctx.St->SquadAssist.IsEmpty() && ctx.St->SquadAssist != was)
+                        ctx.World.LogSquadAssist(member, ctx.St->SquadAssist);
+                }
+                if (!ctx.St->SquadAssist.IsEmpty() && ctx.World.IsAliveUnit(ctx.St->SquadAssist))
+                {
+                    sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(ctx.St->SquadAssist));
+                    return;
+                }
+            }
+
             if (ctx.St && !ctx.St->PathThreat.IsEmpty() && !ctx.World.IsAliveUnit(ctx.St->PathThreat))
                 ctx.St->PathThreat = ObjectGuid::Empty;
             bool const onThreat = ctx.St && !ctx.St->PathThreat.IsEmpty()

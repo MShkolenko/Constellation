@@ -19,6 +19,7 @@
 #include "Creature.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Group.h"
 #include "Map.h"
 #include "MapManager.h"
 #include "ObjectAccessor.h"
@@ -210,6 +211,50 @@ namespace Constellation::Ai
                 if (c != best && aggressive(c) && c->GetExactDist2d(best) <= 10.0f)
                     ++*packOut;
         return best->GetGUID();
+    }
+
+    ObjectGuid WorldView::SquadAttacker(float range, ObjectGuid* memberOut) const
+    {
+        if (memberOut)
+            *memberOut = ObjectGuid::Empty;
+        Group const* g = _self ? _self->GetGroup() : nullptr;
+        if (!g)
+            return ObjectGuid::Empty;
+        Unit* best = nullptr;
+        float bestD = 1.0e9f;
+        for (Group::MemberSlot const& slot : g->GetMemberSlots())
+        {
+            Player* m = ObjectAccessor::GetPlayer(*_self, slot.guid);
+            if (!m || m == _self || !m->IsAlive() || m->GetMapId() != _self->GetMapId()
+                || _self->GetExactDist2d(m) > range)
+                continue;
+            for (Unit* a : m->getAttackers())
+            {
+                if (!a || !a->IsAlive() || !_self->IsValidAttackTarget(a))
+                    continue;
+                float const d = _self->GetExactDist(a);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = a;
+                    if (memberOut)
+                        *memberOut = m->GetGUID();
+                }
+            }
+        }
+        return best ? best->GetGUID() : ObjectGuid::Empty;
+    }
+
+    void WorldView::LogSquadAssist(ObjectGuid member, ObjectGuid attacker) const
+    {
+        if (!_self)
+            return;
+        Player const* m = ObjectAccessor::GetPlayer(*_self, member);
+        Unit const* a = ObjectAccessor::GetUnit(*_self, attacker);
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ОТРЯД-БОЙ {}: помогаю {} против {} ({}, {:.0f} ярд)",
+            _self->GetName(), m ? m->GetName() : std::string("?"), a ? a->GetName() : std::string("?"),
+            a ? a->GetEntry() : 0u, a ? _self->GetExactDist(a) : 0.0f);
     }
 
     void WorldView::LogPathThreat(ObjectGuid unit, uint32 pack, uint32 strong, char const* errand) const

@@ -749,6 +749,11 @@ namespace Constellation::Ai
         // `skip` - спросить движок, не отложена ли цель и не убивала ли дважды (Кодекс, verdict16).
         // Кандидат, рядом с которым стоят больше двух агрессивных, - не одиночный пул: он идёт в `strongOut`.
         using PathSkipFn = bool (*)(void* user, ObjectGuid unit, uint32 entry);
+        // НАПАДАЮЩИЙ НА СОСЕДА ПО ГРУППЕ (отряд, срез 2; эталон `AttackersValue.cpp:69`): ближайший
+        // ко мне из тех, кто бьёт живого члена моей группы в пределах `range`. `memberOut` - кого
+        // защищаем. Пусто - соседи не под ударом.
+        ObjectGuid SquadAttacker(float range, ObjectGuid* memberOut) const;
+        void LogSquadAssist(ObjectGuid member, ObjectGuid attacker) const;
         ObjectGuid PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
                               uint32* packOut, uint32* strongOut, PathSkipFn skip, void* skipUser) const;
         // Сломанных вещей на теле; ноль — драться есть чем.
