@@ -5312,6 +5312,10 @@ public:
             return false;
         if (self->HasUnitState(UNIT_STATE_CONFUSED) && !si->HasAttribute(SPELL_ATTR5_ALLOW_WHILE_CONFUSED))
             return false;
+        // И СТРАХ (Кодекс, verdict24). Заклинания, снимающие контроль, выбор не предлагает вовсе
+        // (он ищет урон, прерывание и лечение), поэтому их исключение здесь не нужно.
+        if (self->HasUnitState(UNIT_STATE_FLEEING) && !si->HasAttribute(SPELL_ATTR5_ALLOW_WHILE_FLEEING))
+            return false;
         // очередь этой сборки: если она не примет, слать бессмысленно (Player.cpp:30922)
         if (!self->CanRequestSpellCast(si, self))
             return false;
