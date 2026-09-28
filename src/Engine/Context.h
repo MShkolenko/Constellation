@@ -742,10 +742,18 @@ namespace Constellation::Ai
         bool  IsInFlight() const;                    // на такси — движение слать нельзя
         // Ближайший нападающий (`:3010-3019`): по списку, а без него — `getAttackerForHelper`.
         std::optional<ObjectGuid> NearestAttacker() const;
+        // УГРОЗА НА ПУТИ (проект отрядов v1, часть B): первый по ходу агрессивный враг, чья зона
+        // агра задевает маршрут на `lookahead` ярдов вперёд. Элиту и тех, кто выше на три уровня и
+        // больше, не называет - их считает в `strongOut`. `packOut` - сколько агрессивных ещё стоит
+        // в десяти ярдах от названного (сорвётся ли пачкой). Пусто - путь чист.
+        ObjectGuid PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
+                              uint32* packOut, uint32* strongOut) const;
         // Сломанных вещей на теле; ноль — драться есть чем.
         uint32 BrokenGear() const;
         // Точка отхода от этого нападающего; false — некуда.
         bool FleePointFrom(ObjectGuid from, Position* out) const;
+        // Строка ЗАЧИСТКА: кого выманиваем с пути, сколько рядом, сколько сильных пропущено, по какому делу.
+        void LogPathThreat(ObjectGuid unit, uint32 pack, uint32 strong, char const* errand) const;
         char const* NameOf(ObjectGuid unit) const;         // имя существа для журнала, «?» если нет
         // План: консультация до меню, чтение меню, взятие (П3) — переходники к модулю.
         void PlanConsult(ObjectGuid giver) const;

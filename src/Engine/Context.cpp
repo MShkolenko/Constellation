@@ -103,6 +103,96 @@ namespace Constellation::Ai
         return _self && _self->IsInFlight();
     }
 
+    ObjectGuid WorldView::PathThreat(std::vector<Position> const& wps, size_t from, float lookahead,
+                                     uint32* packOut, uint32* strongOut) const
+    {
+        if (packOut)
+            *packOut = 0;
+        if (strongOut)
+            *strongOut = 0;
+        if (!_self || from >= wps.size() || lookahead <= 0.0f)
+            return ObjectGuid::Empty;
+
+        // ЛОМАНАЯ ОТ МЕНЯ ПО ТОЧКАМ МАРШРУТА ЯДРА, пока не наберётся `lookahead` ярдов.
+        std::vector<Position> line;
+        line.reserve(8);
+        line.emplace_back(_self->GetPositionX(), _self->GetPositionY(), _self->GetPositionZ());
+        float len = 0.0f;
+        for (size_t i = from; i < wps.size() && len < lookahead; ++i)
+        {
+            len += line.back().GetExactDist2d(wps[i]);
+            line.push_back(wps[i]);
+        }
+        if (line.size() < 2)
+            return ObjectGuid::Empty;
+
+        float const radius = lookahead + 40.0f;     // зона агра редко шире сорока ярдов
+        std::list<Creature*> around;
+        Trinity::AnyUnitInObjectRangeCheck check(_self, radius);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(_self, around, check);
+        Cell::VisitGridObjects(_self, searcher, radius);
+
+        auto aggressive = [&](Creature const* c)
+        {
+            return c->IsAlive() && !c->IsInCombat() && c->IsHostileTo(_self)
+                && c->HasReactState(REACT_AGGRESSIVE) && !c->IsCivilian();
+        };
+
+        Creature* best = nullptr;
+        float bestAlong = 1.0e9f;
+        for (Creature* c : around)
+        {
+            if (!aggressive(c) || !_self->IsValidAttackTarget(c))
+                continue;
+            // ГДЕ ОН ОТНОСИТЕЛЬНО ПУТИ: ближайшее расстояние до отрезков и сколько ярдов пути до этого места.
+            float const cx = c->GetPositionX(), cy = c->GetPositionY();
+            float minD = 1.0e9f, along = 0.0f, acc = 0.0f;
+            for (size_t k = 1; k < line.size(); ++k)
+            {
+                float const ax = line[k - 1].GetPositionX(), ay = line[k - 1].GetPositionY();
+                float const bx = line[k].GetPositionX(),     by = line[k].GetPositionY();
+                float const dx = bx - ax, dy = by - ay;
+                float const seg2 = dx * dx + dy * dy;
+                float t = seg2 > 0.0f ? ((cx - ax) * dx + (cy - ay) * dy) / seg2 : 0.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+                float const px = ax + t * dx - cx, py = ay + t * dy - cy;
+                float const d = std::sqrt(px * px + py * py);
+                float const segLen = std::sqrt(seg2);
+                if (d < minD)
+                    { minD = d; along = acc + t * segLen; }
+                acc += segLen;
+            }
+            if (minD > c->GetAttackDistance(_self) + 2.0f)
+                continue;                           // по этому пути до него не дотянется
+            if (c->IsElite() || c->GetLevelForTarget(_self) > _self->GetLevel() + 2)
+            {
+                if (strongOut)
+                    ++*strongOut;
+                continue;                           // не по силам одному - не выманиваем
+            }
+            if (along < bestAlong)
+                { bestAlong = along; best = c; }
+        }
+        if (!best)
+            return ObjectGuid::Empty;
+        if (packOut)
+            for (Creature* c : around)
+                if (c != best && aggressive(c) && c->GetExactDist2d(best) <= 10.0f)
+                    ++*packOut;
+        return best->GetGUID();
+    }
+
+    void WorldView::LogPathThreat(ObjectGuid unit, uint32 pack, uint32 strong, char const* errand) const
+    {
+        if (!_self)
+            return;
+        Creature const* c = ObjectAccessor::GetCreature(*_self, unit);
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ЗАЧИСТКА {}: на пути {} ({}, {:.0f} ярд) - выманиваю; рядом с ним ещё {}, сильных пропущено {}; дело: {}",
+            _self->GetName(), c ? c->GetName() : std::string("?"), c ? c->GetEntry() : 0u,
+            c ? _self->GetExactDist2d(c) : 0.0f, pack, strong, errand ? errand : "?");
+    }
+
     std::optional<ObjectGuid> WorldView::NearestAttacker() const
     {
         if (!_self)

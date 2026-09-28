@@ -35,6 +35,19 @@ namespace
     // ДО ЦЕЛИ НЕ ДОБРАТЬСЯ — НА ДЕСЯТЬ МИНУТ. Столько же держит лестница у недостижимых
     // собеседников, и по той же причине: за это время меняется и уровень, и обстановка вокруг.
     inline constexpr uint32 COMBAT_UNREACHABLE_MS = 600000;
+    // ЗАЧИСТКА ПУТИ (проект отрядов v1, часть B): на сколько ярдов вперёд смотреть и как часто.
+    // Сорок - столько проходит спутник за пять-шесть секунд, и в этот отрезок укладывается зона
+    // агра обычного моба с запасом на подход. Раз в секунду - поиск по сетке, а не каждый такт.
+    inline constexpr float  PATH_LOOKAHEAD_YARDS  = 40.0f;
+    inline constexpr uint32 PATH_THREAT_EVERY_MS  = 1000;
+
+    // ПОХОД ПО ДЕЛУ - то, во время чего маршрут ядра ведёт спутника мимо мобов.
+    inline bool IsErrand(ActionId a)
+    {
+        return a == ActionId::TravelToObjective || a == ActionId::TurnInQuest || a == ActionId::VisitVendor
+            || a == ActionId::SeekGiverByMap || a == ActionId::TakeQuestNearby || a == ActionId::GatherObjective
+            || a == ActionId::TalkToTarget;
+    }
     inline constexpr uint32 FIGHT_RESERVE_MS      = 600000;   // backstop of the victim reservation (P5): longer than any fight; the real end is the outcome
     inline constexpr uint32 HELD_BY_OTHER_MS      = 10000;    // target held by another: step back ten seconds, the scan offers a neighbour
 
@@ -129,6 +142,9 @@ namespace
             if (ctx.World.IsInCombat())
                 if (std::optional<ObjectGuid> const a = ctx.World.NearestAttacker(); a && *a == victim)
                     return true;
+            // УГРОЗА НА ПУТИ - ТОЖЕ МОЯ ЦЕЛЬ (часть B): её назвал поиск по маршруту этой секунды.
+            if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat == victim)
+                return true;
             return Val<ValueId::Objectives>(ctx).Fight == victim;
         }
 
@@ -838,6 +854,33 @@ namespace
             bool const inCombat = ctx.World.IsInCombat();
             if (RestWanted(ctx) && !inCombat)
                 return;
+
+            // ЗАЧИСТКА ПУТИ (оператор 2026-09-28, проект отрядов v1, часть B): «бот при путешествии
+            // должен учитывать маршрут и не ломиться через группу мобов а методично её вырезать и
+            // проходить». Идём по делу - смотрим на сорок ярдов вперёд по маршруту ядра; агрессивный
+            // враг, чья зона агра задевает путь, выманивается по одному, прежде чем идти дальше.
+            // Отдых стоит выше (строкой раньше): к следующему пулу подходим восстановившись.
+            if (ctx.St && !inCombat && IsErrand(ctx.St->Running)
+                && ctx.St->Move.WaypointIndex < ctx.St->Move.Waypoints.size())
+            {
+                if (getMSTimeDiff(ctx.St->PathThreatAtMs, ctx.NowMs) >= PATH_THREAT_EVERY_MS)
+                {
+                    uint32 pack = 0, strong = 0;
+                    ObjectGuid const was = ctx.St->PathThreat;
+                    ctx.St->PathThreat = ctx.World.PathThreat(ctx.St->Move.Waypoints, ctx.St->Move.WaypointIndex,
+                                                              PATH_LOOKAHEAD_YARDS, &pack, &strong);
+                    ctx.St->PathThreatAtMs = ctx.NowMs;
+                    if (!ctx.St->PathThreat.IsEmpty() && ctx.St->PathThreat != was)
+                        ctx.World.LogPathThreat(ctx.St->PathThreat, pack, strong, NameOf(ctx.St->Running));
+                }
+                if (!ctx.St->PathThreat.IsEmpty())
+                {
+                    sink.Add(ActionId::KillObjective, REL_MOVE, Subject::OfUnit(ctx.St->PathThreat));
+                    return;
+                }
+            }
+            else if (ctx.St && !inCombat)
+                ctx.St->PathThreat = ObjectGuid::Empty;    // не идём - угрозы пути нет
 
             // В БОЮ — НИ КЛЕТКИ, НИ РАЗГОВОРА (Мастер, 2026-09-12 19:40). Шов по намерению отдаёт
             // движку ход в `Travelling`/`Approaching`/`Attacking` с маской `Combat`; обход берёт в
