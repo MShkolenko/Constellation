@@ -2129,7 +2129,19 @@ public:
                 // ДВА КОЛЬЦА И ШЕСТНАДЦАТЬ НАПРАВЛЕНИЙ. Радиус подъёма 39 ярдов — это большой
                 // круг, и одного кольца из двенадцати точек мало, чтобы в нём нашлось тихое
                 // место. Ближнее кольцо предпочтительнее: меньше бежать.
-                float bestScore = quietness(body.GetPositionX(), body.GetPositionY());
+                // СУХО ЛИ ПОД ТОЧКОЙ: земля под ней и нет жидкости у земли. IsInWater ядра без
+                // фильтра видит всякую жидкость, лаву и слизь тоже (TerrainMgr.cpp:729).
+                auto dryAt = [&](float x, float y, float z) -> bool
+                {
+                    float const gz = self->GetMap()->GetHeight(self->GetPhaseShift(), x, y, z + 5.0f, true);
+                    return gz > INVALID_HEIGHT && !self->GetMap()->IsInWater(self->GetPhaseShift(), x, y, gz);
+                };
+                // ТОЧКА ТЕЛА ПРОВЕРЯЕТСЯ ТАК ЖЕ, КАК КОЛЬЦО (окно 28.09 15:28: Rowena восемнадцать раз
+                // поднялась над лавой Чёрной горы - «0 ярдов от тела, ближайший враг не найден»:
+                // без врагов тело набирало тишину 1000, кольцо его не перебивало, а на жидкость
+                // проверялось только кольцо). Мокрое тело - счёт -1, его перебьёт любая сухая точка.
+                bool const bodyDry = dryAt(body.GetPositionX(), body.GetPositionY(), body.GetPositionZ());
+                float bestScore = bodyDry ? quietness(body.GetPositionX(), body.GetPositionY()) : -1.0f;
                 Position bestPos(body.GetPositionX(), body.GetPositionY(), body.GetPositionZ());
                 for (float ring : { 18.0f, 30.0f })
                     for (int i = 0; i < 16; ++i)
@@ -2147,6 +2159,17 @@ public:
                         if (score > bestScore + 1.0f)   // +1: при равной тишине ближнее лучше
                             { bestScore = score; bestPos.Relocate(rx, ry, rz); }
                     }
+
+                // СУХОЙ ТОЧКИ НЕТ ВОВСЕ - ПОДЪЁМ ЗДЕСЬ ЕСТЬ НОВАЯ ГИБЕЛЬ ОТ СРЕДЫ: к целительнице.
+                if (bestScore < 0.0f)
+                {
+                    c.CorpseGaveUp = true;
+                    c.ReviveMs = 0;
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ТЕЛО {}: тело в жидкости, сухой точки в радиусе подъёма нет - иду к целительнице",
+                        self->GetName());
+                    return;
+                }
 
                 // ГДЕ УЖЕ УБИВАЛИ ТРИЖДЫ — ГОДИТСЯ ТОЛЬКО ПО-НАСТОЯЩЕМУ ТИХОЕ МЕСТО.
                 // Иначе подъём будет означать новую гибель через секунды, и круг продолжится.
@@ -2168,6 +2191,9 @@ public:
                     self->GetName(), bestPos.GetPositionX(), bestPos.GetPositionY(), bestPos.GetPositionZ(),
                     bestPos.GetExactDist2d(body.GetPositionX(), body.GetPositionY()),
                     bestScore > 900.0f ? std::string("не найден") : Trinity::StringFormat("в {:.0f} ярдах", bestScore));
+                if (!bodyDry)
+                    TC_LOG_INFO("server.worldserver", "Constellation ТЕЛО {}: тело в жидкости - поднимаюсь на сухом",
+                        self->GetName());
             }
 
             float const tx = c.RevivePicked ? c.RevivePos.GetPositionX() : body.GetPositionX();
