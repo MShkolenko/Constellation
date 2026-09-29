@@ -29,6 +29,7 @@
 #include "BuildStamp.h"
 #include "Registration.h"
 #include "Roster.h"
+#include "Rotation.h"
 
 #include "AccountMgr.h"
 #include "BattlenetAccountMgr.h"
@@ -3723,6 +3724,161 @@ public:
         return true;
     }
 
+    // ПРИМЕТ ЛИ ЯДРО КАСТ СЕЙЧАС - общие проверки выбора удара и списка приоритетов (Rotation.h).
+    // Раньше они жили внутри `PickAttackSpell`; вынесены, чтобы список спрашивал ядро теми же
+    // вопросами, а не похожими. Добавлены аура-требования заклинания (`CasterAuraSpell`,
+    // `ExcludeCasterAuraSpell`): без них Arcane Missiles выбирался без Clearcasting, 28 попыток -
+    // 28 отказов (аудит механик 29.09).
+    bool CastableNow(Player* self, Unit* target, SpellInfo const* si, bool flatRanking, bool* freeOut) const
+    {
+        if (!si->CanBeUsedInCombat(self))
+            return false;
+        // ПО ПЛОЩАДИ — НИ В КОЕМ СЛУЧАЕ (Кодекс, второй разбор умений).
+        // Заклинание с уроном по площади подтягивает соседние группы, и на боевом это
+        // не «чуть хуже», а цепная смерть: спутник собирает на себя пятерых, гибнет,
+        // возрождается, идёт туда же. Спрашиваем у ядра оба признака.
+        // РАЗВЕДКА ДАЛЬНОСТИ ПЛОЩАДНЫХ НЕ ВИДИТ: дистанцию вступления она считает раз за бой, и
+        // «Правосудие» на 30 ярдов поставило бы паладина вдали от цели, без ближнего боя, на всё
+        // время его отката. Подходим как прежде, а площадное берётся в бою, когда рядом пусто.
+        if (target != self && (si->IsAffectingArea() || si->IsTargetingArea())
+            && (flatRanking || !AreaHitsOnlyVictim(self, target, si)))
+            return false;
+        if (si->CheckTarget(self, target, false) != SPELL_CAST_OK)
+            return false;
+        // ГОТОВНОСТЬ — ВОПРОС ЯДРА ЦЕЛИКОМ: SpellHistory::IsReady проверяет блокировку
+        // школы, откат И ЗАРЯДЫ. HasCooldown зарядов не видит, и заклинание с зарядами
+        // считалось готовым всегда.
+        if (!self->GetSpellHistory()->IsReady(si))
+            return false;
+        // УСЛОВИЕ СОСТОЯНИЯ — ВОПРОС ЯДРА, А НЕ СПИСОК ЗАКЛИНАНИЙ (замер: воин раз за разом
+        // просил Victory Rush в двух ярдах от цели, без цены и без чтения — умение даётся
+        // после добивания, и ядро отвергает его в CheckCast через HasAuraState).
+        if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
+            return false;
+        if (si->CasterAuraSpell && !self->HasAura(si->CasterAuraSpell))
+            return false;
+        if (si->ExcludeCasterAuraSpell && self->HasAura(si->ExcludeCasterAuraSpell))
+            return false;
+        // ХВАТАЕТ ЛИ СИЛ — СЧИТАЕТ ЯДРО. Своя арифметика здесь стоила бы ровно того же,
+        // что стоила арифметика по здоровью моба: правдоподобного и неверного числа.
+        bool free = true;
+        for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
+        {
+            if (cost.Amount <= 0)
+                continue;
+            free = false;
+            if (self->GetPower(cost.Power) < cost.Amount)
+                return false;
+        }
+        // ДОСТАЁТ ЛИ ОТСЮДА - СПРАШИВАЕМ ЯДРО ЕГО ЖЕ ПРОВЕРКОЙ, а не своей формулой. Замер окна
+        // 20:13-22:13 (27.09): из 186 кастов «без следа» 70 были вне объявленной дальности,
+        // 49 из них - Crusader Strike паладина с 7-8 ярдов, пока Judgment на 30 стоял готовый.
+        // Приём тот же, что у кузни выше и у ядра в `HandleAcceptTrade`: собрать `Spell`,
+        // выставить `m_targets`, спросить, удалить. `CheckRange(true)` - ровно та мера, по
+        // которой ядро потом отвечает SPELL_FAILED_OUT_OF_RANGE (досягаемость, 8/3 на бегу,
+        // модификаторы). Разведку дальности (`flatRanking`) НЕ трогаем: она выбирает
+        // заклинание, чтобы решить, насколько подходить, и фильтр по нынешней дистанции
+        // отнял бы у неё ответ.
+        // СТОЙКА, СКРЫТНОСТЬ, СНАРЯЖЕНИЕ - ТОЖЕ ВОПРОСЫ ЯДРА, и они от дистанции не зависят,
+        // поэтому задаются и разведке. Замер 23:07-23:38: разбойник 45 боёв подряд просил
+        // Ambush без скрытности (SPELL_ATTR0_ONLY_STEALTHED), воин 6 раз Shield Slam без
+        // щита. Функции те же, что зовёт `Spell::CheckCast` (`CheckShapeshift`, признак
+        // скрытности) и `Spell::CheckItems` целиком (оружие, щит, реагенты, тотемы).
+        // lazy: ауры SPELL_AURA_MOD_IGNORE_SHAPESHIFT, которые ядро учитывает перед
+        // `CheckShapeshift`, здесь не спрашиваются - ошибка только в сторону «не взять
+        // годное»; если у спутников появятся такие ауры, спросить `CheckCast` целиком.
+        if (si->CheckShapeshift(self->GetShapeshiftForm()) != SPELL_CAST_OK)
+            return false;
+        if (si->HasAttribute(SPELL_ATTR0_ONLY_STEALTHED) && !self->HasStealthAura())
+            return false;
+        {
+            Spell* ask = new Spell(self, si, TRIGGERED_NONE);
+            ask->m_targets.SetUnitTarget(target);
+            SpellCastResult const gear = ask->CheckItems(nullptr, nullptr);
+            SpellCastResult const inRange = flatRanking ? SPELL_CAST_OK : ask->CheckRange(true);
+            delete ask;
+            if (gear != SPELL_CAST_OK || inRange != SPELL_CAST_OK)
+                return false;
+        }
+        if (freeOut)
+            *freeOut = free;
+        return true;
+    }
+
+    // СПИСОК ПРИОРИТЕТОВ (Rotation.h): первый шаг, чьё условие верно и который ядро примет сейчас.
+    // Шаги спека, если для спека список есть, иначе шаги класса. Ноль - списка нет или ни один шаг
+    // не подошёл, тогда работает прежний выбор.
+    static constexpr int32 ROT_REFRESH_MS = 3000;   // свой дот с остатком меньше - обновить
+    uint32 PickRotation(Player* self, Unit* victim, Unit** castTarget) const
+    {
+        uint8 const cls = self->GetClass();
+        uint16 const spec = uint16(self->GetPrimarySpecialization());
+        bool specList = false;
+        for (RotStep const& s : Rotation)
+            if (s.Class == cls && s.Spec && s.Spec == spec)
+                { specList = true; break; }
+        Difficulty const diff = self->GetMap()->GetDifficultyID();
+        for (RotStep const& s : Rotation)
+        {
+            if (s.Class != cls || (specList ? s.Spec != spec : s.Spec != 0))
+                continue;
+            if (!self->HasActiveSpell(s.Spell))
+                continue;
+            bool ok = false;
+            switch (s.Cond)
+            {
+                case RotCond::Always:
+                    ok = true;
+                    break;
+                case RotCond::TargetLacksMyAura:
+                {
+                    Aura const* a = victim->GetAura(uint32(s.A), self->GetGUID());
+                    ok = !a || (a->GetDuration() >= 0 && a->GetDuration() < ROT_REFRESH_MS);
+                    break;
+                }
+                case RotCond::PowerAtLeast:
+                    ok = self->GetPower(Powers(s.A)) >= s.B;
+                    break;
+                case RotCond::PowerBelow:
+                    ok = self->GetPower(Powers(s.A)) < s.B;
+                    break;
+                case RotCond::ComboFullOrDying:
+                {
+                    int32 const cp = self->GetPower(POWER_COMBO_POINTS);
+                    int32 const cpMax = self->GetMaxPower(POWER_COMBO_POINTS);
+                    ok = (cpMax > 0 && cp >= cpMax) || (cp > 0 && victim->GetHealthPct() <= FINISHER_DYING_PCT);
+                    break;
+                }
+                case RotCond::TargetHealthBelow:
+                    ok = victim->GetHealthPct() <= float(s.A);
+                    break;
+                case RotCond::SelfHealthBelow:
+                    ok = self->GetHealthPct() <= float(s.A);
+                    break;
+                case RotCond::SelfLacksAura:
+                    ok = !self->HasAura(uint32(s.A)) && (s.B == 0 || self->GetHealthPct() <= float(s.B));
+                    break;
+                case RotCond::SelfLacksAuraFullCombo:
+                {
+                    int32 const cpMax = self->GetMaxPower(POWER_COMBO_POINTS);
+                    ok = !self->HasAura(uint32(s.A)) && cpMax > 0 && self->GetPower(POWER_COMBO_POINTS) >= cpMax;
+                    break;
+                }
+            }
+            if (!ok)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(s.Spell, diff);
+            if (!si)
+                continue;
+            Unit* target = s.OnSelf ? static_cast<Unit*>(self) : victim;
+            if (!CastableNow(self, target, si, false, nullptr))
+                continue;
+            *castTarget = target;
+            return s.Spell;
+        }
+        return 0;
+    }
+
     uint32 PickAttackSpell(Player* self, Unit* victim, uint32 lastSpell = 0,
                            bool flatRanking = false) const
     {
@@ -3772,47 +3928,6 @@ public:
             // должен быть прежним.
             if (!SpellDoes(si, false, diff, 1, !flatRanking))
                 continue;
-            if (!si->CanBeUsedInCombat(self))
-                continue;
-
-            // ПО ПЛОЩАДИ — НИ В КОЕМ СЛУЧАЕ (Кодекс, второй разбор умений).
-            // Заклинание с уроном по площади подтягивает соседние группы, и на боевом это
-            // не «чуть хуже», а цепная смерть: спутник собирает на себя пятерых, гибнет,
-            // возрождается, идёт туда же. Спрашиваем у ядра оба признака.
-            // РАЗВЕДКА ДАЛЬНОСТИ ПЛОЩАДНЫХ НЕ ВИДИТ: дистанцию вступления она считает раз за бой, и
-            // «Правосудие» на 30 ярдов поставило бы паладина вдали от цели, без ближнего боя, на всё
-            // время его отката. Подходим как прежде, а площадное берётся в бою, когда рядом пусто.
-            if ((si->IsAffectingArea() || si->IsTargetingArea())
-                && (flatRanking || !AreaHitsOnlyVictim(self, victim, si)))
-                continue;
-            if (si->CheckTarget(self, victim, false) != SPELL_CAST_OK)
-                continue;
-
-            // ГОТОВНОСТЬ — ВОПРОС ЯДРА ЦЕЛИКОМ: SpellHistory::IsReady проверяет блокировку
-            // школы, откат И ЗАРЯДЫ. HasCooldown зарядов не видит, и заклинание с зарядами
-            // считалось готовым всегда.
-            if (!self->GetSpellHistory()->IsReady(si))
-                continue;
-
-            // УСЛОВИЕ СОСТОЯНИЯ — ВОПРОС ЯДРА, А НЕ СПИСОК ЗАКЛИНАНИЙ (замер: воин раз за разом
-            // просил Victory Rush в двух ярдах от цели, без цены и без чтения — умение даётся
-            // после добивания, и ядро отвергает его в CheckCast через HasAuraState).
-            if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
-                continue;
-
-            // ХВАТАЕТ ЛИ СИЛ — СЧИТАЕТ ЯДРО. Своя арифметика здесь стоила бы ровно того же,
-            // что стоила арифметика по здоровью моба: правдоподобного и неверного числа.
-            bool free = true, affordable = true;
-            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
-            {
-                if (cost.Amount <= 0)
-                    continue;
-                free = false;
-                if (self->GetPower(cost.Power) < cost.Amount)
-                    { affordable = false; break; }
-            }
-            if (!affordable)
-                continue;
 
             // НА КАКУЮ СТУПЕНЬ. Все вопросы задаём ядру.
             // ДОБИВАЮЩИЙ ЖДЁТ ПОЛНЫХ ОЧКОВ КОМБО - ИЛИ УМИРАЮЩЕЙ ЦЕЛИ (П8, второй срез).
@@ -3839,36 +3954,9 @@ public:
                 }
             }
 
-            // ДОСТАЁТ ЛИ ОТСЮДА - СПРАШИВАЕМ ЯДРО ЕГО ЖЕ ПРОВЕРКОЙ, а не своей формулой. Замер окна
-            // 20:13-22:13 (27.09): из 186 кастов «без следа» 70 были вне объявленной дальности,
-            // 49 из них - Crusader Strike паладина с 7-8 ярдов, пока Judgment на 30 стоял готовый.
-            // Приём тот же, что у кузни выше и у ядра в `HandleAcceptTrade`: собрать `Spell`,
-            // выставить `m_targets`, спросить, удалить. `CheckRange(true)` - ровно та мера, по
-            // которой ядро потом отвечает SPELL_FAILED_OUT_OF_RANGE (досягаемость, 8/3 на бегу,
-            // модификаторы). Разведку дальности (`flatRanking`) НЕ трогаем: она выбирает
-            // заклинание, чтобы решить, насколько подходить, и фильтр по нынешней дистанции
-            // отнял бы у неё ответ.
-            // СТОЙКА, СКРЫТНОСТЬ, СНАРЯЖЕНИЕ - ТОЖЕ ВОПРОСЫ ЯДРА, и они от дистанции не зависят,
-            // поэтому задаются и разведке. Замер 23:07-23:38: разбойник 45 боёв подряд просил
-            // Ambush без скрытности (SPELL_ATTR0_ONLY_STEALTHED), воин 6 раз Shield Slam без
-            // щита. Функции те же, что зовёт `Spell::CheckCast` (`CheckShapeshift`, признак
-            // скрытности) и `Spell::CheckItems` целиком (оружие, щит, реагенты, тотемы).
-            // lazy: ауры SPELL_AURA_MOD_IGNORE_SHAPESHIFT, которые ядро учитывает перед
-            // `CheckShapeshift`, здесь не спрашиваются - ошибка только в сторону «не взять
-            // годное»; если у спутников появятся такие ауры, спросить `CheckCast` целиком.
-            if (si->CheckShapeshift(self->GetShapeshiftForm()) != SPELL_CAST_OK)
+            bool free = true;
+            if (!CastableNow(self, victim, si, flatRanking, &free))
                 continue;
-            if (si->HasAttribute(SPELL_ATTR0_ONLY_STEALTHED) && !self->HasStealthAura())
-                continue;
-            {
-                Spell* ask = new Spell(self, si, TRIGGERED_NONE);
-                ask->m_targets.SetUnitTarget(victim);
-                SpellCastResult const gear = ask->CheckItems(nullptr, nullptr);
-                SpellCastResult const inRange = flatRanking ? SPELL_CAST_OK : ask->CheckRange(true);
-                delete ask;
-                if (gear != SPELL_CAST_OK || inRange != SPELL_CAST_OK)
-                    continue;
-            }
 
             int rung = RUNG_FILL;
             if (si->GetRecoveryTime() > 0 || si->ChargeCategoryId)
@@ -5857,6 +5945,12 @@ public:
                     cut = victim->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
                 cutSpell = cut ? cut->GetSpellInfo()->Id : 1;
             }
+        if (!spellId)
+        {
+            Unit* rotTarget = nullptr;
+            if ((spellId = PickRotation(self, victim, &rotTarget)))
+                castTarget = rotTarget;
+        }
         if (!spellId)
             spellId = PickAttackSpell(self, victim, m.LastSpell);
         if (!spellId)
