@@ -662,6 +662,8 @@ namespace Constellation::Ai
         uint64 Taken  = 0;
         uint32 Kills  = 0;              // АТРИБУЦИЯ ЯДРА: OnCreatureKill(мы, кто-то)
         ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
+        uint32 PetLethal = 0;           // удар питомца, смертельный по прогнозу
+        ObjectGuid PetLethalOn;
     };
 
     enum class FightEvent : uint8 { Engaged, Won, Ended };

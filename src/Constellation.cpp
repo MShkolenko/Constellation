@@ -727,6 +727,8 @@ public:
         std::string LastHitName;
         uint32 Kills = 0;               // АТРИБУЦИЯ ЯДРА: OnCreatureKill(мы, кто-то)
         ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
+        uint32 PetLethal = 0;           // удар питомца, смертельный по прогнозу (не убийство!)
+        ObjectGuid PetLethalOn;         // по кому; победой его делает только мёртвая цель в исходе
     };
 
     Blows BlowsOf(ObjectGuid guid)
@@ -760,16 +762,18 @@ public:
         // СНАЧАЛА ОТСЕИВАЕМ, ПОТОМ БЕРЁМ ЗАМОК. Событий урона существо-против-существа
         // на боевом на порядки больше, чем наших, и сериализовать на них шесть потоков
         // карт незачем (Кодекс, проход 11).
-        // УБИЛ ПИТОМЕЦ - УБИЛ ХОЗЯИН (Кодекс 58). `Unit::Kill` зовёт `OnCreatureKill` только для
-        // игрока (Unit.cpp:11555), и победа питомца читалась бы «цель мертва, но добили не мы» -
-        // без лута и без памяти побед. Смерть ядро решает сразу после этого крючка тем же числом:
-        // `health <= damageTaken` (Unit.cpp:985). lazy: скрипт, изменивший урон после нас, или
-        // поглощение сверх смерти могут разойтись с этим прогнозом - редкость, цена одна строка исхода.
+        // УДАР ПИТОМЦА, СМЕРТЕЛЬНЫЙ ПО ПРОГНОЗУ (Кодекс 58-59). `Unit::Kill` зовёт `OnCreatureKill`
+        // только для игрока (Unit.cpp:11555), и победа питомца читалась бы «цель мертва, но добили
+        // не мы» - без лута и без памяти побед. Здесь смерть ещё НЕ решена: неубиваемые, запрет
+        // убивать у заклинания и поглощение сверх смерти отменяют её позже (Unit.cpp:925-1050).
+        // Поэтому пишется только прогноз, а победой его делает исход боя, увидевший цель мёртвой.
+        // lazy: если прогноз отменён, а цель тут же добил кто-то другой, победа припишется нам -
+        // для этого нужны два совпадения в одном такте; разберёмся, если увидим.
         if (attacker && !attacker->IsPlayer() && damage && victim && victim->IsCreature()
             && attacker->IsControlledByPlayer() && victim->GetHealth() <= damage)
             if (Player* owner = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
                 if (owner != attacker)
-                    NoteKill(owner, victim->ToCreature());
+                    NotePetLethal(owner, victim);
         bool const mine = (attacker && attacker->IsPlayer()) || (victim && victim->IsPlayer());
         if (!mine)
             return;
@@ -827,6 +831,17 @@ public:
         {
             ++it->second.Kills;
             it->second.LastKilled = killed->GetGUID();
+        }
+    }
+
+    void NotePetLethal(Player* owner, Unit* victim)
+    {
+        std::lock_guard<std::mutex> lock(_blowsLock);
+        auto it = _blows.find(owner->GetGUID());
+        if (it != _blows.end())
+        {
+            ++it->second.PetLethal;
+            it->second.PetLethalOn = victim->GetGUID();
         }
     }
 
@@ -9262,6 +9277,7 @@ public:
         Constellation::Ai::BlowsSnapshot s;
         s.Swings = b.Swings; s.Landed = b.Landed; s.Zeroed = b.Zeroed; s.Dealt = b.Dealt;
         s.Hits = b.Hits; s.Taken = b.Taken; s.Kills = b.Kills; s.LastKilled = b.LastKilled;
+        s.PetLethal = b.PetLethal; s.PetLethalOn = b.PetLethalOn;
         return s;
     }
 

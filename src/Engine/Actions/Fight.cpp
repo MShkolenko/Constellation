@@ -563,10 +563,14 @@ namespace
         bool Outcome(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
         {
             BlowsSnapshot const now = ctx.Fight.Snapshot();
-            bool const won = now.Kills > f.Base.Kills && now.LastKilled == victim;
+            bool const own = now.Kills > f.Base.Kills && now.LastKilled == victim;
+            // ДОБИЛ ПИТОМЕЦ: прогноз из `OnDamage` плюс решение ядра - цель мертва (Кодекс 59).
+            bool const pet = !own && now.PetLethal > f.Base.PetLethal && now.PetLethalOn == victim
+                && !ctx.World.IsAliveUnit(victim);
+            bool const won = own || pet;
             if (won)
             {
-                Report(ctx, f, FightEvent::Won, "ПОБЕДА");
+                Report(ctx, f, FightEvent::Won, own ? "ПОБЕДА" : "ПОБЕДА (добил питомец)");
                 // ДОБЫЧА ТОЛЬКО СО СВОЕГО УБИЙСТВА: право проверит и ядро, но пакет, заведомо
                 // обречённый на отказ, лучше не слать. Настройка — лестницы.
                 if (ctx.World.LootAllowed())
