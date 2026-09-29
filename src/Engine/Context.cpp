@@ -846,7 +846,10 @@ namespace Constellation::Ai
             SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
             if (!si || si->IsPassive() || !si->HasEffect(SPELL_EFFECT_SUMMON_PET))
                 continue;
-            if (!_self->GetSpellHistory()->IsReady(si))
+            // `IsReady` общего отката не видит (Кодекс 58): под ним ядро отвергает запрос, и
+            // нормальный призыв ушёл бы в отказанные на десять минут. Очередь - тот же вопрос.
+            if (!_self->GetSpellHistory()->IsReady(si) || _self->GetSpellHistory()->HasGlobalCooldown(si)
+                || !_self->CanRequestSpellCast(si, _self))
                 continue;
             bool affordable = true;
             for (SpellPowerCost const& cost : si->CalcPowerCost(_self, si->GetSchoolMask()))

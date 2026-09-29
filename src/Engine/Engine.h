@@ -228,7 +228,7 @@ namespace Constellation::Ai
         uint32 PetSpell = 0;
         uint32 PetAskedAtMs = 0;
         uint32 PetRefused[4] = { 0, 0, 0, 0 };
-        uint32 PetRefusedUntilMs[4] = { 0, 0, 0, 0 };
+        uint32 PetRefusedAtMs[4] = { 0, 0, 0, 0 };   // когда отказано; срок - интервалом (Кодекс 58)
 
         // РАДИ КАКОГО КВЕСТА ШЛИ В ПОСЛЕДНИЙ РАЗ - для памяти опасности. Обработчик гибели
         // пишет смерть на квест (`KilledOnQuest`), и раньше брал его из `c.TravelQuest`, который

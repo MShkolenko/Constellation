@@ -760,6 +760,16 @@ public:
         // СНАЧАЛА ОТСЕИВАЕМ, ПОТОМ БЕРЁМ ЗАМОК. Событий урона существо-против-существа
         // на боевом на порядки больше, чем наших, и сериализовать на них шесть потоков
         // карт незачем (Кодекс, проход 11).
+        // УБИЛ ПИТОМЕЦ - УБИЛ ХОЗЯИН (Кодекс 58). `Unit::Kill` зовёт `OnCreatureKill` только для
+        // игрока (Unit.cpp:11555), и победа питомца читалась бы «цель мертва, но добили не мы» -
+        // без лута и без памяти побед. Смерть ядро решает сразу после этого крючка тем же числом:
+        // `health <= damageTaken` (Unit.cpp:985). lazy: скрипт, изменивший урон после нас, или
+        // поглощение сверх смерти могут разойтись с этим прогнозом - редкость, цена одна строка исхода.
+        if (attacker && !attacker->IsPlayer() && damage && victim && victim->IsCreature()
+            && attacker->IsControlledByPlayer() && victim->GetHealth() <= damage)
+            if (Player* owner = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
+                if (owner != attacker)
+                    NoteKill(owner, victim->ToCreature());
         bool const mine = (attacker && attacker->IsPlayer()) || (victim && victim->IsPlayer());
         if (!mine)
             return;

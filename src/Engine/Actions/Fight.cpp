@@ -797,13 +797,42 @@ namespace
     inline constexpr uint32 PET_TRACE_MS   = 2000;     // каст с чтением виден сразу, мгновенный - питомцем
     inline constexpr uint32 PET_REFUSED_MS = 600000;
 
+    // СРОК ОТКАЗА - ИНТЕРВАЛ ОТ МОМЕНТА ОТКАЗА, А НЕ СРАВНЕНИЕ АБСОЛЮТНЫХ ОТМЕТОК (Кодекс 58):
+    // после 2^31 мс работы мира знак разности абсолютных сроков врёт. Просроченное стирается.
     inline size_t PetSkipList(Ctx& ctx, uint32 (&out)[4])
     {
         size_t n = 0;
         for (size_t i = 0; i < 4; ++i)
-            if (ctx.St->PetRefused[i] && int32(ctx.St->PetRefusedUntilMs[i] - ctx.NowMs) > 0)
-                out[n++] = ctx.St->PetRefused[i];
+        {
+            if (!ctx.St->PetRefused[i])
+                continue;
+            if (getMSTimeDiff(ctx.St->PetRefusedAtMs[i], ctx.NowMs) >= PET_REFUSED_MS)
+                { ctx.St->PetRefused[i] = 0; continue; }
+            out[n++] = ctx.St->PetRefused[i];
+        }
         return n;
+    }
+
+    // ОТКАЗ ЗАПОМИНАЕТСЯ В ЛЮБОМ СЛУЧАЕ - и когда ядро не начало призыв, и когда пакет не ушёл:
+    // движок после провала `Execute` отсрочки не ставит, а `Useful` остался бы истинным, и
+    // спутник стоял бы, каждый такт проваливая одно и то же.
+    inline void PetRefuse(Ctx& ctx, uint32 spell, char const* why)
+    {
+        EngineState& st = *ctx.St;
+        uint32 skip[4];
+        PetSkipList(ctx, skip);                 // стирает просроченное - свободный слот найдётся
+        size_t slot = 0;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (!st.PetRefused[i])
+                { slot = i; break; }
+            if (getMSTimeDiff(st.PetRefusedAtMs[i], ctx.NowMs) > getMSTimeDiff(st.PetRefusedAtMs[slot], ctx.NowMs))
+                slot = i;                       // все заняты - вытесняется самый старый отказ
+        }
+        st.PetRefused[slot] = spell;
+        st.PetRefusedAtMs[slot] = ctx.NowMs;
+        st.PetSpell = 0;
+        ctx.World.LogPet(spell, why);
     }
 
     inline uint32 PetToSummon(Ctx& ctx)
@@ -850,14 +879,7 @@ namespace
                     return true;
                 // ЯДРО НЕ ПРИЗВАЛО: не начало чтения и питомца нет. Это заклинание - в отказанные,
                 // иначе охотник без питомца в стойле просил бы каждую секунду.
-                size_t slot = 0;
-                for (size_t i = 1; i < 4; ++i)
-                    if (int32(st.PetRefusedUntilMs[i] - st.PetRefusedUntilMs[slot]) < 0)
-                        slot = i;
-                st.PetRefused[slot] = st.PetSpell;
-                st.PetRefusedUntilMs[slot] = ctx.NowMs + PET_REFUSED_MS;
-                ctx.World.LogPet(st.PetSpell, "ядро не призвало, десять минут не прошу");
-                st.PetSpell = 0;
+                PetRefuse(ctx, st.PetSpell, "ядро не призвало, десять минут не прошу");
                 return false;
             }
             uint32 const spell = PetToSummon(ctx);
@@ -865,7 +887,10 @@ namespace
                 return false;
             ctx.Act.StopMoving();
             if (!ctx.Act.CastSpell(spell, ctx.World.Guid()))
+            {
+                PetRefuse(ctx, spell, "пакет призыва не ушёл, десять минут не прошу");
                 return false;
+            }
             st.PetSpell = spell;
             st.PetAskedAtMs = ctx.NowMs;
             ctx.World.LogPet(spell, "призываю");
