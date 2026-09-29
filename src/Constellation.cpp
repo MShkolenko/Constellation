@@ -166,8 +166,9 @@ struct Settings
     float QuestGiverRange = 30.0f;
     float FightRange      = 120.0f;
     bool  SkipElites      = true;       // одиночка не дерётся с элитными и редкими
+    static constexpr uint32 MEAT_CROWD = 6;     // заступников, с которых голодание порог не снимает
     uint32 MaxAssist      = 2;          // сколько заступников у цели ещё терпимо (0 = не проверять)
-    uint32 StarveMs       = 300000;     // и через сколько без боя порог отступает
+    uint32 StarveMs       = 60000;      // и через сколько без боя порог отступает
     float KiteYards       = 30.0f;      // на сколько уводить цель от лагеря (0 = не уводить)
     bool  Flying          = true;       // пользоваться ли полётными путями
     float FlyIfFartherThan = 400.0f;    // ближе этого лететь незачем
@@ -223,7 +224,7 @@ struct Settings
     FightRange      = sConfigMgr->GetFloatDefault("Constellation.FightRange", 120.0f);
         SkipElites      = sConfigMgr->GetBoolDefault("Constellation.SkipElites", true);
         MaxAssist       = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.MaxAssist", 2), 0, 20);
-        StarveMs        = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.StarveMs", 300000), 60000, 3600000);
+        StarveMs        = std::clamp<uint32>(sConfigMgr->GetIntDefault("Constellation.StarveMs", 60000), 60000, 3600000);
         KiteYards       = std::clamp(sConfigMgr->GetFloatDefault("Constellation.KiteYards", 30.0f), 0.0f, 60.0f);
         Flying          = sConfigMgr->GetBoolDefault("Constellation.Flying", true);
         // НАСТРОЙКИ ПРОВЕРЯЕМ, А НЕ ПРИНИМАЕМ ЛЮБЫЕ (Кодекс): отрицательный порог означал бы
@@ -10465,14 +10466,18 @@ public:
                     packX += other->GetPositionX();
                     packY += other->GetPositionY();
                     packZ += other->GetPositionZ();
-                    if (Cfg().MaxAssist && assists > Cfg().MaxAssist)
-                        break;              // порог превышен — считать дальше незачем
+                    if (Cfg().MaxAssist && assists >= std::max(Cfg().MaxAssist + 1, Cfg().MEAT_CROWD))
+                        break;              // и порог, и мясная толпа определены — считать дальше незачем
                 }
             }
             // ГОЛОДАНИЕ ОТМЕНЯЕТ ПОРОГ (разбор): цели, которые водятся только стаями, иначе стали
             // бы невыполнимы навсегда. Долго нет боя — берём наименее людную, но элитных всё
             // равно не берём: это отдельное правило.
-            if (Cfg().MaxAssist && assists > Cfg().MaxAssist && mem.StarvedMs < Cfg().StarveMs)
+            // МЯСНАЯ ТОЛПА (оператор, 29.09: 3-4 гибели за 5 минут у скоплений по 10 мобов в одной
+            // точке): при шести и более заступниках голодание порог не снимает - дело ждёт отряд.
+            // lazy: число зашито; в конфиг вынесу, если понадобится подбирать.
+            if (Cfg().MaxAssist && assists > Cfg().MaxAssist
+                && (mem.StarvedMs < Cfg().StarveMs || assists >= Cfg().MEAT_CROWD))
             {
                 ++rejPack;
                 if (diag && !diag->ToughNoted)
