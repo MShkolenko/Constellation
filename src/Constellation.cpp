@@ -8668,7 +8668,7 @@ public:
                  area && !landing && depth++ < 16; area = area->ParentAreaID ? sAreaTableStore.LookupEntry(area->ParentAreaID) : nullptr)
                 if (area->ContentTuningID)
                     landing = sDB2Manager.GetContentTuningData(area->ContentTuningID, self->m_playerData->CtrOptions->ConditionalFlags);
-            if (landing && landing->MinLevel > int16(self->GetLevel()) + 2)
+            if (landing && landing->MinLevel > int16(self->GetLevel()))
                 continue;
             float const tail = std::sqrt(std::pow(to->Pos.X - target.GetPositionX(), 2.0f)
                                        + std::pow(to->Pos.Y - target.GetPositionY(), 2.0f));
