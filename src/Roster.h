@@ -16,7 +16,7 @@
  */
 
 /*
- * Constellation -- the roster: eight humans, one starting zone.
+ * Constellation -- the roster: eight humans (Northshire) and nine trolls (Echo Isles).
  *
  * CUT TO EIGHT on 2026-09-09, and the reason is not arithmetic. The operator: "только люди на
  * стартовой локации, без ДК / налаживаешь модуль по ним. остальное это частности / основные
@@ -67,10 +67,16 @@ struct RosterEntry
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
 };
 
-// 8: люди без рыцаря смерти (было 10, до сокращения 114). ЧИСЛО ЗДЕСЬ — НЕ
+// 17: восемь людей и девять троллей, оба без рыцаря смерти. ЧИСЛО ЗДЕСЬ - НЕ
 // УКРАШЕНИЕ: std::array с меньшим числом записей компилируется молча и добивает остаток
 // нулями, то есть спутниками без имени.
-inline constexpr std::array<RosterEntry, 8> Roster =
+//
+// ТРОЛЛИ ЦЕЛИКОМ (оператор, 29.09): «выпускай троллей ... троллей целиком». Это единственная
+// не союзная раса с обоими недостающими людям классами, друидом и шаманом. Все девять
+// начинают на одном месте (Echo Isles, карта 1, -1171 -5263 по playercreateinfo), поэтому
+// правило «одна раса - одна стартовая зона» держится внутри каждой команды. Строки взяты из
+// ростера до сокращения 09.09: персонажи с этими именами уже есть в базе и вернутся, где стоят.
+inline constexpr std::array<RosterEntry, 17> Roster =
 {{
     // восемь классов человека, которые начинают в Северной Долине
     { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE },
@@ -81,6 +87,16 @@ inline constexpr std::array<RosterEntry, 8> Roster =
     { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE },
     { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE },
     { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE },
+    // девять классов тролля, которые начинают на Echo Isles
+    { "Zalko",      RACE_TROLL,                 CLASS_WARRIOR,       GENDER_MALE },
+    { "Jubaka",     RACE_TROLL,                 CLASS_HUNTER,        GENDER_MALE },
+    { "Tayana",     RACE_TROLL,                 CLASS_ROGUE,         GENDER_FEMALE },
+    { "Zulwara",    RACE_TROLL,                 CLASS_PRIEST,        GENDER_FEMALE },
+    { "Nakuru",     RACE_TROLL,                 CLASS_SHAMAN,        GENDER_MALE },
+    { "Sennja",     RACE_TROLL,                 CLASS_MAGE,          GENDER_FEMALE },
+    { "Voljara",    RACE_TROLL,                 CLASS_WARLOCK,       GENDER_FEMALE },
+    { "Bumbu",      RACE_TROLL,                 CLASS_MONK,          GENDER_MALE },
+    { "Yalanda",    RACE_TROLL,                 CLASS_DRUID,         GENDER_FEMALE },
 }};
 }
 
