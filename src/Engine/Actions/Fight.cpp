@@ -844,6 +844,14 @@ namespace
         ctx.World.LogPet(spell, why);
     }
 
+    // ВЫДАЧА ОХОТНИКУ - НЕ ЧАЩЕ РАЗА В ДЕСЯТЬ МИНУТ: если ядро не создало питомца, повтор каждую
+    // секунду был бы тем же вечным провалом, что закрыт у призыва.
+    inline bool HunterGrantDue(Ctx& ctx)
+    {
+        return ctx.St && Tuning().Pets && ctx.World.HunterNeedsPet()
+            && (!ctx.St->PetGrantAtMs || getMSTimeDiff(ctx.St->PetGrantAtMs, ctx.NowMs) >= PET_REFUSED_MS);
+    }
+
     inline uint32 PetToSummon(Ctx& ctx)
     {
         if (!ctx.St || !Tuning().Pets)
@@ -861,7 +869,7 @@ namespace
         bool Useful(Ctx& ctx, Bid const&) override
         {
             return ctx.St && Tuning().Pets && !ctx.World.IsInCombat()
-                && (ctx.St->PetSpell != 0 || PetToSummon(ctx) != 0);
+                && (ctx.St->PetSpell != 0 || PetToSummon(ctx) != 0 || HunterGrantDue(ctx));
         }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
@@ -893,7 +901,18 @@ namespace
             }
             uint32 const spell = PetToSummon(ctx);
             if (!spell)
+            {
+                // ОХОТНИК БЕЗ ЕДИНОГО ПИТОМЦА: призывать некого - выдаём (оператор 2026-09-29, «немного
+                // отойдём от основного принципа»). Не пакет клиента, а последовательность ядра из
+                // `Spell::EffectTameCreature`; дальше питомец живёт по обычным правилам - «Призыв
+                // питомца 1», стойло, сохранение.
+                if (!HunterGrantDue(ctx))
+                    return false;
+                st.PetGrantAtMs = ctx.NowMs ? ctx.NowMs : 1;
+                ctx.Act.StopMoving();
+                ctx.World.GrantHunterPet();     // строку журнала пишет сама выдача
                 return false;
+            }
             ctx.Act.StopMoving();
             if (!ctx.Act.CastSpell(spell, ctx.World.Guid()))
             {
@@ -934,7 +953,7 @@ namespace
             // ПИТОМЕЦ ПРЕЖДЕ ДЕЛА И ДРАКИ, НО ПОСЛЕ ОТДЫХА: выше похода, выманивания на пути и
             // перелёта (REL_MOVE), ниже прерываний. Начатый призыв доводится и при отдыхе.
             if (ctx.St && !ctx.World.IsInCombat()
-                && (ctx.St->PetSpell != 0 || (!RestWanted(ctx) && PetToSummon(ctx) != 0)))
+                && (ctx.St->PetSpell != 0 || (!RestWanted(ctx) && (PetToSummon(ctx) != 0 || HunterGrantDue(ctx)))))
                 sink.Add(ActionId::SummonPet, REL_MOVE + 1.0f, Subject());
 
             // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший

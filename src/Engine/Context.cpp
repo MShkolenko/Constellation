@@ -846,6 +846,30 @@ namespace Constellation::Ai
         return _self && (!_self->GetPetGUID().IsEmpty() || !_self->GetCharmedGUID().IsEmpty());
     }
 
+    bool WorldView::HunterNeedsPet() const
+    {
+        if (!_self || _self->GetClass() != CLASS_HUNTER || _self->GetLevel() < HUNTER_PET_LEVEL
+            || !_self->IsAlive() || _self->IsInCombat() || HasPet())
+            return false;
+        if (PetStable const* ps = _self->GetPetStable())
+        {
+            for (auto const& p : ps->ActivePets)
+                if (p)
+                    return false;
+            for (auto const& p : ps->StabledPets)
+                if (p)
+                    return false;
+            if (!ps->UnslottedPets.empty())
+                return false;
+        }
+        return true;
+    }
+
+    uint32 WorldView::GrantHunterPet() const
+    {
+        return _self ? GrantHunterPetFor(_self) : 0;
+    }
+
     uint32 WorldView::PetSummonSpell(uint32 const* skip, size_t skipCount) const
     {
         if (!_self || !_self->IsAlive() || _self->IsInCombat() || _self->IsMounted() || _self->IsInFlight()

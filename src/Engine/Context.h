@@ -872,6 +872,9 @@ namespace Constellation::Ai
         // призыва из книги, готовое и по карману, старшее по уровню; `skip` - отказанные ядром.
         // 0 - питомец есть, призывать нечем или сейчас нельзя (бой, седло, такси, каст, мёртв).
         bool       HasPet() const;
+        // Охотник от HUNTER_PET_LEVEL, живой, вне боя, без питомца и с пустым стойлом целиком.
+        bool       HunterNeedsPet() const;
+        uint32     GrantHunterPet() const;              // вид выданного существа, 0 - не вышло
         uint32     PetSummonSpell(uint32 const* skip, size_t skipCount) const;
         void       LogPet(uint32 spellId, char const* what) const;
 
@@ -1134,6 +1137,10 @@ namespace Constellation::Ai
     // Два предиката боя лестницы, целиком: одна реализация на оба механизма.
     bool  StillWantedFor(Player* self, uint32 entry);
     float EngageRangeFor(Player* self, Unit* target);
+    // ОХОТНИКУ БЕЗ ЕДИНОГО ПИТОМЦА - ВЫДАТЬ (оператор 2026-09-29): вид существа или 0.
+    // Уровень - тот, с которого в этой сборке есть «Призыв питомца 1» (883, SpellLevels 5).
+    inline constexpr uint8 HUNTER_PET_LEVEL = 5;
+    uint32 GrantHunterPetFor(Player* self);
     bool  LootAllowedFor();
     float KiteYardsFor();
 

@@ -79,6 +79,8 @@
 #include "Corpse.h"
 #include "MapManager.h"
 #include "ObjectMgr.h"
+#include "Containers.h"
+#include "Pet.h"
 #include "Opcodes.h"
 #include "PartyPackets.h"
 #include "Item.h"
@@ -3602,6 +3604,79 @@ public:
     // 44). Смысл запрета сохранён: заденет соседа - не берём. Радиус - ядра (`CalcRadius` по обеим
     // целям эффекта), центр - и цель, и я (конус и «вокруг себя» считаются от меня), плюс два ярда.
     // Соседом не считается тот, кто уже дерётся с нами, и зверёк (он не зовёт на помощь).
+    // ОХОТНИКУ - ПОДХОДЯЩЕГО И РАЗНОГО ПИТОМЦА (оператор 2026-09-29: «выдавай охотникам питомцев
+    // подходящих, разнообразных ... как в азероткоре сделано?»). Эталон - mod-playerbots
+    // `PlayerbotFactory::InitPet`: случайный приручаемый вид, у которого есть спавны, уровень
+    // питомца - уровень хозяина. «Подходящий» здесь - местный: сперва виды, чьи спавны в
+    // HUNTER_PET_NEAR_YARDS от охотника, иначе любой приручаемый этой карты; экзотика - нет.
+    // Последовательность - ядра (`Spell::EffectTameCreature`): создать, поставить на карту,
+    // сделать питомцем, сохранить текущим, отдать клиенту книгу питомца.
+    static constexpr float HUNTER_PET_NEAR_YARDS = 400.0f;
+
+    struct TameSpawn { uint32 Entry; float X, Y; };
+
+    std::vector<TameSpawn> const& TameSpawnsOn(uint32 mapId)
+    {
+        std::lock_guard<std::mutex> lock(_tameLock);
+        if (!_tameBuilt)
+        {
+            // Один проход по всем спавнам за жизнь мира - и только когда охотнику понадобился питомец.
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+            {
+                CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(data.id);
+                if (!ct || !ct->IsTameable(false, ct->GetDifficulty(DIFFICULTY_NONE)))
+                    continue;
+                _tame[data.mapId].push_back({ data.id, data.spawnPoint.GetPositionX(), data.spawnPoint.GetPositionY() });
+            }
+            _tameBuilt = true;
+        }
+        static std::vector<TameSpawn> const none;
+        auto it = _tame.find(mapId);
+        return it != _tame.end() ? it->second : none;
+    }
+
+    uint32 GrantHunterPet(Player* self)
+    {
+        if (!self || self->GetClass() != CLASS_HUNTER || !self->GetPetGUID().IsEmpty() || !self->IsAlive()
+            || self->IsInCombat())
+            return 0;
+        std::vector<TameSpawn> const& spawns = TameSpawnsOn(self->GetMapId());
+        std::vector<uint32> near, far;
+        for (TameSpawn const& t : spawns)
+        {
+            std::vector<uint32>& to = self->GetExactDist2d(t.X, t.Y) <= HUNTER_PET_NEAR_YARDS ? near : far;
+            if (std::find(to.begin(), to.end(), t.Entry) == to.end())
+                to.push_back(t.Entry);
+        }
+        std::vector<uint32> const& pool = !near.empty() ? near : far;
+        if (pool.empty())
+        {
+            TC_LOG_INFO("server.worldserver", "Constellation ПИТОМЕЦ {}: на карте {} нет приручаемых видов - выдать некого",
+                self->GetName(), self->GetMapId());
+            return 0;
+        }
+        uint32 const entry = Trinity::Containers::SelectRandomContainerElement(pool);
+        Pet* pet = self->CreateTamedPetFrom(entry, 0);
+        if (!pet)
+        {
+            TC_LOG_INFO("server.worldserver", "Constellation ПИТОМЕЦ {}: ядро не создало питомца из вида {} (стойло занято?)",
+                self->GetName(), entry);
+            return 0;
+        }
+        uint8 const level = self->GetLevel();
+        pet->SetLevel(level > 1 ? level - 1 : level);  // как у ядра: вспышка повышения уровня
+        pet->GetMap()->AddToMap(pet->ToCreature());
+        pet->SetLevel(level);
+        self->SetMinion(pet, true);
+        pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+        self->PetSpellInitialize();
+        TC_LOG_INFO("server.worldserver",
+            "Constellation ПИТОМЕЦ {} (класс 3, ур {}): выдан {} ({}), семейство {}; местных видов {}, по карте {}",
+            self->GetName(), uint32(level), pet->GetName(), entry, uint32(pet->GetCreatureTemplate()->family),
+            uint32(near.size()), uint32(far.size()));
+        return entry;
+    }
+
     bool AreaHitsOnlyVictim(Player* self, Unit* victim, SpellInfo const* si) const
     {
         float radius = 0.0f;
@@ -3614,15 +3689,17 @@ public:
             return false;                   // площадь без радиуса - не знаем, кого заденет
         radius += 2.0f;
         float const reach = radius + self->GetExactDist2d(victim);
-        std::list<Creature*> near;
+        // Кодекс 61: искать всех (и игроков), а годность - тем же предикатом, что при выборе целей
+        // заклинания: `IsValidAttackTarget(unit, spell)` включает обнаружение невидимых.
+        std::list<Unit*> near;
         Trinity::AnyUnitInObjectRangeCheck check(self, reach);
-        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
-        Cell::VisitGridObjects(self, searcher, reach);
-        for (Creature* c : near)
+        Trinity::UnitListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+        Cell::VisitAllObjects(self, searcher, reach);
+        for (Unit* c : near)
         {
             if (c == victim || !c->IsAlive() || c->IsCritter() || c->IsInCombatWith(self))
                 continue;
-            if (!self->IsValidAttackTarget(c))
+            if (!self->IsValidAttackTarget(c, si))
                 continue;
             if (c->GetExactDist2d(victim) <= radius || c->GetExactDist2d(self) <= radius)
                 return false;
@@ -12386,6 +12463,9 @@ private:
 
     std::vector<Companion> _companions;
     std::mutex _blowsLock;                                  // см. Blows: шесть потоков карт
+    std::mutex _tameLock;                                   // приручаемые спавны: строятся один раз
+    bool _tameBuilt = false;
+    std::unordered_map<uint32, std::vector<TameSpawn>> _tame;
     std::unordered_map<ObjectGuid, Manager::Blows> _blows;  // счёт ударов, по GUID спутника
     bool _debugPairDone = false;
     uint32 _questsTaken = 0;
@@ -12870,6 +12950,11 @@ namespace Constellation::Ai
     // ПРАВИЛО ДИСТАНЦИИ — лестницы, дословно (`ApproachingTarget`, «с какой дистанции
     // драться»): дальность лучшего заклинания минус два ярда, чтобы шаг не выбрасывал за
     // границу; всё, что меньше восьми, — ближний бой. Только при включённых умениях.
+    uint32 GrantHunterPetFor(Player* self)
+    {
+        return Constellation::Manager::Instance()->GrantHunterPet(self);
+    }
+
     float EngageRangeFor(Player* self, Unit* target)
     {
         if (!Constellation::Cfg().Abilities || !self || !target)
