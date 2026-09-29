@@ -1306,6 +1306,10 @@ public:
         // (Кодекс, verdict29), и его отказ «очередью» не назовёшь
         bool const queueable = info && p->CanRequestSpellCast(info, p)
             && (gcdBefore || (!channelBefore && p->HasUnitState(UNIT_STATE_CASTING)));   // как ядро, Player.cpp:31761 (Кодекс, 30-32)
+        // лицом к цели, как клиент перед кастом: прямой урон без этого ядро отклоняет (ночной тест 29.09 -
+        // 120 копий по живой цели, все «следа нет»)
+        if (target != p)
+            Constellation::Ai::ClientAct(p, c->Session).Face(target->GetGUID());
         bool const sent = Constellation::Ai::ClientAct(p, c->Session).CastSpell(spellId, target->GetGUID());
         // ПРИНЯЛО ЛИ ЯДРО (Кодекс, verdict28). Взяло - если в слоте каста или канала НОВЫЙ объект
         // (не тот, что шёл до отправки: тот же номер, уже идущий, не доказательство), либо начался
@@ -1322,8 +1326,8 @@ public:
             : queueable ? "в очереди (ГКД или каст на исходе)" : gcdBefore ? "следа нет: шёл ГКД"
             : cdBefore ? "следа нет: шёл откат" : (genericBefore || channelBefore) ? "следа нет: шёл другой каст"
             : "следа нет";
-        TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-КАСТ {}: {} по {} ({}) - {}", p->GetName(), spellId,
-            target->GetName(), target->GetEntry(), outcome);
+        TC_LOG_INFO("server.worldserver", "Constellation КОНСОЛЬ-КАСТ {}: {} по {} ({}, {:.1f} ярд) - {}", p->GetName(), spellId,
+            target->GetName(), target->GetEntry(), p->GetDistance(target), outcome);
         handler->PSendSysMessage("Constellation: %s кастует %u по %s - %s", p->GetName().c_str(), spellId,
             target->GetName().c_str(), outcome);
         return true;
