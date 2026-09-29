@@ -8660,17 +8660,15 @@ public:
             // за квестом 353 посадил его в Пылающих степях - мобы там не ниже 15-го; дорога назад не
             // строилась, до мастера не дойти, 23 гибели от тех же волков). Уровни зоны - как у ядра:
             // ContentTuning области, при нуле - её зоны.
-            if (AreaTableEntry const* area = sAreaTableStore.LookupEntry(
-                    self->GetMap()->GetAreaId(self->GetPhaseShift(), to->Pos.X, to->Pos.Y, to->Pos.Z)))
-            {
-                if (!area->ContentTuningID && area->ParentAreaID)
-                    if (AreaTableEntry const* zone = sAreaTableStore.LookupEntry(area->ParentAreaID))
-                        area = zone;
-                if (Optional<ContentTuningLevels> levels = sDB2Manager.GetContentTuningData(area->ContentTuningID,
-                        self->m_playerData->CtrOptions->ConditionalFlags))
-                    if (levels->MinLevel > int16(self->GetLevel()) + 2)
-                        continue;
-            }
+            // вверх по цепочке родителей до первой области, чьи уровни разрешаются (Кодекс, verdict53)
+            Optional<ContentTuningLevels> landing;
+            for (AreaTableEntry const* area = sAreaTableStore.LookupEntry(
+                     self->GetMap()->GetAreaId(self->GetPhaseShift(), to->Pos.X, to->Pos.Y, to->Pos.Z));
+                 area && !landing; area = area->ParentAreaID ? sAreaTableStore.LookupEntry(area->ParentAreaID) : nullptr)
+                if (area->ContentTuningID)
+                    landing = sDB2Manager.GetContentTuningData(area->ContentTuningID, self->m_playerData->CtrOptions->ConditionalFlags);
+            if (landing && landing->MinLevel > int16(self->GetLevel()) + 2)
+                continue;
             float const tail = std::sqrt(std::pow(to->Pos.X - target.GetPositionX(), 2.0f)
                                        + std::pow(to->Pos.Y - target.GetPositionY(), 2.0f));
             if (tail < walkAll)                     // хуже прямой ходьбы нам не нужно
