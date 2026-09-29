@@ -12,6 +12,7 @@
  * Copyright (C) 2026 Constellation contributors. Licensed under the GNU AGPL v3 — see COPYING.
  */
 #include "Context.h"
+#include "Rotation.h"
 
 #include "Bag.h"
 #include "Cell.h"
@@ -901,6 +902,52 @@ namespace Constellation::Ai
                 { best = id; bestLevel = si->SpellLevel; }
         }
         return best;
+    }
+
+    uint32 WorldView::SelfBuffSpell(uint32 const* skip, size_t skipCount) const
+    {
+        if (!_self || !_self->IsAlive() || _self->IsInCombat() || _self->IsMounted() || _self->IsInFlight()
+            || _self->IsNonMeleeSpellCast(false) || _self->HasStealthAura())
+            return 0;
+        Difficulty const diff = _self->GetMap()->GetDifficultyID();
+        for (BuffStep const& b : Buffs)
+        {
+            if (b.Class != _self->GetClass() || !_self->HasActiveSpell(b.Spell) || _self->HasAura(b.Aura))
+                continue;
+            if (std::find(skip, skip + skipCount, b.Spell) != skip + skipCount)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(b.Spell, diff);
+            if (!si || !_self->GetSpellHistory()->IsReady(si) || _self->GetSpellHistory()->HasGlobalCooldown(si)
+                || !_self->CanRequestSpellCast(si, _self))
+                continue;
+            bool affordable = true;
+            for (SpellPowerCost const& cost : si->CalcPowerCost(_self, si->GetSchoolMask()))
+                if (cost.Amount > 0 && _self->GetPower(cost.Power) < cost.Amount)
+                    { affordable = false; break; }
+            if (affordable)
+                return b.Spell;
+        }
+        return 0;
+    }
+
+    bool WorldView::HasBuffOf(uint32 spellId) const
+    {
+        if (!_self)
+            return false;
+        for (BuffStep const& b : Buffs)
+            if (b.Spell == spellId)
+                return _self->HasAura(b.Aura);
+        return false;
+    }
+
+    void WorldView::LogBuff(uint32 spellId, char const* what) const
+    {
+        if (!_self)
+            return;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        TC_LOG_INFO("server.worldserver", "Constellation УСИЛЕНИЕ {} (класс {}, ур {}): {} ({}) - {}",
+            _self->GetName(), uint32(_self->GetClass()), uint32(_self->GetLevel()),
+            (si && si->SpellName) ? si->SpellName->Str[LOCALE_enUS] : "?", spellId, what);
     }
 
     void WorldView::LogPet(uint32 spellId, char const* what) const

@@ -877,6 +877,11 @@ namespace Constellation::Ai
         uint32     GrantHunterPet() const;              // вид выданного существа, 0 - не вышло
         uint32     PetSummonSpell(uint32 const* skip, size_t skipCount) const;
         void       LogPet(uint32 spellId, char const* what) const;
+        // Усиление из `Buffs` (Rotation.h), которого на себе нет и которое ядро примет сейчас; 0 - нечего.
+        // `HasBuffOf` - аура этого усиления уже висит.
+        uint32     SelfBuffSpell(uint32 const* skip, size_t skipCount) const;
+        bool       HasBuffOf(uint32 spellId) const;
+        void       LogBuff(uint32 spellId, char const* what) const;
 
         // -- ОТВОД (кайт): утащить цель от лагеря и там добить. Правило лестницы целиком -------
         //

@@ -125,6 +125,26 @@ inline constexpr RotStep Rotation[] =
 
     // DEATH KNIGHT / DEMON HUNTER / EVOKER: not in the roster; the generic pick serves them.
 };
+
+// SELF BUFFS OUT OF COMBAT: what a player keeps up between fights (an hour-long buff, weapon poisons).
+// Cast on self when the aura is missing, the character is idle and the core would accept the cast.
+struct BuffStep
+{
+    uint8  Class;
+    uint32 Spell;
+    uint32 Aura;
+};
+
+inline constexpr BuffStep Buffs[] =
+{
+    { CLASS_WARRIOR, 6673,   6673   },  // Battle Shout
+    { CLASS_PRIEST,  21562,  21562  },  // Power Word: Fortitude
+    { CLASS_MAGE,    1459,   1459   },  // Arcane Intellect
+    { CLASS_DRUID,   1126,   1126   },  // Mark of the Wild
+    { CLASS_SHAMAN,  192106, 192106 },  // Lightning Shield
+    { CLASS_ROGUE,   315584, 315584 },  // Instant Poison
+    { CLASS_ROGUE,   3408,   3408   },  // Crippling Poison
+};
 }
 
 #endif

@@ -51,7 +51,8 @@ namespace Constellation::Ai
     X(TakeQuestNearby,    "взять квест рядом")                              \
     X(SeekGiverByMap,     "идти к квестодателю по карте")                    \
     X(FollowOwner,        "идти за хозяином")                               \
-    X(SummonPet,          "призвать питомца")
+    X(SummonPet,          "призвать питомца")                               \
+    X(BuffSelf,           "наложить усиление")
 
     // §3.2 — TRIGGERS HAVE NO CONSUMER (Master, 2026-09-15 18:25: П2 struck). The eight names
     // the skeleton listed here (StandingInAreaTrigger, LateCreditAppeared, PassedFlightMaster,

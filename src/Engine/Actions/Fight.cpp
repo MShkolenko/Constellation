@@ -942,6 +942,104 @@ namespace
         }
     };
 
+    // УСИЛЕНИЯ ВНЕ БОЯ (аудит механик 29.09: модуль не накладывал ни одного - Fortitude, Arcane Intellect,
+    // Battle Shout, яды). Тот же порядок, что у призыва питомца: попросить, дождаться ауры, а отказ ядра
+    // запомнить на PET_REFUSED_MS, чтобы не просить каждую секунду.
+    inline size_t BuffSkipList(Ctx& ctx, uint32 (&out)[4])
+    {
+        size_t n = 0;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (!ctx.St->BuffRefused[i])
+                continue;
+            if (getMSTimeDiff(ctx.St->BuffRefusedAtMs[i], ctx.NowMs) >= PET_REFUSED_MS)
+            {
+                ctx.St->BuffRefused[i] = 0;
+                continue;
+            }
+            out[n++] = ctx.St->BuffRefused[i];
+        }
+        return n;
+    }
+
+    inline void BuffRefuse(Ctx& ctx, uint32 spell, char const* why)
+    {
+        EngineState& st = *ctx.St;
+        uint32 skip[4];
+        BuffSkipList(ctx, skip);
+        size_t slot = 0;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (!st.BuffRefused[i])
+                { slot = i; break; }
+            if (getMSTimeDiff(st.BuffRefusedAtMs[i], ctx.NowMs) > getMSTimeDiff(st.BuffRefusedAtMs[slot], ctx.NowMs))
+                slot = i;
+        }
+        st.BuffRefused[slot] = spell;
+        st.BuffRefusedAtMs[slot] = ctx.NowMs;
+        st.BuffSpell = 0;
+        ctx.World.LogBuff(spell, why);
+    }
+
+    inline uint32 BuffToCast(Ctx& ctx)
+    {
+        if (!ctx.St)
+            return 0;
+        uint32 skip[4];
+        size_t const n = BuffSkipList(ctx, skip);
+        return ctx.World.SelfBuffSpell(skip, n);
+    }
+
+    class BuffSelfAction final : public Action
+    {
+    public:
+        BuffSelfAction() : Action(ActionId::BuffSelf) { }
+
+        bool Useful(Ctx& ctx, Bid const&) override
+        {
+            return ctx.St && !ctx.World.IsInCombat() && (ctx.St->BuffSpell != 0 || BuffToCast(ctx) != 0);
+        }
+
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
+
+        bool Execute(Ctx& ctx, Bid const&) override
+        {
+            if (!ctx.St)
+                return false;
+            EngineState& st = *ctx.St;
+            if (ctx.World.IsInCombat())
+            {
+                st.BuffSpell = 0;
+                return false;
+            }
+            if (st.BuffSpell)
+            {
+                if (ctx.World.HasBuffOf(st.BuffSpell))
+                {
+                    ctx.World.LogBuff(st.BuffSpell, "наложено");
+                    st.BuffSpell = 0;
+                    return false;
+                }
+                if (ctx.World.IsCasting() || getMSTimeDiff(st.BuffAskedAtMs, ctx.NowMs) < PET_TRACE_MS)
+                    return true;
+                BuffRefuse(ctx, st.BuffSpell, "ядро не наложило, десять минут не прошу");
+                return false;
+            }
+            uint32 const spell = BuffToCast(ctx);
+            if (!spell)
+                return false;
+            ctx.Act.StopMoving();
+            if (!ctx.Act.CastSpell(spell, ctx.World.Guid()))
+            {
+                BuffRefuse(ctx, spell, "пакет не ушёл, десять минут не прошу");
+                return false;
+            }
+            st.BuffSpell = spell;
+            st.BuffAskedAtMs = ctx.NowMs;
+            return true;
+        }
+    };
+
     // ВЫЖИВАНИЕ — СВОЯ СТРАТЕГИЯ, А НЕ УГОЛОК БОЕВОЙ. `Survival` объявлена в списке ровно под
     // это, и разделение не косметическое: маска включает стратегии ПОРОЗНЬ, а «выключить бой,
     // оставить отдых» под общей крышей перестало бы работать.
@@ -971,6 +1069,11 @@ namespace
             if (ctx.St && !ctx.World.IsInCombat()
                 && (ctx.St->PetSpell != 0 || (!RestWanted(ctx) && (PetToSummon(ctx) != 0 || HunterGrantDue(ctx)))))
                 sink.Add(ActionId::SummonPet, REL_MOVE + 1.0f, Subject());
+
+            // УСИЛЕНИЕ ПОСЛЕ ПИТОМЦА: тоже прежде дела, но не при отдыхе (начатое доводится).
+            if (ctx.St && !ctx.World.IsInCombat()
+                && (ctx.St->BuffSpell != 0 || (!RestWanted(ctx) && BuffToCast(ctx) != 0)))
+                sink.Add(ActionId::BuffSelf, REL_MOVE + 0.5f, Subject());
 
             // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший
             // бой, с нападающим — отходить. REL_MOVE: выше боя и отдыха, которым в бою со
@@ -1232,6 +1335,7 @@ namespace Constellation::Ai
     {
         engine.Register(std::make_unique<RestAction>());
         engine.Register(std::make_unique<SummonPetAction>());
+        engine.Register(std::make_unique<BuffSelfAction>());
         engine.Register(std::make_unique<SurvivalStrategy>());
         engine.Register(std::make_unique<KillObjectiveAction>());
         engine.Register(std::make_unique<OpenCageForTargetAction>());
