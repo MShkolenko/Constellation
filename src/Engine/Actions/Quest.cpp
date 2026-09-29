@@ -312,8 +312,10 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 // ПРИНИМАЮЩИЙ СТОИТ ТАМ, ГДЕ ГИБЛИ (Адель, 30+ гибелей за час): поход к точке
                 // цели задания это спрашивал (`TravelToObjective`), сдача - нет, и спутник шёл
                 // к одному и тому же пятну по кругу. Тот же предикат, тот же срок, что у
-                // недоступного принимающего: квест вернётся, когда гибели выйдут из памяти
-                // или спутник подрастёт (уровень снимает запрет внутри предиката).
+                // недоступного принимающего. Записи гибелей НЕ стареют (`DeathSpots` - счётчик и
+                // уровень без времени): запрет снимает только рост уровня выше записанного + 2,
+                // до тех пор квест переоткладывается каждые десять минут (Кодекс 63). Это
+                // осознанно: спутник занят другим делом и растёт.
                 if (ctx.Danger.DeadlyToTravelTo(t.Where.GetPositionX(), t.Where.GetPositionY()))
                 {
                     TC_LOG_INFO("server.worldserver",
@@ -635,6 +637,15 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                 return false;
 
             float const d = ctx.World.DistanceTo2d(t.Where);
+            // ТОТ ЖЕ ВОПРОС, ЧТО У СДАЧИ (Кодекс 63): квестодатель в клетках, где гибли, - не идём.
+            if (d > SEEK_ARRIVED_YARDS && ctx.Danger.DeadlyToTravelTo(t.Where.GetPositionX(), t.Where.GetPositionY()))
+            {
+                TC_LOG_INFO("server.worldserver",
+                    "Constellation ОТСРОЧКА {}: поиск квестодателя (точка {:.0f} {:.0f}) на {} мс - там гибли",
+                    ctx.World.Name(), t.Where.GetPositionX(), t.Where.GetPositionY(), SEEK_UNREACHABLE_MS);
+                Defer(ctx, BackoffKind::Visited, bid.About, 0, SEEK_UNREACHABLE_MS);
+                return false;
+            }
             if (d <= SEEK_ARRIVED_YARDS)
             {
                 ctx.World.ClearVisit();     // П6: дошёл - отметка визита больше никого не сдвигает
