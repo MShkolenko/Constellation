@@ -101,3 +101,16 @@ Constellation.Squads = 1
 #
 
 Constellation.Talents = 1
+
+#
+#    Constellation.Pets
+#        Description: Pets. A companion out of combat, alive and without a pet
+#                     summons one (warlock Imp/Voidwalker, hunter Call Pet). A
+#                     hunter of level 5+ with no pet at all is given a random
+#                     local tameable creature through the core's own tame
+#                     sequence, at most once per ten minutes.
+#                     Read at .reload config.
+#        Default:     1
+#
+
+Constellation.Pets = 1
