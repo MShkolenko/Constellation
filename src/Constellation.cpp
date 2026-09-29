@@ -10259,6 +10259,13 @@ public:
 
         uint32 seen = 0, matched = 0, rejected = 0, rejBusy = 0, rejInvalid = 0, rejLos = 0, rejPhase = 0, rejPack = 0, rejReserved = 0;
         uint32 assists = 0, bestAssists = 0xFFFFFFFF;
+        // ОТРЯД МОЖЕТ БРАТЬ ТОЛПУ (Кодекс, verdict56): двое живых из группы рядом - уже не одиночка.
+        uint32 squadNear = 0;
+        if (Group const* sg = self->GetGroup())
+            for (Group::MemberSlot const& slot : sg->GetMemberSlots())
+                if (Player const* m = ObjectAccessor::GetPlayer(*self, slot.guid))
+                    if (m != self && m->IsAlive() && m->GetMapId() == self->GetMapId() && self->GetExactDist2d(m) <= 40.0f)
+                        ++squadNear;
         // СПИСОК УГРОЗ — ОДИН РАЗ НА ПРОХОД, А НЕ НА КАЖДОГО КАНДИДАТА (разбор: перебор был
         // квадратичным). Здесь только те, кто вообще может вступить: живой, враждебный, ещё не
         // занятый чужим боем.
@@ -10474,10 +10481,10 @@ public:
             // бы невыполнимы навсегда. Долго нет боя — берём наименее людную, но элитных всё
             // равно не берём: это отдельное правило.
             // МЯСНАЯ ТОЛПА (оператор, 29.09: 3-4 гибели за 5 минут у скоплений по 10 мобов в одной
-            // точке): при шести и более заступниках голодание порог не снимает - дело ждёт отряд.
+            // точке): при шести и более заступниках голодание порог не снимает, если рядом меньше двух из группы.
             // lazy: число зашито; в конфиг вынесу, если понадобится подбирать.
             if (Cfg().MaxAssist && assists > Cfg().MaxAssist
-                && (mem.StarvedMs < Cfg().StarveMs || assists >= Cfg().MEAT_CROWD))
+                && (mem.StarvedMs < Cfg().StarveMs || (assists >= Cfg().MEAT_CROWD && squadNear < 2)))
             {
                 ++rejPack;
                 if (diag && !diag->ToughNoted)
