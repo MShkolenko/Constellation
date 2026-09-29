@@ -8662,9 +8662,10 @@ public:
             // ContentTuning области, при нуле - её зоны.
             // вверх по цепочке родителей до первой области, чьи уровни разрешаются (Кодекс, verdict53)
             Optional<ContentTuningLevels> landing;
+            uint8 depth = 0;                        // 16 шагов, как в Plan.cpp: цикл в данных не повесит такт
             for (AreaTableEntry const* area = sAreaTableStore.LookupEntry(
                      self->GetMap()->GetAreaId(self->GetPhaseShift(), to->Pos.X, to->Pos.Y, to->Pos.Z));
-                 area && !landing; area = area->ParentAreaID ? sAreaTableStore.LookupEntry(area->ParentAreaID) : nullptr)
+                 area && !landing && depth++ < 16; area = area->ParentAreaID ? sAreaTableStore.LookupEntry(area->ParentAreaID) : nullptr)
                 if (area->ContentTuningID)
                     landing = sDB2Manager.GetContentTuningData(area->ContentTuningID, self->m_playerData->CtrOptions->ConditionalFlags);
             if (landing && landing->MinLevel > int16(self->GetLevel()) + 2)
