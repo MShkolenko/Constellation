@@ -309,6 +309,21 @@ inline constexpr float TURNIN_TALK_YARDS    = 4.0f;
                     return false;
                 }
 
+                // ПРИНИМАЮЩИЙ СТОИТ ТАМ, ГДЕ ГИБЛИ (Адель, 30+ гибелей за час): поход к точке
+                // цели задания это спрашивал (`TravelToObjective`), сдача - нет, и спутник шёл
+                // к одному и тому же пятну по кругу. Тот же предикат, тот же срок, что у
+                // недоступного принимающего: квест вернётся, когда гибели выйдут из памяти
+                // или спутник подрастёт (уровень снимает запрет внутри предиката).
+                if (ctx.Danger.DeadlyToTravelTo(t.Where.GetPositionX(), t.Where.GetPositionY()))
+                {
+                    TC_LOG_INFO("server.worldserver",
+                        "Constellation ОТСРОЧКА {}: сдача квеста {} (принимающий {} в {:.0f} {:.0f}) на {} мс - там гибли",
+                        ctx.World.Name(), quest, t.EnderEntry, t.Where.GetPositionX(), t.Where.GetPositionY(),
+                        TURNIN_UNREACHABLE_MS);
+                    Defer(ctx, BackoffKind::Unreachable, bid.About, 0, TURNIN_UNREACHABLE_MS);
+                    return false;
+                }
+
                 // НЕ ВИДНО — ЗНАЧИТ ИДЁМ. Это и есть та «отдельная работа», которую прежний
                 // комментарий обещал вынести в своё действие: она не понадобилась. Форма та же,
                 // что у похода к квестодателю и у боя, — дойти и сделать, — и части те же.
