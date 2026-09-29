@@ -782,6 +782,22 @@ namespace Constellation::Ai
         return who && who->IsAlive();
     }
 
+    bool WorldView::IsCorpseUnit(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Unit* who = ObjectAccessor::GetUnit(*_self, unit);
+        return who && !who->IsAlive();
+    }
+
+    bool WorldView::TappedByMe(ObjectGuid unit) const
+    {
+        if (!_self || unit.IsEmpty())
+            return false;
+        Creature* who = ObjectAccessor::GetCreature(*_self, unit);
+        return who && who->isTappedBy(_self);
+    }
+
     uint32 WorldView::EntryOf(ObjectGuid unit) const
     {
         if (!_self || unit.IsEmpty())

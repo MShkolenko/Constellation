@@ -73,6 +73,7 @@ namespace
             || a == ActionId::TalkToTarget;
     }
     inline constexpr uint32 FIGHT_RESERVE_MS      = 600000;   // backstop of the victim reservation (P5): longer than any fight; the real end is the outcome
+    inline constexpr uint32 PET_LETHAL_FRESH_MS   = 2000;     // прогноз добивания питомцем старше - не наш
     inline constexpr uint32 HELD_BY_OTHER_MS      = 10000;    // target held by another: step back ten seconds, the scan offers a neighbour
 
     // ОСТАНАВЛИВАЕМСЯ НЕ У САМОЙ ТОЧКИ. Ноль означал бы «встань в него», а достаточную близость
@@ -564,16 +565,20 @@ namespace
         {
             BlowsSnapshot const now = ctx.Fight.Snapshot();
             bool const own = now.Kills > f.Base.Kills && now.LastKilled == victim;
-            // ДОБИЛ ПИТОМЕЦ: прогноз из `OnDamage` плюс решение ядра - цель мертва (Кодекс 59).
+            // ДОБИЛ ПИТОМЕЦ: прогноз из `OnDamage` плюс решение ядра - ТРУП на месте (Кодекс 59-60).
+            // Прогноз свежий: отменённый ядром и оставшийся с прошлых тактов не делает победой
+            // чужое убийство. Исход приходит на такте после смерти, две секунды - с запасом.
             bool const pet = !own && now.PetLethal > f.Base.PetLethal && now.PetLethalOn == victim
-                && !ctx.World.IsAliveUnit(victim);
+                && getMSTimeDiff(now.PetLethalMs, ctx.NowMs) <= PET_LETHAL_FRESH_MS
+                && ctx.World.IsCorpseUnit(victim);
             bool const won = own || pet;
             if (won)
             {
                 Report(ctx, f, FightEvent::Won, own ? "ПОБЕДА" : "ПОБЕДА (добил питомец)");
                 // ДОБЫЧА ТОЛЬКО СО СВОЕГО УБИЙСТВА: право проверит и ядро, но пакет, заведомо
-                // обречённый на отказ, лучше не слать. Настройка — лестницы.
-                if (ctx.World.LootAllowed())
+                // обречённый на отказ, лучше не слать. Настройка — лестницы. Убийство питомцем
+                // права хозяину не даёт, если хозяин сам цель не задел (Кодекс 60).
+                if (ctx.World.LootAllowed() && (own || ctx.World.TappedByMe(victim)))
                     LootThroughDoor(ctx, victim, f.Loot);
             }
             else

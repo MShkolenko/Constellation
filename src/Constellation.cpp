@@ -729,6 +729,7 @@ public:
         ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
         uint32 PetLethal = 0;           // удар питомца, смертельный по прогнозу (не убийство!)
         ObjectGuid PetLethalOn;         // по кому; победой его делает только мёртвая цель в исходе
+        uint32 PetLethalMs = 0;         // когда (игровые мс) - победой считается только свежий прогноз
     };
 
     Blows BlowsOf(ObjectGuid guid)
@@ -842,6 +843,7 @@ public:
         {
             ++it->second.PetLethal;
             it->second.PetLethalOn = victim->GetGUID();
+            it->second.PetLethalMs = GameTime::GetGameTimeMS();
         }
     }
 
@@ -3593,6 +3595,41 @@ public:
     // гарантированно — и книга с ближним периодическим и дальним заполнителем получила бы
     // ближнюю дистанцию на весь бой. Разведку дальности нельзя вешать на первую ступень
     // ротации, поэтому она спрашивает ровно то, что спрашивала до ротации.
+    // ПЛОЩАДНОЕ - ТОЛЬКО КОГДА В ПЛОЩАДИ НИКОГО, КРОМЕ ЦЕЛИ (оператор 2026-09-29, «все делай»:
+    // вернуть «Правосудие»). Сверка 29.09: у Judgment 20271 третий эффект бьёт всех в 12 ярдах от
+    // цели (цели 53/16, SpellRadius 32, без MaxTargets и условий), у Shield of the Righteous - конус.
+    // Запрет «по площади - ни в коем случае» отнимал их целиком, а паладин гиб от одиночек (13 из
+    // 44). Смысл запрета сохранён: заденет соседа - не берём. Радиус - ядра (`CalcRadius` по обеим
+    // целям эффекта), центр - и цель, и я (конус и «вокруг себя» считаются от меня), плюс два ярда.
+    // Соседом не считается тот, кто уже дерётся с нами, и зверёк (он не зовёт на помощь).
+    bool AreaHitsOnlyVictim(Player* self, Unit* victim, SpellInfo const* si) const
+    {
+        float radius = 0.0f;
+        for (SpellEffectInfo const& e : si->GetEffects())
+            if (e.IsEffect() && (e.IsTargetingArea() || e.IsAreaAuraEffect()
+                                 || e.IsEffect(SPELL_EFFECT_PERSISTENT_AREA_AURA)))
+                radius = std::max({ radius, e.CalcRadius(self, SpellTargetIndex::TargetA),
+                                    e.CalcRadius(self, SpellTargetIndex::TargetB) });
+        if (radius <= 0.0f)
+            return false;                   // площадь без радиуса - не знаем, кого заденет
+        radius += 2.0f;
+        float const reach = radius + self->GetExactDist2d(victim);
+        std::list<Creature*> near;
+        Trinity::AnyUnitInObjectRangeCheck check(self, reach);
+        Trinity::CreatureListSearcher<Trinity::AnyUnitInObjectRangeCheck> searcher(self, near, check);
+        Cell::VisitGridObjects(self, searcher, reach);
+        for (Creature* c : near)
+        {
+            if (c == victim || !c->IsAlive() || c->IsCritter() || c->IsInCombatWith(self))
+                continue;
+            if (!self->IsValidAttackTarget(c))
+                continue;
+            if (c->GetExactDist2d(victim) <= radius || c->GetExactDist2d(self) <= radius)
+                return false;
+        }
+        return true;
+    }
+
     uint32 PickAttackSpell(Player* self, Unit* victim, uint32 lastSpell = 0,
                            bool flatRanking = false) const
     {
@@ -3649,7 +3686,11 @@ public:
             // Заклинание с уроном по площади подтягивает соседние группы, и на боевом это
             // не «чуть хуже», а цепная смерть: спутник собирает на себя пятерых, гибнет,
             // возрождается, идёт туда же. Спрашиваем у ядра оба признака.
-            if (si->IsAffectingArea() || si->IsTargetingArea())
+            // РАЗВЕДКА ДАЛЬНОСТИ ПЛОЩАДНЫХ НЕ ВИДИТ: дистанцию вступления она считает раз за бой, и
+            // «Правосудие» на 30 ярдов поставило бы паладина вдали от цели, без ближнего боя, на всё
+            // время его отката. Подходим как прежде, а площадное берётся в бою, когда рядом пусто.
+            if ((si->IsAffectingArea() || si->IsTargetingArea())
+                && (flatRanking || !AreaHitsOnlyVictim(self, victim, si)))
                 continue;
             if (si->CheckTarget(self, victim, false) != SPELL_CAST_OK)
                 continue;
@@ -9277,7 +9318,7 @@ public:
         Constellation::Ai::BlowsSnapshot s;
         s.Swings = b.Swings; s.Landed = b.Landed; s.Zeroed = b.Zeroed; s.Dealt = b.Dealt;
         s.Hits = b.Hits; s.Taken = b.Taken; s.Kills = b.Kills; s.LastKilled = b.LastKilled;
-        s.PetLethal = b.PetLethal; s.PetLethalOn = b.PetLethalOn;
+        s.PetLethal = b.PetLethal; s.PetLethalOn = b.PetLethalOn; s.PetLethalMs = b.PetLethalMs;
         return s;
     }
 

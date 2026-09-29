@@ -664,6 +664,7 @@ namespace Constellation::Ai
         ObjectGuid LastKilled;          // и КОГО именно — без этого победа не адресная
         uint32 PetLethal = 0;           // удар питомца, смертельный по прогнозу
         ObjectGuid PetLethalOn;
+        uint32 PetLethalMs = 0;         // игровые мс прогноза
     };
 
     enum class FightEvent : uint8 { Engaged, Won, Ended };
@@ -846,6 +847,11 @@ namespace Constellation::Ai
         // (сторож подмены цели), ни «жив ли он» (исход), ни «нужен ли он ещё заданию».
         ObjectGuid CurrentVictim() const;                   // `GetVictim()` — ядро обнуляет в момент смерти цели
         bool       IsAliveUnit(ObjectGuid unit) const;      // жив ли (труп на месте — не жив)
+        // ТРУП НА МЕСТЕ: существо найдено и мертво. Не «не жив»: пропавший (исчез, выгружен) -
+        // не доказательство смерти (Кодекс 60).
+        bool       IsCorpseUnit(ObjectGuid unit) const;
+        // Право на добычу у меня (список тапа ядра): удар питомца его не даёт (Creature.cpp:1387).
+        bool       TappedByMe(ObjectGuid unit) const;
         uint64     QuestLogSignature() const;               // (квест, статус) по слотам — без счётчиков
         uint32     EntryOf(ObjectGuid unit) const;          // вид существа, 0 если его нет
         // ЦЕЛЬ ЕЩЁ НУЖНА ЗАДАНИЮ — предикат лестницы целиком (`StillWanted`): прямая цель,
