@@ -20,6 +20,9 @@
 #include "MiscPackets.h"
 #include "NPCPackets.h"
 #include "Opcodes.h"
+#include "CharmInfo.h"
+#include "Pet.h"
+#include "PetPackets.h"
 #include "Player.h"
 #include "QuestPackets.h"
 #include "SpellPackets.h"
@@ -177,6 +180,25 @@ namespace Constellation::Ai
         WorldPackets::Combat::AttackSwing swing(std::move(raw));
         swing.Victim = victim;
         _session->HandleAttackSwingOpcode(swing);
+        return true;
+    }
+
+    bool ClientAct::PetAttack(ObjectGuid victim)
+    {
+        if (!Usable() || victim.IsEmpty())
+            return false;
+        Pet* pet = _self->GetPet();
+        if (!pet || !pet->IsAlive() || (pet->GetVictim() && pet->GetVictim()->GetGUID() == victim))
+            return false;
+        WorldPacket raw(CMSG_PET_ACTION);
+        WorldPackets::Pet::PetAction act(std::move(raw));
+        act.PetGUID = pet->GetGUID();
+        act.Action = MAKE_UNIT_ACTION_BUTTON(COMMAND_ATTACK, ACT_COMMAND);
+        act.TargetGUID = victim;
+        _session->HandlePetAction(act);
+        TC_LOG_INFO("server.worldserver", "Constellation ПИТОМЕЦ {}: {} в атаку на {} (было на {})",
+            _self->GetName(), pet->GetName(), victim.ToString(),
+            pet->GetVictim() ? pet->GetVictim()->GetName() : std::string("никого"));
         return true;
     }
 

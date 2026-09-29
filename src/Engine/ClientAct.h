@@ -188,6 +188,9 @@ namespace Constellation::Ai
         bool Face(ObjectGuid target);                               // CMSG_MOVE_SET_FACING
         bool AttackSwing(ObjectGuid victim);                        // CMSG_ATTACK_SWING
         bool AttackStop();                                          // CMSG_ATTACK_STOP
+        // The pet bar's Attack button: works in any react state (a passive pet only skips assisting
+        // on its own, PetAI::OwnerAttacked). Sent only when the pet is alive and not on this victim.
+        bool PetAttack(ObjectGuid victim);                          // CMSG_PET_ACTION (COMMAND_ATTACK)
 
         // -- loot: four opcodes, one protocol (open -> money -> items -> release). Bodies moved
         //    from the ladder's LootFromCorpse/TakeOpenLoot; the protocol itself is

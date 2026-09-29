@@ -399,6 +399,8 @@ namespace
                 f.EngageRangeKnown = true;
             }
             bool const closeEnough = ctx.World.CloseEnough(victim, f.EngageRange);
+            if (f.Engaged)
+                ctx.Act.PetAttack(victim);  // питомец на цель, как кнопка «Атаковать»; повтор - только если сошёл
 
             // ---- ОТВОД: УТАЩИТЬ ЦЕЛЬ ОТ ЛАГЕРЯ И ТАМ ДОБИТЬ (лестница, `:3986-4076`) -----
             // Точку берём один раз — прочь от того места, где мы её зацепили; идём спиной,
@@ -549,6 +551,7 @@ namespace
                 f = EngineState::FightState{ .Loot = f.Loot };
                 return false;
             }
+            ctx.Act.PetAttack(victim);
             if (f.Engaged)
                 return true;                        // повторный замах: база и доклад уже есть
             // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою — ОДИН РАЗ.
