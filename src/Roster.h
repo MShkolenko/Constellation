@@ -65,6 +65,7 @@ struct RosterEntry
     uint8 Race;
     uint8 Class;
     uint8 Sex;              // GENDER_MALE / GENDER_FEMALE -- must match Name
+    uint16 Spec = 0;        // ChrSpecialization asked for at level 10; 0 = the first damage spec
 };
 
 // 17: восемь людей и девять троллей, оба без рыцаря смерти. ЧИСЛО ЗДЕСЬ - НЕ
@@ -76,27 +77,30 @@ struct RosterEntry
 // начинают на одном месте (Echo Isles, карта 1, -1171 -5263 по playercreateinfo), поэтому
 // правило «одна раса - одна стартовая зона» держится внутри каждой команды. Строки взяты из
 // ростера до сокращения 09.09: персонажи с этими именами уже есть в базе и вернутся, где стоят.
+// СПЕК ЗАДАН У КАЖДОГО (оператор, 29.09: «делай все»; аудит механик 29.09): «первый урон по
+// порядку» делал всех магов Тайными, и сосульки, над которыми работали сутки, не доставались
+// никому. Спеки разнесены между людьми и троллями, чтобы каждая механика шла вживую хоть у кого-то.
 inline constexpr std::array<RosterEntry, 17> Roster =
 {{
     // восемь классов человека, которые начинают в Северной Долине
-    { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE },
-    { "Aldric",     RACE_HUMAN,                 CLASS_PALADIN,       GENDER_MALE },
-    { "Rowena",     RACE_HUMAN,                 CLASS_HUNTER,        GENDER_FEMALE },
-    { "Cecily",     RACE_HUMAN,                 CLASS_ROGUE,         GENDER_FEMALE },
-    { "Adeline",    RACE_HUMAN,                 CLASS_PRIEST,        GENDER_FEMALE },
-    { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE },
-    { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE },
-    { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE },
+    { "Garrick",    RACE_HUMAN,                 CLASS_WARRIOR,       GENDER_MALE, 71 },
+    { "Aldric",     RACE_HUMAN,                 CLASS_PALADIN,       GENDER_MALE, 70 },
+    { "Rowena",     RACE_HUMAN,                 CLASS_HUNTER,        GENDER_FEMALE, 253 },
+    { "Cecily",     RACE_HUMAN,                 CLASS_ROGUE,         GENDER_FEMALE, 260 },
+    { "Adeline",    RACE_HUMAN,                 CLASS_PRIEST,        GENDER_FEMALE, 258 },
+    { "Emrick",     RACE_HUMAN,                 CLASS_MAGE,          GENDER_MALE, 64 },
+    { "Deverel",    RACE_HUMAN,                 CLASS_WARLOCK,       GENDER_MALE, 265 },
+    { "Brienne",    RACE_HUMAN,                 CLASS_MONK,          GENDER_FEMALE, 269 },
     // девять классов тролля, которые начинают на Echo Isles
-    { "Zalko",      RACE_TROLL,                 CLASS_WARRIOR,       GENDER_MALE },
-    { "Jubaka",     RACE_TROLL,                 CLASS_HUNTER,        GENDER_MALE },
-    { "Tayana",     RACE_TROLL,                 CLASS_ROGUE,         GENDER_FEMALE },
-    { "Zulwara",    RACE_TROLL,                 CLASS_PRIEST,        GENDER_FEMALE },
-    { "Nakuru",     RACE_TROLL,                 CLASS_SHAMAN,        GENDER_MALE },
-    { "Sennja",     RACE_TROLL,                 CLASS_MAGE,          GENDER_FEMALE },
-    { "Voljara",    RACE_TROLL,                 CLASS_WARLOCK,       GENDER_FEMALE },
-    { "Bumbu",      RACE_TROLL,                 CLASS_MONK,          GENDER_MALE },
-    { "Yalanda",    RACE_TROLL,                 CLASS_DRUID,         GENDER_FEMALE },
+    { "Zalko",      RACE_TROLL,                 CLASS_WARRIOR,       GENDER_MALE, 72 },
+    { "Jubaka",     RACE_TROLL,                 CLASS_HUNTER,        GENDER_MALE, 254 },
+    { "Tayana",     RACE_TROLL,                 CLASS_ROGUE,         GENDER_FEMALE, 259 },
+    { "Zulwara",    RACE_TROLL,                 CLASS_PRIEST,        GENDER_FEMALE, 258 },
+    { "Nakuru",     RACE_TROLL,                 CLASS_SHAMAN,        GENDER_MALE, 262 },
+    { "Sennja",     RACE_TROLL,                 CLASS_MAGE,          GENDER_FEMALE, 63 },
+    { "Voljara",    RACE_TROLL,                 CLASS_WARLOCK,       GENDER_FEMALE, 267 },
+    { "Bumbu",      RACE_TROLL,                 CLASS_MONK,          GENDER_MALE, 269 },
+    { "Yalanda",    RACE_TROLL,                 CLASS_DRUID,         GENDER_FEMALE, 103 },
 }};
 }
 

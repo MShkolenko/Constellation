@@ -73,6 +73,7 @@ namespace
             || a == ActionId::TalkToTarget;
     }
     inline constexpr uint32 FIGHT_RESERVE_MS      = 600000;   // backstop of the victim reservation (P5): longer than any fight; the real end is the outcome
+    inline constexpr uint32 PET_CMD_EVERY_MS      = 3000;     // повтор команды питомцу, если он сошёл с цели
     inline constexpr uint32 PET_LETHAL_FRESH_MS   = 2000;     // прогноз добивания питомцем старше - не наш
     inline constexpr uint32 HELD_BY_OTHER_MS      = 10000;    // target held by another: step back ten seconds, the scan offers a neighbour
 
@@ -242,6 +243,7 @@ namespace
             // бессмыслен. Уходим и выбираем заново — но уже с новым отсчётом.
             if (cur != victim)
                 return End(ctx, f, "цель подменилась", /*ban=*/false);
+            SendPet(ctx, f, victim);
 
             BlowsSnapshot const now = ctx.Fight.Snapshot();
             if (now.Dealt > f.DealtHigh)
@@ -400,7 +402,7 @@ namespace
             }
             bool const closeEnough = ctx.World.CloseEnough(victim, f.EngageRange);
             if (f.Engaged)
-                ctx.Act.PetAttack(victim);  // питомец на цель, как кнопка «Атаковать»; повтор - только если сошёл
+                SendPet(ctx, f, victim);
 
             // ---- ОТВОД: УТАЩИТЬ ЦЕЛЬ ОТ ЛАГЕРЯ И ТАМ ДОБИТЬ (лестница, `:3986-4076`) -----
             // Точку берём один раз — прочь от того места, где мы её зацепили; идём спиной,
@@ -531,6 +533,17 @@ namespace
             return false;
         }
 
+        // ПИТОМЕЦ НА ЦЕЛЬ, как кнопка «Атаковать» на панели: каждый такт боя, но не чаще раза в
+        // PET_CMD_EVERY_MS, потому что ядро может молча отказать (хозяин верхом, цель не годится,
+        // Кодекс 65) и тогда повтор каждый такт был бы спамом.
+        static void SendPet(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
+        {
+            if (f.PetCmdMs && getMSTimeDiff(f.PetCmdMs, ctx.NowMs) < PET_CMD_EVERY_MS)
+                return;
+            if (ctx.Act.PetAttack(victim))
+                f.PetCmdMs = ctx.NowMs ? ctx.NowMs : 1;
+        }
+
         // ВСТУПЛЕНИЕ: повернуться, выбрать, ударить — и спросить у ядра, приняло ли оно замах.
         bool Swing(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
         {
@@ -551,7 +564,7 @@ namespace
                 f = EngineState::FightState{ .Loot = f.Loot };
                 return false;
             }
-            ctx.Act.PetAttack(victim);
+            SendPet(ctx, f, victim);
             if (f.Engaged)
                 return true;                        // повторный замах: база и доклад уже есть
             // ОТСЕЧКА: всё, что насчитается дальше, относится ИМЕННО к этому бою — ОДИН РАЗ.

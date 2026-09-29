@@ -187,6 +187,8 @@ namespace Constellation::Ai
     {
         if (!Usable() || victim.IsEmpty())
             return false;
+        if (_self->IsMounted())
+            return false;                           // ядро отказывает хозяину верхом (PetHandler.cpp:66)
         Pet* pet = _self->GetPet();
         if (!pet || !pet->IsAlive() || (pet->GetVictim() && pet->GetVictim()->GetGUID() == victim))
             return false;

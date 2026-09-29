@@ -1247,6 +1247,19 @@ public:
             return;
         if (!spec || spec->OrderIndex >= INITIAL_SPECIALIZATION_INDEX)
         {
+            if (uint16 const wanted = c.Entry ? c.Entry->Spec : 0)
+            {
+                ChrSpecializationEntry const* w = sChrSpecializationStore.LookupEntry(wanted);
+                if (w && w->ClassID == self->GetClass())
+                {
+                    c.TalentSentAtMs = now ? now : 1;
+                    ++c.TalentTries;
+                    RequestSpec(c, self, wanted);
+                    return;
+                }
+                TC_LOG_ERROR("server.worldserver", "Constellation СПЕЦИАЛИЗАЦИЯ {}: в ростере спек {} не этого класса - беру первый урон",
+                    self->GetName(), wanted);
+            }
             for (uint32 i = 0; i < INITIAL_SPECIALIZATION_INDEX; ++i)
                 if (ChrSpecializationEntry const* s = sDB2Manager.GetChrSpecializationByIndex(self->GetClass(), i))
                     if (s->GetRole() == ChrSpecializationRole::Dps)
@@ -10992,7 +11005,9 @@ public:
 
     static bool SquadFit(Player const* a, Player const* b)
     {
-        return a->GetMapId() == b->GetMapId() && a->IsAlive() && b->IsAlive()
+        // ОДНА СТОРОНА (Кодекс 65): в ростере теперь Орда и Альянс, а ядро отвергает приглашение
+        // чужой стороне (GroupHandler.cpp:85) - без проверки зов повторялся бы каждые 10 с.
+        return a->GetTeam() == b->GetTeam() && a->GetMapId() == b->GetMapId() && a->IsAlive() && b->IsAlive()
             && std::abs(int32(a->GetLevel()) - int32(b->GetLevel())) <= SQUAD_LEVEL_SPREAD
             && a->GetExactDist2d(b) <= SQUAD_GATHER_YARDS && ShareOpenQuest(a, b);
     }

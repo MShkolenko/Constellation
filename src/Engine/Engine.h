@@ -207,6 +207,7 @@ namespace Constellation::Ai
             bool          PackKnown   = false;
             bool          Kiting      = false;
             uint32        KiteMs      = 0;
+            uint32        PetCmdMs    = 0;      // когда питомцу последний раз сказали «Атаковать»
             Position      KiteTo;
             CastMemory    Cast;
             LootCounters  Loot;                 // за всё время, как у лестницы
