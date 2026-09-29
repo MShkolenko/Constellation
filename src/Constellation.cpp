@@ -3665,6 +3665,9 @@ public:
         }
         uint8 const level = self->GetLevel();
         pet->SetLevel(level > 1 ? level - 1 : level);  // как у ядра: вспышка повышения уровня
+        float px, py, pz;   // как в ядре: рядом с хозяином, а не внутри него (Кодекс 62)
+        self->GetClosePoint(px, py, pz, pet->GetCombatReach(), PET_FOLLOW_DIST, pet->GetFollowAngle());
+        pet->Relocate(px, py, pz, self->GetOrientation());
         pet->GetMap()->AddToMap(pet->ToCreature());
         pet->SetLevel(level);
         self->SetMinion(pet, true);
