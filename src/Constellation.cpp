@@ -135,6 +135,7 @@ struct Settings
     bool  TakeQuests      = true;       // БРАТЬ квесты; сдавать разрешает Quests
     bool  PathClear       = true;       // зачистка пути (проект отрядов v1, часть B)
     bool  Squads          = true;       // отряды спутников по общей цели (часть A1)
+    bool  Pets            = true;       // призывать питомца вне боя (оператор 2026-09-29)
     bool  Talents         = true;       // спек с 10-го уровня и стартовая сборка талантов клиента
     bool  Fight           = true;
     bool  Abilities       = false;      // произносить умения, а не только выбирать
@@ -199,6 +200,7 @@ struct Settings
         // не сняла; если суд повторится, её гасит `.reload config`, а не откат и пересборка.
         PathClear       = sConfigMgr->GetBoolDefault("Constellation.PathClear", true);
         Squads          = sConfigMgr->GetBoolDefault("Constellation.Squads", true);
+        Pets            = sConfigMgr->GetBoolDefault("Constellation.Pets", true);
         Talents         = sConfigMgr->GetBoolDefault("Constellation.Talents", true);
         Fight           = sConfigMgr->GetBoolDefault("Constellation.Fight", true);
         // УМЕНИЯ ПО УМОЛЧАНИЮ ТОЛЬКО ВЫБИРАЮТСЯ, НО НЕ ПРОИЗНОСЯТСЯ.
@@ -12899,6 +12901,7 @@ namespace Constellation::Ai
         t.TakeQuests      = Constellation::Cfg().TakeQuests;
         t.PathClear       = Constellation::Cfg().PathClear;
         t.Squads          = Constellation::Cfg().Squads;
+        t.Pets            = Constellation::Cfg().Pets;
         t.Flying          = Constellation::Cfg().Flying;
         t.Follow          = Constellation::Cfg().Follow;
         t.FollowDistance  = Constellation::Cfg().FollowDistance;

@@ -788,6 +788,91 @@ namespace
         // любое расстояние.
     };
 
+    // ПРИЗВАТЬ ПИТОМЦА (оператор 2026-09-29: «суммонер без суммона зачастую имеет 60% силы»).
+    // Сверка 29.09: ни одного питомца в `character_pet` живого мира, «Призыв беса» не произносился
+    // ни разу, а в гибелях при одном враждебном рядом охотница первая (22 из 66). Тот же опкод, что
+    // у клиента; годится ли призыв (стойло охотника, мёртвый питомец) решает `Spell::CheckCast`.
+    // lazy: воскрешение мёртвого питомца охотника (982) не делается - такой призыв ядро отклонит,
+    // и заклинание уйдёт в отказанные на PET_REFUSED_MS; нужен отдельный шаг, если это замерится.
+    inline constexpr uint32 PET_TRACE_MS   = 2000;     // каст с чтением виден сразу, мгновенный - питомцем
+    inline constexpr uint32 PET_REFUSED_MS = 600000;
+
+    inline size_t PetSkipList(Ctx& ctx, uint32 (&out)[4])
+    {
+        size_t n = 0;
+        for (size_t i = 0; i < 4; ++i)
+            if (ctx.St->PetRefused[i] && int32(ctx.St->PetRefusedUntilMs[i] - ctx.NowMs) > 0)
+                out[n++] = ctx.St->PetRefused[i];
+        return n;
+    }
+
+    inline uint32 PetToSummon(Ctx& ctx)
+    {
+        if (!ctx.St || !Tuning().Pets)
+            return 0;
+        uint32 skip[4];
+        size_t const n = PetSkipList(ctx, skip);
+        return ctx.World.PetSummonSpell(skip, n);
+    }
+
+    class SummonPetAction final : public Action
+    {
+    public:
+        SummonPetAction() : Action(ActionId::SummonPet) { }
+
+        bool Useful(Ctx& ctx, Bid const&) override
+        {
+            return ctx.St && Tuning().Pets && !ctx.World.IsInCombat()
+                && (ctx.St->PetSpell != 0 || PetToSummon(ctx) != 0);
+        }
+
+        bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
+
+        bool Execute(Ctx& ctx, Bid const&) override
+        {
+            if (!ctx.St)
+                return false;
+            EngineState& st = *ctx.St;
+            if (ctx.World.IsInCombat())
+            {
+                st.PetSpell = 0;                // напали посреди призыва - сначала драться
+                return false;
+            }
+            if (st.PetSpell)
+            {
+                if (ctx.World.HasPet())
+                {
+                    ctx.World.LogPet(st.PetSpell, "призван");
+                    st.PetSpell = 0;
+                    return false;
+                }
+                if (ctx.World.IsCasting() || getMSTimeDiff(st.PetAskedAtMs, ctx.NowMs) < PET_TRACE_MS)
+                    return true;
+                // ЯДРО НЕ ПРИЗВАЛО: не начало чтения и питомца нет. Это заклинание - в отказанные,
+                // иначе охотник без питомца в стойле просил бы каждую секунду.
+                size_t slot = 0;
+                for (size_t i = 1; i < 4; ++i)
+                    if (int32(st.PetRefusedUntilMs[i] - st.PetRefusedUntilMs[slot]) < 0)
+                        slot = i;
+                st.PetRefused[slot] = st.PetSpell;
+                st.PetRefusedUntilMs[slot] = ctx.NowMs + PET_REFUSED_MS;
+                ctx.World.LogPet(st.PetSpell, "ядро не призвало, десять минут не прошу");
+                st.PetSpell = 0;
+                return false;
+            }
+            uint32 const spell = PetToSummon(ctx);
+            if (!spell)
+                return false;
+            ctx.Act.StopMoving();
+            if (!ctx.Act.CastSpell(spell, ctx.World.Guid()))
+                return false;
+            st.PetSpell = spell;
+            st.PetAskedAtMs = ctx.NowMs;
+            ctx.World.LogPet(spell, "призываю");
+            return true;
+        }
+    };
+
     // ВЫЖИВАНИЕ — СВОЯ СТРАТЕГИЯ, А НЕ УГОЛОК БОЕВОЙ. `Survival` объявлена в списке ровно под
     // это, и разделение не косметическое: маска включает стратегии ПОРОЗНЬ, а «выключить бой,
     // оставить отдых» под общей крышей перестало бы работать.
@@ -811,6 +896,12 @@ namespace
             // ОДИН ВОПРОС на ставку, на `Useful` и на стратегии, которые уступают отдыху: `RestWanted`.
             if (RestWanted(ctx))
                 sink.Add(ActionId::Rest, REL_HIGH, Subject());
+
+            // ПИТОМЕЦ ПРЕЖДЕ ДЕЛА И ДРАКИ, НО ПОСЛЕ ОТДЫХА: выше похода, выманивания на пути и
+            // перелёта (REL_MOVE), ниже прерываний. Начатый призыв доводится и при отдыхе.
+            if (ctx.St && !ctx.World.IsInCombat()
+                && (ctx.St->PetSpell != 0 || (!RestWanted(ctx) && PetToSummon(ctx) != 0)))
+                sink.Add(ActionId::SummonPet, REL_MOVE + 1.0f, Subject());
 
             // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший
             // бой, с нападающим — отходить. REL_MOVE: выше боя и отдыха, которым в бою со
@@ -1071,6 +1162,7 @@ namespace Constellation::Ai
     void RegisterFightActions(Engine& engine)
     {
         engine.Register(std::make_unique<RestAction>());
+        engine.Register(std::make_unique<SummonPetAction>());
         engine.Register(std::make_unique<SurvivalStrategy>());
         engine.Register(std::make_unique<KillObjectiveAction>());
         engine.Register(std::make_unique<OpenCageForTargetAction>());

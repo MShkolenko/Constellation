@@ -859,6 +859,13 @@ namespace Constellation::Ai
         // дистанция И прямая видимость, для ближнего боя — охват ядра.
         bool       CloseEnough(ObjectGuid unit, float engageRange) const;
         bool       IsCasting() const;                       // `IsNonMeleeSpellCast(false)`
+        // ПИТОМЕЦ (оператор 2026-09-29: «суммонер без суммона зачастую имеет 60% силы»).
+        // `HasPet` - у ядра есть гуид питомца или подчинённого. `PetSummonSpell` - заклинание
+        // призыва из книги, готовое и по карману, старшее по уровню; `skip` - отказанные ядром.
+        // 0 - питомец есть, призывать нечем или сейчас нельзя (бой, седло, такси, каст, мёртв).
+        bool       HasPet() const;
+        uint32     PetSummonSpell(uint32 const* skip, size_t skipCount) const;
+        void       LogPet(uint32 spellId, char const* what) const;
 
         // -- ОТВОД (кайт): утащить цель от лагеря и там добить. Правило лестницы целиком -------
         //
@@ -1058,6 +1065,7 @@ namespace Constellation::Ai
         bool   TakeQuests     = true;     // `Constellation.TakeQuests`: брать квесты (был флаг `QuestTick`)
         bool   PathClear      = true;     // `Constellation.PathClear`: зачистка пути
         bool   Squads         = true;     // `Constellation.Squads`: отряды (общий бой, одна цель)
+        bool   Pets           = true;     // `Constellation.Pets`: призывать питомца вне боя
         bool   Flying         = true;     // `Constellation.Flying`: полёты и камень разрешены
         bool   Follow         = true;     // `Constellation.Follow`: следовать за хозяином
         float  FollowDistance = 4.0f;     // насколько близко держаться

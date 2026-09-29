@@ -26,6 +26,10 @@
 #include "ObjectMgr.h"
 #include "PathGenerator.h"
 #include "Player.h"
+#include "SpellHistory.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include <algorithm>
 
 namespace Constellation::Ai
 {
@@ -819,6 +823,51 @@ namespace Constellation::Ai
     bool WorldView::IsCasting() const
     {
         return _self && _self->IsNonMeleeSpellCast(false);
+    }
+
+    bool WorldView::HasPet() const
+    {
+        return _self && (!_self->GetPetGUID().IsEmpty() || !_self->GetCharmedGUID().IsEmpty());
+    }
+
+    uint32 WorldView::PetSummonSpell(uint32 const* skip, size_t skipCount) const
+    {
+        if (!_self || !_self->IsAlive() || _self->IsInCombat() || _self->IsMounted() || _self->IsInFlight()
+            || HasPet() || _self->IsNonMeleeSpellCast(false))
+            return 0;
+        Difficulty const diff = _self->GetMap()->GetDifficultyID();
+        uint32 best = 0, bestLevel = 0;
+        for (auto const& [id, ps] : _self->GetSpellMap())
+        {
+            if (!_self->HasActiveSpell(id))
+                continue;
+            if (std::find(skip, skip + skipCount, id) != skip + skipCount)
+                continue;
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
+            if (!si || si->IsPassive() || !si->HasEffect(SPELL_EFFECT_SUMMON_PET))
+                continue;
+            if (!_self->GetSpellHistory()->IsReady(si))
+                continue;
+            bool affordable = true;
+            for (SpellPowerCost const& cost : si->CalcPowerCost(_self, si->GetSchoolMask()))
+                if (cost.Amount > 0 && _self->GetPower(cost.Power) < cost.Amount)
+                    { affordable = false; break; }
+            if (!affordable)
+                continue;
+            if (!best || si->SpellLevel > bestLevel)
+                { best = id; bestLevel = si->SpellLevel; }
+        }
+        return best;
+    }
+
+    void WorldView::LogPet(uint32 spellId, char const* what) const
+    {
+        if (!_self)
+            return;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        TC_LOG_INFO("server.worldserver", "Constellation ПИТОМЕЦ {} (класс {}, ур {}): {} ({}) - {}",
+            _self->GetName(), uint32(_self->GetClass()), uint32(_self->GetLevel()),
+            (si && si->SpellName) ? si->SpellName->Str[LOCALE_enUS] : "?", spellId, what);
     }
 
     float WorldView::KiteYards() const
