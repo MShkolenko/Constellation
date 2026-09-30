@@ -28,6 +28,7 @@
 
 #include "BuildStamp.h"
 #include "Registration.h"
+#include "BornGear.h"
 #include "Roster.h"
 #include "Rotation.h"
 
@@ -161,6 +162,7 @@ struct Settings
     // остаётся полным. Никаких канареек: когорта общая, поштучно включается умение.
     uint32 EngineStrategies = 0;
     uint32 MaxActive      = 0;
+    uint32 Groups         = 1;          // маска групп состава: бит 0 - новорождённые, 1 - ур. 10, 2 - ур. 20
     uint32 PerTick        = 6;
     uint32 MaxQuests      = 10;
     uint32 QuestIntervalMs = 5000;
@@ -217,6 +219,7 @@ struct Settings
         Engine          = sConfigMgr->GetBoolDefault("Constellation.Engine", false);
         EngineStrategies = uint32(sConfigMgr->GetIntDefault("Constellation.EngineStrategies", 0));
         MaxActive       = sConfigMgr->GetIntDefault("Constellation.MaxActive", 0);
+        Groups          = sConfigMgr->GetIntDefault("Constellation.Groups", 1);
         PerTick         = sConfigMgr->GetIntDefault("Constellation.PerTick", 6);
         MaxQuests       = sConfigMgr->GetIntDefault("Constellation.MaxQuests", 10);
         QuestIntervalMs = sConfigMgr->GetIntDefault("Constellation.QuestIntervalMs", 5000);
@@ -276,6 +279,7 @@ enum class Behavior : uint8 { Idle, Recovering, FollowingOwner, Travelling, Appr
 struct Companion
 {
     RosterEntry const* Entry = nullptr;
+    bool BornDone = false;              // набор при рождении группы 10/20 выдан (обнуляется вайпом)
     std::string PersistentName;         // the name actually stored in DB (fallback-aware)
     uint32 AccountId = 0;               // ITS OWN game account
     uint32 BnetId = 0;                  // ITS OWN battlenet account (warband isolation)
@@ -3274,6 +3278,8 @@ public:
 
         // ОБНОВКИ — ПЕРВЫМ ДЕЛОМ И НЕЧАСТО: раз в полминуты, одна за проход.
         // Ничего не переключает, просто улучшает всё, что будет дальше.
+        if (c.Entry && c.Entry->Level > 1 && !c.BornDone)
+            BornKit(c, self);
         if (idleScan && !c.EquipScanMs)
         {
             c.EquipScanMs = 30000 + (c.Guid.GetCounter() % 5000u);
@@ -3647,6 +3653,99 @@ public:
         static std::vector<TameSpawn> const none;
         auto it = _tame.find(mapId);
         return it != _tame.end() ? it->second : none;
+    }
+
+    // ============================================================================================
+    // НАБОР ПРИ РОЖДЕНИИ группы 10-го и 20-го уровня (оператор 2026-09-30: «в шмоте для их уровня, это
+    // важно», «с маунтами, если уже положено»). ОСОЗНАННОЕ ИСКЛЮЧЕНИЕ из инварианта 0, того же рода,
+    // что выдача питомца охотнику: предметы не приходят пакетами клиента, их создаёт ядро, как это
+    // делают `Player::Create` с начальным набором и квестовая награда. Один раз на новорождённого:
+    // `BornDone` живёт в слоте (обнуляется вайпом), а на поздний перезапуск мира (игровое время уже
+    // больше пяти минут) набор не накладывается повторно.
+    // ============================================================================================
+    static constexpr uint32 BORN_MAX_PLAYED_S = 300;
+    static constexpr uint32 MOUNT_HUMAN_BROWN_HORSE = 458;
+    static constexpr uint32 MOUNT_TROLL_EMERALD_RAPTOR = 8395;
+
+    void BornKit(Companion& c, Player* self)
+    {
+        RosterEntry const* e = c.Entry;
+        if (!e || e->Level <= 1 || c.BornDone || !self->IsAlive())
+            return;
+        c.BornDone = true;
+        if (self->GetLevel() != e->Level || self->GetTotalPlayedTime() > BORN_MAX_PLAYED_S)
+            return;                         // перезапуск мира, а не рождение
+
+        // СТАРТОВАЯ ОДЕЖДА УХОДИТ: `StoreNewItemInBestSlots` кладёт только в пустой слот.
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (slot != EQUIPMENT_SLOT_BODY && slot != EQUIPMENT_SLOT_TABARD)
+                if (self->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    self->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+
+        uint32 wanted = 0, worn = 0;
+        for (BornItem const& b : BornGear)
+        {
+            if (b.Level != e->Level || b.Race != e->Race || b.Class != e->Class || b.Spec != e->Spec)
+                continue;
+            ++wanted;
+            if (self->StoreNewItemInBestSlots(b.Item, 1, ItemContext::Quest_Reward))
+                ++worn;
+        }
+        // СУМКИ, ЕДА, ДЕНЬГИ
+        uint32 const bag = e->Level >= 20 ? 4499u : 4498u;        // 12 и 8 мест, вещи торговца
+        for (int i = 0; i < 4; ++i)
+            self->StoreNewItemInBestSlots(bag, 1, ItemContext::NONE);
+        self->StoreNewItemInBestSlots(194680, 20, ItemContext::NONE);     // еда, уровень 10
+        if (self->GetPowerType() == POWER_MANA)
+            self->StoreNewItemInBestSlots(163783, 20, ItemContext::NONE); // питьё, уровень 10
+        self->ModifyMoney(int64(e->Level >= 20 ? 100000 : 20000));        // 10 и 2 золотых
+
+        // ЕЗДОВОЙ НАВЫК ДАЁТ УРОВЕНЬ (`GiveLevel` -> `LearnDefaultSkills`), маунт расы - одно заклинание.
+        uint32 const mount = e->Race == RACE_TROLL ? MOUNT_TROLL_EMERALD_RAPTOR : MOUNT_HUMAN_BROWN_HORSE;
+        if (!self->HasSpell(mount))
+            self->LearnSpell(mount, false);
+
+        self->SetFullHealth();
+        TC_LOG_INFO("server.worldserver",
+            "Constellation НАБОР {} (класс {}, ур {}, группа {}): предметов {} из {} на месте, сумки, еда, деньги, маунт {}",
+            self->GetName(), uint32(e->Class), uint32(e->Level), uint32(e->Group), worn, wanted, mount);
+    }
+
+    // ГДЕ РОДИТЬСЯ: хаб группы - трактирщик по записи, место - его точка в мире (ядро знает, где он
+    // стоит, а координаты руками опечатываются). Строится один раз, при первом рождении.
+    bool LandingFor(RosterEntry const& e, WorldLocation& out)
+    {
+        if (!e.Group)
+            return false;
+        bool const horde = e.Race == RACE_TROLL;
+        uint32 inn = 0, seen = 0;
+        for (LandingHub const& h : LandingHubs)
+            if (h.Group == e.Group && h.Horde == horde)
+            {
+                if (seen++ == e.Hub) { inn = h.InnEntry; break; }
+            }
+        if (!inn)
+            return false;
+        std::lock_guard<std::mutex> lock(_landLock);
+        if (!_landBuilt)
+        {
+            for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+            {
+                if (data.phaseId || data.phaseGroup || data.terrainSwapMap != -1)
+                    continue;
+                for (LandingHub const& h : LandingHubs)
+                    if (h.InnEntry == data.id && !_land.count(data.id))
+                        _land[data.id] = WorldLocation(data.mapId, data.spawnPoint.GetPositionX(),
+                                                       data.spawnPoint.GetPositionY(), data.spawnPoint.GetPositionZ(),
+                                                       data.spawnPoint.GetOrientation());
+            }
+            _landBuilt = true;
+        }
+        auto it = _land.find(inn);
+        if (it == _land.end())
+            return false;
+        out = it->second;
+        return true;
     }
 
     uint32 GrantHunterPet(Player* self)
@@ -11910,6 +12009,8 @@ private:
         // collection tables' foreign keys fail on every login.
         for (RosterEntry const& entry : Roster)
         {
+            if (!(Cfg().Groups & (1u << entry.Group)))
+                continue;                   // группа выключена: состав не заводится и не вайпается
             Companion c;
             c.Entry = &entry;
             c.PersistentName = entry.Name;
@@ -11934,9 +12035,13 @@ private:
         }
         BuildSpawnIndex();
         TC_LOG_INFO("server.loading", "Constellation: bootstrap - roster {}, one account each", uint32(_companions.size()));
-        if (_companions.size() != Roster.size())
+        uint32 enabled = 0;
+        for (RosterEntry const& entry : Roster)
+            if (Cfg().Groups & (1u << entry.Group))
+                ++enabled;
+        if (_companions.size() != enabled)
             TC_LOG_ERROR("server.loading", "Constellation: ONLY {} of {} companions provisioned - the roster is short",
-                uint32(_companions.size()), uint32(Roster.size()));
+                uint32(_companions.size()), enabled);
     }
 
     // Its own battlenet + game account, created on first need. Returns false if the
@@ -11969,8 +12074,13 @@ private:
     // offers 11 classes. Resolved once per race and cached.
     bool ResolveAccount(Companion& c)
     {
-        c.BnetEmail = Trinity::StringFormat("{}-R{}@algalon.local", Cfg().Account, uint32(c.Entry->Race));
-        auto known = _raceAccounts.find(c.Entry->Race);
+        // АККАУНТ НА (РАСУ, ГРУППУ): мир-коллекции аккаунта общая, и маунт двадцатого уровня иначе
+        // появлялся бы в книге новорождённого (аккаунт прежней группы сохраняет старый адрес).
+        uint32 const accountKey = uint32(c.Entry->Race) | (uint32(c.Entry->Group) << 8);
+        c.BnetEmail = c.Entry->Group
+            ? Trinity::StringFormat("{}-R{}G{}@algalon.local", Cfg().Account, uint32(c.Entry->Race), uint32(c.Entry->Group))
+            : Trinity::StringFormat("{}-R{}@algalon.local", Cfg().Account, uint32(c.Entry->Race));
+        auto known = _raceAccounts.find(accountKey);
         if (known != _raceAccounts.end())
         {
             c.BnetId = known->second.first;
@@ -12024,7 +12134,7 @@ private:
             c.AccountId = 0;
             return false;
         }
-        _raceAccounts[c.Entry->Race] = { c.BnetId, c.AccountId };
+        _raceAccounts[accountKey] = { c.BnetId, c.AccountId };
         return true;
     }
 
@@ -12090,7 +12200,7 @@ private:
                 {
                     // cache gets the name that actually went to the database
                     sCharacterCache->AddCharacterCacheEntry(c.Guid, c.AccountId, c.PersistentName,
-                        c.Entry->Sex, c.Entry->Race, c.Entry->Class, 1, false);
+                        c.Entry->Sex, c.Entry->Race, c.Entry->Class, c.Entry->Level, false);
                     TC_LOG_INFO("server.worldserver", "Constellation: created {} ({})", c.PersistentName, c.Guid.ToString());
                     SendEnum(c);
                     return true;
@@ -12557,13 +12667,42 @@ private:
             delete ptr;
         });
         newChar->GetMotionMaster()->Initialize();
-        if (!newChar->Create(sObjectMgr->GetGenerator<HighGuid::Player>().Generate(), createInfo.get()))
+        // РОЖДЕНИЕ НА УРОВНЕ: `Player::Create` берёт стартовый уровень из настройки мира и только потом
+        // считает характеристики, таланты, навыки и полёты. lazy: глобальная запись на время одного
+        // вызова (мир в одном потоке, значение возвращается сразу); путь побезопаснее - шаблон
+        // персонажа в базе мира с правом аккаунта, но это больше частей.
+        uint32 const startLevel = sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL);
+        if (e.Level > 1)
+            sWorld->setIntConfig(CONFIG_START_PLAYER_LEVEL, e.Level);
+        bool const created = newChar->Create(sObjectMgr->GetGenerator<HighGuid::Player>().Generate(), createInfo.get());
+        sWorld->setIntConfig(CONFIG_START_PLAYER_LEVEL, startLevel);
+        if (!created)
         {
             TC_LOG_ERROR("server.worldserver", "Constellation: Player::Create failed for {} (race {}, class {})",
                 name, e.Race, e.Class);
             return false;
         }
         newChar->setCinematic(1);
+        // РОДИТЬСЯ НА ХАБЕ ГРУППЫ, а не в Нортшире или на Эхо-Айлс: до первого сохранения место и дом
+        // меняются как часть создания (мир, карта, координаты, привязка к трактиру).
+        if (e.Group)
+        {
+            WorldLocation landing;
+            if (LandingFor(e, landing))
+            {
+                newChar->Relocate(landing);
+                if (landing.GetMapId() != newChar->GetMapId())
+                    newChar->SetMap(sMapMgr->CreateMap(landing.GetMapId(), newChar.get()));
+                newChar->UpdatePositionData();
+                newChar->SetHomebind(landing, newChar->GetAreaId());
+                TC_LOG_INFO("server.worldserver", "Constellation ХАБ {}: группа {} ур {}, карта {} ({:.0f} {:.0f} {:.0f}), зона {}",
+                    name, uint32(e.Group), uint32(e.Level), landing.GetMapId(), landing.GetPositionX(),
+                    landing.GetPositionY(), landing.GetPositionZ(), newChar->GetZoneId());
+            }
+            else
+                TC_LOG_ERROR("server.worldserver", "Constellation ХАБ {}: нет точки трактирщика для группы {} хаба {} - остаётся у стартовой зоны",
+                    name, uint32(e.Group), uint32(e.Hub));
+        }
 
         CharacterDatabaseTransaction characterTransaction = CharacterDatabase.BeginTransaction();
         LoginDatabaseTransaction loginTransaction = LoginDatabase.BeginTransaction();
@@ -12697,7 +12836,10 @@ private:
     // ТОЧКИ ОБЪЕКТОВ-ФОКУСОВ: карта -> номер фокуса -> где стоят. Заклинание заготовки требует
     // фокуса (у 51769 это 1552, рунная кузня), и без него ядро откажет.
     std::unordered_map<uint32, std::unordered_map<uint32, std::vector<GatherSpawn>>> _focusSpawns;
-    std::unordered_map<uint8, std::pair<uint32, uint32>> _raceAccounts;   // раса -> {bnet, игровая}
+    std::unordered_map<uint32, std::pair<uint32, uint32>> _raceAccounts;  // (раса | группа << 8) -> {bnet, игровая}
+    std::mutex _landLock;
+    bool _landBuilt = false;
+    std::unordered_map<uint32, WorldLocation> _land;                      // запись трактирщика -> его точка
     uint32 _warmupMs = 0;
     bool   _engineSealed = false;   // Seal() зовётся ровно один раз за подъём мира
     uint32 _throttleMs = 0;

@@ -114,3 +114,14 @@ Constellation.Talents = 1
 #
 
 Constellation.Pets = 1
+
+#
+#    Constellation.Groups
+#        Bitmask of the roster groups brought into the world (operator 2026-09-30). Group 0 is the 17
+#        newborns, group 1 the 17 born at level 10, group 2 the 17 born at level 20, each with its own
+#        account, landing hubs and born kit (Roster.h, BornGear.h). 1 = newborns only (the old state),
+#        7 = all three. Changing it needs a restart; a disabled group is neither created nor wiped.
+#        Default: 1
+#
+
+Constellation.Groups = 1
