@@ -5883,22 +5883,10 @@ public:
                 continue;
             if (si->IsAffectingArea() || si->IsTargetingArea())
                 continue;
-            if (!si->CanBeUsedInCombat(self))
-                continue;
-            if (si->CheckTarget(self, self, false) != SPELL_CAST_OK)
-                continue;               // на себя не ложится — не наш случай
-            if (si->CasterAuraState && !self->HasAuraState(AuraStateType(si->CasterAuraState), si, self))
-                continue;               // условие состояния не выполнено — ядро откажет
-            // ГОТОВНОСТЬ — ВОПРОС ЯДРА ЦЕЛИКОМ: SpellHistory::IsReady проверяет блокировку
-            // школы, откат И ЗАРЯДЫ. HasCooldown зарядов не видит, и заклинание с зарядами
-            // считалось готовым всегда.
-            if (!self->GetSpellHistory()->IsReady(si))
-                continue;
-            bool affordable = true;
-            for (SpellPowerCost const& cost : si->CalcPowerCost(self, si->GetSchoolMask()))
-                if (cost.Amount > 0 && self->GetPower(cost.Power) < cost.Amount)
-                    { affordable = false; break; }
-            if (!affordable)
+            // ТЕ ЖЕ ВОПРОСЫ ЯДРУ, ЧТО У УДАРА (`CastableNow`: цель, готовность с зарядами, условие
+            // состояния, цена), и среди них облик: друид в облике кошки иначе выбирал бы
+            // «Восстановление» каждый такт, ядро отказывало, а удар не выбирался вовсе.
+            if (!CastableNow(self, self, si, false, nullptr))
                 continue;
             if (!best || si->SpellLevel > bestLevel)
                 { best = id; bestLevel = si->SpellLevel; }

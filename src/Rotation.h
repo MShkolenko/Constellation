@@ -119,7 +119,10 @@ inline constexpr RotStep Rotation[] =
     { CLASS_SHAMAN,  0, 73899,  RotCond::Always },                       // Primal Strike (melee range only)
     { CLASS_SHAMAN,  0, 188196, RotCond::Always },                       // Lightning Bolt
 
-    // DRUID (caster until forms are driven): keep Moonfire up, Wrath.
+    // DRUID: in Cat Form (kept up by the buffs below from level 5) the finisher at full points, else Shred;
+    // before Cat Form, or when it is not up, the caster pair. Steps of the wrong form fail CheckShapeshift.
+    { CLASS_DRUID,   0, 22568,  RotCond::ComboFullOrDying },             // Ferocious Bite
+    { CLASS_DRUID,   0, 5221,   RotCond::Always },                       // Shred
     { CLASS_DRUID,   0, 8921,   RotCond::TargetLacksMyAura, 164812 },    // Moonfire
     { CLASS_DRUID,   0, 5176,   RotCond::Always },                       // Wrath
 
@@ -140,7 +143,8 @@ inline constexpr BuffStep Buffs[] =
     { CLASS_WARRIOR, 6673,   6673   },  // Battle Shout
     { CLASS_PRIEST,  21562,  21562  },  // Power Word: Fortitude
     { CLASS_MAGE,    1459,   1459   },  // Arcane Intellect
-    { CLASS_DRUID,   1126,   1126   },  // Mark of the Wild
+    { CLASS_DRUID,   1126,   1126   },  // Mark of the Wild (before the form: it cannot be cast in Cat Form)
+    { CLASS_DRUID,   768,    768    },  // Cat Form: the druid fights and travels as a cat from level 5
     { CLASS_SHAMAN,  192106, 192106 },  // Lightning Shield
     { CLASS_ROGUE,   315584, 315584 },  // Instant Poison
     { CLASS_ROGUE,   3408,   3408   },  // Crippling Poison

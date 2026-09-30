@@ -917,7 +917,8 @@ namespace Constellation::Ai
             if (std::find(skip, skip + skipCount, b.Spell) != skip + skipCount)
                 continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(b.Spell, diff);
-            if (!si || !_self->GetSpellHistory()->IsReady(si) || _self->GetSpellHistory()->HasGlobalCooldown(si)
+            if (!si || si->CheckShapeshift(_self->GetShapeshiftForm()) != SPELL_CAST_OK
+                || !_self->GetSpellHistory()->IsReady(si) || _self->GetSpellHistory()->HasGlobalCooldown(si)
                 || !_self->CanRequestSpellCast(si, _self))
                 continue;
             bool affordable = true;
