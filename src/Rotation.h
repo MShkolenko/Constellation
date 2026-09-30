@@ -154,6 +154,7 @@ inline constexpr RotStep Rotation[] =
     { CLASS_WARRIOR, 71, 7384,   RotCond::Always },                                // Overpower
     { CLASS_WARRIOR, 71, 1464,   RotCond::PowerAtLeast, POWER_RAGE, 500 },         // Slam above 50 rage
     { CLASS_WARRIOR, 71, 57755,  RotCond::Always },                                // Heroic Throw (8-30 yd only)
+    { CLASS_WARRIOR, 71, 1464,   RotCond::PowerAtLeast, POWER_RAGE, 300 },         // Slam at 30-50 rage with Mortal Strike down: not Hamstring
     { CLASS_WARRIOR, 71, 0,      RotCond::PowerBelow, POWER_RAGE, 300 },           // HOLD: keep the rage
 
     // WARRIOR Fury 72 (Zalko)
@@ -261,7 +262,8 @@ inline constexpr RotStep Rotation[] =
     { CLASS_MONK,    269, 100784, RotCond::PowerAtLeast, POWER_CHI, 3, false, true }, // Blackout Kick
     { CLASS_MONK,    269, 100780, RotCond::PowerBelow,   POWER_CHI, 4, false, true }, // Tiger Palm to build
     { CLASS_MONK,    269, 100780, RotCond::Always },                               // Tiger Palm fallback
-    { CLASS_MONK,    269, 117952, RotCond::Always },                               // Crackling Jade Lightning
+    { CLASS_MONK,    269, 0,      RotCond::PowerBelow, POWER_ENERGY, 50 },         // HOLD: no channel that blocks the next builder
+    { CLASS_MONK,    269, 117952, RotCond::Always },                               // Crackling Jade Lightning (out of melee only)
 
     // SHAMAN Elemental 262 (Nakuru). Storm Elemental does nothing in this core and stays out.
     { CLASS_SHAMAN,  262, 192106, RotCond::SelfLacksAura,    192106, 0, true },    // Lightning Shield
