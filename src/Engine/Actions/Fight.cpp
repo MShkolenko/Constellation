@@ -20,6 +20,7 @@
  * Copyright (C) 2026 Constellation contributors. Licensed under the GNU AGPL v3 — see COPYING.
  */
 #include "../Values.h"
+#include "Rotation.h"
 #include "../Engine.h"
 #include "../ClientAct.h"
 
@@ -501,6 +502,11 @@ namespace
                 std::optional<float> const d = ctx.World.DistanceTo(victim);
                 if (!d)
                     return Abandon(ctx, f);
+                // РАЗБОЙНИК УХОДИТ В ТЕНЬ НА ПОДХОДЕ (аудит механик 29.09): Ambush и Cheap Shot бьют только из
+                // незаметности, а без неё модуль их не брал ни разу. Тот же пакет каста, что у клиента.
+                if (*d <= Constellation::OPENER_STEALTH_YARDS)
+                    if (uint32 const stealth = ctx.World.StealthForOpener())
+                        ctx.Act.CastSpell(stealth, ctx.World.Guid());
                 float const dt = ctx.Act.SliceSeconds();
                 // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
                 // включённых умениях (`Constellation.Abilities = 1` на реалме), иначе четыре ярда.
@@ -547,6 +553,13 @@ namespace
         // ВСТУПЛЕНИЕ: повернуться, выбрать, ударить — и спросить у ядра, приняло ли оно замах.
         bool Swing(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
         {
+            // ИЗ НЕЗАМЕТНОСТИ СНАЧАЛА ПРИЁМ, ПОТОМ АВТОУДАР: первый же замах снял бы незаметность до Ambush.
+            if (!f.Engaged && ctx.World.IsStealthed())
+            {
+                ctx.Act.Face(victim);
+                ctx.Act.SetSelection(victim);
+                CastThroughDoor(ctx, victim, f.Cast);
+            }
             // ПОВОРОТ ПЕРВЫМ: `Unit::UpdateMeleeAttackingState` требует `HasInArc`.
             if (!ctx.Act.Face(victim) || !ctx.Act.SetSelection(victim) || !ctx.Act.AttackSwing(victim))
                 return f.Engaged ? false : Abandon(ctx, f);

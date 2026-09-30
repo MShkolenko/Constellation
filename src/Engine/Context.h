@@ -881,6 +881,8 @@ namespace Constellation::Ai
         // `HasBuffOf` - аура этого усиления уже висит.
         uint32     SelfBuffSpell(uint32 const* skip, size_t skipCount) const;
         uint32     FormToLeave() const;         // боевой облик (`CombatForms`), который вне боя пора снять; 0 - нет
+        uint32     StealthForOpener() const;    // Stealth, если разбойнику пора в него перед боем; 0 - нет
+        bool       IsStealthed() const;
         bool       HasBuffOf(uint32 spellId) const;
         void       LogBuff(uint32 spellId, char const* what) const;
 

@@ -941,6 +941,23 @@ namespace Constellation::Ai
         return 0;
     }
 
+    uint32 WorldView::StealthForOpener() const
+    {
+        if (!_self || _self->GetClass() != CLASS_ROGUE || !_self->IsAlive() || _self->IsInCombat()
+            || _self->HasStealthAura() || _self->IsMounted() || !_self->HasActiveSpell(OPENER_STEALTH_SPELL))
+            return 0;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(OPENER_STEALTH_SPELL, _self->GetMap()->GetDifficultyID());
+        if (!si || !_self->GetSpellHistory()->IsReady(si) || _self->GetSpellHistory()->HasGlobalCooldown(si)
+            || !_self->CanRequestSpellCast(si, _self))
+            return 0;
+        return OPENER_STEALTH_SPELL;
+    }
+
+    bool WorldView::IsStealthed() const
+    {
+        return _self && _self->HasStealthAura();
+    }
+
     bool WorldView::HasBuffOf(uint32 spellId) const
     {
         if (!_self)

@@ -84,7 +84,10 @@ inline constexpr RotStep Rotation[] =
     { CLASS_HUNTER,  0, 56641,  RotCond::Always },                       // Steady Shot
     { CLASS_HUNTER,  0, 185358, RotCond::Always },                       // Arcane Shot (whatever focus is left)
 
-    // ROGUE: Slice and Dice when missing, finisher at full points, else the builder.
+    // ROGUE: the opener from Stealth (the engine stealths on the approach; both need stealth, which the
+    // usability check asks the core), then Slice and Dice when missing, finisher at full points, else the builder.
+    { CLASS_ROGUE,   0, 8676,   RotCond::Always },                       // Ambush (stealth only)
+    { CLASS_ROGUE,   0, 1833,   RotCond::Always },                       // Cheap Shot (stealth only)
     { CLASS_ROGUE,   0, 315496, RotCond::SelfLacksAuraFullCombo, 315496 }, // Slice and Dice (spends points)
     { CLASS_ROGUE,   0, 196819, RotCond::ComboFullOrDying },             // Eviscerate
     { CLASS_ROGUE,   0, 1752,   RotCond::Always },                       // Sinister Strike
@@ -143,6 +146,11 @@ struct BuffStep
 // FORMS TAKEN FOR A FIGHT and left after it (right click on the aura, CMSG_CANCEL_AURA): out of combat a
 // shapeshifted player cannot take a taxi, use quest items or cast lock spells.
 inline constexpr uint32 CombatForms[] = { 768 };   // Cat Form
+
+// STEALTH ON THE APPROACH: cast when the victim is this close and the fight has not started, so the
+// opener (Ambush, Cheap Shot) can land before the first auto attack breaks stealth.
+inline constexpr uint32 OPENER_STEALTH_SPELL = 1784;   // Stealth
+inline constexpr float  OPENER_STEALTH_YARDS = 30.0f;
 
 inline constexpr BuffStep Buffs[] =
 {
