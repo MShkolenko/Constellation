@@ -13059,6 +13059,10 @@ namespace Constellation::Ai
     {
         if (!Constellation::Cfg().Abilities || !self || !target)
             return 0.0f;
+        // ДРУИД С ОБЛИКОМ КОШКИ ИДЁТ ВПЛОТНУЮ: первым действием боя он станет кошкой (Rotation.h), и
+        // дистанция «Гнева» оставила бы его в сорока ярдах от цели с одними ударами ближнего боя.
+        if (self->GetClass() == CLASS_DRUID && self->HasActiveSpell(768))
+            return 0.0f;
         if (uint32 sp = Constellation::Manager::Instance()->PickAttackSpell(self, target, 0, true))
             if (SpellInfo const* si = sSpellMgr->GetSpellInfo(sp, self->GetMap()->GetDifficultyID()))
             {
