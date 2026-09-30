@@ -981,6 +981,16 @@ namespace
         ctx.World.LogBuff(spell, why);
     }
 
+    // ОБЛИК СНИМАЕТСЯ, ТОЛЬКО КОГДА БОЯ НЕТ И У ДВИЖКА: ядро ставит «в бою» лишь с первым попаданием,
+    // а кошкой друид становится на первом такте боя - без этой оговорки облик снимался бы и надевался
+    // по кругу до первого удара (ревью 30.09).
+    inline uint32 FormToLeaveNow(Ctx& ctx)
+    {
+        if (!ctx.St || ctx.St->Fight.Engaged || !ctx.St->Fight.Victim.IsEmpty())
+            return 0;
+        return ctx.World.FormToLeave();
+    }
+
     inline uint32 BuffToCast(Ctx& ctx)
     {
         if (!ctx.St)
@@ -998,7 +1008,7 @@ namespace
         bool Useful(Ctx& ctx, Bid const&) override
         {
             return ctx.St && !ctx.World.IsInCombat()
-                && (ctx.St->BuffSpell != 0 || ctx.World.FormToLeave() != 0 || BuffToCast(ctx) != 0);
+                && (ctx.St->BuffSpell != 0 || FormToLeaveNow(ctx) != 0 || BuffToCast(ctx) != 0);
         }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
@@ -1014,7 +1024,7 @@ namespace
                 return false;
             }
             // БОЕВОЙ ОБЛИК СНИМАЕТСЯ ПОСЛЕ БОЯ (Кодекс 77): кошка не сядет на такси и не применит квестовый предмет.
-            if (uint32 const form = ctx.World.FormToLeave())
+            if (uint32 const form = FormToLeaveNow(ctx))
             {
                 ctx.Act.CancelAura(form);
                 ctx.World.LogBuff(form, "облик снят после боя");
@@ -1080,7 +1090,7 @@ namespace
 
             // УСИЛЕНИЕ ПОСЛЕ ПИТОМЦА: тоже прежде дела, но не при отдыхе (начатое доводится).
             if (ctx.St && !ctx.World.IsInCombat()
-                && (ctx.St->BuffSpell != 0 || ctx.World.FormToLeave() != 0 || (!RestWanted(ctx) && BuffToCast(ctx) != 0)))
+                && (ctx.St->BuffSpell != 0 || FormToLeaveNow(ctx) != 0 || (!RestWanted(ctx) && BuffToCast(ctx) != 0)))
                 sink.Add(ActionId::BuffSelf, REL_MOVE + 0.5f, Subject());
 
             // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший
