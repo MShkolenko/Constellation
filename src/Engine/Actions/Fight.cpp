@@ -74,6 +74,7 @@ namespace
             || a == ActionId::TalkToTarget;
     }
     inline constexpr uint32 FIGHT_RESERVE_MS      = 600000;   // backstop of the victim reservation (P5): longer than any fight; the real end is the outcome
+    inline constexpr uint8  OPENER_WAIT_TICKS     = 5;        // тактов ждать отката перед приёмом из незаметности
     inline constexpr uint32 PET_CMD_EVERY_MS      = 3000;     // повтор команды питомцу, если он сошёл с цели
     inline constexpr uint32 PET_LETHAL_FRESH_MS   = 2000;     // прогноз добивания питомцем старше - не наш
     inline constexpr uint32 HELD_BY_OTHER_MS      = 10000;    // target held by another: step back ten seconds, the scan offers a neighbour
@@ -504,9 +505,12 @@ namespace
                     return Abandon(ctx, f);
                 // РАЗБОЙНИК УХОДИТ В ТЕНЬ НА ПОДХОДЕ (аудит механик 29.09): Ambush и Cheap Shot бьют только из
                 // незаметности, а без неё модуль их не брал ни разу. Тот же пакет каста, что у клиента.
-                if (*d <= Constellation::OPENER_STEALTH_YARDS)
+                if (!f.StealthAsked && *d <= Constellation::OPENER_STEALTH_YARDS)
                     if (uint32 const stealth = ctx.World.StealthForOpener())
+                    {
+                        f.StealthAsked = true;      // один раз за бой: отказ ядра не повторяется каждый такт
                         ctx.Act.CastSpell(stealth, ctx.World.Guid());
+                    }
                 float const dt = ctx.Act.SliceSeconds();
                 // ДИСТАНЦИЯ ВСТУПЛЕНИЯ — ЛЕСТНИЦЫ (`:4088`): дальность заклинания у дальника при
                 // включённых умениях (`Constellation.Abilities = 1` на реалме), иначе четыре ярда.
@@ -554,11 +558,17 @@ namespace
         bool Swing(Ctx& ctx, EngineState::FightState& f, ObjectGuid victim)
         {
             // ИЗ НЕЗАМЕТНОСТИ СНАЧАЛА ПРИЁМ, ПОТОМ АВТОУДАР: первый же замах снял бы незаметность до Ambush.
+            // Приём не ушёл, пока идёт общий откат незаметности, - подождать несколько тактов, а не снять
+            // незаметность автоударом (ревью 30.09).
             if (!f.Engaged && ctx.World.IsStealthed())
             {
                 ctx.Act.Face(victim);
                 ctx.Act.SetSelection(victim);
-                CastThroughDoor(ctx, victim, f.Cast);
+                if (!CastThroughDoor(ctx, victim, f.Cast) && f.OpenerWaits < OPENER_WAIT_TICKS)
+                {
+                    ++f.OpenerWaits;
+                    return true;
+                }
             }
             // ПОВОРОТ ПЕРВЫМ: `Unit::UpdateMeleeAttackingState` требует `HasInArc`.
             if (!ctx.Act.Face(victim) || !ctx.Act.SetSelection(victim) || !ctx.Act.AttackSwing(victim))

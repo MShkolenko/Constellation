@@ -208,6 +208,8 @@ namespace Constellation::Ai
             bool          Kiting      = false;
             uint32        KiteMs      = 0;
             uint32        PetCmdMs    = 0;      // когда питомцу последний раз сказали «Атаковать»
+            bool          StealthAsked = false; // незаметность на подходе просится один раз за бой
+            uint8         OpenerWaits = 0;      // такты ожидания отката перед приёмом из незаметности
             Position      KiteTo;
             CastMemory    Cast;
             LootCounters  Loot;                 // за всё время, как у лестницы
