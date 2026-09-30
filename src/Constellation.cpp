@@ -3809,7 +3809,7 @@ public:
     // Шаги спека, если для спека список есть, иначе шаги класса. Ноль - списка нет или ни один шаг
     // не подошёл, тогда работает прежний выбор.
     static constexpr int32 ROT_REFRESH_MS = 3000;   // свой дот с остатком меньше - обновить
-    uint32 PickRotation(Player* self, Unit* victim, Unit** castTarget) const
+    uint32 PickRotation(Player* self, Unit* victim, Unit** castTarget, uint32 lastNoRepeat = 0) const
     {
         uint8 const cls = self->GetClass();
         uint16 const spec = uint16(self->GetPrimarySpecialization());
@@ -3822,7 +3822,9 @@ public:
         {
             if (s.Class != cls || (specList ? s.Spec != spec : s.Spec != 0))
                 continue;
-            if (!self->HasActiveSpell(s.Spell))
+            if (s.Spell && !self->HasActiveSpell(s.Spell))
+                continue;
+            if (s.NoRepeat && s.Spell == lastNoRepeat)
                 continue;
             bool ok = false;
             switch (s.Cond)
@@ -3833,7 +3835,8 @@ public:
                 case RotCond::TargetLacksMyAura:
                 {
                     Aura const* a = victim->GetAura(uint32(s.A), self->GetGUID());
-                    ok = !a || (a->GetDuration() >= 0 && a->GetDuration() < ROT_REFRESH_MS);
+                    ok = (!a || (a->GetDuration() >= 0 && a->GetDuration() < ROT_REFRESH_MS))
+                        && (s.B == 0 || victim->GetHealthPct() >= float(s.B));   // B: not on a target about to die
                     break;
                 }
                 case RotCond::PowerAtLeast:
@@ -3864,9 +3867,26 @@ public:
                     ok = !self->HasAura(uint32(s.A)) && cpMax > 0 && self->GetPower(POWER_COMBO_POINTS) >= cpMax;
                     break;
                 }
+                case RotCond::SelfHasAura:
+                {
+                    Aura const* a = self->GetAura(uint32(s.A));
+                    ok = a && a->GetStackAmount() >= std::max<int32>(1, s.B);
+                    break;
+                }
+                case RotCond::TargetLacksMyAuraFullCombo:
+                {
+                    Aura const* a = victim->GetAura(uint32(s.A), self->GetGUID());
+                    int32 const cpMax = self->GetMaxPower(POWER_COMBO_POINTS);
+                    ok = (!a || (a->GetDuration() >= 0 && a->GetDuration() < ROT_REFRESH_MS))
+                        && cpMax > 0 && self->GetPower(POWER_COMBO_POINTS) >= cpMax
+                        && (s.B == 0 || victim->GetHealthPct() >= float(s.B));
+                    break;
+                }
             }
             if (!ok)
                 continue;
+            if (!s.Spell)
+                return ROT_HOLD;            // шаг ожидания: ничего не читать и не звать общий выбор
             SpellInfo const* si = sSpellMgr->GetSpellInfo(s.Spell, diff);
             if (!si)
                 continue;
@@ -5936,8 +5956,12 @@ public:
         if (!spellId)
         {
             Unit* rotTarget = nullptr;
-            if ((spellId = PickRotation(self, victim, &rotTarget)))
+            if ((spellId = PickRotation(self, victim, &rotTarget, m.LastNoRepeat)))
+            {
+                if (spellId == ROT_HOLD)
+                    return false;           // список велит копить ресурс - в этот такт без умения
                 castTarget = rotTarget;
+            }
         }
         if (!spellId)
             spellId = PickAttackSpell(self, victim, m.LastSpell);
@@ -6001,6 +6025,8 @@ public:
         // спутник перевыбирал и перезаписывал его, ни разу ничего не отправив, — и ступень
         // следующего выбора зависела от числа тактов. Ротации нужно «что реально ушло».
         m.LastSpell = spellId;
+        if (IsNoRepeatSpell(self->GetClass(), spellId))
+            m.LastNoRepeat = spellId;
 
         // СЛЕД УСПЕХА — ОБЩИЙ ОТКАТ, а не «идёт ли заклинание».
         //

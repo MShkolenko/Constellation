@@ -104,6 +104,7 @@ namespace Constellation::Ai
     struct CastMemory
     {
         uint32 LastSpell     = 0;       // что именно произносили — иначе выбор не проверить
+        uint32 LastNoRepeat  = 0;       // последний из шагов списка с пометкой «не повторять» (Rotation.h)
         uint32 CastsTried    = 0;       // за этот бой: попыток произнести
         uint32 CastsWent     = 0;       //               и сколько ушло (по следу в ядре)
         uint32 CastsBusy     = 0;       // не просили: уже читаем или не истёк общий откат

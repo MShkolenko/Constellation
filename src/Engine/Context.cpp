@@ -932,9 +932,16 @@ namespace Constellation::Ai
             || _self->IsNonMeleeSpellCast(false) || _self->HasStealthAura())
             return 0;
         Difficulty const diff = _self->GetMap()->GetDifficultyID();
+        uint16 const spec = uint16(_self->GetPrimarySpecialization());
+        bool specRows = false;
+        for (BuffStep const& b : Buffs)
+            if (b.Class == _self->GetClass() && b.Spec && b.Spec == spec)
+                { specRows = true; break; }
         for (BuffStep const& b : Buffs)
         {
-            if (b.Class != _self->GetClass() || !_self->HasActiveSpell(b.Spell) || _self->HasAura(b.Aura))
+            if (b.Class != _self->GetClass() || (specRows ? b.Spec != spec : b.Spec != 0))
+                continue;
+            if (!_self->HasActiveSpell(b.Spell) || _self->HasAura(b.Aura))
                 continue;
             if (std::find(skip, skip + skipCount, b.Spell) != skip + skipCount)
                 continue;
