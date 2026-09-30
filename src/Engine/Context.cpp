@@ -26,6 +26,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PathGenerator.h"
+#include "Pet.h"
 #include "Player.h"
 #include "SpellHistory.h"
 #include "SpellInfo.h"
@@ -842,9 +843,28 @@ namespace Constellation::Ai
         return _self && _self->IsNonMeleeSpellCast(false);
     }
 
+    // ЖИВОЙ питомец или подчинённый. Мёртвый питомец (труп рядом или запись в стойле с нулём здоровья)
+    // не в счёт: его нужно воскресить, а призыв ядро отвергает, пока в активных есть мёртвый
+    // (Spell.cpp, «No pet can be summoned if any pet is dead"; аудит механик 29.09).
     bool WorldView::HasPet() const
     {
-        return _self && (!_self->GetPetGUID().IsEmpty() || !_self->GetCharmedGUID().IsEmpty());
+        if (!_self)
+            return false;
+        if (!_self->GetCharmedGUID().IsEmpty())
+            return true;
+        Pet* pet = _self->GetPet();
+        return pet && pet->IsAlive();
+    }
+
+    static bool HasDeadPet(Player* self)
+    {
+        if (Pet* pet = self->GetPet())
+            return !pet->IsAlive();
+        if (PetStable const* ps = self->GetPetStable())
+            for (auto const& p : ps->ActivePets)
+                if (p && !p->Health)
+                    return true;
+        return false;
     }
 
     bool WorldView::HunterNeedsPet() const
@@ -877,6 +897,8 @@ namespace Constellation::Ai
             || HasPet() || _self->IsNonMeleeSpellCast(false))
             return 0;
         Difficulty const diff = _self->GetMap()->GetDifficultyID();
+        // МЁРТВЫЙ - ВОСКРЕСИТЬ (Revive Pet), живого нет - ПРИЗВАТЬ.
+        SpellEffectName const wanted = HasDeadPet(_self) ? SPELL_EFFECT_RESURRECT_PET : SPELL_EFFECT_SUMMON_PET;
         uint32 best = 0, bestLevel = 0;
         for (auto const& [id, ps] : _self->GetSpellMap())
         {
@@ -885,7 +907,7 @@ namespace Constellation::Ai
             if (std::find(skip, skip + skipCount, id) != skip + skipCount)
                 continue;
             SpellInfo const* si = sSpellMgr->GetSpellInfo(id, diff);
-            if (!si || si->IsPassive() || !si->HasEffect(SPELL_EFFECT_SUMMON_PET))
+            if (!si || si->IsPassive() || !si->HasEffect(wanted))
                 continue;
             // `IsReady` общего отката не видит (Кодекс 58): под ним ядро отвергает запрос, и
             // нормальный призыв ушёл бы в отказанные на десять минут. Очередь - тот же вопрос.
