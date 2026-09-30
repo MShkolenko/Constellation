@@ -3705,9 +3705,14 @@ public:
         if (!self->HasSpell(mount))
             self->LearnSpell(mount, false);
 
+        // ДОМ - В ТРАКТИРЕ ХАБА: строка привязки появилась при входе (по умолчанию - ближайшее кладбище).
+        WorldLocation landing;
+        if (LandingFor(*e, landing))
+            self->SetHomebind(landing, self->GetAreaId());
+
         self->SetFullHealth();
         TC_LOG_INFO("server.worldserver",
-            "Constellation НАБОР {} (класс {}, ур {}, группа {}): предметов {} из {} на месте, сумки, еда, деньги, маунт {}",
+            "Constellation НАБОР {} (класс {}, ур {}, группа {}): выдано предметов {} из {}, сумки, еда, деньги, маунт {}, дом на хабе",
             self->GetName(), uint32(e->Class), uint32(e->Level), uint32(e->Group), worn, wanted, mount);
     }
 
@@ -12692,9 +12697,15 @@ private:
             {
                 newChar->Relocate(landing);
                 if (landing.GetMapId() != newChar->GetMapId())
+                {
+                    // `Player::Create` уже привязал карту старта, и `SetMap` на другую при занятой ссылке
+                    // это ABORT (ревью 30.09): сначала отцепить.
+                    newChar->ResetMap();
                     newChar->SetMap(sMapMgr->CreateMap(landing.GetMapId(), newChar.get()));
+                }
                 newChar->UpdatePositionData();
-                newChar->SetHomebind(landing, newChar->GetAreaId());
+                // ПРИВЯЗКА К ТРАКТИРУ здесь не пишется: строки `character_homebind` ещё нет (её заводит
+                // первый вход), а `SetHomebind` только обновляет существующую. Делает `BornKit`.
                 TC_LOG_INFO("server.worldserver", "Constellation ХАБ {}: группа {} ур {}, карта {} ({:.0f} {:.0f} {:.0f}), зона {}",
                     name, uint32(e.Group), uint32(e.Level), landing.GetMapId(), landing.GetPositionX(),
                     landing.GetPositionY(), landing.GetPositionZ(), newChar->GetZoneId());
