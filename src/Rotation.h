@@ -140,6 +140,10 @@ struct BuffStep
     uint32 Aura;
 };
 
+// FORMS TAKEN FOR A FIGHT and left after it (right click on the aura, CMSG_CANCEL_AURA): out of combat a
+// shapeshifted player cannot take a taxi, use quest items or cast lock spells.
+inline constexpr uint32 CombatForms[] = { 768 };   // Cat Form
+
 inline constexpr BuffStep Buffs[] =
 {
     { CLASS_WARRIOR, 6673,   6673   },  // Battle Shout

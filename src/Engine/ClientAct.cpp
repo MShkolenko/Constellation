@@ -204,6 +204,18 @@ namespace Constellation::Ai
         return true;
     }
 
+    bool ClientAct::CancelAura(uint32 spellId)
+    {
+        if (!Usable() || !spellId)
+            return false;
+        WorldPacket raw(CMSG_CANCEL_AURA);
+        WorldPackets::Spells::CancelAura cancel(std::move(raw));
+        cancel.CasterGUID = _self->GetGUID();
+        cancel.SpellID = int32(spellId);
+        _session->HandleCancelAuraOpcode(cancel);
+        return true;
+    }
+
     bool ClientAct::AttackStop()                                    // :6935
     {
         if (!Usable())

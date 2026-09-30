@@ -880,6 +880,7 @@ namespace Constellation::Ai
         // Усиление из `Buffs` (Rotation.h), которого на себе нет и которое ядро примет сейчас; 0 - нечего.
         // `HasBuffOf` - аура этого усиления уже висит.
         uint32     SelfBuffSpell(uint32 const* skip, size_t skipCount) const;
+        uint32     FormToLeave() const;         // боевой облик (`CombatForms`), который вне боя пора снять; 0 - нет
         bool       HasBuffOf(uint32 spellId) const;
         void       LogBuff(uint32 spellId, char const* what) const;
 

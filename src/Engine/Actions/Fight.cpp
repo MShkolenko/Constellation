@@ -997,7 +997,8 @@ namespace
 
         bool Useful(Ctx& ctx, Bid const&) override
         {
-            return ctx.St && !ctx.World.IsInCombat() && (ctx.St->BuffSpell != 0 || BuffToCast(ctx) != 0);
+            return ctx.St && !ctx.World.IsInCombat()
+                && (ctx.St->BuffSpell != 0 || ctx.World.FormToLeave() != 0 || BuffToCast(ctx) != 0);
         }
 
         bool Possible(Ctx& ctx, Bid const&) override { return ctx.St != nullptr; }
@@ -1010,6 +1011,13 @@ namespace
             if (ctx.World.IsInCombat())
             {
                 st.BuffSpell = 0;
+                return false;
+            }
+            // БОЕВОЙ ОБЛИК СНИМАЕТСЯ ПОСЛЕ БОЯ (Кодекс 77): кошка не сядет на такси и не применит квестовый предмет.
+            if (uint32 const form = ctx.World.FormToLeave())
+            {
+                ctx.Act.CancelAura(form);
+                ctx.World.LogBuff(form, "облик снят после боя");
                 return false;
             }
             if (st.BuffSpell)
@@ -1072,7 +1080,7 @@ namespace
 
             // УСИЛЕНИЕ ПОСЛЕ ПИТОМЦА: тоже прежде дела, но не при отдыхе (начатое доводится).
             if (ctx.St && !ctx.World.IsInCombat()
-                && (ctx.St->BuffSpell != 0 || (!RestWanted(ctx) && BuffToCast(ctx) != 0)))
+                && (ctx.St->BuffSpell != 0 || ctx.World.FormToLeave() != 0 || (!RestWanted(ctx) && BuffToCast(ctx) != 0)))
                 sink.Add(ActionId::BuffSelf, REL_MOVE + 0.5f, Subject());
 
             // В БОЮ, А ДРАТЬСЯ НЕЧЕМ (`Idle`, `:2998-3132`): без нападающих — сбросить завиcший

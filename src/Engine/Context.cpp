@@ -931,6 +931,16 @@ namespace Constellation::Ai
         return 0;
     }
 
+    uint32 WorldView::FormToLeave() const
+    {
+        if (!_self || !_self->IsAlive() || _self->IsInCombat())
+            return 0;
+        for (uint32 form : CombatForms)
+            if (_self->HasAura(form))
+                return form;
+        return 0;
+    }
+
     bool WorldView::HasBuffOf(uint32 spellId) const
     {
         if (!_self)

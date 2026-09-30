@@ -191,6 +191,7 @@ namespace Constellation::Ai
         // The pet bar's Attack button: works in any react state (a passive pet only skips assisting
         // on its own, PetAI::OwnerAttacked). Sent only when the pet is alive and not on this victim.
         bool PetAttack(ObjectGuid victim);                          // CMSG_PET_ACTION (COMMAND_ATTACK)
+        bool CancelAura(uint32 spellId);                            // CMSG_CANCEL_AURA (right click on own aura)
 
         // -- loot: four opcodes, one protocol (open -> money -> items -> release). Bodies moved
         //    from the ladder's LootFromCorpse/TakeOpenLoot; the protocol itself is
